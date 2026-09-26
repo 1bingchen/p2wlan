@@ -762,6 +762,7 @@ impl UdpTransport {
                                 network_generation,
                                 punch_generation,
                                 hard_hard_session_token: None,
+                                hard_hard_exclusive: false,
                                 created_at: Instant::now(),
                                 authenticated_evidence: 0,
                                 phase: DynamicSocketPhase::Provisional,
@@ -782,6 +783,7 @@ impl UdpTransport {
                             network_generation,
                             punch_generation,
                             hard_hard_session_token: None,
+                            hard_hard_exclusive: false,
                             created_at: Instant::now(),
                             authenticated_evidence: 0,
                             phase: DynamicSocketPhase::Provisional,
@@ -978,6 +980,28 @@ impl UdpTransport {
         }
     }
 
+    /// Reserve a fresh socket before publishing its affinity. Only the owner
+    /// of a provisional socket may do this, so an ordinary sender cannot
+    /// already have resolved a usable entry before isolation takes effect.
+    pub(crate) async fn reserve_hard_hard_socket(
+        &self,
+        peer_id: &str,
+        socket_index: usize,
+    ) -> bool {
+        let mut state = self.socket_state.lock().await;
+        let Some(entry) = state.dynamic.get_mut(&socket_index) else {
+            return false;
+        };
+        if entry.peer_id != peer_id
+            || entry.phase != DynamicSocketPhase::Provisional
+            || entry.network_generation != self.peers.current_network_generation_sync()
+        {
+            return false;
+        }
+        entry.hard_hard_exclusive = true;
+        true
+    }
+
     /// Bind a local-only token to every speculative socket in a bounded
     /// rendezvous. The token is checked only after the authenticated Probe v2
     /// identity has been verified; it is never trusted as wire authentication.
@@ -995,6 +1019,7 @@ impl UdpTransport {
             return false;
         }
         entry.hard_hard_session_token = Some(token.to_string());
+        entry.hard_hard_exclusive = true;
         true
     }
 

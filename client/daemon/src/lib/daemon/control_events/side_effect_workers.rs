@@ -572,6 +572,20 @@ impl Daemon {
                 offer = next;
                 continue;
             }
+            if !self
+                .wait_for_hard_hard_profile_publication(&offer, &mut reservation)
+                .await
+            {
+                let Some(next) = self
+                    .pending_handshakes
+                    .lock()
+                    .finish_candidate_offer_work(&peer_id, reservation.owner)
+                else {
+                    return;
+                };
+                offer = next;
+                continue;
+            }
             if let Some(newest) = self
                 .pending_handshakes
                 .lock()

@@ -77,6 +77,114 @@ enum HardHardOfferHandling {
 }
 
 impl Daemon {
+    /// Signal delivery and roster polling are independent. Keep this exact
+    /// offer in its existing bounded owner while one requested roster refresh
+    /// supplies the producer's real profile identity. Never extend rendezvous
+    /// time or synthesize a generation from the signal's declaration.
+    async fn wait_for_hard_hard_profile_publication(
+        &self,
+        offer: &PendingPeerOffer,
+        reservation: &mut CandidateOfferWorkReservation,
+    ) -> bool {
+        let Some(coordination) = offer
+            .session_id
+            .as_deref()
+            .and_then(HardHardCoordination::parse)
+        else {
+            return true;
+        };
+        let Some(punch_at_ms) = offer.punch_at_ms else {
+            return true;
+        };
+        let peer_id = &offer.from_node_id;
+        let expected_session = offer
+            .peer_session_generation
+            .or_else(|| self.peers.peer_session_generation_sync(peer_id));
+        let wait_ms = punch_at_ms.saturating_sub(
+            hard_hard_now_ms().saturating_add(HARD_HARD_MIN_RESPONSE_LEAD.as_millis() as u64),
+        );
+        let deadline = tokio::time::Instant::now()
+            + Duration::from_millis(wait_ms)
+                .min(HARD_HARD_PUNCH_LEAD - HARD_HARD_MIN_RESPONSE_LEAD);
+        let mut refresh_requested = false;
+        loop {
+            let current = || {
+                !*reservation.cancellation.borrow()
+                    && self
+                        .pending_handshakes
+                        .lock()
+                        .candidate_offer_work_is_current(peer_id, reservation.owner)
+                    && self.peers.current_network_generation_sync() == offer.network_generation
+                    && self.peers.peer_session_generation_sync(peer_id) == expected_session
+                    && self.peers.signal_sender_identity_matches_peer_sync(
+                        peer_id,
+                        offer.sender_public_key.as_deref(),
+                    )
+            };
+            if !current() {
+                return false;
+            }
+            // Yield immediately to the one newest-wins successor. The caller
+            // takes it before any incarnation/candidate mutation.
+            if self
+                .pending_handshakes
+                .lock()
+                .candidate_offer_work_has_successor(peer_id, reservation.owner)
+            {
+                return true;
+            }
+            let Some(connection) = self.peers.get_connection(peer_id).await else {
+                return false;
+            };
+            if !current() {
+                return false;
+            }
+            let observed = connection
+                .remote_nat_profile
+                .as_ref()
+                .and_then(|profile| profile.generation);
+            if observed.is_some_and(|generation| {
+                generation > coordination.local_profile_generation
+                    || (generation == coordination.local_profile_generation
+                        && connection.remote_nat_profile_is_fresh())
+            }) {
+                // A newer generation must reach the original strict binding
+                // check and be rejected, rather than waiting for a downgrade.
+                return true;
+            }
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero()
+                || !hard_hard_punch_window_is_usable(hard_hard_now_ms(), punch_at_ms)
+                || offer
+                    .candidates_expires_at_ms
+                    .is_some_and(|expires| expires <= hard_hard_now_ms())
+            {
+                return true;
+            }
+            if !refresh_requested {
+                refresh_requested = true;
+                self.control.refresh_peers_now();
+                self.timeline.emit(
+                    "hard_hard_profile_publication_wait",
+                    None,
+                    Some("profile_metadata_pending"),
+                    Some(format!(
+                        "peer={peer_id} declared_generation={} observed_generation={observed:?}",
+                        coordination.local_profile_generation,
+                    )),
+                );
+            }
+            tokio::select! {
+                changed = reservation.cancellation.changed() => {
+                    if changed.is_err() || *reservation.cancellation.borrow() {
+                        return false;
+                    }
+                }
+                _ = sleep(UNKNOWN_PEER_OFFER_POLL.min(remaining)) => {}
+            }
+        }
+    }
+
     /// Repair the local peer-manager roster when a signal races a lifecycle
     /// event.  The control client keeps an authoritative snapshot separately
     /// from the event consumer; a PeerLeft/PeerJoined boundary can therefore

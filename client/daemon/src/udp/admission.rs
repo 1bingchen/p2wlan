@@ -914,6 +914,23 @@ impl UdpTransport {
                     ));
                 }
             }
+            if let Some(dynamic) = state.dynamic.get(&socket_index) {
+                if !dynamic.permits_ordinary_traffic()
+                    && !(accepts_authenticated_ack
+                        && purpose == PendingProbePurpose::ConnectivityCheck
+                        && hard_hard_session_token.is_some()
+                        && hard_hard_session_token == dynamic.hard_hard_session_token.as_deref()
+                        && peer_id == Some(dynamic.peer_id.as_str())
+                        && Arc::ptr_eq(&dynamic.socket, &socket))
+                {
+                    return Err(ProbeSendFailure::new(
+                        ProbeSendFailureKind::SocketRevoked,
+                        DaemonError::Network(
+                            "probe rejected: socket reserved for authenticated rendezvous".into(),
+                        ),
+                    ));
+                }
+            }
             let send_lease = if socket_index >= DYNAMIC_SOCKET_INDEX_BASE {
                 state.dynamic.get(&socket_index).map(|entry| {
                     entry.send_leases.acquire();

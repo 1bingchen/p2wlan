@@ -52,14 +52,70 @@ fn forecast_horizon_and_current_sample_freshness_are_separate() {
 }
 
 #[test]
-fn clean_forecast_keeps_exact_existing_ranked_window() {
+fn immediate_clean_forecast_keeps_exact_existing_ranked_window() {
     for sequence in [[1000, 1001, 1002], [6000, 5998, 5996], [65530, 65533, 0]] {
         let model = build_model(&sequence, None, 100);
         assert_eq!(
-            predict_for_rendezvous(&model, sequence[2], timing(500), None, false).unwrap(),
+            predict_for_rendezvous(&model, sequence[2], timing(0), None, false).unwrap(),
             predict_ports(&model, sequence[2])
         );
     }
+}
+
+#[test]
+fn scheduled_clean_batch_keeps_ranked_prefix_and_covers_unobserved_drift() {
+    for sequence in [
+        [1000, 1001, 1002],
+        [6000, 5998, 5996],
+        [65525, 65528, 65531],
+    ] {
+        let model = build_model(&sequence, None, 100);
+        let immediate = predict_ports(&model, sequence[2]);
+        let scheduled =
+            predict_for_rendezvous(&model, sequence[2], timing(3_500), None, false).unwrap();
+        assert_eq!(&scheduled[..immediate.len()], immediate.as_slice());
+        assert_eq!(scheduled.len(), p2pnet_nat::mapping::MAX_PREDICTED_PORTS);
+        assert!(scheduled.iter().all(|candidate| candidate.port != 0));
+        let unique = scheduled
+            .iter()
+            .map(|candidate| candidate.port)
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(unique.len(), scheduled.len());
+    }
+    let model = build_model(&[1000, 1001, 1002], None, 100);
+    let count = predict_for_rendezvous(&model, 1002, timing(3_500), None, false)
+        .unwrap()
+        .len();
+    let a = fixed_step_rendezvous_order(count, false, false);
+    let b = fixed_step_rendezvous_order(count, true, true);
+    assert!(reciprocal_pair(&a, &b, 2, 3));
+    assert!(!reciprocal_pair(
+        &a[..6],
+        &fixed_step_rendezvous_order(6, true, true),
+        2,
+        3
+    ));
+}
+
+#[test]
+fn scheduled_expansion_does_not_override_confidence_or_wrap_safety() {
+    let mut model = build_model(&[1000, 1001, 1002], None, 100);
+    model.confidence = 59;
+    assert!(
+        predict_for_rendezvous(&model, 1002, timing(3_500), None, false)
+            .unwrap()
+            .is_empty()
+    );
+    let model = build_model(&[65531, 65532, 65533], None, 100);
+    let scheduled = predict_for_rendezvous(&model, 65533, timing(3_500), None, false).unwrap();
+    assert!(scheduled.len() <= p2pnet_nat::mapping::MAX_PREDICTED_PORTS);
+    assert_eq!(scheduled[0].port, 65534);
+    assert!(scheduled.iter().all(|candidate| candidate.port != 0));
+    let unique = scheduled
+        .iter()
+        .map(|candidate| candidate.port)
+        .collect::<std::collections::HashSet<_>>();
+    assert_eq!(unique.len(), scheduled.len());
 }
 
 #[test]

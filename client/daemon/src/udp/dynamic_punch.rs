@@ -842,6 +842,9 @@ impl UdpTransport {
         // the predecessor pin so a cancellation that lands right after the
         // commit can roll the peer back to its old path — conditionally, by
         // the watcher, only while the affinity still equals this commit's pin.
+        if measure_only && !self.reserve_hard_hard_socket(peer_id, socket_index).await {
+            return FreshMappingOutcome::Rejected(FreshMappingRejection::Superseded);
+        }
         let commit_outcome = provisional_guard
             .commit_and_pin(
                 self,

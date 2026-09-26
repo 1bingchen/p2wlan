@@ -52,6 +52,7 @@ impl WinnerFixture {
                 .attach_dynamic_punch_socket("peer-b", index, socket.clone(), 0, generation, None)
                 .await
                 .unwrap();
+            assert!(udp.reserve_hard_hard_socket("peer-b", index).await);
             let commit = if position == 0 {
                 guard
                     .commit_and_pin(&udp, "peer-b", index, 0, generation)
@@ -461,4 +462,233 @@ async fn hard_hard_sticky_winner_model_requires_shared_pair_nomination() {
         left.cleanup().await;
         right.cleanup().await;
     }
+}
+
+// The measurement result is committed before its coordinator can publish the
+// token. Ordinary workers must not consume any mapping in that handoff gap.
+#[tokio::test]
+async fn hard_hard_reservation_fences_the_commit_to_token_handoff() {
+    let fixture = WinnerFixture::new().await;
+    let (index, socket) = fixture.udp.bind_fresh_punch_socket().await.unwrap();
+    let guard = fixture
+        .udp
+        .attach_dynamic_punch_socket("peer-b", index, socket.clone(), 0, 3, None)
+        .await
+        .unwrap();
+    assert!(fixture.udp.reserve_hard_hard_socket("peer-b", index).await);
+    assert!(guard
+        .commit_and_pin(&fixture.udp, "peer-b", index, 0, 3)
+        .await
+        .committed());
+    assert!(guard.finalize().await);
+    assert_eq!(fixture.udp.hard_hard_socket_token(index).await, None);
+    assert!(fixture.udp.socket_for_peer(Some("peer-b")).await.is_none());
+    assert!(fixture
+        .udp
+        .resolve_dynamic_socket_for_send("peer-b")
+        .await
+        .is_none());
+    assert!(fixture
+        .udp
+        .resolve_send_socket_with_lease("peer-b")
+        .await
+        .is_none());
+    // Resolving ordinary traffic must not erase the reserved affinity.
+    assert_eq!(
+        fixture.udp.dynamic_socket_index_for_peer("peer-b").await,
+        Some(index)
+    );
+    assert!(fixture
+        .udp
+        .resolve_dynamic_socket_index_for_send("peer-b", index)
+        .await
+        .is_some());
+    let endpoint = fixture.remote.local_addr().unwrap();
+    for token in [None, Some(TOKEN)] {
+        let rejected = fixture
+            .udp
+            .send_probe_on_socket_result_with_hard_hard_token_classified(
+                index,
+                socket.clone(),
+                Some("peer-b"),
+                endpoint,
+                false,
+                PendingProbePurpose::ConnectivityCheck,
+                token,
+                true,
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(rejected.kind, ProbeSendFailureKind::SocketRevoked);
+    }
+    let packet = EncryptedPeerPacket {
+        room_authorization: None,
+        peer_id: "peer-b".into(),
+        dst_ip: "10.20.0.2".into(),
+        wire_bytes: vec![0; 85],
+        is_business: false,
+    };
+    assert!(fixture.udp.send_packet_to(&packet, endpoint).await.is_err());
+    assert!(fixture
+        .udp
+        .send_encrypted_packet_on_socket(&socket, index, &packet, endpoint)
+        .await
+        .is_err());
+    assert!(fixture.udp.pending_probes.lock().await.is_empty());
+    let mut bytes = [0; 2048];
+    assert_eq!(
+        fixture.remote.try_recv_from(&mut bytes).unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+    assert!(
+        fixture
+            .udp
+            .tag_hard_hard_socket("peer-b", index, TOKEN)
+            .await
+    );
+    let sent = fixture
+        .udp
+        .send_probe_on_socket_result_with_hard_hard_token_classified(
+            index,
+            socket.clone(),
+            Some("peer-b"),
+            endpoint,
+            false,
+            PendingProbePurpose::ConnectivityCheck,
+            Some(TOKEN),
+            true,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(sent.socket_index, index);
+    let (_, source) = timeout(
+        Duration::from_millis(250),
+        fixture.remote.recv_from(&mut bytes),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(source, socket.local_addr().unwrap());
+    fixture.cleanup().await;
+}
+
+#[tokio::test]
+async fn hard_hard_reservation_allows_only_owned_checks_until_matching_authenticated_ack() {
+    let fixture = WinnerFixture::new().await;
+    let endpoint = fixture.remote.local_addr().unwrap();
+    for (purpose, token) in [
+        (PendingProbePurpose::ConnectivityCheck, None),
+        (PendingProbePurpose::ConnectivityCheck, Some("other-token")),
+        (PendingProbePurpose::ConsentCheck, Some(TOKEN)),
+        (PendingProbePurpose::RelayBackoffHeartbeat, Some(TOKEN)),
+    ] {
+        let rejected = fixture
+            .udp
+            .send_probe_on_socket_result_with_hard_hard_token_classified(
+                fixture.indices[0],
+                fixture.sockets[0].clone(),
+                Some("peer-b"),
+                endpoint,
+                false,
+                purpose,
+                token,
+                true,
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(rejected.kind, ProbeSendFailureKind::SocketRevoked);
+    }
+    assert!(fixture.udp.socket_for_peer(Some("peer-b")).await.is_none());
+    assert!(fixture
+        .udp
+        .resolve_send_socket_with_lease("peer-b")
+        .await
+        .is_none());
+    assert!(fixture.udp.pending_probes.lock().await.is_empty());
+    let mut bytes = [0; 2048];
+    assert_eq!(
+        fixture.remote.try_recv_from(&mut bytes).unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+    let sent = fixture.send(0).await;
+    let (_, source) = timeout(
+        Duration::from_millis(250),
+        fixture.remote.recv_from(&mut bytes),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(source, fixture.sockets[0].local_addr().unwrap());
+    for _ in 1..sent.datagrams_sent {
+        timeout(
+            Duration::from_millis(250),
+            fixture.remote.recv_from(&mut bytes),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    }
+    // These arrive before the authenticated ACK on the same receive queue.
+    // Neither an unsolicited legacy punch nor a correlated legacy ACK may
+    // consume the reservation or count as authentication.
+    fixture
+        .remote
+        .send_to(&build_punch_packet(), source)
+        .await
+        .unwrap();
+    fixture
+        .remote
+        .send_to(&build_punch_ack(sent.nonce), source)
+        .await
+        .unwrap();
+    let key = fixture.peers.probe_key_for_peer("peer-b").await.unwrap();
+    let ack = build_authenticated_punch_ack(sent.nonce, "peer-b", "peer-a", 0, &key);
+    fixture.remote.send_to(&ack, source).await.unwrap();
+    timeout(Duration::from_millis(250), fixture.validation.notified())
+        .await
+        .unwrap();
+    fixture.assert_winner().await;
+    assert_eq!(
+        fixture.remote.try_recv_from(&mut bytes).unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+    assert_eq!(
+        fixture.udp.socket_for_peer(Some("peer-b")).await.unwrap().0,
+        fixture.indices[0]
+    );
+    assert_eq!(
+        fixture
+            .udp
+            .resolve_send_socket_with_lease("peer-b")
+            .await
+            .unwrap()
+            .0,
+        fixture.indices[0]
+    );
+    let packet = EncryptedPeerPacket {
+        room_authorization: None,
+        peer_id: "peer-b".into(),
+        dst_ip: "10.20.0.2".into(),
+        wire_bytes: vec![0; 85],
+        is_business: false,
+    };
+    assert_eq!(
+        fixture.udp.send_packet_to(&packet, endpoint).await.unwrap(),
+        85
+    );
+    timeout(Duration::from_millis(250), async {
+        loop {
+            let (size, source) = fixture.remote.recv_from(&mut bytes).await.unwrap();
+            if size == 85 {
+                assert_eq!(source, fixture.sockets[0].local_addr().unwrap());
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    fixture.cleanup().await;
 }

@@ -883,6 +883,9 @@ pub(crate) struct DynamicPunchSocket {
     /// binds an authenticated packet received on this socket to the exact
     /// bounded rendezvous that owns the socket.
     pub(crate) hard_hard_session_token: Option<String>,
+    /// Reserve a measured mapping before its token handoff. Ordinary traffic
+    /// may use it only after authenticated evidence on this exact socket.
+    pub(crate) hard_hard_exclusive: bool,
     pub(crate) created_at: Instant,
     /// Monotonic counter of AUTHENTICATED post-attach evidence observed on
     /// this socket: a matched Probe-v2 ACK, an accepted authenticated punch,
@@ -1051,6 +1054,10 @@ impl DynamicSocketPhase {
 }
 
 impl DynamicPunchSocket {
+    pub(crate) fn permits_ordinary_traffic(&self) -> bool {
+        !self.hard_hard_exclusive || self.authenticated_evidence > 0
+    }
+
     pub(crate) fn local_endpoint(&self) -> Option<SocketAddr> {
         self.socket.local_addr().ok()
     }

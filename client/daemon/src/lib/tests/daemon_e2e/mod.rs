@@ -184,6 +184,7 @@ mod control_event_contention;
 mod direct_first;
 mod handshake_arbiter;
 mod handshake_contention;
+mod hard_hard_profile_publication;
 mod incarnation_fencing;
 mod network_outbound;
 mod relay_and_stun;

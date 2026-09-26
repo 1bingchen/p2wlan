@@ -1119,6 +1119,19 @@ impl UdpTransport {
             }
 
             if let Some(packet) = legacy_punch {
+                // A legacy datagram supplies no authenticated evidence and
+                // must neither consume a reserved mapping with an ACK nor
+                // unlock it through the legacy affinity-adoption path.
+                if self
+                    .socket_state
+                    .lock()
+                    .await
+                    .dynamic
+                    .get(&socket_index)
+                    .is_some_and(|entry| !entry.permits_ordinary_traffic())
+                {
+                    continue;
+                }
                 self.update_socket_diagnostics(socket_index, |metrics| {
                     metrics.datagrams_received = metrics.datagrams_received.saturating_add(1)
                 })

@@ -1724,6 +1724,14 @@ impl UdpTransport {
         packet: &EncryptedPeerPacket,
         endpoint: SocketAddr,
     ) -> Result<usize> {
+        if !self
+            .permits_ordinary_send_on_socket(&packet.peer_id, socket_index, socket)
+            .await
+        {
+            return Err(DaemonError::Network(
+                "encrypted send rejected: socket unavailable or reserved for rendezvous".into(),
+            ));
+        }
         let sent = std::future::poll_fn(|cx| {
             // Re-evaluate on EVERY readiness poll, including after socket backpressure.
             if packet
@@ -1785,6 +1793,12 @@ impl UdpTransport {
         packet: &EncryptedPeerPacket,
         endpoint: SocketAddr,
     ) -> std::result::Result<(), crate::dplpmtud::DplpmtudProbeSendFailure> {
+        if !self
+            .permits_ordinary_send_on_socket(&packet.peer_id, socket_index, socket)
+            .await
+        {
+            return Err(crate::dplpmtud::DplpmtudProbeSendFailure::TransientSend);
+        }
         let sent = std::future::poll_fn(|cx| {
             // Re-evaluate on EVERY readiness poll, including after socket backpressure.
             if packet

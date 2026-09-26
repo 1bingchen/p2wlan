@@ -1332,6 +1332,12 @@ impl PendingHandshakeState {
             .is_some_and(|worker| worker.owner == owner && !*worker.cancellation.borrow())
     }
 
+    fn candidate_offer_work_has_successor(&self, peer_id: &str, owner: u64) -> bool {
+        self.candidate_offer_workers
+            .get(peer_id)
+            .is_some_and(|worker| worker.owner == owner && worker.queued.is_some())
+    }
+
     #[cfg(test)]
     fn has_candidate_offer_work_for_test(&self, peer_id: &str) -> bool {
         self.candidate_offer_workers.contains_key(peer_id)

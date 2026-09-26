@@ -4,7 +4,8 @@
 //! may predict a bounded future rendezvous, but an already stale sample cannot.
 
 use super::{
-    model_is_fresh, predict_ports_with_learning, ModelRejection, PortModel, PredictionCandidate,
+    model_is_fresh, predict_ports_with_learning, ModelRejection, PortModel, PortModelKind,
+    PredictionCandidate, PredictionReason, MAX_PREDICTED_PORTS,
 };
 use std::collections::HashSet;
 use std::net::SocketAddr;
@@ -40,14 +41,45 @@ pub fn predict_for_rendezvous(
         .now_ms
         .saturating_sub(timing.last_measurement_send_at_ms)
         .saturating_add(timing.send_delay_ms);
-    Ok(predict_ports_with_learning(
+    let mut candidates = predict_ports_with_learning(
         model,
         last,
         timing.measurement_span_ms,
         gap_ms,
         step_estimate,
         reverse_window,
-    ))
+    );
+    // A short, perfectly regular STUN batch is evidence of stride, not of
+    // zero competing allocations throughout the future rendezvous wait.
+    // Spend the existing bounded successor budget for scheduled fixed-step
+    // rendezvous, retaining every original ranked hypothesis. This also gives
+    // the reciprocal role schedule room for modest first-send drift. It is
+    // deterministic coverage, not a reduced model confidence or a promise of
+    // predicting arbitrary shared-NAT activity.
+    if timing.send_delay_ms > 0 && !candidates.is_empty() {
+        if let PortModelKind::FixedStep { step } = model.kind {
+            let mut seen = candidates
+                .iter()
+                .map(|candidate| candidate.port)
+                .collect::<HashSet<_>>();
+            for distance in 1..=MAX_PREDICTED_PORTS {
+                if candidates.len() >= MAX_PREDICTED_PORTS {
+                    break;
+                }
+                let port = super::modular_add_wide(last, i64::from(step) * distance as i64);
+                if port != 0 && seen.insert(port) {
+                    candidates.push(PredictionCandidate {
+                        port,
+                        rank: candidates.len() as u8,
+                        reason: PredictionReason::SuccessorWindow {
+                            distance: (distance - 1) as u8,
+                        },
+                    });
+                }
+            }
+        }
+    }
+    Ok(candidates)
 }
 
 /// Keep the freshest eight ranked hypotheses, then cover the rest of the

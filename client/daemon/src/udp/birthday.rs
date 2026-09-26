@@ -450,7 +450,10 @@ impl UdpTransport {
         // protected by the same generation/cancellation fences.
         for (position, (socket_index, _, guard, punch_generation, _)) in attached.iter().enumerate()
         {
-            let committed = if position == 0 {
+            let reserved = self.reserve_hard_hard_socket(peer_id, *socket_index).await;
+            let committed = if !reserved {
+                false
+            } else if position == 0 {
                 guard
                     .commit_and_pin(
                         self,

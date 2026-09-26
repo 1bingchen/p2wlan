@@ -67,6 +67,7 @@ impl UdpTransport {
                     .await
                     .dynamic
                     .get(&index)
+                    .filter(|dynamic| dynamic.permits_ordinary_traffic())
                     .map(|dynamic| dynamic.socket.clone())
                 {
                     return Some((index, socket));
@@ -93,6 +94,28 @@ impl UdpTransport {
             return self.ipv6_socket.clone().map(|s| (IPV6_SOCKET_INDEX, s));
         }
         self.socket_for_peer(peer_id).await
+    }
+
+    /// Exact encrypted sends must not consume an unproven rendezvous mapping.
+    /// Isolation is established while provisional and never re-enabled after
+    /// authentication, so a successful check cannot race a later reservation.
+    pub(super) async fn permits_ordinary_send_on_socket(
+        &self,
+        peer_id: &str,
+        socket_index: usize,
+        socket: &Arc<UdpSocket>,
+    ) -> bool {
+        if socket_index < DYNAMIC_SOCKET_INDEX_BASE || socket_index == IPV6_SOCKET_INDEX {
+            return true;
+        }
+        let state = self.socket_state.lock().await;
+        state.dynamic.get(&socket_index).is_some_and(|entry| {
+            entry.peer_id == peer_id
+                && entry.phase.is_usable()
+                && entry.network_generation == self.peers.current_network_generation_sync()
+                && Arc::ptr_eq(&entry.socket, socket)
+                && entry.permits_ordinary_traffic()
+        })
     }
 
     /// Resolve the exact socket that received an authenticated direct packet.
@@ -194,6 +217,7 @@ impl UdpTransport {
         let dynamic = state.dynamic.get(&pin.socket_index)?;
         if dynamic.peer_id != peer_id
             || !dynamic.phase.is_usable()
+            || !dynamic.permits_ordinary_traffic()
             || dynamic.network_generation != self.peers.current_network_generation_sync()
         {
             return None;
@@ -493,6 +517,11 @@ impl UdpTransport {
                         && dynamic.network_generation
                             == self.peers.current_network_generation_sync()
                     {
+                        // Keep the reservation and affinity intact; substituting
+                        // another socket would also invalidate the expectation.
+                        if !dynamic.permits_ordinary_traffic() {
+                            return None;
+                        }
                         let leases = dynamic.send_leases.clone();
                         let socket = dynamic.socket.clone();
                         let index = pin.socket_index;

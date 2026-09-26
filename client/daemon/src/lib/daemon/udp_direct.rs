@@ -654,13 +654,8 @@ async fn run_udp_direct_instance(
             &candidate_sources,
             fresh_mapping_harness_loopback,
         );
-        let defer_simulator_endpoint_publication =
-            fresh_mapping_harness_loopback && peers.hard_hard_experiment_only();
         let mut published_endpoint = None;
-        if let Some(endpoint) = initial_control_endpoint
-            .as_ref()
-            .filter(|_| !defer_simulator_endpoint_publication)
-        {
+        if let Some(endpoint) = initial_control_endpoint.as_ref() {
             // The handshake control lane has its own bounded deadline; a
             // short caller budget keeps a pathological lane from stalling
             // transport startup.
@@ -695,10 +690,6 @@ async fn run_udp_direct_instance(
             let candidate_snapshot = candidate_snapshot.clone();
             let stun_servers = stun_servers.clone();
             let signal_control = control.clone();
-            let deferred_control_endpoint = defer_simulator_endpoint_publication
-                .then_some(initial_control_endpoint)
-                .flatten();
-            let deferred_nat_type = advertised_nat_type.clone();
             async move {
                 publish_local_candidates_to_known_peers(
                     &control,
@@ -719,44 +710,9 @@ async fn run_udp_direct_instance(
                     }),
                 )
                 .await;
-
-                // The isolated Hard↔Hard simulator lane is deliberately
-                // stricter than production and the existing topology gates:
-                // candidate signaling must land first so the following
-                // live-measurement publication binds the NAT profile to the
-                // receiver's final candidate epoch. Ordinary direct/relay
-                // gates retain their endpoint-first startup ordering.
-                let endpoint = deferred_control_endpoint?;
-                match tokio::time::timeout(
-                    Duration::from_millis(STARTUP_ENDPOINT_PUBLISH_BUDGET_MS),
-                    control.update_endpoint_for_handshake(&endpoint, &deferred_nat_type),
-                )
-                .await
-                {
-                    Ok(Ok(())) => Some(endpoint),
-                    Ok(Err(err)) => {
-                        warn!(
-                            "Failed to publish simulator UDP endpoint after candidate fan-out '{endpoint}': {err}"
-                        );
-                        None
-                    }
-                    Err(_) => {
-                        warn!(
-                            "Simulator UDP endpoint publish after candidate fan-out '{endpoint}' exceeded its budget"
-                        );
-                        None
-                    }
-                }
             }
         };
-        let initial_publication_worker = if defer_simulator_endpoint_publication {
-            if let Some(endpoint) = initial_publication_task.await {
-                published_endpoint = Some(endpoint);
-            }
-            None
-        } else {
-            Some(tokio::spawn(initial_publication_task))
-        };
+        let initial_publication_worker = Some(tokio::spawn(initial_publication_task));
 
         // Route inspection invokes platform commands (`route`/`ip`) and must
         // not block the async runtime while the UDP instance is starting.

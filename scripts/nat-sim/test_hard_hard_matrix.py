@@ -343,6 +343,12 @@ class HardHardMatrixRunnerTests(unittest.TestCase):
         cross = MATRIX_RUNNER.SCENARIO_BY_NAME["strict-unequal-drift-delay"].env
         self.assertNotEqual(cross["STEP_A"], cross["STEP_B"])
         self.assertGreater(int(cross["SWEEP_NOISE_COUNT"]), 0)
+        self.assertEqual(cross["SWEEP_NOISE_EVERY"], "1")
+        sweep = MATRIX_RUNNER.SCENARIO_BY_NAME["strict-sweep-noise"].env
+        self.assertEqual((sweep["STRICT_FILTERING_A"], sweep["STRICT_FILTERING_B"]), ("1", "1"))
+        self.assertEqual((sweep["CONSUME_A"], sweep["CONSUME_B"]), ("1", "1"))
+        self.assertEqual(sweep["SWEEP_NOISE_EVERY"], "1")
+        self.assertEqual(sweep["SWEEP_NOISE_LIMIT"], "16")
         self.assertNotEqual(cross["STUN_DELAY_A_MS"], cross["STUN_DELAY_B_MS"])
 
     def test_capture_loss_retains_requested_denominator_and_partial_attempt_costs(self):

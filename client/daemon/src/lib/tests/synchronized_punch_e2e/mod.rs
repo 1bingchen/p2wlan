@@ -702,9 +702,14 @@ impl NatPacketLink {
         // harness must therefore fall back to a deterministic usable dynamic
         // socket instead of dropping the packet merely because affinity is
         // not committed yet.
-        let has_dynamic_socket = target_udp.has_dynamic_socket_for_peer(target_peer).await;
-        if has_dynamic_socket {
-            if let Some((_, socket)) = target_udp.socket_for_peer(Some(target_peer)).await {
+        // This is an inbound NAT delivery, not admission for ordinary sends.
+        // Reserved rendezvous sockets reject the latter until authentication,
+        // but must still receive the very first authenticated punch/ACK.
+        if let Some(index) = target_udp.dynamic_socket_index_for_peer(target_peer).await {
+            if let Some(socket) = target_udp
+                .socket_for_inbound_peer_index(target_peer, index)
+                .await
+            {
                 if let Ok(target) = socket.local_addr() {
                     return source_socket
                         .send_to(data, target)

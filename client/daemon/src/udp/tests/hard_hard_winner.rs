@@ -692,3 +692,79 @@ async fn hard_hard_reservation_allows_only_owned_checks_until_matching_authentic
     .unwrap();
     fixture.cleanup().await;
 }
+
+#[tokio::test]
+async fn hard_hard_reservation_preserves_authenticated_detached_receive_arc_handoff() {
+    let fixture = WinnerFixture::new().await;
+    assert!(
+        fixture
+            .udp
+            .promote_hard_hard_winner_for_test("peer-b", TOKEN, fixture.indices[0], 0,)
+            .await
+    );
+    let endpoint = fixture.remote.local_addr().unwrap();
+    let packet = EncryptedPeerPacket {
+        room_authorization: None,
+        peer_id: "peer-b".into(),
+        dst_ip: "10.20.0.2".into(),
+        wire_bytes: vec![4; 85],
+        is_business: false,
+    };
+    // While an entry exists its exact identity remains authoritative, even
+    // after authentication. A different socket cannot borrow its permission.
+    let wrong_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    assert!(fixture
+        .udp
+        .send_encrypted_packet_on_socket(&wrong_socket, fixture.indices[0], &packet, endpoint,)
+        .await
+        .is_err());
+    let mut wrong_peer = packet.clone();
+    wrong_peer.peer_id = "other-peer".into();
+    assert!(fixture
+        .udp
+        .send_encrypted_packet_on_socket(
+            &fixture.sockets[0],
+            fixture.indices[0],
+            &wrong_peer,
+            endpoint,
+        )
+        .await
+        .is_err());
+    fixture
+        .udp
+        .detach_dynamic_socket_by_index(fixture.indices[0], "received_arc_handoff")
+        .await;
+    assert!(fixture
+        .udp
+        .resolve_dynamic_socket_index_for_send("peer-b", fixture.indices[0])
+        .await
+        .is_none());
+    // A validated inbound envelope already retains this exact Arc; completing
+    // its reply must neither re-resolve a different socket nor recreate state.
+    assert_eq!(
+        fixture
+            .udp
+            .send_encrypted_packet_on_socket(
+                &fixture.sockets[0],
+                fixture.indices[0],
+                &packet,
+                endpoint,
+            )
+            .await
+            .unwrap(),
+        packet.wire_bytes.len()
+    );
+    let mut bytes = [0; 2048];
+    let (size, source) = timeout(Duration::from_secs(1), fixture.remote.recv_from(&mut bytes))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(source, fixture.sockets[0].local_addr().unwrap());
+    assert_eq!(&bytes[..size], packet.wire_bytes.as_slice());
+    assert!(fixture
+        .udp
+        .resolve_dynamic_socket_index_for_send("peer-b", fixture.indices[0])
+        .await
+        .is_none());
+    fixture.cleanup().await;
+}

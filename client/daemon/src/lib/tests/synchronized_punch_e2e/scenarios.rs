@@ -871,6 +871,61 @@ async fn hard_hard_two_peer_success_with_minimum_stun_capacity() {
     hard_hard_two_peer_success_with_stun(HarnessStunProfile::MINIMUM_CAPACITY).await;
 }
 
+#[tokio::test]
+async fn hard_hard_nat_link_delivers_to_reserved_socket_without_ordinary_send_admission() {
+    let (_daemon, peers, udp, _control) = build_hard_hard_ordinary_fallback_fixture().await;
+    let (tx, mut rx) = mpsc::channel(1);
+    let udp = udp.with_inbound_channel(tx);
+    let (index, socket) = udp.bind_fresh_punch_socket().await.unwrap();
+    let generation = peers.current_network_generation_sync();
+    let punch_generation = peers.next_punch_generation(HARD_HARD_B).await;
+    let guard = udp
+        .attach_dynamic_punch_socket(
+            HARD_HARD_B,
+            index,
+            socket.clone(),
+            generation,
+            punch_generation,
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(udp.reserve_hard_hard_socket(HARD_HARD_B, index).await);
+    assert!(
+        guard
+            .commit_and_pin_for_test(&udp, HARD_HARD_B, index, generation, punch_generation,)
+            .await
+    );
+    assert!(guard.finalize().await);
+    assert!(udp.socket_for_peer(Some(HARD_HARD_B)).await.is_none());
+
+    // The NAT forwards bytes without granting authenticated evidence; the
+    // real UDP reader and subsequent protocol handlers own that decision.
+    let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let bytes = [4, 0, 0, 0, 1, 2, 3, 4];
+    let delivered = NatPacketLink::forward(
+        &sender,
+        &bytes,
+        &udp,
+        HARD_HARD_B,
+        None,
+        true,
+        &AtomicBool::new(false),
+    )
+    .await;
+    assert_eq!(delivered, Some(socket.local_addr().unwrap()));
+    let inbound = timeout(Duration::from_secs(1), rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(inbound.socket_index, Some(index));
+    assert_eq!(inbound.wire_bytes, bytes);
+    assert_eq!(udp.authenticated_evidence_for_socket(index).await, 0);
+    assert!(udp.socket_for_peer(Some(HARD_HARD_B)).await.is_none());
+    udp.detach_all_dynamic_punch_sockets("reserved_nat_delivery_test")
+        .await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn hard_hard_asymmetric_mtu_500_900() {
     hard_hard_two_peer_success_with_stun_and_mtu(HarnessStunProfile::FULL_CAPACITY, [500, 900])

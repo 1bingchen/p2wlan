@@ -615,12 +615,21 @@ impl WireGuardTransport {
                                     );
                                 }
                             }
-                            let binding_guard = self
-                                .acquire_current_session_evidence_guard(
+                            let binding_outcome = self
+                                .acquire_current_session_evidence_guard_outcome(
                                     &inbound.peer_id,
                                     inbound.session_instance,
                                 )
                                 .await;
+                            let binding_contended = matches!(
+                                binding_outcome,
+                                CurrentSessionEvidenceGuardOutcome::Contended
+                            );
+                            let binding_guard = match binding_outcome {
+                                CurrentSessionEvidenceGuardOutcome::Current(guard) => Some(guard),
+                                CurrentSessionEvidenceGuardOutcome::Contended
+                                | CurrentSessionEvidenceGuardOutcome::Stale => None,
+                            };
                             let binding_session_current =
                                 inbound.session_instance.is_none() || binding_guard.is_some();
                             if binding_session_current {
@@ -669,12 +678,26 @@ impl WireGuardTransport {
                                 }
                             } else {
                                 peers.emit_timeline(
-                                    "stale_session_evidence",
-                                    Some("relay"),
-                                    Some("session_replaced_or_removed"),
+                                    if binding_contended {
+                                        "session_evidence_contended"
+                                    } else {
+                                        "stale_session_evidence"
+                                    },
+                                    relay_endpoint.as_ref().map(|_| "relay").or(Some("direct")),
+                                    Some(if binding_contended {
+                                        "session_evidence_fence_contended"
+                                    } else {
+                                        "session_replaced_or_removed"
+                                    }),
                                     Some(format!(
-                                        "peer={} session_instance={:?} responder_binding=stale",
-                                        inbound.peer_id, inbound.session_instance,
+                                        "peer={} session_instance={:?} responder_binding={}",
+                                        inbound.peer_id,
+                                        inbound.session_instance,
+                                        if binding_contended {
+                                            "contended"
+                                        } else {
+                                            "stale"
+                                        },
                                     )),
                                 );
                             }
@@ -768,26 +791,31 @@ impl WireGuardTransport {
                                     // peer incarnation.
                                     let peer_session_generation =
                                         peers.peer_session_generation_sync(&inbound.peer_id);
-                                    let session_guard = if token_kind == DirectValidationKind::Ack {
-                                        self.acquire_current_session_evidence_guard(
+                                    // Only this internal validation path waits:
+                                    // a simultaneous local send is contention,
+                                    // not evidence that the decrypted instance
+                                    // was replaced. The earlier optional binding
+                                    // check remains try-only, so there is one
+                                    // bounded wait budget per validation frame.
+                                    let session_outcome = self
+                                        .acquire_direct_validation_session_guard(
                                             &inbound.peer_id,
                                             inbound.session_instance,
                                         )
-                                        .await
-                                    } else {
-                                        None
+                                        .await;
+                                    let session_contended = matches!(
+                                        session_outcome,
+                                        CurrentSessionEvidenceGuardOutcome::Contended
+                                    );
+                                    let session_guard = match session_outcome {
+                                        CurrentSessionEvidenceGuardOutcome::Current(guard) => {
+                                            Some(guard)
+                                        }
+                                        CurrentSessionEvidenceGuardOutcome::Contended
+                                        | CurrentSessionEvidenceGuardOutcome::Stale => None,
                                     };
-                                    let session_current = if inbound.session_instance.is_none() {
-                                        true
-                                    } else if token_kind == DirectValidationKind::Ack {
-                                        session_guard.is_some()
-                                    } else {
-                                        self.session_instance_is_current(
-                                            &inbound.peer_id,
-                                            inbound.session_instance,
-                                        )
-                                        .await
-                                    };
+                                    let session_current = inbound.session_instance.is_none()
+                                        || session_guard.is_some();
                                     // Direct validation revalidates the exact
                                     // peer lifecycle and owned request token.
                                     // Release the inbound evidence fence before
@@ -824,9 +852,9 @@ impl WireGuardTransport {
                                         }
                                     } else {
                                         peers.emit_timeline(
-                                            "stale_session_evidence",
+                                            if session_contended { "session_evidence_contended" } else { "stale_session_evidence" },
                                             Some("direct"),
-                                            Some("session_replaced_or_removed"),
+                                            Some(if session_contended { "direct_validation_session_fence_timeout" } else { "session_replaced_or_removed" }),
                                             Some(format!(
                                                 "peer={} session_instance={:?} direct_validation={:?}",
                                                 inbound.peer_id,

@@ -27,6 +27,8 @@ mod tests {
     use crate::udp::UdpTransport;
     use tokio::time::{sleep, timeout};
 
+    include!("tests/direct_validation_contention.rs");
+
     #[test]
     fn first_usable_evidence_requires_a_decrypted_overlay_ip_packet() {
         assert!(!is_real_overlay_business_packet(&[]));

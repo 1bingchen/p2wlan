@@ -210,6 +210,7 @@ fn test_parse_roundtrip_recovers_mapping_allocation_filtering_hairpin() {
                     (false, false, None, None),
                     (false, false, None, Some(true)),
                     (false, true, Some(7), None),
+                    (false, true, Some(-7), None),
                     (true, false, None, None),
                 ] {
                     let profile = fingerprint_profile(
@@ -357,7 +358,7 @@ fn test_parse_corrupted_token_value_not_parsed() {
         "p2v2:m=bogus_token;a=stable;d=0;c=70;f=unknown;h=unknown", // unknown m value
         "p2v2:m=open;a=sometimes;d=0;c=70;f=unknown;h=unknown",     // unknown a value
         "p2v2:m=open;a=stable;d=0;c=999;f=unknown;h=unknown",       // c out of u8 range
-        "p2v2:m=open;a=stable;d=-5;c=70;f=unknown;h=unknown",       // negative d
+        "p2v2:m=open;a=stable;d=-2147483649;c=70;f=unknown;h=unknown", // out of i32 range
         "p2v2:m=open;a=stable;d=0;c=70;f=weird;h=unknown",          // unknown f value
         "p2v2:m=open;a=stable;d=0;c=70;f=unknown;h=maybe",          // unknown h value
         "p2v2:m=open;a=stable;d=0;c=70;z=9;f=unknown;h=unknown",    // unrecognized key
@@ -389,4 +390,40 @@ fn test_r1_static_inference_f_apd_implies_m_apd() {
     // The udp_blocked=true path: m and f are both the blocked flavor.
     let blocked = infer_filtering_behavior(true, MappingBehavior::UdpBlocked);
     assert_eq!(blocked, FilteringBehavior::UdpBlocked);
+}
+
+#[test]
+fn test_signed_allocation_roundtrip_preserves_profile_identity() {
+    for delta in [-5, -3, i32::MIN] {
+        let profile = fingerprint_profile(
+            MappingBehavior::AddressOrPortDependent,
+            FilteringBehavior::Unknown,
+            HairpinBehavior::Unknown,
+            false,
+            true,
+            Some(delta),
+            Some(true),
+            60,
+        );
+        let label = profile.control_label_with_evidence(u64::MAX, Some(u64::MAX), Some(u64::MAX));
+        assert!(label.len() <= 128);
+        let hint = parse_nat_hint(&label);
+        assert!(hint.parsed, "reverse allocation is valid: {label}");
+        assert_eq!(hint.port_delta, Some(delta));
+        assert_eq!(hint.profile_generation, Some(u64::MAX));
+        assert_eq!(hint.observation_sequence, Some(u64::MAX));
+        assert_eq!(hint.registration_lifecycle, Some(u64::MAX));
+        let legacy = parse_nat_hint(&format!(
+            "p2:m=address_or_port_dependent;a=linear;d={delta};c=60;g=1"
+        ));
+        assert!(legacy.parsed);
+        assert_eq!(legacy.port_delta, Some(delta));
+        assert_eq!(legacy.profile_generation, Some(1));
+    }
+    let hint = parse_nat_hint(
+        "p2v2:m=address_or_port_dependent;a=linear;d=-5;c=60;f=unknown;h=unknown;g=1;o=3;l=1",
+    );
+    let capabilities = crate::NatCapabilities::from_fingerprint_hint(&hint, None);
+    assert!(capabilities.hard_allocation_is_predictable());
+    assert_eq!(capabilities.profile_generation, Some(1));
 }

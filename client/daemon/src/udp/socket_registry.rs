@@ -99,6 +99,9 @@ impl UdpTransport {
     /// Exact encrypted sends must not consume an unproven rendezvous mapping.
     /// Isolation is established while provisional and never re-enabled after
     /// authentication, so a successful check cannot race a later reservation.
+    /// An already detached entry leaves admission to the caller's exact Arc
+    /// handoff: authenticated validation requests retain their receiving socket
+    /// specifically so their ACK can still use that mapping after detach.
     pub(super) async fn permits_ordinary_send_on_socket(
         &self,
         peer_id: &str,
@@ -109,7 +112,7 @@ impl UdpTransport {
             return true;
         }
         let state = self.socket_state.lock().await;
-        state.dynamic.get(&socket_index).is_some_and(|entry| {
+        state.dynamic.get(&socket_index).map_or(true, |entry| {
             entry.peer_id == peer_id
                 && entry.phase.is_usable()
                 && entry.network_generation == self.peers.current_network_generation_sync()

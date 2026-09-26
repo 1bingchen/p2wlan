@@ -626,12 +626,13 @@ pub fn parse_nat_hint(input: &str) -> NatFingerprintHint {
             }
             "d" => {
                 // `control_label` emits `d=?` when there is no port delta, and
-                // a non-negative integer otherwise.  Reject anything else.
+                // a signed allocation stride otherwise. Reverse allocators must
+                // preserve the entire label, including generation/lifecycle fences.
                 port_delta = if value == "?" {
                     None
                 } else {
                     match value.parse::<i32>() {
-                        Ok(d) if d >= 0 => Some(d),
+                        Ok(d) => Some(d),
                         _ => return unparsed_hint(&raw),
                     }
                 };

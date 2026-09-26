@@ -1,27 +1,26 @@
 #[tokio::test]
-async fn test_probe_filtering_behavior_treats_changed_port_as_address_dependent() {
+async fn test_probe_filtering_behavior_keeps_port_only_response_unknown() {
     let (server, _handle) =
         spawn_change_request_stun_server(ChangeResponseMode::ChangedPortForIpPort).await;
     let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
 
-    let filtering = probe_filtering_behavior(&socket, server, Duration::from_secs(1)).await;
+    let filtering =
+        probe_filtering_behavior(&socket, server, Duration::from_secs(1), &[server]).await;
 
-    assert_eq!(filtering, Some(FilteringBehavior::AddressDependent));
+    assert_eq!(filtering, None);
 }
 
 #[tokio::test]
-async fn test_probe_filtering_behavior_detects_address_dependent() {
+async fn test_probe_filtering_behavior_keeps_unsupported_change_ip_unknown() {
     let (server, _handle) =
         spawn_change_request_stun_server(ChangeResponseMode::ChangedPortForPortOnly).await;
     let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
 
-    // The first (change-ip+port) probe is intentionally dropped by this
-    // fixture, so the second probe runs only after one full timeout. Keep the
-    // budget generous enough for the Tokio scheduler when the whole crate is
-    // running in parallel.
-    let filtering = probe_filtering_behavior(&socket, server, Duration::from_millis(500)).await;
+    // A dropped unsupported request is not evidence of restrictive filtering.
+    let filtering =
+        probe_filtering_behavior(&socket, server, Duration::from_millis(500), &[server]).await;
 
-    assert_eq!(filtering, Some(FilteringBehavior::AddressDependent));
+    assert_eq!(filtering, None);
 }
 
 #[test]
@@ -32,14 +31,17 @@ fn test_changed_ip_port_classifier_requires_ip_change_for_endpoint_independent()
     let unchanged = server;
 
     assert_eq!(
-        classify_changed_ip_port_response(server, changed_ip),
+        classify_filtering_probe_response(server, changed_ip, &[server]),
         Some(FilteringBehavior::EndpointIndependent)
     );
     assert_eq!(
-        classify_changed_ip_port_response(server, changed_port),
-        Some(FilteringBehavior::AddressDependent)
+        classify_filtering_probe_response(server, changed_port, &[server]),
+        None
     );
-    assert_eq!(classify_changed_ip_port_response(server, unchanged), None);
+    assert_eq!(
+        classify_filtering_probe_response(server, unchanged, &[server]),
+        None
+    );
 }
 
 #[tokio::test]

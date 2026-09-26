@@ -1116,7 +1116,7 @@ impl UdpTransport {
         socket_index: usize,
         network_generation: u64,
     ) -> bool {
-        let (identity, losers) = {
+        let identity = {
             // Keep the exact socket entry locked across manager selection.
             // `hard_hard_select_winner` commits its session record and sticky
             // winner without any later await; once it returns, this same poll
@@ -1139,6 +1139,25 @@ impl UdpTransport {
                 return false;
             };
             let punch_generation = entry.punch_generation;
+            let loser_indices = state
+                .dynamic
+                .iter()
+                .filter(|(index, entry)| {
+                    **index != socket_index
+                        && entry.peer_id == peer_id
+                        && entry.network_generation == network_generation
+                        && entry.hard_hard_session_token.as_deref() == Some(token)
+                })
+                .map(|(index, _)| *index)
+                .collect::<HashSet<_>>();
+            // Match the sender's lock order: socket state -> pending -> token
+            // bindings. Acquire every cleanup lock BEFORE selecting a winner,
+            // so cancellation observes either the untouched candidate set or
+            // the complete winner/loser transaction. Diagnostics readers never
+            // retain this lock while acquiring socket state.
+            let mut pending = self.pending_probes.lock().await;
+            let mut bindings = self.hard_hard_probe_bindings.lock().await;
+            let mut diagnostics = self.dynamic_socket_diagnostics.lock().await;
             let Some(identity) = self
                 .peers
                 .hard_hard_select_winner(
@@ -1167,22 +1186,25 @@ impl UdpTransport {
                 .expect("winner entry verified above");
             winner.authenticated_evidence = winner.authenticated_evidence.saturating_add(1);
             winner.phase = DynamicSocketPhase::Finalized;
-            let loser_indices = state
-                .dynamic
-                .iter()
-                .filter(|(index, entry)| {
-                    **index != socket_index
-                        && entry.peer_id == peer_id
-                        && entry.network_generation == network_generation
-                        && entry.hard_hard_session_token.as_deref() == Some(token)
-                })
-                .map(|(index, _)| *index)
-                .collect::<Vec<_>>();
-            let losers = loser_indices
-                .into_iter()
-                .filter_map(|index| state.dynamic.remove(&index))
-                .collect::<Vec<_>>();
-            (identity, losers)
+            // A sticky winner makes every other token-scoped socket terminal:
+            // none can become the business path or adopt a late ACK. Unlike a
+            // normal detach, retaining their readers for the ACK grace serves
+            // no purpose. Worse, waiting here holds the epoch gate needed by
+            // those ACKs and delays the winner's immediate reply/validation.
+            // Revoke and stop the bounded loser set in this same poll. A send
+            // already handed to the kernel may finish through its Arc/lease,
+            // but no new send can resolve the removed entry and its cancelled
+            // pending probe cannot restore affinity. No cleanup task is needed.
+            for index in &loser_indices {
+                if let Some(entry) = state.dynamic.remove(index) {
+                    entry.shutdown_tx.send_replace(true);
+                    entry.reader.abort();
+                }
+            }
+            pending.retain(|_, probe| !loser_indices.contains(&probe.socket_index));
+            bindings.retain(|nonce, _| pending.contains_key(nonce));
+            diagnostics.retain(|index, _| !loser_indices.contains(index));
+            identity
         };
         // The authenticated packet, affinity pin and Finalized phase are one
         // socket-state commit.  In particular, no durable diagnostics await
@@ -1205,10 +1227,6 @@ impl UdpTransport {
                 ),
             )
             .await;
-        for entry in losers {
-            self.detach_dynamic_entry(entry, "hard_hard_loser_socket")
-                .await;
-        }
         self.peers
             .record_direct_event_for_generation_with_socket(
                 peer_id,

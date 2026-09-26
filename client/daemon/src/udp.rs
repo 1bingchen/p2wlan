@@ -374,4 +374,7 @@ mod birthday;
 
 mod punch_sender;
 
+mod punch_pacing;
+use punch_pacing::HardHardProbePacer;
+
 mod punch_reports;

@@ -685,6 +685,7 @@ impl UdpTransport {
             .await
             .unwrap_or_default();
         let direct_commit_seq_at_start = self.peers.direct_commit_seq_sync(peer_id);
+        let pacing = Arc::new(HardHardProbePacer::new());
         for wave in 0..birthday.waves_planned {
             if wave > 0 {
                 sleep(HARD_HARD_BIRTHDAY_WAVE_INTERVAL).await;
@@ -745,6 +746,7 @@ impl UdpTransport {
                 let peer_id = peer_id.to_string();
                 let session_token = session_token.to_string();
                 let live_counters = live.clone();
+                let worker_pacing = pacing.clone();
                 let assigned_count = assigned.len();
                 workers.spawn(async move {
                     let result = transport
@@ -757,6 +759,7 @@ impl UdpTransport {
                             Some(profile_fence),
                             Some(&session_token),
                             live_counters,
+                            Some(worker_pacing),
                         )
                         .await;
                     (assigned_count, result)
@@ -804,6 +807,12 @@ impl UdpTransport {
                 return Err(DaemonError::Network(format!(
                     "hard-hard birthday worker stopped: {stop_reason}"
                 )));
+            }
+            if aggregate.pacing_deadline_reached {
+                birthday.stop_reason = Some("deadline".to_string());
+                update_birthday_sweep_counters(&mut birthday, &aggregate);
+                publish_birthday_sweep_progress(&progress, &birthday, &aggregate).await;
+                break;
             }
             if !wave_fully_completed {
                 birthday.stop_reason = Some(

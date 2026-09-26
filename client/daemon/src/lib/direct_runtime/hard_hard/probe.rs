@@ -1021,6 +1021,7 @@ async fn run_hard_hard_local_measurement(
     stun_timeout: Duration,
     session_token: &str,
     cancellation: Option<&Arc<crate::PunchSessionCancellation>>,
+    punch_at_ms: u64,
 ) -> std::result::Result<HardHardLocalMeasurement, FreshMappingRejection> {
     if peers
         .hard_hard_plan_uses_birthday(peer_id)
@@ -1041,7 +1042,14 @@ async fn run_hard_hard_local_measurement(
             .map(|result| HardHardLocalMeasurement::Birthday(Box::new(result)));
     }
     match udp
-        .run_hard_hard_fresh_mapping_generation(peer_id, observers, stun_timeout, cancellation)
+        .run_hard_hard_fresh_mapping_generation(
+            peer_id,
+            observers,
+            stun_timeout,
+            cancellation,
+            Duration::from_millis(punch_at_ms.saturating_sub(hard_hard_now_ms())),
+            HARD_HARD_PUNCH_LEAD,
+        )
         .await
     {
         FreshMappingOutcome::Accepted(result, handoff) => {
@@ -1060,7 +1068,7 @@ async fn run_hard_hard_local_measurement(
 fn hard_hard_measurement_payload(
     measurement: &HardHardLocalMeasurement,
     boot_epoch_ms: u64,
-) -> Option<HardHardMeasurementPayload> {
+) -> std::result::Result<HardHardMeasurementPayload, HardHardPayloadRejection> {
     match measurement {
         HardHardLocalMeasurement::Predictable { result, .. } => {
             let strategy_candidate_cap =
@@ -1073,14 +1081,16 @@ fn hard_hard_measurement_payload(
                     result.predicted_ports.len(),
                     result.predicted_ports.len(),
                 );
-            (!candidates.is_empty()).then_some(HardHardMeasurementPayload {
-                candidates,
-                candidate_sources: sources,
-                local_confidence: result.model.confidence,
-                local_model: hard_hard_model_label(&result.model.kind).to_string(),
-                strategy_candidate_cap,
-                candidate_contract,
-            })
+            (!candidates.is_empty())
+                .then_some(HardHardMeasurementPayload {
+                    candidates,
+                    candidate_sources: sources,
+                    local_confidence: result.model.confidence,
+                    local_model: hard_hard_model_label(&result.model.kind).to_string(),
+                    strategy_candidate_cap,
+                    candidate_contract,
+                })
+                .ok_or(HardHardPayloadRejection::EmptyPredictionWindow)
         }
         HardHardLocalMeasurement::Birthday(result) => {
             let fresh_id = FreshPredictionId {
@@ -1088,7 +1098,8 @@ fn hard_hard_measurement_payload(
                 generation: result
                     .sockets
                     .first()
-                    .map(|socket| socket.punch_generation)?,
+                    .map(|socket| socket.punch_generation)
+                    .ok_or(HardHardPayloadRejection::EmptyPredictionWindow)?,
             };
             let source = fresh_prediction_source_label(fresh_id);
             let mut candidates = Vec::with_capacity(result.candidate_endpoints.len());
@@ -1108,14 +1119,16 @@ fn hard_hard_measurement_payload(
                     result.requested_level,
                     candidates.len(),
                 );
-            (!candidates.is_empty()).then_some(HardHardMeasurementPayload {
-                candidates,
-                candidate_sources: sources,
-                local_confidence: result.model_confidence,
-                local_model: result.model_label.clone(),
-                strategy_candidate_cap: result.level.min(crate::MAX_SIGNAL_CANDIDATES),
-                candidate_contract,
-            })
+            (!candidates.is_empty())
+                .then_some(HardHardMeasurementPayload {
+                    candidates,
+                    candidate_sources: sources,
+                    local_confidence: result.model_confidence,
+                    local_model: result.model_label.clone(),
+                    strategy_candidate_cap: result.level.min(crate::MAX_SIGNAL_CANDIDATES),
+                    candidate_contract,
+                })
+                .ok_or(HardHardPayloadRejection::EmptyPredictionWindow)
         }
     }
 }
@@ -1494,6 +1507,8 @@ async fn hard_hard_wait_and_sweep(
                 Some(reason.to_string())
             } else if direct_confirmed {
                 None
+            } else if report.pacing_deadline_reached {
+                Some("deadline".to_string())
             } else {
                 Some("no_authenticated_direct_confirmation".to_string())
             };

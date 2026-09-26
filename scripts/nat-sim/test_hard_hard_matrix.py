@@ -31,6 +31,7 @@ RUNNER_SPEC.loader.exec_module(MATRIX_RUNNER)
 
 FAKE_SMOKE = r'''
 import json
+import struct
 import os
 from pathlib import Path
 
@@ -207,7 +208,36 @@ for number in range(1, rounds + 1):
             encoding="utf-8",
         )
     if scenario != "strict-bilateral":
-        (round_dir / "nat-trace.jsonl").write_text('{"event":"mapped"}\n', encoding="utf-8")
+        features = {
+            "egress_capture": "shim", "unassigned_egress_listeners": 0,
+            "direct_gate_preserves_source_allocations": True,
+            "strict_filtering_a": os.environ["STRICT_FILTERING_A"] == "1",
+            "strict_filtering_b": os.environ["STRICT_FILTERING_B"] == "1",
+            "consume_a": int(os.environ["CONSUME_A"]), "consume_b": int(os.environ["CONSUME_B"]),
+            "sweep_noise_every": int(os.environ["SWEEP_NOISE_EVERY"]),
+            "sweep_noise_count": int(os.environ["SWEEP_NOISE_COUNT"]),
+            "sweep_noise_limit": int(os.environ["SWEEP_NOISE_LIMIT"]),
+        }
+        (round_dir / "nat-sim.out").write_text("NAT_FEATURES=" + json.dumps(features) + "\n")
+        trace = []
+        for side in ("A", "B"):
+            for event in ("egress_gateway_ready", "egress_captured", "stun_mapping_observed"):
+                trace.append({"nat": side, "event": event, "client": side + "-client",
+                              "bytes": 0, "gateway_port": 45000 if side == "A" else 45001})
+            (round_dir / ("node-" + side.lower() + ".egress-stats")).write_bytes(
+                struct.pack("=8sQQQQ", b"P2CNT001", 1, 0, 0, 45000 if side == "A" else 45001))
+            for _ in range(features["consume_" + side.lower()]):
+                trace.append({"nat": side, "event": "mapping_consumed", "client": side + "-client",
+                              "stage": "post_measurement_before_first_peer"})
+            trace.append({"nat": side, "event": "peer_mapping_started", "client": side + "-client",
+                          "prior_peer_mappings": 0})
+            if features["sweep_noise_every"] and features["sweep_noise_count"]:
+                trace.append({"nat": side, "event": "mapping_consumed", "client": side + "-client",
+                              "stage": "during_sweep", "prior_peer_mappings": features["sweep_noise_every"]})
+            trace.append({"nat": side, "event": "mapping_bound", "public_endpoint": side,
+                          "destination": "B" if side == "A" else "A"})
+        (round_dir / "nat-trace.jsonl").write_text("".join(
+            json.dumps({"sequence": i + 1, **row}) + "\n" for i, row in enumerate(trace)))
 
 raise SystemExit(7 if scenario == "unequal-step" else 0)
 '''
@@ -303,6 +333,32 @@ class HardHardMatrixRunnerTests(unittest.TestCase):
             MATRIX_RUNNER.SCENARIO_BY_NAME["reorder-only"].description,
         )
         self.assertIn("before its existing signaling API", MATRIX_RUNNER.SCENARIO_BY_NAME["offer-dispatch-delay"].description)
+
+    def test_strict_cross_factor_scenarios_keep_filtering_and_measurement_drift(self):
+        for name in ("strict-phase-drift", "strict-unequal-drift-delay", "strict-negative-drift-delay"):
+            with self.subTest(scenario=name):
+                env = MATRIX_RUNNER.SCENARIO_BY_NAME[name].env
+                self.assertEqual((env["STRICT_FILTERING_A"], env["STRICT_FILTERING_B"]), ("1", "1"))
+                self.assertEqual((env["CONSUME_A"], env["CONSUME_B"]), ("2", "3"))
+        cross = MATRIX_RUNNER.SCENARIO_BY_NAME["strict-unequal-drift-delay"].env
+        self.assertNotEqual(cross["STEP_A"], cross["STEP_B"])
+        self.assertGreater(int(cross["SWEEP_NOISE_COUNT"]), 0)
+        self.assertNotEqual(cross["STUN_DELAY_A_MS"], cross["STUN_DELAY_B_MS"])
+
+    def test_capture_loss_retains_requested_denominator_and_partial_attempt_costs(self):
+        self.fake_smoke.write_text(self.fake_smoke.read_text().replace(
+            'raise SystemExit(7 if scenario == "unequal-step" else 0)',
+            'for path in root.glob("round-*/node-b.egress-stats"):\n    path.unlink()\nraise SystemExit(0)'))
+        output = self.directory / "capture-missing"
+        result = subprocess.run(self.command(output), capture_output=True, text=True)
+        self.assertNotEqual(result.returncode, 0)
+        manifest = json.loads((output / "manifest.json").read_text())
+        self.assertEqual(manifest["summary"]["requested_rounds"], 1)
+        self.assertEqual(manifest["summary"]["invalid_rounds"], 1)
+        record = manifest["runs"][0]["rounds"][0]
+        self.assertIn("b_shim_send_counters_missing_or_invalid", record["reason"])
+        self.assertEqual(len(record["partial_attempts"]), 2)
+        self.assertEqual(manifest["summary"]["costs"]["all_requested"]["known_observed_costs"]["probe_datagrams"], 8)
 
     def test_a0_stage_parser_keeps_only_redacted_allowlisted_fields(self):
         round_dir = self.directory / "a0-stage-parser"

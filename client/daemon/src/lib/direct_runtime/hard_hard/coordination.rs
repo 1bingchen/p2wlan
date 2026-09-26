@@ -265,11 +265,55 @@ fn hard_hard_coordination_from_plan(
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HardHardPayloadRejection {
+    BatchStale,
+    InvalidPublicIp,
+    EmptyPredictionWindow,
+}
+
+impl HardHardPayloadRejection {
+    fn failure_class(self) -> &'static str {
+        match self {
+            Self::BatchStale => "measurement_insufficient",
+            Self::InvalidPublicIp | Self::EmptyPredictionWindow => "model_unpredictable",
+        }
+    }
+
+    fn reason(self) -> &'static str {
+        match self {
+            Self::BatchStale => "batch_stale",
+            Self::InvalidPublicIp => "invalid_public_ip",
+            Self::EmptyPredictionWindow => "empty_prediction_window",
+        }
+    }
+}
+
 fn hard_hard_prediction_payload(
     result: &FreshMappingResult,
     boot_epoch_ms: u64,
-) -> Option<(Vec<String>, HashMap<String, String>)> {
-    let public_ip = result.public_ip.filter(|ip| !ip.is_unspecified())?;
+) -> std::result::Result<(Vec<String>, HashMap<String, String>), HardHardPayloadRejection> {
+    hard_hard_prediction_payload_at(result, boot_epoch_ms, crate::udp::monotonic_millis())
+}
+
+fn hard_hard_prediction_payload_at(
+    result: &FreshMappingResult,
+    boot_epoch_ms: u64,
+    now_ms: u64,
+) -> std::result::Result<(Vec<String>, HashMap<String, String>), HardHardPayloadRejection> {
+    // Freshness is checked again at publication; the forecast was made for
+    // the bounded planned first-send time, not for the measurement completion.
+    if !p2pnet_nat::model_is_fresh(
+        &result.model,
+        crate::udp::FRESH_MAPPING_MODEL_MAX_AGE,
+        now_ms,
+    ) {
+        return Err(HardHardPayloadRejection::BatchStale);
+    }
+    let public_ip = result
+        .public_ip
+        .filter(|ip| !ip.is_unspecified())
+        .ok_or(HardHardPayloadRejection::InvalidPublicIp)?;
     let fresh_id = FreshPredictionId {
         boot_epoch: boot_epoch_ms,
         generation: result.punch_generation,
@@ -278,14 +322,18 @@ fn hard_hard_prediction_payload(
     let limit = hard_hard_prediction_limit(&result.model.kind, result.model.confidence);
     let mut candidates = Vec::with_capacity(limit);
     let mut sources = HashMap::with_capacity(limit);
-    for port in result.predicted_ports.iter().take(limit) {
-        let endpoint = SocketAddr::new(public_ip, *port).to_string();
+    for port in
+        p2pnet_nat::mapping::rendezvous::bounded_prediction_window(&result.predicted_ports, limit)
+    {
+        let endpoint = SocketAddr::new(public_ip, port).to_string();
         if !candidates.contains(&endpoint) {
             candidates.push(endpoint.clone());
             sources.insert(endpoint, fresh_label.clone());
         }
     }
-    (!candidates.is_empty()).then_some((candidates, sources))
+    (!candidates.is_empty())
+        .then_some((candidates, sources))
+        .ok_or(HardHardPayloadRejection::EmptyPredictionWindow)
 }
 
 fn hard_hard_model_label(kind: &p2pnet_nat::mapping::PortModelKind) -> &'static str {
@@ -300,23 +348,14 @@ fn hard_hard_model_label(kind: &p2pnet_nat::mapping::PortModelKind) -> &'static 
     }
 }
 
-fn hard_hard_prediction_limit(kind: &p2pnet_nat::mapping::PortModelKind, confidence: u8) -> usize {
-    if matches!(
-        kind,
-        p2pnet_nat::mapping::PortModelKind::FixedStep { .. }
-            | p2pnet_nat::mapping::PortModelKind::Linear { .. }
-            | p2pnet_nat::mapping::PortModelKind::NoisyLinear { .. }
-    ) {
-        if confidence >= 90 {
-            8
-        } else if confidence >= 75 {
-            16
-        } else {
-            32
-        }
-    } else {
-        32
-    }
+fn hard_hard_prediction_limit(
+    _kind: &p2pnet_nat::mapping::PortModelKind,
+    _confidence: u8,
+) -> usize {
+    // The predictor already chooses its confidence/elapsed-time window. A
+    // second 8/16 cap erased its measured drift and reverse-allocation cover.
+    // Retain the existing maximum; all actual sends keep their separate budget.
+    HARD_HARD_MAX_PREDICTION_TARGETS
 }
 
 fn hard_hard_plan_matches(

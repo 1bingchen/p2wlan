@@ -1915,6 +1915,8 @@ pub(crate) struct PunchSendReport {
     /// The session stopped enumerating candidates because the epoch's hard
     /// candidate-iteration budget was reached.
     pub candidate_iteration_capped: bool,
+    /// The shared Hard-Hard send clock reached its bounded sweep deadline.
+    pub pacing_deadline_reached: bool,
     /// Exact endpoints that accepted at least one logical probe. This is an
     /// internal aggregation aid for multi-wave Hard↔Hard diagnostics; callers
     /// must use `unique_target_endpoints` for the bounded count.

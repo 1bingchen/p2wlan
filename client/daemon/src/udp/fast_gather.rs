@@ -68,7 +68,7 @@ impl UdpTransport {
         }))
         .await;
 
-        let mut report = candidate_report_from_observations(
+        let mut report = p2pnet_nat::candidate_report_from_unordered_observations(
             local_addr,
             self.peers.gather_host_candidates().await,
             observations,
@@ -94,8 +94,11 @@ impl UdpTransport {
                     }))
                     .await;
                     let local_addr = socket.local_addr().ok()?;
-                    let pool_report =
-                        candidate_report_from_observations(local_addr, false, observations);
+                    let pool_report = p2pnet_nat::candidate_report_from_unordered_observations(
+                        local_addr,
+                        false,
+                        observations,
+                    );
                     Some((socket_index, pool_report))
                 }
             }))
@@ -132,7 +135,7 @@ impl UdpTransport {
                     }
                 }))
                 .await;
-                let ipv6_report = candidate_report_from_observations(
+                let ipv6_report = p2pnet_nat::candidate_report_from_unordered_observations(
                     ipv6_local_addr,
                     self.peers.gather_host_candidates().await,
                     v6_observations,
@@ -174,7 +177,6 @@ impl UdpTransport {
         stun_timeout: Duration,
     ) {
         if report.nat_profile.udp_blocked
-            || report.nat_profile.mapping_behavior != MappingBehavior::EndpointIndependent
             || report.nat_profile.filtering_behavior != FilteringBehavior::Unknown
         {
             return;
@@ -200,20 +202,16 @@ impl UdpTransport {
             .query_stun_live_response(&self.socket, server, timeout, true, true)
             .await
         {
-            if let Some(filtering) = classify_live_filtering_response(server, response.source) {
+            if let Some(filtering) = p2pnet_nat::ice::classify_filtering_probe_response(
+                server,
+                response.source,
+                stun_servers,
+            ) {
                 report.nat_profile.filtering_behavior = filtering;
-                return;
             }
         }
-
-        if let Ok(response) = self
-            .query_stun_live_response(&self.socket, server, timeout, false, true)
-            .await
-        {
-            if response.source.ip() == server.ip() && response.source != server {
-                report.nat_profile.filtering_behavior = FilteringBehavior::AddressDependent;
-            }
-        }
+        // Port-only success cannot separate EIF from ADF without a verified
+        // uncontacted alternate-IP experiment. Keep the filtering axis unknown.
     }
 }
 
@@ -223,17 +221,12 @@ fn stun_timeout_for_live_filtering_probe(timeout: Duration) -> Duration {
         .max(Duration::from_millis(50))
 }
 
+#[cfg(test)]
 fn classify_live_filtering_response(
     server: SocketAddr,
     response_source: SocketAddr,
 ) -> Option<FilteringBehavior> {
-    if response_source.ip() != server.ip() {
-        Some(FilteringBehavior::EndpointIndependent)
-    } else if response_source != server {
-        Some(FilteringBehavior::AddressDependent)
-    } else {
-        None
-    }
+    p2pnet_nat::ice::classify_filtering_probe_response(server, response_source, &[server])
 }
 
 /// Fold evidence from one socket-pool member into the daemon-level NAT

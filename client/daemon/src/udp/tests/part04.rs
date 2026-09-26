@@ -792,6 +792,8 @@ async fn hard_hard_measurement_sweeps_from_the_same_exact_socket() {
             &nat.observers,
             Duration::from_millis(500),
             None,
+            Duration::from_millis(500),
+            Duration::from_millis(3_500),
         )
         .await;
     let result = match outcome {
@@ -917,6 +919,7 @@ async fn exact_dynamic_socket_live_recorder_counts_compatibility_success_once() 
             None,
             None,
             Some(live.clone()),
+            None,
         )
         .await
         .unwrap();
@@ -957,6 +960,7 @@ async fn exact_dynamic_socket_live_recorder_counts_compatibility_failure_as_part
             None,
             None,
             Some(live.clone()),
+            None,
         )
         .await
         .unwrap();

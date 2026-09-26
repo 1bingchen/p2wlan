@@ -3,6 +3,43 @@ mod hard_hard_tests {
     use super::*;
 
     #[test]
+    fn hard_hard_payload_expiry_is_reported_as_stale_not_unpredictable() {
+        let public_ip = "198.51.100.10".parse().unwrap();
+        let mut result = FreshMappingResult {
+            punch_generation: 7,
+            network_generation: 3,
+            socket_local_endpoint: "0.0.0.0:45000".parse().unwrap(),
+            socket_index: 4096,
+            model: p2pnet_nat::build_model(&[40000, 40001, 40002], Some(public_ip), 100),
+            predicted_ports: vec![40003, 40004, 40005],
+            public_ip: Some(public_ip),
+            first_punch_sent_at_ms: 0,
+            last_punch_sent_at_ms: 0,
+            measurement: crate::udp::HardHardMeasurementStats::default(),
+        };
+        let expires_at = 100 + crate::udp::FRESH_MAPPING_MODEL_MAX_AGE.as_millis() as u64;
+        assert!(hard_hard_prediction_payload_at(&result, 10, expires_at).is_ok());
+        let rejection = hard_hard_prediction_payload_at(&result, 10, expires_at + 1).unwrap_err();
+        assert_eq!(rejection, HardHardPayloadRejection::BatchStale);
+        assert_eq!(rejection.failure_class(), "measurement_insufficient");
+        assert_eq!(
+            rejection.reason(),
+            FreshMappingRejection::BatchStale.label()
+        );
+        result.predicted_ports.clear();
+        assert_eq!(
+            hard_hard_prediction_payload_at(&result, 10, 101).unwrap_err(),
+            HardHardPayloadRejection::EmptyPredictionWindow,
+        );
+        result.predicted_ports.push(40003);
+        result.public_ip = None;
+        assert_eq!(
+            hard_hard_prediction_payload_at(&result, 10, 101).unwrap_err(),
+            HardHardPayloadRejection::InvalidPublicIp,
+        );
+    }
+
+    #[test]
     fn hard_hard_signal_delay_requires_the_explicit_experiment_lane() {
         assert_eq!(hard_hard_experiment_signal_delay_ms(false, Some("1200")), 0);
         assert_eq!(
@@ -185,12 +222,12 @@ mod hard_hard_tests {
     }
 
     #[test]
-    fn predictable_strategy_cap_remains_eight_sixteen_or_thirty_two() {
+    fn predictable_strategy_cap_preserves_forecast_inside_existing_maximum() {
         use p2pnet_nat::mapping::PortModelKind;
 
         let fixed = PortModelKind::FixedStep { step: 1 };
-        assert_eq!(hard_hard_prediction_limit(&fixed, 90), 8);
-        assert_eq!(hard_hard_prediction_limit(&fixed, 75), 16);
+        assert_eq!(hard_hard_prediction_limit(&fixed, 90), 32);
+        assert_eq!(hard_hard_prediction_limit(&fixed, 75), 32);
         assert_eq!(hard_hard_prediction_limit(&fixed, 74), 32);
         assert_eq!(
             hard_hard_prediction_limit(&PortModelKind::MonotonicWindow { direction: 1 }, 99),

@@ -212,7 +212,9 @@ pub struct NatProfile {
     /// Whether this profile is a good candidate for bounded birthday probing.
     #[serde(default)]
     pub birthday_candidate: bool,
-    /// Confidence score from 0-100.
+    /// Coarse discovery evidence score from 0-100, not a measured probability
+    /// of predicting the peer-facing port. Concurrent allocation observations
+    /// are capped at 60; a fresh ordered PortModel owns execution confidence.
     pub confidence: u8,
 }
 

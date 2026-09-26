@@ -385,6 +385,7 @@ pub(crate) async fn spawn_hard_hard_responder(
             signal.stun_timeout,
             &coordination.token,
             Some(&cancellation),
+            punch_at_ms,
         )
         .await
         {
@@ -479,29 +480,31 @@ pub(crate) async fn spawn_hard_hard_responder(
                 .await;
             return;
         }
-        let Some(HardHardMeasurementPayload {
+        let HardHardMeasurementPayload {
             candidates,
             candidate_sources,
             local_confidence,
             local_model,
             strategy_candidate_cap,
             candidate_contract,
-        }) = hard_hard_measurement_payload(&measurement, signal.boot_epoch_ms)
-        else {
-            let _ = record_hard_hard_pre_session_failure(
-                &peers,
-                &peer_id,
-                peer_session_generation,
-                current_plan,
-                &coordination.token,
-                "responder",
-                0,
-                Some(&measurement_observation),
-                "model_unpredictable",
-                "empty_prediction_window",
-            )
-            .await;
-            return;
+        } = match hard_hard_measurement_payload(&measurement, signal.boot_epoch_ms) {
+            Ok(payload) => payload,
+            Err(rejection) => {
+                let _ = record_hard_hard_pre_session_failure(
+                    &peers,
+                    &peer_id,
+                    peer_session_generation,
+                    current_plan,
+                    &coordination.token,
+                    "responder",
+                    0,
+                    Some(&measurement_observation),
+                    rejection.failure_class(),
+                    rejection.reason(),
+                )
+                .await;
+                return;
+            }
         };
         let Some(primary_socket) = hard_hard_measurement_primary_socket(
             &peer_id,
@@ -1000,6 +1003,25 @@ pub(crate) async fn spawn_hard_hard_responder(
         let fresh_socket = sweep_record.fresh_socket;
         let birthday_socket_indices =
             birthday.then(|| hard_hard_measurement_socket_indices(&measurement));
+        // hh1 initiators sweep the advertised list in its original order.
+        // Only the responder changes its local send order, retaining rank zero
+        // and every advertised endpoint. This also works with older hh1
+        // initiators; no candidate or protocol field is invented. Apply the
+        // bounded two-phase plan only to complete fixed-step windows.
+        let remote_prediction = if !birthday
+            && response_coordination.local_prediction_model == "fixed_step"
+            && response_coordination.remote_prediction_model == "fixed_step"
+        {
+            p2pnet_nat::mapping::rendezvous::fixed_step_rendezvous_targets(
+                &sweep_record.prediction_window,
+                &remote_prediction,
+                true,
+                fresh_socket.punch_generation % 2 != 0,
+            )
+            .unwrap_or(remote_prediction)
+        } else {
+            remote_prediction
+        };
         let cleanup_udp = udp.clone();
         let swept = hard_hard_wait_and_sweep(
             udp,

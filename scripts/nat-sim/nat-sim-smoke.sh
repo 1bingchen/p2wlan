@@ -60,6 +60,19 @@ STEP_A=${STEP_A:-1}
 STEP_B=${STEP_B:-1}
 CONSUME_A=${CONSUME_A:-0}
 CONSUME_B=${CONSUME_B:-0}
+SWEEP_NOISE_EVERY=${SWEEP_NOISE_EVERY:-0}
+SWEEP_NOISE_COUNT=${SWEEP_NOISE_COUNT:-0}
+SWEEP_NOISE_LIMIT=${SWEEP_NOISE_LIMIT:-64}
+# Hard-Hard captures every loopback UDP send from the daemon's original fd.
+# Legacy gates retain their existing simulator route unless explicitly opted in.
+EGRESS_CAPTURE=${EGRESS_CAPTURE:-}
+if [[ -z "$EGRESS_CAPTURE" ]]; then
+  if [[ "$MODE" == "hard-hard" ]]; then EGRESS_CAPTURE=shim; else EGRESS_CAPTURE=listeners; fi
+fi
+if [[ "$EGRESS_CAPTURE" != shim && "$EGRESS_CAPTURE" != listeners ]]; then
+  echo "[nat-sim] EGRESS_CAPTURE must be shim or listeners" >&2
+  exit 2
+fi
 LOSS=${LOSS:-0.0}
 REORDER=${REORDER:-0}
 STRICT_FILTERING=${STRICT_FILTERING:-0}
@@ -85,7 +98,7 @@ ALLOW_REPLAY_REJECTS=${ALLOW_REPLAY_REJECTS:-0}
 HARD_HARD_GATE_MAX_SKEW_MS=${HARD_HARD_GATE_MAX_SKEW_MS:-250}
 UNASSIGNED_EGRESS_LISTENERS=${UNASSIGNED_EGRESS_LISTENERS:-}
 if [[ -z "$UNASSIGNED_EGRESS_LISTENERS" ]]; then
-  if [[ "$MODE" == "hard-hard" ]]; then
+  if [[ "$MODE" == "hard-hard" && "$EGRESS_CAPTURE" == listeners ]]; then
     UNASSIGNED_EGRESS_LISTENERS=32
   else
     UNASSIGNED_EGRESS_LISTENERS=0
@@ -1089,14 +1102,31 @@ wait_for_relay_confirmation_barrier() {
   BARRIER_B_HTTP="$b_http"
 }
 
+stop_pid_group_bounded() {
+  (( $# > 0 )) || return 0
+  local pid alive=0
+  for pid in "$@"; do kill "$pid" 2>/dev/null || true; done
+  for _ in {1..60}; do
+    alive=0
+    for pid in "$@"; do
+      if kill -0 "$pid" 2>/dev/null; then alive=1; fi
+    done
+    (( alive == 0 )) && break
+    sleep 0.05
+  done
+  for pid in "$@"; do
+    if kill -0 "$pid" 2>/dev/null; then
+      kill -KILL "$pid" 2>/dev/null || true
+      CLEANUP_FORCED=1
+      overall=1
+      echo "[nat-sim] FAIL reason_code=cleanup_forced_kill" >&2
+    fi
+  done
+  wait "$@" 2>/dev/null || true
+}
+
 stop_round_processes() {
-  local pid
-  for pid in "${PIDS[@]:-}"; do
-    kill "$pid" 2>/dev/null || true
-  done
-  for pid in "${PIDS[@]:-}"; do
-    wait "$pid" 2>/dev/null || true
-  done
+  if (( ${#PIDS[@]} > 0 )); then stop_pid_group_bounded "${PIDS[@]}"; fi
   PIDS=()
 }
 
@@ -1115,6 +1145,9 @@ echo "[nat-sim] mode=$MODE isolated network id: $NETWORK_ID"
 echo "[nat-sim] exact_head_sha=${NAT_TOPOLOGY_HEAD_SHA:-unknown} replica=${NAT_TOPOLOGY_REPLICA:-1}"
 echo "[nat-sim] reserved control port base: $PORT"
 echo "[nat-sim] traversal flags: strict_filtering_a=$STRICT_FILTERING_A strict_filtering_b=$STRICT_FILTERING_B mapping_a=$MAPPING_MODE_A mapping_b=$MAPPING_MODE_B delay_a_ms=$DELAY_A_MS delay_b_ms=$DELAY_B_MS stun_delay_a_ms=$STUN_DELAY_A_MS stun_delay_b_ms=$STUN_DELAY_B_MS signal_delay_a_ms=$SIGNAL_DELAY_A_MS signal_delay_b_ms=$SIGNAL_DELAY_B_MS prepare_delay_a_ms=$PREPARE_DELAY_A_MS prepare_delay_b_ms=$PREPARE_DELAY_B_MS duplicate_rate=$DUPLICATE_RATE unassigned_egress_listeners=$UNASSIGNED_EGRESS_LISTENERS fresh_mapping=$FRESH_MAPPING_PUNCH predicted_candidates=$PREDICTED_CANDIDATES birthday=$BIRTHDAY_PROBING socket_pool=${SOCKET_POOL:-default}"
+if [[ "$EGRESS_CAPTURE" == shim ]]; then
+  python3 "$ROOT_DIR/scripts/nat-sim/udp_egress.py" --build "$BASE_DIR/udp-egress-shim.so"
+fi
 echo "[nat-sim] building control server, relay and daemon..."
 (
   cd "$ROOT_DIR/server"
@@ -1148,6 +1181,10 @@ for round in $(seq 1 "$ROUNDS"); do
   STRICT_FILTERING_FLAG=""
   if [[ "$STRICT_FILTERING" == "1" ]]; then STRICT_FILTERING_FLAG="--strict-filtering"; fi
   NAT_FEATURE_FLAGS=(
+    --egress-capture "$EGRESS_CAPTURE"
+    --sweep-noise-every "$SWEEP_NOISE_EVERY"
+    --sweep-noise-count "$SWEEP_NOISE_COUNT"
+    --sweep-noise-limit "$SWEEP_NOISE_LIMIT"
     --mapping-mode-a "$MAPPING_MODE_A" --mapping-mode-b "$MAPPING_MODE_B"
     --delay-a-ms "$DELAY_A_MS" --delay-b-ms "$DELAY_B_MS"
     --stun-delay-a-ms "$STUN_DELAY_A_MS" --stun-delay-b-ms "$STUN_DELAY_B_MS"
@@ -1162,7 +1199,8 @@ for round in $(seq 1 "$ROUNDS"); do
     # candidate epoch. The gate remains closed after both real Hard<->Hard
     # workers have scheduled the same 3500ms rendezvous, then opens 10ms before
     # their validated server-clock deadline. This keeps earlier control-path
-    # Direct copies from perturbing the fresh mappings under measurement.
+    # Direct copies from winning before the measured experiment. The shim
+    # still allocates their source mappings; the gate affects delivery only.
     DIRECT_GATE_FILE="$ROUND_DIR/hard-hard-direct.open"
     rm -f -- "$DIRECT_GATE_FILE"
     NAT_FEATURE_FLAGS+=(--direct-gate-file "$DIRECT_GATE_FILE")
@@ -1199,6 +1237,19 @@ for round in $(seq 1 "$ROUNDS"); do
   if [[ -z "$STUN_A" || -z "$STUN_B" ]]; then
     echo "[nat-sim] round $round: FAIL reason_code=test_harness_startup_failure stage=nat_simulator" >&2
     exit 1
+  fi
+
+  DAEMON_A_CMD=("$ROOT_DIR/target/debug/p2wlan-daemon")
+  DAEMON_B_CMD=("$ROOT_DIR/target/debug/p2wlan-daemon")
+  if [[ "$EGRESS_CAPTURE" == shim ]]; then
+    EGRESS_A_PORT=$(sed -n 's/^EGRESS_A_PORT=//p' "$ROUND_DIR/nat-sim.out")
+    EGRESS_B_PORT=$(sed -n 's/^EGRESS_B_PORT=//p' "$ROUND_DIR/nat-sim.out")
+    if ! [[ "$EGRESS_A_PORT" =~ ^[1-9][0-9]*$ && "$EGRESS_B_PORT" =~ ^[1-9][0-9]*$ ]]; then
+      echo "[nat-sim] round $round: FAIL reason_code=egress_gateway_missing" >&2
+      exit 1
+    fi
+    DAEMON_A_CMD=(python3 "$ROOT_DIR/scripts/nat-sim/udp_egress.py" --library "$BASE_DIR/udp-egress-shim.so" --port "$EGRESS_A_PORT" --stats "$ROUND_DIR/node-a.egress-stats" -- "${DAEMON_A_CMD[@]}")
+    DAEMON_B_CMD=(python3 "$ROOT_DIR/scripts/nat-sim/udp_egress.py" --library "$BASE_DIR/udp-egress-shim.so" --port "$EGRESS_B_PORT" --stats "$ROUND_DIR/node-b.egress-stats" -- "${DAEMON_B_CMD[@]}")
   fi
 
   # Relay(s) (safety net; TCP, bypasses the NATs).  Multiple relays offer a
@@ -1310,7 +1361,7 @@ for round in $(seq 1 "$ROUNDS"); do
   if (( PREPARE_DELAY_A_MS > 0 )); then
     python3 -c 'import sys,time; time.sleep(int(sys.argv[1]) / 1000)' "$PREPARE_DELAY_A_MS"
   fi
-  printf '%s\n' "$TOKEN" | P2WLAN_DISABLE_TUN=1 P2WLAN_TEST_RUN_ID="$ROUND_RUN_ID" P2WLAN_EXPERIMENT_BASELINE_SHA="$EXPERIMENT_BASELINE_SHA" P2WLAN_EXPERIMENT_VARIANT="$EXPERIMENT_VARIANT" P2WLAN_EXPERIMENT_SCENARIO="$EXPERIMENT_SCENARIO" P2WLAN_EXPERIMENT_SEED="$NAT_SEED" P2WLAN_EXPERIMENT_SIGNAL_DELAY_MS="$SIGNAL_DELAY_A_MS" RUST_LOG="$NAT_SIM_RUST_LOG" "$ROOT_DIR/target/debug/p2wlan-daemon" \
+  printf '%s\n' "$TOKEN" | P2WLAN_DISABLE_TUN=1 P2WLAN_TEST_RUN_ID="$ROUND_RUN_ID" P2WLAN_EXPERIMENT_BASELINE_SHA="$EXPERIMENT_BASELINE_SHA" P2WLAN_EXPERIMENT_VARIANT="$EXPERIMENT_VARIANT" P2WLAN_EXPERIMENT_SCENARIO="$EXPERIMENT_SCENARIO" P2WLAN_EXPERIMENT_SEED="$NAT_SEED" P2WLAN_EXPERIMENT_SIGNAL_DELAY_MS="$SIGNAL_DELAY_A_MS" RUST_LOG="$NAT_SIM_RUST_LOG" "${DAEMON_A_CMD[@]}" \
     --config "$NODE_A_RUNTIME/config.json" \
     --control "http://127.0.0.1:$PORT" \
     --network "$NETWORK_ID" \
@@ -1342,7 +1393,7 @@ for round in $(seq 1 "$ROUNDS"); do
   if (( PREPARE_DELAY_B_MS > 0 )); then
     python3 -c 'import sys,time; time.sleep(int(sys.argv[1]) / 1000)' "$PREPARE_DELAY_B_MS"
   fi
-  printf '%s\n' "$TOKEN" | P2WLAN_DISABLE_TUN=1 P2WLAN_TEST_RUN_ID="$ROUND_RUN_ID" P2WLAN_EXPERIMENT_BASELINE_SHA="$EXPERIMENT_BASELINE_SHA" P2WLAN_EXPERIMENT_VARIANT="$EXPERIMENT_VARIANT" P2WLAN_EXPERIMENT_SCENARIO="$EXPERIMENT_SCENARIO" P2WLAN_EXPERIMENT_SEED="$NAT_SEED" P2WLAN_EXPERIMENT_SIGNAL_DELAY_MS="$SIGNAL_DELAY_B_MS" RUST_LOG="$NAT_SIM_RUST_LOG" "$ROOT_DIR/target/debug/p2wlan-daemon" \
+  printf '%s\n' "$TOKEN" | P2WLAN_DISABLE_TUN=1 P2WLAN_TEST_RUN_ID="$ROUND_RUN_ID" P2WLAN_EXPERIMENT_BASELINE_SHA="$EXPERIMENT_BASELINE_SHA" P2WLAN_EXPERIMENT_VARIANT="$EXPERIMENT_VARIANT" P2WLAN_EXPERIMENT_SCENARIO="$EXPERIMENT_SCENARIO" P2WLAN_EXPERIMENT_SEED="$NAT_SEED" P2WLAN_EXPERIMENT_SIGNAL_DELAY_MS="$SIGNAL_DELAY_B_MS" RUST_LOG="$NAT_SIM_RUST_LOG" "${DAEMON_B_CMD[@]}" \
     --config "$NODE_B_RUNTIME/config.json" \
     --control "http://127.0.0.1:$PORT" \
     --network "$NETWORK_ID" \
@@ -2250,22 +2301,25 @@ except Exception:
 
   CLEANUP_START_MS=$(python3 -c 'import time; print(int(time.time()*1000))')
   CLEANUP_PROCESS_COUNT=$((4 + ${#RELAY_PIDS[@]}))
-  kill "$NODE_A_PID" "$NODE_B_PID" "$SERVER_PID" "$NAT_PID" 2>/dev/null || true
-  for relay_pid in "${RELAY_PIDS[@]:-}"; do
-    kill "$relay_pid" 2>/dev/null || true
-  done
-  wait "$NODE_A_PID" "$NODE_B_PID" "$SERVER_PID" "$NAT_PID" 2>/dev/null || true
-  for relay_pid in "${RELAY_PIDS[@]:-}"; do
-    wait "$relay_pid" 2>/dev/null || true
-  done
+  CLEANUP_FORCED=0
+  # Stop producers before the simulator. Compare original successful sends
+  # with gateway receipts instead of assuming local UDP cannot be dropped.
+  stop_pid_group_bounded "$NODE_A_PID" "$NODE_B_PID"
+  if [[ "$EGRESS_CAPTURE" == shim ]]; then
+    if ! python3 "$ROOT_DIR/scripts/nat-sim/udp_egress.py" --drain "$ROUND_DIR"; then
+      echo "[nat-sim] ROUND $round: FAIL reason_code=egress_capture_drain_incomplete" >&2
+      overall=1
+    fi
+  fi
+  stop_pid_group_bounded "$SERVER_PID" "$NAT_PID" "${RELAY_PIDS[@]}"
   CLEANUP_END_MS=$(python3 -c 'import time; print(int(time.time()*1000))')
   python3 - "$ROUND_DIR/cleanup.json" "$((CLEANUP_END_MS - CLEANUP_START_MS))" \
-    "$CLEANUP_PROCESS_COUNT" <<'PY'
+    "$CLEANUP_PROCESS_COUNT" "$CLEANUP_FORCED" <<'PY'
 import json
 import os
 import sys
 
-path, duration_ms, process_count = sys.argv[1:]
+path, duration_ms, process_count, forced = sys.argv[1:]
 with open(path, "w", encoding="utf-8") as handle:
     json.dump(
         {
@@ -2273,6 +2327,7 @@ with open(path, "w", encoding="utf-8") as handle:
             "duration_ms": int(duration_ms),
             "process_count": int(process_count),
             "all_reaped": True,
+            "forced_termination": forced == "1",
         },
         handle,
         sort_keys=True,

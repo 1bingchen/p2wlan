@@ -222,6 +222,7 @@ impl UdpTransport {
             attempts,
             cancellation,
             false,
+            None,
         )
         .await
     }
@@ -237,7 +238,12 @@ impl UdpTransport {
         observers: &[SocketAddr],
         stun_timeout: Duration,
         cancellation: Option<&Arc<crate::PunchSessionCancellation>>,
+        scheduled_delay: Duration,
+        max_scheduled_delay: Duration,
     ) -> FreshMappingOutcome {
+        if scheduled_delay > max_scheduled_delay {
+            return FreshMappingOutcome::Rejected(FreshMappingRejection::BatchStale);
+        }
         self.run_fresh_mapping_generation_internal(
             peer_id,
             observers,
@@ -247,6 +253,10 @@ impl UdpTransport {
             0,
             cancellation,
             true,
+            Some((
+                monotonic_millis().saturating_add(scheduled_delay.as_millis() as u64),
+                max_scheduled_delay.as_millis() as u64,
+            )),
         )
         .await
     }
@@ -262,6 +272,7 @@ impl UdpTransport {
         attempts: u32,
         cancellation: Option<&Arc<crate::PunchSessionCancellation>>,
         measure_only: bool,
+        scheduled_send: Option<(u64, u64)>,
     ) -> FreshMappingOutcome {
         if !self.peers.local_nat_requires_fresh_mapping_punch().await {
             return FreshMappingOutcome::Rejected(FreshMappingRejection::StableLocalNat);
@@ -606,14 +617,41 @@ impl UdpTransport {
             .await
             .map(|snapshot| snapshot.direction);
         let direction = peer_direction.unwrap_or(learning.direction);
-        let predicted = predict_ports_with_learning(
-            &model,
-            last,
-            measurement_span_ms,
-            probe_gap_ms,
-            effective_step,
-            direction == DirectionPattern::Reverse,
-        );
+        let predicted = if let Some((send_at_ms, max_send_delay_ms)) = scheduled_send {
+            // The measure-only lane has not pinned a peer-facing mapping yet.
+            // Shared allocators keep moving until the scheduled first send.
+            let timing = p2pnet_nat::mapping::rendezvous::RendezvousPredictionTiming {
+                measurement_span_ms,
+                last_measurement_send_at_ms: last_sent_at_ms,
+                now_ms,
+                send_delay_ms: send_at_ms.saturating_sub(now_ms),
+                max_send_delay_ms,
+                max_model_age: FRESH_MAPPING_MODEL_MAX_AGE,
+            };
+            match p2pnet_nat::mapping::rendezvous::predict_for_rendezvous(
+                &model,
+                last,
+                timing,
+                effective_step,
+                direction == DirectionPattern::Reverse,
+            ) {
+                Ok(predicted) => predicted,
+                Err(_) => {
+                    self.detach_dynamic_socket_by_index(socket_index, "forecast_stale")
+                        .await;
+                    return FreshMappingOutcome::Rejected(FreshMappingRejection::BatchStale);
+                }
+            }
+        } else {
+            predict_ports_with_learning(
+                &model,
+                last,
+                measurement_span_ms,
+                probe_gap_ms,
+                effective_step,
+                direction == DirectionPattern::Reverse,
+            )
+        };
         let predicted_ports = predicted
             .iter()
             .map(|candidate| candidate.port)
@@ -632,6 +670,7 @@ impl UdpTransport {
             sequence = %sequence_label,
             deltas = %deltas_label,
             sample_age_ms = now_ms.saturating_sub(batch.started_at_ms),
+            forecast_delay_ms = scheduled_send.map_or(0, |(at_ms, _)| at_ms.saturating_sub(now_ms)),
             step_estimate = ?learning.step_estimate,
             learner_revision_count = learning.revision_count,
             direction_pattern = learning.direction.as_str(),

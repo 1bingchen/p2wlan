@@ -32,6 +32,8 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+pub mod rendezvous;
+
 /// One STUN mapping observation on a dedicated punch socket.
 ///
 /// `sequence` is the request send order (0-based).  Responses may arrive in

@@ -129,6 +129,7 @@ pub(super) fn merge_punch_send_reports(destination: &mut PunchSendReport, source
     destination.failure_kind =
         combine_birthday_failure_kind(destination.failure_kind, source.failure_kind);
     destination.epoch_budget_exhausted |= source.epoch_budget_exhausted;
+    destination.pacing_deadline_reached |= source.pacing_deadline_reached;
     destination.candidate_iteration_capped |= source.candidate_iteration_capped;
     destination.first_send_at_ms = match (destination.first_send_at_ms, source.first_send_at_ms) {
         (Some(left), Some(right)) => Some(left.min(right)),

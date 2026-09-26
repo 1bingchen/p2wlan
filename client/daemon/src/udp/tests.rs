@@ -106,3 +106,9 @@ async fn room_authorization_is_checked_at_udp_socket_boundary() {
 
 #[path = "tests/destination_budget.rs"]
 mod destination_budget;
+
+#[path = "tests/hard_hard_winner.rs"]
+mod hard_hard_winner;
+
+#[path = "tests/hard_hard_pacing.rs"]
+mod hard_hard_pacing;

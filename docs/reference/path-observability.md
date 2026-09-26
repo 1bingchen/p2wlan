@@ -74,7 +74,11 @@ control_reconnect_counter_survives_timeline_eviction 是必须保持的回归契
 
 `--help` 列出完整参数。输出目录必须是仓库外尚不存在的绝对路径，创建为仅当前用户可访问；runner 不覆盖或清理已有目录。每个固定 seed 只执行一次，不做诊断重试，原始 stdout/stderr、两端日志/status、NAT trace、进程清理耗时和普通 `nat-evidence.json` 均保留。缺任一侧 typed attempt、首业务证据、健康的 critical task、完整进程回收或原始 trace 时，manifest 失败关闭。
 
-矩阵包含等/异步长、负步长回绕、端口竞争、单/双侧严格过滤、非对称 NAT/STUN/信令/准备延迟、丢包/乱序/重复，以及固定 seed 的高熵随机映射和 Relay 重连。Hard↔Hard 模式最多预建 32 个“仅允许已登记内端发送触发映射”的模拟器公网监听槽，以忠实承载双方同时首发；公网入站不能创建或认领这些槽，其他模式默认关闭。高熵场景是负对照：允许 Direct 失败并以 Relay 有界兜底，但不允许缺证据、任务泄漏或无界退出。取消的 generation/session fencing 由隔离 Rust 回归覆盖；本地双进程模拟不代表两台物理设备、真实运营商 NAT 或公网成功率。
+矩阵包含等/异步长、负步长回绕、端口竞争、单/双侧严格过滤、非对称 NAT/STUN/信令/准备延迟、丢包/乱序/重复，以及固定 seed 的高熵随机映射和 Relay 重连。Hard↔Hard 模式默认 `EGRESS_CAPTURE=shim`，在 macOS/Linux 测试子进程中拦截生产 daemon 的 loopback UDP `sendto` / `sendmsg`，保留原 socket 和目的地址；发往尚未绑定目的端口的包也先创建源 NAT 映射，再执行对端过滤。此模式关闭预建监听槽。普通 Direct/Relay gate 保留原入口；shim 不链接进生产程序，也不安装到全局环境。
+
+`CONSUME_A` / `CONSUME_B` 在每个已测量 socket 的最后一次 STUN 与首次 peer 出站之间注入分配；`SWEEP_NOISE_EVERY` / `SWEEP_NOISE_COUNT` 在发送期间按新映射数量注入，并受 `SWEEP_NOISE_LIMIT` 总量约束。trace 区分两个阶段、源 socket、新映射和未绑定目的。`mapping_fidelity` 核对两端 shim 成功发送的包数/字节与网关捕获完全一致，并检查严格过滤与注入配置确实生效；本机 UDP 捕获丢包、缺计数或噪声阶段不符都会使该轮证据无效。互惠映射对数量是整轮模拟器事实，不能代替 attempt 命中、加密验证或业务成功。
+
+高熵场景是负对照：允许 Direct 失败并以 Relay 有界兜底，但不允许缺证据、任务泄漏或无界退出。取消的 generation/session fencing 由隔离 Rust 回归覆盖；本地双进程模拟不代表两台物理设备、真实运营商 NAT 或公网成功率。
 
 manifest 分开报告 requested 场景/轮次、smoke 执行结果、证据有效性、保护期内 Direct 首业务、Relay-first、Relay 后升级 Direct、固定观测期最终 Direct、全部可读 typed attempt 失败/终态分布、测量年龄与计划偏差、候选执行和确认命中位置、条件延迟样本量、全部 requested 与 valid-only 两套 packet/byte/STUN/候选逻辑 payload 成本、同一 session/plan 的配对和不完整报告数、计划 Socket 峰值、清理耗时、子进程 CPU/RSS 和 critical task 数。部分无效轮次中可读的单侧成本保留，未读到的字段以 unknown/incomplete 表示；完整控制传输字节当前未知。`first_usable` 的请求级路径结果、attempt 级身份归因和有效轮次统计是独立分母。资源数包含本地构建、启动、实验与清理，不是跨主机性能比较；本轮没有隔离的遥测开/关性能 A/B，只用确定性回归约束候选顺序、预算、路径和取消不变。它不把不同 seed 当作不同真实网络，也不从无因果证据的数据宣称成功率提升。
 

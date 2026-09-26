@@ -364,6 +364,7 @@ pub(crate) async fn spawn_hard_hard_initiator(
             signal.stun_timeout,
             &coordination.token,
             Some(&cancellation),
+            punch_at_ms,
         )
         .await
         {
@@ -457,39 +458,41 @@ pub(crate) async fn spawn_hard_hard_initiator(
                 .await;
             return;
         }
-        let Some(HardHardMeasurementPayload {
+        let HardHardMeasurementPayload {
             candidates,
             candidate_sources,
             local_confidence,
             local_model,
             strategy_candidate_cap,
             candidate_contract,
-        }) = hard_hard_measurement_payload(&measurement, signal.boot_epoch_ms)
-        else {
-            let _ = record_hard_hard_pre_session_failure(
-                &peers,
-                &peer_id,
-                peer_session_generation,
-                plan,
-                &coordination.token,
-                "initiator",
-                0,
-                Some(&measurement_observation),
-                "model_unpredictable",
-                "empty_prediction_window",
-            )
-            .await;
-            peers
+        } = match hard_hard_measurement_payload(&measurement, signal.boot_epoch_ms) {
+            Ok(payload) => payload,
+            Err(rejection) => {
+                let _ = record_hard_hard_pre_session_failure(
+                    &peers,
+                    &peer_id,
+                    peer_session_generation,
+                    plan,
+                    &coordination.token,
+                    "initiator",
+                    0,
+                    Some(&measurement_observation),
+                    rejection.failure_class(),
+                    rejection.reason(),
+                )
+                .await;
+                peers
                 .record_direct_event(
                     &peer_id,
                     "hard_hard_measurement_failed",
                     None,
                     None,
                     None,
-                    "Hard↔Hard model produced no usable public prediction window; Relay remains available",
+                    format!("Hard↔Hard prediction publication rejected: {}; Relay remains available", rejection.reason()),
                 )
                 .await;
-            return;
+                return;
+            }
         };
         let Some(primary_socket) =
             hard_hard_measurement_primary_socket(&peer_id, &coordination.token, &measurement, plan)

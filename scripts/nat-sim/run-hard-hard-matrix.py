@@ -26,6 +26,8 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Iterable
 
+from mapping_evidence import summarize_mapping_evidence
+
 
 SCHEMA_VERSION = 4
 ATTEMPT_SCHEMA_VERSION = 2
@@ -243,6 +245,35 @@ SCENARIOS = (
         "signaling-delay",
         "Hold only node A's Hard-Hard offer before its existing signaling API call; no NAT UDP fault injection.",
         env={"SIGNAL_DELAY_A_MS": "400", "SIGNAL_DELAY_B_MS": "0"},
+    ),
+    Scenario(
+        "strict-phase-drift", 42201, "strict-mapping-noise",
+        "Bilateral APDF with 2/3 allocations after each socket's measurement and before its first peer mapping.",
+        env={"STRICT_FILTERING_A": "1", "STRICT_FILTERING_B": "1", "CONSUME_A": "2", "CONSUME_B": "3"},
+    ),
+    Scenario(
+        "strict-sweep-noise", 42211, "strict-mapping-noise",
+        "Bilateral APDF with bounded competing allocations during each distinct-target sweep.",
+        env={"STRICT_FILTERING_A": "1", "STRICT_FILTERING_B": "1",
+             "SWEEP_NOISE_EVERY": "4", "SWEEP_NOISE_COUNT": "1", "SWEEP_NOISE_LIMIT": "16"},
+    ),
+    Scenario(
+        "strict-unequal-drift-delay", 42221, "strict-cross-factor",
+        "Bilateral APDF, unequal strides, post-measurement drift, sweep noise, and asymmetric timing.",
+        env={"STRICT_FILTERING_A": "1", "STRICT_FILTERING_B": "1", "STEP_A": "1", "STEP_B": "7",
+             "CONSUME_A": "2", "CONSUME_B": "3", "SWEEP_NOISE_EVERY": "8",
+             "SWEEP_NOISE_COUNT": "1", "SWEEP_NOISE_LIMIT": "8",
+             "DELAY_A_MS": "80", "DELAY_B_MS": "10", "STUN_DELAY_A_MS": "100",
+             "STUN_DELAY_B_MS": "20", "SIGNAL_DELAY_A_MS": "120", "SIGNAL_DELAY_B_MS": "15",
+             "PREPARE_DELAY_B_MS": "400", "HARD_HARD_GATE_MAX_SKEW_MS": "1000"},
+    ),
+    Scenario(
+        "strict-negative-drift-delay", 42231, "strict-cross-factor",
+        "Bilateral APDF with unequal negative strides, wrap, post-measurement drift and asymmetric delivery.",
+        env={"STRICT_FILTERING_A": "1", "STRICT_FILTERING_B": "1", "STEP_A": "-3", "STEP_B": "-5",
+             "BASE_A": "1024", "BASE_B": "65535", "CONSUME_A": "2", "CONSUME_B": "3",
+             "DELAY_A_MS": "10", "DELAY_B_MS": "80", "SIGNAL_DELAY_A_MS": "100",
+             "HARD_HARD_GATE_MAX_SKEW_MS": "1000"},
     ),
     Scenario(
         "random-high-entropy-negative",
@@ -778,6 +809,8 @@ def validate_round(
     cleanup = load_object(round_dir / "cleanup.json")
     if cleanup.get("schema_version") != 1 or cleanup.get("all_reaped") is not True:
         raise EvidenceError("cleanup_evidence_invalid")
+    if cleanup.get("forced_termination") is True:
+        raise EvidenceError("cleanup_forced_termination")
     cleanup_duration_ms = required_int(cleanup.get("duration_ms"), "cleanup_duration_ms")
     cleanup_process_count = required_int(
         cleanup.get("process_count"), "cleanup_process_count", minimum=4
@@ -829,13 +862,22 @@ def validate_round(
         first_a["within_direct_first_protection"] is True
         and first_b["within_direct_first_protection"] is True
     )
+    mapping_evidence = summarize_mapping_evidence(round_dir, scenario.env)
+    if not mapping_evidence["valid"]:
+        raise EvidenceError("mapping_fidelity_rejected:" + ",".join(mapping_evidence["errors"]))
+    if (scenario.env.get("STRICT_FILTERING_A") == "1" and scenario.env.get("STRICT_FILTERING_B") == "1"
+            and first_a["path"] == "direct" and mapping_evidence["reciprocal_mapping_pairs"] == 0):
+        raise EvidenceError("strict_direct_without_reciprocal_mapping")
     raw_files = {name: str(round_dir / name) for name in required_files}
+    for name in ("nat-sim.out", "node-a.egress-stats", "node-b.egress-stats"):
+        raw_files[name] = str(round_dir / name)
     if (round_dir / "server.log").is_file():
         raw_files["server.log"] = str(round_dir / "server.log")
     return {
         "round": round_number,
         "seed": seed,
         "result": "valid",
+        "nat_mapping_evidence": mapping_evidence,
         "first_usable_path": first_a["path"],
         "direct_within_protection": direct_within_protection,
         "final_path_a": final_a,
@@ -1501,6 +1543,13 @@ def aggregate_runs(runs: list[dict[str, Any]]) -> dict[str, Any]:
             "reorder_stage_evidence_validity_counts": reorder_stage_counts,
             "existing_end_to_end_verdicts_preserved": preserved_end_to_end_results,
         },
+        "mapping_fidelity": {
+            "scope": "requested_rounds_including_invalid",
+            "valid_rounds": sum(item.get("nat_mapping_evidence", {}).get("valid") is True for item in rounds),
+            "reciprocal_mapping_pairs_by_round": [
+                item.get("nat_mapping_evidence", {}).get("reciprocal_mapping_pairs") for item in rounds
+            ],
+        },
         "requested_rounds": len(rounds),
         "valid_rounds": len(valid),
         "invalid_rounds": len(rounds) - len(valid),
@@ -1633,6 +1682,10 @@ def execute_scenario(
         "BASE_B": "26000",
         "CONSUME_A": "0",
         "CONSUME_B": "0",
+        "SWEEP_NOISE_EVERY": "0",
+        "SWEEP_NOISE_COUNT": "0",
+        "SWEEP_NOISE_LIMIT": "64",
+        "EGRESS_CAPTURE": "shim",
         "STRICT_FILTERING": "0",
         "STRICT_FILTERING_A": "0",
         "STRICT_FILTERING_B": "0",
@@ -1651,7 +1704,7 @@ def execute_scenario(
         "DUPLICATE_RATE": "0",
         "ALLOW_REPLAY_REJECTS": "0",
         "HARD_HARD_GATE_MAX_SKEW_MS": "250",
-        "UNASSIGNED_EGRESS_LISTENERS": "32",
+        "UNASSIGNED_EGRESS_LISTENERS": "0",
         "FRESH_MAPPING_PUNCH": "1",
         "PREDICTED_CANDIDATES": "1",
         "BIRTHDAY_PROBING": "1",
@@ -1718,6 +1771,7 @@ def execute_scenario(
                 "partial_attempts": partial_attempts,
                 "partial_report_errors": partial_errors,
                 "a0_stage_evidence": extract_a0_stage_evidence(round_dir),
+                "nat_mapping_evidence": summarize_mapping_evidence(round_dir, scenario.env),
             }
         duplicate_evidence = extract_duplicate_fault_evidence(
             round_dir,
@@ -1795,7 +1849,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--max-executions",
         type=int,
-        default=16,
+        default=24,
         help=f"capacity fence, at most {MAX_MATRIX_EXECUTIONS} scenario-round executions",
     )
     parser.add_argument("--dry-run", action="store_true", help="print the resolved plan without executing")
@@ -1905,12 +1959,19 @@ def main(argv: list[str] | None = None) -> int:
             "completed_at": None,
             "result": "running",
             "plan": plan,
+            "simulator_source_sha256": {
+                name: hashlib.sha256((root / "scripts/nat-sim" / name).read_bytes()).hexdigest()
+                for name in ("nat_sim.py", "udp_egress_shim.c", "udp_egress.py", "mapping_evidence.py")
+            },
             "protocol_contract": {
                 "direct_first_window_ms": 5000,
                 "hard_hard_punch_lead_ms": 3500,
                 "strategy_changed_by_observability": False,
                 "diagnostic_retries": 0,
                 "hard_hard_experiment_only": True,
+                "egress_capture": "libc_sendto_sendmsg_with_exact_sent_vs_captured_counts",
+                "phase_drift": "per_measured_socket_after_stun_before_first_peer_mapping",
+                "sweep_noise": "bounded_allocations_before_each_configured_distinct_target_interval",
                 "a0_stage_evidence_schema_version": A0_STAGE_SCHEMA_VERSION,
                 "a0_stage_identity": "hashed session_tag and plan_tag when the hh1 envelope exists; local_pre_session otherwise",
             },

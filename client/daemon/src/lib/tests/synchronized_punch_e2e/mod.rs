@@ -1906,6 +1906,72 @@ struct CurrentFreshDirect {
     predicted_ports: Vec<u16>,
 }
 
+async fn wait_for_current_birthday_direct(
+    peers: &PeerManager,
+    udp: &UdpTransport,
+    peer_id: &str,
+) -> (peer::PeerDiagnostics, usize) {
+    let current = timeout(Duration::from_secs(1), async {
+        loop {
+            let diagnostics = peers
+                .diagnostic_with_path_selection(peer_id, true, false, Duration::ZERO, None)
+                .await
+                .map(|(_, diagnostics)| diagnostics);
+            let affinity = udp.affinity_pin_for_test(peer_id).await;
+            let selected = udp
+                .socket_for_peer(Some(peer_id))
+                .await
+                .and_then(|(index, socket)| {
+                    socket
+                        .local_addr()
+                        .ok()
+                        .map(|local_endpoint| (index, local_endpoint))
+                });
+            if let (Some(diagnostics), Some(affinity), Some((index, local_endpoint))) =
+                (diagnostics, affinity, selected)
+            {
+                // HighEntropy owns a birthday socket set, not a predictable
+                // LocalFreshMapping. Read the committed pair and actual UDP
+                // owner instead of requiring a prediction-cache entry.
+                let exact_pair = diagnostics
+                    .current_direct_pair
+                    .as_ref()
+                    .is_some_and(|pair| {
+                        pair.selected
+                            && pair.nominated
+                            && pair.source == peer::CandidatePairSource::PeerReflexive
+                            && pair.local_endpoint.as_deref()
+                                == Some(local_endpoint.to_string()).as_deref()
+                    });
+                if diagnostics.state == ConnectionState::Direct
+                    && diagnostics.active_path == Some(NetworkPath::Direct)
+                    && affinity.socket_index == index
+                    && exact_pair
+                    && udp.dynamic_socket_phase_for_test(index).await
+                        == Some(crate::udp::DynamicSocketPhase::Finalized)
+                    && udp.authenticated_evidence_for_socket(index).await > 0
+                {
+                    return (diagnostics, index);
+                }
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    if let Ok(current) = current {
+        return current;
+    }
+    let diagnostics = peers.get_connection(peer_id).await;
+    let affinity = udp.affinity_pin_for_test(peer_id).await;
+    let selected = udp
+        .socket_for_peer(Some(peer_id))
+        .await
+        .map(|(index, socket)| (index, socket.local_addr()));
+    panic!(
+        "birthday Direct socket state did not converge: peer={peer_id} diagnostics={diagnostics:#?} affinity={affinity:#?} selected={selected:#?}"
+    );
+}
+
 async fn wait_for_current_fresh_direct(
     peers: &PeerManager,
     udp: &UdpTransport,

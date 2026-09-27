@@ -1088,8 +1088,7 @@ async fn hard_hard_random_random_birthday_collision_is_full_production_e2e() {
             harness.link.a_public.local_addr().unwrap(),
         ),
     ] {
-        let current = wait_for_current_fresh_direct(peers, udp, remote_id).await;
-        let peer = current.diagnostics;
+        let (peer, winner_socket) = wait_for_current_birthday_direct(peers, udp, remote_id).await;
         assert_eq!(peer.state, ConnectionState::Direct);
         assert_eq!(peer.active_path, Some(NetworkPath::Direct));
         let observed = peer
@@ -1106,9 +1105,8 @@ async fn hard_hard_random_random_birthday_collision_is_full_production_e2e() {
             assert!(observed.detail.contains("strategy=bounded_birthday"));
             assert!(observed.detail.contains("socket_count=2"));
         }
-        // The exact committed fresh socket, affinity and Direct pair are
+        // The exact committed birthday socket, affinity and Direct pair are
         // authoritative even when the auxiliary winner event skips its ring.
-        let winner_socket = current.socket_index;
         let winner_phase = udp.dynamic_socket_phase_for_test(winner_socket).await;
         assert_eq!(
             winner_phase,
@@ -1189,7 +1187,6 @@ async fn hard_hard_random_random_birthday_collision_is_full_production_e2e() {
                         .filter_map(|event| event.hard_hard_attempt)
                         .filter(|report| {
                             report.attempt == 1
-                                && report.direct_confirmed
                                 && report
                                     .birthday_sweep
                                     .as_ref()
@@ -1209,10 +1206,15 @@ async fn hard_hard_random_random_birthday_collision_is_full_production_e2e() {
     for report in &birthday_reports {
         assert_eq!(report.mode, "birthday");
         assert_eq!(report.attempt, 1);
-        assert!(report.direct_confirmed);
         assert!(report.socket_index.is_some());
-        assert_eq!(report.failure_class, "encrypted_validation_completed");
-        assert_eq!(report.terminal_reason, "direct_confirmed");
+        // Legacy HH1 can finish its scan when the authenticated winner removes
+        // a loser socket. That partial report need not observe the later
+        // Direct commit. Both peers' exact Direct proof above owns success;
+        // this report owns the same complete scan accounting as the old summary.
+        if report.direct_confirmed {
+            assert_eq!(report.failure_class, "encrypted_validation_completed");
+            assert_eq!(report.terminal_reason, "direct_confirmed");
+        }
         let sweep = report
             .birthday_sweep
             .as_ref()

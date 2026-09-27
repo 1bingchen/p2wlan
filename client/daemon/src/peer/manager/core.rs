@@ -998,6 +998,14 @@ impl PeerManager {
         self.connections.write().await
     }
 
+    /// Pause target snapshot preparation before its connection writer is queued.
+    #[cfg(test)]
+    pub(crate) async fn hold_local_interface_networks_writer_for_test(
+        &self,
+    ) -> tokio::sync::RwLockWriteGuard<'_, Vec<LocalNetwork>> {
+        self.local_interface_networks.write().await
+    }
+
     #[cfg(test)]
     pub(crate) fn install_peer_add_wait_observer_for_test(
         &self,

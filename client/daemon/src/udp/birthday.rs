@@ -64,7 +64,7 @@ pub(super) fn birthday_permutation_stride(seed: u64) -> u64 {
     for _ in 0..32 {
         if [3, 5, 17, 257]
             .into_iter()
-            .all(|factor| stride % factor != 0)
+            .all(|factor| !stride.is_multiple_of(factor))
         {
             return stride;
         }

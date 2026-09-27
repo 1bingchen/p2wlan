@@ -179,8 +179,11 @@ test('a directory snapshot cannot replace the connection snapshot update time', 
   client.getQueryCache().find({ queryKey: ['connections', 'networks'], exact: true }).setState({ dataUpdatedAt: oldDirectory })
   client.getQueryCache().find({ queryKey: key, exact: true }).setState({ dataUpdatedAt: newConnection })
   const html = renderPage(client)
-  assert.match(html, /datetime="2025-06-07T08:09:10\.000Z"/)
-  assert.doesNotMatch(html, /datetime="2024-01-02T03:04:05\.000Z"/)
+  // HTML attribute names are case-insensitive; React's real SSR serializer
+  // currently emits dateTime. Compare the complete values, not its spelling.
+  const timestamps = [...html.matchAll(/<time\b[^>]*\bdatetime="([^"]+)"/gi)].map((match) => match[1])
+  assert.deepEqual(timestamps, [new Date(newConnection).toISOString()])
+  assert.equal(timestamps.includes(new Date(oldDirectory).toISOString()), false)
 })
 
 test('offline polling retains the list and displays a paused snapshot warning', (t) => {

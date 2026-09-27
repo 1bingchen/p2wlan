@@ -423,12 +423,14 @@ pub(crate) async fn spawn_hard_hard_responder(
             &udp,
             &peers,
             &peer_id,
-            &signal.stun_servers,
-            signal.stun_timeout,
-            &coordination.token,
-            Some(&cancellation),
-            punch_at_ms,
-            coordination.v2.is_some(),
+            HardHardMeasurementRequest {
+                observers: &signal.stun_servers,
+                stun_timeout: signal.stun_timeout,
+                session_token: &coordination.token,
+                cancellation: Some(&cancellation),
+                punch_at_ms,
+                coordinated: coordination.v2.is_some(),
+            },
         )
         .await
         {

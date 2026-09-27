@@ -630,6 +630,89 @@ struct MockControlServer {
     task: JoinHandle<()>,
 }
 
+fn signal_has_candidate(body: &str, to_node_id: &str, candidate: &str) -> bool {
+    let payload: serde_json::Value =
+        serde_json::from_str(body).expect("mock signal POST must contain valid JSON");
+    payload
+        .get("to_node_id")
+        .and_then(serde_json::Value::as_str)
+        == Some(to_node_id)
+        && payload
+            .get("candidates")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|candidates| {
+                candidates
+                    .iter()
+                    .any(|value| value.as_str() == Some(candidate))
+            })
+}
+
+#[test]
+fn mock_signal_candidate_matching_ignores_metadata_and_preserves_duplicate_posts() {
+    // A publication at 2026-09-27 12:26:05 UTC expires 45 seconds later.
+    // The expiry contains "51201", so matching that port against the entire
+    // JSON incorrectly counts the old request as the replacement as well.
+    let old = serde_json::json!({
+        "to_node_id": "peer-rebind",
+        "type": "peer_offer_fresh",
+        "candidates": ["203.0.113.92:51200"],
+        "candidate_sources": { "203.0.113.92:51201": "metadata-only" },
+        "candidate_generation": 51201,
+        "client_time_ms": 1_790_511_965_000u64,
+        "candidates_expires_at_ms": 1_790_512_010_000u64,
+    })
+    .to_string();
+    let replacement = serde_json::json!({
+        "to_node_id": "peer-rebind",
+        "type": "peer_offer",
+        "candidates": ["203.0.113.92:51201"],
+        "candidate_generation": 51200,
+        "client_time_ms": 1_790_511_965_001u64,
+        "candidates_expires_at_ms": 1_790_512_010_001u64,
+    })
+    .to_string();
+    assert!(signal_has_candidate(
+        &old,
+        "peer-rebind",
+        "203.0.113.92:51200"
+    ));
+    assert!(!signal_has_candidate(
+        &old,
+        "peer-rebind",
+        "203.0.113.92:51201"
+    ));
+    assert!(!signal_has_candidate(
+        &old,
+        "peer-rebin",
+        "203.0.113.92:51200"
+    ));
+    assert!(!signal_has_candidate(
+        &old,
+        "peer-rebind",
+        "203.0.113.93:51200"
+    ));
+
+    let mut posts = vec![old, replacement.clone()];
+    for candidate in ["203.0.113.92:51200", "203.0.113.92:51201"] {
+        assert_eq!(
+            posts
+                .iter()
+                .filter(|body| signal_has_candidate(body, "peer-rebind", candidate))
+                .count(),
+            1,
+        );
+    }
+    posts.push(replacement);
+    assert_eq!(
+        posts
+            .iter()
+            .filter(|body| signal_has_candidate(body, "peer-rebind", "203.0.113.92:51201"))
+            .count(),
+        2,
+        "actual duplicate POSTs must still be counted separately",
+    );
+}
+
 fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack
         .windows(needle.len())
@@ -920,7 +1003,7 @@ async fn candidate_offer_workers_are_fair_and_fifo() {
         }
         if body.contains("peer-slow") {
             MockAction::Stall
-        } else if body.contains("peer-fifo") && body.contains("51010") {
+        } else if signal_has_candidate(body, "peer-fifo", "203.0.113.92:51010") {
             MockAction::Delay200
         } else {
             MockAction::Ok
@@ -1017,11 +1100,11 @@ async fn candidate_offer_workers_are_fair_and_fifo() {
     let posts = server.signal_posts.lock().unwrap().clone();
     let first_fifo = posts
         .iter()
-        .position(|body| body.contains("peer-fifo") && body.contains("51010"))
+        .position(|body| signal_has_candidate(body, "peer-fifo", "203.0.113.92:51010"))
         .expect("the first FIFO request must reach the server");
     let second_fifo = posts
         .iter()
-        .position(|body| body.contains("peer-fifo") && body.contains("51011"))
+        .position(|body| signal_has_candidate(body, "peer-fifo", "203.0.113.92:51011"))
         .expect("the second FIFO request must reach the server");
     assert!(
         first_fifo < second_fifo,
@@ -1040,7 +1123,7 @@ async fn candidate_offer_workers_are_fair_and_fifo() {
 #[tokio::test]
 async fn cancelled_candidate_offer_keeps_same_peer_worker_available() {
     let server = MockControlServer::spawn(|kind, body| {
-        if kind == "signal" && body.contains("51100") {
+        if kind == "signal" && signal_has_candidate(body, "peer-rebind", "203.0.113.92:51100") {
             MockAction::Stall
         } else {
             MockAction::Ok
@@ -1082,7 +1165,7 @@ async fn cancelled_candidate_offer_keeps_same_peer_worker_available() {
                 .lock()
                 .unwrap()
                 .iter()
-                .any(|body| body.contains("peer-rebind") && body.contains("51100"))
+                .any(|body| signal_has_candidate(body, "peer-rebind", "203.0.113.92:51100"))
             {
                 break;
             }
@@ -1115,18 +1198,23 @@ async fn cancelled_candidate_offer_keeps_same_peer_worker_available() {
     assert_eq!(
         posts
             .iter()
-            .filter(|body| body.contains("peer-rebind") && body.contains("51100"))
+            .filter(|body| signal_has_candidate(body, "peer-rebind", "203.0.113.92:51100"))
             .count(),
         1,
-        "the cancelled request may reach the wire once but must not retry"
+        "the cancelled request may reach the wire once but must not retry: {posts:?}"
     );
     assert_eq!(
         posts
             .iter()
-            .filter(|body| body.contains("peer-rebind") && body.contains("51101"))
+            .filter(|body| signal_has_candidate(body, "peer-rebind", "203.0.113.92:51101"))
             .count(),
         1,
-        "the first replacement offer must reach the wire exactly once"
+        "the first replacement offer must reach the wire exactly once: {posts:?}"
+    );
+    assert_eq!(
+        posts.len(),
+        2,
+        "only the cancelled request and its replacement may reach the server: {posts:?}",
     );
 
     drop(client);
@@ -1140,7 +1228,7 @@ async fn cancelled_candidate_offer_keeps_same_peer_worker_available() {
 #[tokio::test]
 async fn in_flight_fresh_ownership_cancellation_keeps_same_peer_worker_available() {
     let server = MockControlServer::spawn(|kind, body| {
-        if kind == "signal" && body.contains("51200") {
+        if kind == "signal" && signal_has_candidate(body, "peer-rebind", "203.0.113.92:51200") {
             MockAction::Stall
         } else {
             MockAction::Ok
@@ -1184,7 +1272,7 @@ async fn in_flight_fresh_ownership_cancellation_keeps_same_peer_worker_available
                 .lock()
                 .unwrap()
                 .iter()
-                .any(|body| body.contains("peer-rebind") && body.contains("51200"))
+                .any(|body| signal_has_candidate(body, "peer-rebind", "203.0.113.92:51200"))
             {
                 break;
             }
@@ -1222,18 +1310,23 @@ async fn in_flight_fresh_ownership_cancellation_keeps_same_peer_worker_available
     assert_eq!(
         posts
             .iter()
-            .filter(|body| body.contains("peer-rebind") && body.contains("51200"))
+            .filter(|body| signal_has_candidate(body, "peer-rebind", "203.0.113.92:51200"))
             .count(),
         1,
-        "the cancelled fresh request may reach the server once but must not retry"
+        "the cancelled fresh request may reach the server once but must not retry: {posts:?}"
     );
     assert_eq!(
         posts
             .iter()
-            .filter(|body| body.contains("peer-rebind") && body.contains("51201"))
+            .filter(|body| signal_has_candidate(body, "peer-rebind", "203.0.113.92:51201"))
             .count(),
         1,
-        "the replacement offer must reach the wire exactly once"
+        "the replacement offer must reach the wire exactly once: {posts:?}"
+    );
+    assert_eq!(
+        posts.len(),
+        2,
+        "only the cancelled request and its replacement may reach the server: {posts:?}",
     );
 
     drop(client);
@@ -1432,7 +1525,10 @@ async fn critical_answer_retries_exact_payload_then_succeeds() {
 #[tokio::test]
 async fn cancelled_critical_answer_aborts_and_new_owner_is_unaffected() {
     let server = MockControlServer::spawn(|kind, body| {
-        if kind == "signal" && body.contains("\"type\":\"peer_answer\"") && body.contains("60001") {
+        if kind == "signal"
+            && body.contains("\"type\":\"peer_answer\"")
+            && signal_has_candidate(body, "peer-x", "203.0.113.90:60001")
+        {
             MockAction::Stall
         } else {
             MockAction::Ok
@@ -1476,7 +1572,7 @@ async fn cancelled_critical_answer_aborts_and_new_owner_is_unaffected() {
                 .lock()
                 .unwrap()
                 .iter()
-                .any(|body| body.contains("60001"))
+                .any(|body| signal_has_candidate(body, "peer-x", "203.0.113.90:60001"))
             {
                 break;
             }
@@ -1493,7 +1589,7 @@ async fn cancelled_critical_answer_aborts_and_new_owner_is_unaffected() {
         .lock()
         .unwrap()
         .iter()
-        .filter(|body| body.contains("60001"))
+        .filter(|body| signal_has_candidate(body, "peer-x", "203.0.113.90:60001"))
         .count();
     assert_eq!(
         stalled_posts, 1,
@@ -1518,7 +1614,7 @@ async fn cancelled_critical_answer_aborts_and_new_owner_is_unaffected() {
             .lock()
             .unwrap()
             .iter()
-            .filter(|body| body.contains("60002"))
+            .filter(|body| signal_has_candidate(body, "peer-x", "203.0.113.90:60002"))
             .count(),
         1,
         "the new owner's answer must reach the wire exactly once"

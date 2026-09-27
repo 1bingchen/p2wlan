@@ -598,42 +598,9 @@ mod hard_hard_tests {
         SocketAddr,
         crate::peer::PeerSessionGeneration,
     ) {
-        let (peers, udp, mut identity, remote) = exact_socket_proof_fixture().await;
-        let mut record = peers
-            .hard_hard_session_for_test(&identity.peer_id)
-            .await
-            .expect("exact fixture must install a session ledger record");
-
-        peers
-            .update_nat_profile(birthday_runtime_nat_profile())
-            .await;
-        let local_profile_generation = peers.current_local_profile_generation_sync();
-        let session_token = "birthday-runtime-token".to_string();
-        identity.session_token = session_token.clone();
-        identity.local_profile_generation = local_profile_generation;
-        record.session_id = "birthday-runtime-session".to_string();
-        record.session_token = session_token.clone();
-        record.probe_session_id = Some("probe-session-exact".to_string());
-        record.local_profile_generation = local_profile_generation;
-        record.requested_birthday_level = 64;
-        record.generated_candidate_count = 64;
-        record.signaled_candidate_count = 1;
-        record.birthday = true;
-        record.requested_socket_indices = vec![identity.socket_index, identity.socket_index + 1];
-        record.requested_socket_count = 2;
-        record.prediction_window = vec![remote];
-        record.remote_prediction = vec![remote];
-        record.fresh_socket = identity.clone();
-        record.punch_at_ms = hard_hard_now_ms();
-        record.expires_at_ms = record.punch_at_ms.saturating_add(30_000);
-        record.state = crate::peer::HardHardSessionState::AwaitingPeer;
-        record.attempt_count = 0;
-        record.cancellation = Arc::new(crate::PunchSessionCancellation::default());
-        assert!(peers.hard_hard_register_session(record).await);
-        assert!(
-            udp.tag_hard_hard_socket(&identity.peer_id, identity.socket_index, &session_token)
-                .await
-        );
+        // The socket and session must receive their final token at first
+        // installation; an existing proof socket cannot be retagged.
+        let (peers, udp, identity, remote) = exact_socket_fixture(None, true).await;
         let peer_session_generation = peers
             .peer_session_generation_sync(&identity.peer_id)
             .expect("exact fixture peer must have an active lifecycle generation");
@@ -1278,6 +1245,63 @@ mod hard_hard_tests {
         replacement.session_token = "replacement-token".to_string();
         replacement.fresh_socket.session_token = replacement.session_token.clone();
         replacement.cancellation = Arc::new(crate::PunchSessionCancellation::default());
+        assert!(
+            !udp.tag_hard_hard_socket(
+                &old.peer_id,
+                old.fresh_socket.socket_index,
+                &replacement.session_token,
+            )
+            .await,
+            "a replacement session must not take over a socket bound to the old token"
+        );
+        assert_eq!(
+            udp.hard_hard_socket_token(old.fresh_socket.socket_index)
+                .await,
+            Some(old.session_token.clone())
+        );
+        let (socket_index, socket) = udp.bind_fresh_punch_socket().await.unwrap();
+        assert_ne!(socket_index, old.fresh_socket.socket_index);
+        replacement.fresh_socket.socket_index = socket_index;
+        replacement.fresh_socket.socket_local_endpoint = socket.local_addr().unwrap();
+        replacement.fresh_socket.punch_generation += 1;
+        replacement.requested_socket_indices = vec![socket_index];
+        let handoff = udp
+            .attach_dynamic_punch_socket(
+                &replacement.peer_id,
+                socket_index,
+                socket,
+                replacement.local_network_generation,
+                replacement.fresh_socket.punch_generation,
+                Some(&replacement.cancellation),
+            )
+            .await
+            .unwrap();
+        assert!(
+            udp.reserve_hard_hard_socket(&replacement.peer_id, socket_index)
+                .await
+        );
+        assert!(
+            handoff
+                .commit_and_pin_for_test(
+                    &udp,
+                    &replacement.peer_id,
+                    socket_index,
+                    replacement.local_network_generation,
+                    replacement.fresh_socket.punch_generation,
+                )
+                .await
+        );
+        assert!(handoff.finalize().await);
+        // Finalizing the new affinity detaches its superseded predecessor
+        // before session registration cancels the old session. Late cleanup
+        // must therefore tolerate the old socket already being gone.
+        assert!(!old.cancellation.is_cancelled());
+        assert_eq!(
+            udp.hard_hard_socket_token(old.fresh_socket.socket_index)
+                .await,
+            None,
+            "the finalized handoff must retire the old socket before late session cleanup"
+        );
         assert!(peers.hard_hard_register_session(replacement.clone()).await);
         assert!(old.cancellation.is_cancelled());
         assert_eq!(
@@ -1300,6 +1324,12 @@ mod hard_hard_tests {
             )
             .await
         );
+        assert!(
+            udp.hard_hard_socket_identity_is_current(&replacement.fresh_socket)
+                .await,
+            "the replacement must own its exact socket and affinity before old cleanup"
+        );
+        assert!(!replacement.cancellation.is_cancelled());
 
         let _ = peers
             .hard_hard_retire_session(&old.peer_id, &old.session_id, &old.session_token)
@@ -1325,6 +1355,12 @@ mod hard_hard_tests {
                 .await
         );
         assert_eq!(udp.dynamic_socket_count().await, 1);
+        assert!(
+            udp.hard_hard_socket_identity_is_current(&replacement.fresh_socket)
+                .await,
+            "old token and socket cleanup must preserve the replacement's exact identity and affinity"
+        );
+        assert!(!replacement.cancellation.is_cancelled());
         assert!(peers
             .hard_hard_session_by_token(&replacement.peer_id, &replacement.session_token)
             .await
@@ -2319,6 +2355,18 @@ mod hard_hard_tests {
         crate::peer::HardHardFreshSocketIdentity,
         SocketAddr,
     ) {
+        exact_socket_fixture(strategy, false).await
+    }
+
+    async fn exact_socket_fixture(
+        strategy: Option<crate::peer::HardHardProbeStrategy>,
+        birthday: bool,
+    ) -> (
+        Arc<PeerManager>,
+        UdpTransport,
+        crate::peer::HardHardFreshSocketIdentity,
+        SocketAddr,
+    ) {
         let peers = Arc::new(PeerManager::new(
             Config::generate_default("https://ctrl.test", "hard-hard-exact-proof").unwrap(),
         ));
@@ -2326,6 +2374,14 @@ mod hard_hard_tests {
             "hard-hard-exact-proof",
             0,
         ));
+        let (session_id, session_token) = if birthday {
+            peers
+                .update_nat_profile(birthday_runtime_nat_profile())
+                .await;
+            ("birthday-runtime-session", "birthday-runtime-token")
+        } else {
+            ("proof-session", "proof-token")
+        };
         let remote: SocketAddr = "198.51.100.20:41000".parse().unwrap();
         peers
             .add_peer(&crate::control::PeerInfo {
@@ -2390,10 +2446,10 @@ mod hard_hard_tests {
 
         let identity = crate::peer::HardHardFreshSocketIdentity {
             peer_id: "peer-exact-proof".to_string(),
-            session_token: "proof-token".to_string(),
+            session_token: session_token.to_string(),
             network_generation: 0,
             remote_candidate_epoch,
-            local_profile_generation: 0,
+            local_profile_generation: peers.current_local_profile_generation_sync(),
             remote_profile_generation: 7,
             punch_generation: 1,
             socket_index,
@@ -2441,7 +2497,7 @@ mod hard_hard_tests {
                             start_ack_delivery: None,
                         }
                     }),
-                    session_id: "proof-session".to_string(),
+                    session_id: session_id.to_string(),
                     probe_session_id: Some("probe-session-exact".to_string()),
                     session_token: identity.session_token.clone(),
                     peer_id: identity.peer_id.clone(),
@@ -2453,16 +2509,24 @@ mod hard_hard_tests {
                     remote_profile_generation: identity.remote_profile_generation,
                     local_prediction_confidence: 90,
                     remote_prediction_confidence: 90,
-                    requested_birthday_level: 0,
-                    generated_candidate_count: 1,
+                    requested_birthday_level: if birthday { 64 } else { 0 },
+                    generated_candidate_count: if birthday { 64 } else { 1 },
                     signaled_candidate_count: 1,
-                    birthday: false,
-                    requested_socket_indices: vec![socket_index],
-                    requested_socket_count: 1,
+                    birthday,
+                    requested_socket_indices: if birthday {
+                        vec![socket_index, socket_index + 1]
+                    } else {
+                        vec![socket_index]
+                    },
+                    requested_socket_count: if birthday { 2 } else { 1 },
                     prediction_window: vec![remote],
                     remote_prediction: vec![remote],
                     fresh_socket: identity.clone(),
-                    punch_at_ms: now.saturating_add(5_000),
+                    punch_at_ms: if birthday {
+                        now
+                    } else {
+                        now.saturating_add(5_000)
+                    },
                     expires_at_ms: now.saturating_add(30_000),
                     state: crate::peer::HardHardSessionState::AwaitingPeer,
                     attempt_count: 0,

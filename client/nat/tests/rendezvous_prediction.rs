@@ -265,8 +265,61 @@ fn unequal_windows_preserve_the_proved_common_prefix_and_all_remaining_targets()
             }
             let mut sparse_suffix = remote.clone();
             let last = sparse_suffix.last_mut().unwrap();
-            last.set_port(last.port() + 7);
-            assert!(fixed_step_rendezvous_targets(&local, &sparse_suffix, true, false).is_none());
+            // Skip one rank in the original direction. The final delta is
+            // 2*step while every earlier delta is step: both have the same
+            // sign, so this cannot accidentally become a valid wrap.
+            last.set_port((i32::from(last.port()) + step) as u16);
+            for phase in [false, true] {
+                assert!(
+                    fixed_step_rendezvous_targets(&local, &sparse_suffix, true, phase).is_none(),
+                    "local_width={local_width} remote_width={remote_width} step={step} phase={phase}"
+                );
+                assert!(
+                    fixed_step_rendezvous_targets(&sparse_suffix, &local, true, phase).is_none(),
+                    "a gap anywhere in either advertised window must reject reordering"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn circular_rank_shape_does_not_establish_allocation_domain_evidence() {
+    use p2pnet_nat::{infer_port_domain, PortDomainEvidence};
+
+    let local = endpoints("192.0.2.1", &(5000..5009).collect::<Vec<_>>());
+    // Adding seven to the last element of [40000, 39998, 39996, 39994]
+    // is not a reliable sparse counterexample: [-2, -2, +5] describes a
+    // complete rank sequence modulo seven. Its reversal is equally regular.
+    for (ports, step) in [
+        ([40000, 39998, 39996, 40001], -2),
+        ([40001, 39996, 39998, 40000], 2),
+    ] {
+        let witness = PortDomainEvidence::ObservedRange {
+            first: 39995,
+            last: 40001,
+        };
+        assert!(ports
+            .windows(2)
+            .all(|pair| witness.advance(pair[0], step) == Some(pair[1])));
+        assert!(
+            infer_port_domain(&ports).is_err(),
+            "a mathematical rank witness must not manufacture measured NAT evidence"
+        );
+        let remote = endpoints("198.51.100.2", &ports);
+        for phase in [false, true] {
+            let expected = fixed_step_rendezvous_order(remote.len(), true, phase)
+                .into_iter()
+                .map(|rank| remote[rank])
+                .collect::<Vec<_>>();
+            assert_eq!(
+                fixed_step_rendezvous_targets(&local, &remote, true, phase),
+                Some(expected)
+            );
+            assert_eq!(
+                fixed_step_rendezvous_targets(&local, &remote, false, phase),
+                Some(remote.clone())
+            );
         }
     }
 }

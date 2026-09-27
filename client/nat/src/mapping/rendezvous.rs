@@ -146,6 +146,9 @@ pub fn fixed_step_rendezvous_order(
 /// A wrapped window may use the predictor's observed port domain instead of
 /// the legacy 65536 ring. The check below proves only consecutive candidate
 /// ranks in the advertised list; it never creates port-domain/NAT evidence.
+/// A list sparse under linear arithmetic may be complete under a circular
+/// domain. Accepting that shape does not establish that the NAT uses it;
+/// allocation evidence and freshness remain the caller's responsibility.
 pub fn fixed_step_rendezvous_targets(
     local: &[SocketAddr],
     remote: &[SocketAddr],

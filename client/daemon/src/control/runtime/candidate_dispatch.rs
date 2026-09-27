@@ -30,11 +30,13 @@ enum PendingCandidateDispatch {
         reservation: CandidateQueueReservation,
         closed_retries_remaining: u8,
     },
-    Lane {
-        command: Option<CandidateDispatchCommand>,
-        deadline: Instant,
-        auth: Option<CriticalControlAuth>,
-    },
+    Lane(Box<PendingCandidateLane>),
+}
+
+struct PendingCandidateLane {
+    command: Option<CandidateDispatchCommand>,
+    deadline: Instant,
+    auth: Option<CriticalControlAuth>,
 }
 
 impl PendingCandidateDispatch {
@@ -42,14 +44,14 @@ impl PendingCandidateDispatch {
         command: CandidateDispatchCommand,
         auth_rx: &watch::Receiver<Option<CriticalControlAuth>>,
     ) -> Self {
-        Self::Lane {
+        Self::Lane(Box::new(PendingCandidateLane {
             deadline: command
                 .command
                 .not_after
                 .unwrap_or_else(|| Instant::now() + CRITICAL_SIGNAL_OVERALL_DEADLINE),
             command: Some(command),
             auth: auth_rx.borrow().clone(),
-        }
+        }))
     }
 
     fn wait_for_closed_lane(
@@ -73,14 +75,14 @@ impl PendingCandidateDispatch {
         lanes: &HashMap<String, CandidateOfferLane>,
         auth_rx: &watch::Receiver<Option<CriticalControlAuth>>,
     ) -> Option<CandidateDispatchCommand> {
-        let Self::Lane {
+        let Self::Lane(pending) = self else {
+            return None;
+        };
+        let PendingCandidateLane {
             command,
             deadline,
             auth,
-        } = self
-        else {
-            return None;
-        };
+        } = pending.as_mut();
         if candidate_command_revoked(
             &command.as_ref()?.command,
             *deadline,
@@ -110,14 +112,13 @@ impl PendingCandidateDispatch {
                     command,
                     closed_retries_remaining: *closed_retries_remaining,
                 }),
-            Self::Lane {
-                command,
-                deadline,
-                auth,
-            } => {
-                let Some(command) = command.as_mut() else {
-                    return None;
-                };
+            Self::Lane(pending) => {
+                let PendingCandidateLane {
+                    command,
+                    deadline,
+                    auth,
+                } = pending.as_mut();
+                let command = command.as_mut()?;
                 let command = &mut command.command;
                 let ownership = command.fresh_ownership.clone();
                 loop {

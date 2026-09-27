@@ -274,5 +274,5 @@ fn hard_hard_plan_digest(
         }
     }
     let digest = hash.finalize();
-    Some(digest[..16].try_into().ok()?)
+    digest[..16].try_into().ok()
 }

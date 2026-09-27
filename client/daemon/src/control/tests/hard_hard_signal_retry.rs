@@ -1,3 +1,5 @@
+type StartAckRetryFenceHook = Arc<Mutex<Option<Box<dyn FnOnce() + Send>>>>;
+
 struct StartAckRetryHarness {
     client: ControlClient,
     auth_tx: watch::Sender<Option<CriticalControlAuth>>,
@@ -193,7 +195,7 @@ async fn final_ack_permanent_auth_and_registration_conflict_are_not_retried() {
 #[tokio::test]
 async fn final_ack_retry_stops_on_owner_drop_cancellation_or_registration_replacement() {
     for fence in 0..3 {
-        let hook: Arc<Mutex<Option<Box<dyn FnOnce() + Send>>>> = Arc::new(Mutex::new(None));
+        let hook: StartAckRetryFenceHook = Arc::new(Mutex::new(None));
         let first_request_hook = hook.clone();
         let server = MockControlServer::spawn(move |_, body| {
             if body.contains("start-ack-retry-test") {

@@ -132,7 +132,9 @@ mod hard_hard_wire_v2_tests {
     fn unknown_flags_models_strategy_and_invalid_bounds_are_rejected() {
         let original = wire_bytes(&envelope(HardHardV2Stage::Answer));
         for (offset, replacement) in [
-            (0, 0x45),
+            (0, 0x85), // Reserved high bit; 0x45 is a valid SyncAck.
+            (0, 0x42), // Unknown stage 6.
+            (0, 0x47), // Unknown stage 7.
             (0, 0x35),
             (57, 101),
             (58, 101),
@@ -160,12 +162,31 @@ mod hard_hard_wire_v2_tests {
             HardHardV2Stage::Answer,
             HardHardV2Stage::Ready,
             HardHardV2Stage::ReadyAck,
+            HardHardV2Stage::Sync,
+            HardHardV2Stage::SyncAck,
         ] {
             let mut bytes = wire_bytes(&envelope(stage));
             bytes[0] ^= 4;
             assert!(
                 HardHardCoordination::parse(&wire_from_bytes(&bytes)).is_none(),
                 "{stage:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn sync_stages_use_the_known_extended_stage_bit() {
+        for (stage, flags) in [
+            (HardHardV2Stage::Sync, 0x40),
+            (HardHardV2Stage::SyncAck, 0x45),
+        ] {
+            let mut value = envelope(stage);
+            value.v2.as_mut().unwrap().phase = false;
+            let bytes = wire_bytes(&value);
+            assert_eq!(bytes[0], flags);
+            assert_eq!(
+                HardHardCoordination::parse(&wire_from_bytes(&bytes)),
+                Some(value)
             );
         }
     }

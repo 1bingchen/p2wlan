@@ -49,12 +49,14 @@ async fn hard_hard_accept_answer(
         .hard_hard_agree_plan(
             &record.peer_id,
             &record.session_token,
-            meta.local,
-            agreement,
-            remote,
-            answer.local_network_generation,
-            answer.local_prediction_confidence,
-            hard_hard_sync_uncertainty(offer.v2.as_ref()?, meta),
+            crate::peer::HardHardPlanAgreement {
+                remote_offer: meta.local,
+                agreement,
+                remote_prediction: remote,
+                remote_network_generation: answer.local_network_generation,
+                remote_confidence: answer.local_prediction_confidence,
+                sync_uncertainty: hard_hard_sync_uncertainty(offer.v2.as_ref()?, meta),
+            },
         )
         .await?;
     let mut ready = offer;

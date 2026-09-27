@@ -835,13 +835,26 @@ async fn hard_hard_hh2_prepare_bounds_scope_preflight_connection_contention() {
     let epoch = fixture.udp.network_epoch_gate.lock().await;
     let connections = fixture.peers.hold_connections_writer_for_test().await;
     tokio::time::pause();
-    let started = tokio::time::Instant::now();
-    assert!(fixture
-        .udp
-        .prepare_hh2_direct_commit(&epoch, "peer-b", Some(&scope))
-        .await
-        .is_err());
-    assert!(started.elapsed() <= Duration::from_millis(100));
+    {
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(100);
+        let boundary = tokio::time::sleep_until(deadline);
+        let prepare = fixture
+            .udp
+            .prepare_hh2_direct_commit(&epoch, "peer-b", Some(&scope));
+        tokio::pin!(boundary, prepare);
+        assert!(futures_util::poll!(prepare.as_mut()).is_pending());
+        tokio::time::sleep_until(deadline - Duration::from_millis(1)).await;
+        assert!(futures_util::poll!(prepare.as_mut()).is_pending());
+        // Tokio rounds both deadlines to its millisecond timer tick. A
+        // paused clock may therefore advance slightly beyond 100ms from a
+        // fractional starting instant. Require completion at the same 100ms
+        // timer boundary, without granting another timer tick or lock release.
+        boundary.await;
+        assert!(matches!(
+            futures_util::poll!(prepare.as_mut()),
+            std::task::Poll::Ready(Err(()))
+        ));
+    }
     drop(connections);
     drop(epoch);
     tokio::time::resume();

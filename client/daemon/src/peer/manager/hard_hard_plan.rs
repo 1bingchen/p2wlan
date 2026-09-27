@@ -72,6 +72,17 @@ pub(crate) struct HardHardAgreedPlan {
     pub(crate) digest: [u8; 16],
 }
 
+/// Inputs from one validated ANSWER. The session ledger remains the owner of
+/// the accepted plan; this borrowed input does not retain a second copy.
+pub(crate) struct HardHardPlanAgreement<'a> {
+    pub(crate) remote_offer: HardHardOfferParameters,
+    pub(crate) agreement: HardHardAgreedPlan,
+    pub(crate) remote_prediction: &'a [SocketAddr],
+    pub(crate) remote_network_generation: u64,
+    pub(crate) remote_confidence: u8,
+    pub(crate) sync_uncertainty: Duration,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct HardHardAgreedStart {
     pub(crate) server_time_ms: u64,
@@ -326,29 +337,28 @@ impl PeerManager {
         &self,
         peer: &str,
         token: &str,
-        remote_offer: HardHardOfferParameters,
-        agreement: HardHardAgreedPlan,
-        remote_prediction: &[SocketAddr],
-        remote_network_generation: u64,
-        remote_confidence: u8,
-        sync_uncertainty: Duration,
+        input: HardHardPlanAgreement<'_>,
     ) -> Option<HardHardSessionRecord> {
+        let HardHardPlanAgreement {
+            remote_offer,
+            agreement,
+            remote_prediction,
+            remote_network_generation,
+            remote_confidence,
+            sync_uncertainty,
+        } = input;
         if !remote_offer.is_valid(remote_prediction) {
             return None;
         }
         let mut sessions = self.hard_hard_sessions.lock().await;
-        let Some(record) = sessions.values_mut().find(|record| {
+        let record = sessions.values_mut().find(|record| {
             record.peer_id == peer
                 && record.session_token == token
                 && record.state == HardHardSessionState::AwaitingPeer
                 && !record.cancellation.is_cancelled()
                 && record.expires_at_ms >= hard_hard_now_ms()
-        }) else {
-            return None;
-        };
-        let Some(plan) = record.coordinated_plan.as_mut() else {
-            return None;
-        };
+        })?;
+        let plan = record.coordinated_plan.as_mut()?;
         if remote_network_generation == 0
             || remote_confidence == 0
             || (record.remote_network_generation != 0

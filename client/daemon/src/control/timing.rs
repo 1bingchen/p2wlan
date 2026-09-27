@@ -39,7 +39,7 @@ impl TimingState {
     fn invalidate(&mut self, discard_pool: bool) {
         self.sample = None;
         // Saturation fails closed instead of reusing an earlier identity.
-        self.network_epoch = self.network_epoch.checked_add(1).unwrap_or(u64::MAX);
+        self.network_epoch = self.network_epoch.saturating_add(1);
         if discard_pool || self.network_epoch == u64::MAX {
             self.http_pool_id = 0;
         }

@@ -540,42 +540,45 @@ impl WireGuardTransport {
                         return;
                     };
                     let deadline = hh2_commit.as_ref().map(|commit| commit.deadline);
-                    let mut hooks = DirectValidationAckCommitHooks {
-                        pair: hh2_commit.as_mut().map(|commit| {
-                            commit as &mut (dyn crate::peer::DirectCommitHooks + Send)
-                        }),
-                        session_guard: &mut session_guard,
-                        committed: &mut promoted,
+                    // End the borrowed hook scope before inspecting or dropping
+                    // the actual HH commit guard and transport session guard.
+                    let accepted = {
+                        let mut hooks = DirectValidationAckCommitHooks {
+                            pair: hh2_commit.as_mut().map(|commit| {
+                                commit as &mut (dyn crate::peer::DirectCommitHooks + Send)
+                            }),
+                            session_guard: &mut session_guard,
+                            committed: &mut promoted,
+                        };
+                        let commit = peers.record_direct_success_with_commit_hooks(
+                            &epoch,
+                            peer_id,
+                            Some(source),
+                            proof.generation,
+                            local_endpoint,
+                            latency,
+                            Some(proof.remote_candidate_epoch),
+                            Some(crate::peer::DirectValidationIdentity::authenticated_ack(
+                                crate::peer::PathEpoch::new(
+                                    proof.generation,
+                                    proof.peer_session_generation,
+                                    proof.remote_candidate_epoch,
+                                ),
+                                proof.owner_token,
+                                proof.request_id,
+                                proof.endpoint,
+                                source,
+                            )),
+                            Some(&mut hooks),
+                        );
+                        if let Some(deadline) = deadline {
+                            tokio::time::timeout_at(deadline, commit)
+                                .await
+                                .unwrap_or(false)
+                        } else {
+                            commit.await
+                        }
                     };
-                    let commit = peers.record_direct_success_with_commit_hooks(
-                        &epoch,
-                        peer_id,
-                        Some(source),
-                        proof.generation,
-                        local_endpoint,
-                        latency,
-                        Some(proof.remote_candidate_epoch),
-                        Some(crate::peer::DirectValidationIdentity::authenticated_ack(
-                            crate::peer::PathEpoch::new(
-                                proof.generation,
-                                proof.peer_session_generation,
-                                proof.remote_candidate_epoch,
-                            ),
-                            proof.owner_token,
-                            proof.request_id,
-                            proof.endpoint,
-                            source,
-                        )),
-                        Some(&mut hooks),
-                    );
-                    let accepted = if let Some(deadline) = deadline {
-                        tokio::time::timeout_at(deadline, commit)
-                            .await
-                            .unwrap_or(false)
-                    } else {
-                        commit.await
-                    };
-                    drop(hooks);
                     // Legacy/already-committed exact pairs may receive an
                     // accepted no-op. A new HH pair still requires its actual
                     // synchronous hook before any socket adoption is allowed.

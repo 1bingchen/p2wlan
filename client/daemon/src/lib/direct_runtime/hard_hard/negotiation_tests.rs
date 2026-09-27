@@ -133,12 +133,14 @@ async fn first_answer_returns_the_committed_claim_snapshot_without_relaxing_iden
             .hard_hard_agree_plan(
                 &before.peer_id,
                 &before.session_token,
-                original.local,
-                original.agreement.unwrap(),
-                &answered,
-                answer.local_network_generation,
-                answer.local_prediction_confidence.saturating_sub(1),
-                Duration::from_millis(25)
+                crate::peer::HardHardPlanAgreement {
+                    remote_offer: original.local,
+                    agreement: original.agreement.unwrap(),
+                    remote_prediction: &answered,
+                    remote_network_generation: answer.local_network_generation,
+                    remote_confidence: answer.local_prediction_confidence.saturating_sub(1),
+                    sync_uncertainty: Duration::from_millis(25),
+                }
             )
             .await
             .is_none(),

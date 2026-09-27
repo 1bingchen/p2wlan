@@ -1052,17 +1052,31 @@ async fn hard_hard_birthday_level(peers: &PeerManager, peer_id: &str) -> usize {
     )
 }
 
+/// Borrowed inputs for a single measurement; cancellation and the scheduled
+/// send remain owned by the existing rendezvous session.
+struct HardHardMeasurementRequest<'a> {
+    observers: &'a [SocketAddr],
+    stun_timeout: Duration,
+    session_token: &'a str,
+    cancellation: Option<&'a Arc<crate::PunchSessionCancellation>>,
+    punch_at_ms: u64,
+    coordinated: bool,
+}
+
 async fn run_hard_hard_local_measurement(
     udp: &UdpTransport,
     peers: &PeerManager,
     peer_id: &str,
-    observers: &[SocketAddr],
-    stun_timeout: Duration,
-    session_token: &str,
-    cancellation: Option<&Arc<crate::PunchSessionCancellation>>,
-    punch_at_ms: u64,
-    coordinated: bool,
+    request: HardHardMeasurementRequest<'_>,
 ) -> std::result::Result<HardHardLocalMeasurement, FreshMappingRejection> {
+    let HardHardMeasurementRequest {
+        observers,
+        stun_timeout,
+        session_token,
+        cancellation,
+        punch_at_ms,
+        coordinated,
+    } = request;
     if coordinated {
         let level = hard_hard_birthday_level(peers, peer_id).await;
         return udp

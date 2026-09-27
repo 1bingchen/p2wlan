@@ -133,6 +133,187 @@ async fn peer_lifecycle_wait_drives_granted_responder_writer() {
 }
 
 #[tokio::test]
+async fn peer_answer_drives_candidate_target_writer_before_incarnation_commit() {
+    let mut config =
+        Config::generate_default("http://127.0.0.1:1", "answer-candidate-writer").unwrap();
+    config.node.node_id = "zz-local-answer-candidate-writer".to_string();
+    config.network.punch_attempts = 1;
+    let daemon = Daemon::new(config);
+    let peer_id = "peer-answer-candidate-writer";
+    let remote_identity = NodeIdentity::generate();
+    let public_key = hex::encode(remote_identity.public_key());
+    daemon
+        .peers
+        .add_peer(&control::PeerInfo {
+            node_id: peer_id.to_string(),
+            public_key: public_key.clone(),
+            virtual_ip: "10.20.0.2".to_string(),
+            online: true,
+            ..control::PeerInfo::default()
+        })
+        .await;
+    let udp = crate::udp::UdpTransport::bind("127.0.0.1:0".parse().unwrap(), daemon.peers.clone())
+        .await
+        .unwrap();
+    let local_candidate = udp.local_addr().unwrap().to_string();
+    *daemon.udp_transport.write().await = Some(udp);
+    daemon
+        .publish_candidate_snapshot(vec![local_candidate], HashMap::new(), Vec::new())
+        .await;
+
+    let mut initiator = HandshakeInitiator::new(
+        daemon.local_identity().unwrap(),
+        remote_identity.public_key(),
+        None,
+    );
+    let initiation = initiator.create_initiation().unwrap();
+    let mut responder = HandshakeResponder::new(remote_identity, None);
+    let (response, _) = responder
+        .consume_initiation_and_respond(&initiation)
+        .unwrap();
+    daemon
+        .pending_handshakes
+        .lock()
+        .insert(peer_id.to_string(), initiator, None, None);
+
+    let peers = daemon.peers.clone();
+    let transport = daemon.transport.clone();
+    let timeline = daemon.timeline.clone();
+    let pending = daemon.pending_handshakes.clone();
+    let attempts = daemon.punch_attempts.clone();
+    let control = daemon.control.clone();
+    let shutdown = daemon.shutdown_sender();
+    // Target preparation reads this independent snapshot immediately before
+    // queueing the connection writer. Keep it closed until the candidate lane
+    // has passed its non-queuing begin_hole_punch commit.
+    let interface_writer = peers.hold_local_interface_networks_writer_for_test().await;
+    let offer_generation = 0x4000_0000_0000_0000 | (411 << 21) | 1;
+    control
+        .event_sender()
+        .send(ControlEvent::PeerOffer {
+            from_node_id: peer_id.to_string(),
+            candidates: vec!["127.0.0.1:9".to_string()],
+            session_id: None,
+            probe_ephemeral_public_key: None,
+            candidate_sources: HashMap::new(),
+            candidate_generation: offer_generation,
+            candidates_expires_at_ms: None,
+            handshake_init: Vec::new(),
+            punch_at_ms: None,
+            punch_at_server_ms: None,
+            sender_public_key: Some(public_key.clone()),
+        })
+        .unwrap();
+    let (network_tx, _network_rx) = mpsc::channel(8);
+    let mut relay_started = false;
+    let mut daemon_task = daemon;
+    let loop_task = tokio::spawn(async move {
+        daemon_task
+            .run_control_event_loop(&mut relay_started, network_tx)
+            .await;
+    });
+    timeout(Duration::from_secs(1), async {
+        loop {
+            if peers
+                .get_connection(peer_id)
+                .await
+                .is_some_and(|connection| {
+                    connection.state == ConnectionState::HolePunching
+                        && connection.last_candidate_generation() == offer_generation
+                })
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the real candidate owner never passed its non-queuing punch commit");
+
+    let connection_map = peers.connection_map_for_test();
+    let connection_reader = connection_map.clone().read_owned().await;
+    drop(interface_writer);
+    timeout(Duration::from_secs(1), async {
+        while connection_map.try_read().is_ok() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("candidate target preparation did not enqueue its fair connection writer");
+    assert!(pending.lock().has_candidate_offer_work_for_test(peer_id));
+
+    let receipt = control::SignalDeliveryReceipt::pending();
+    control
+        .event_sender()
+        .send(ControlEvent::DeliveredSignal {
+            signal_id: "answer-behind-candidate-target-writer".to_string(),
+            signal_seq: Some(2),
+            signal_type: "peer_answer".to_string(),
+            event: Box::new(ControlEvent::PeerAnswer {
+                from_node_id: peer_id.to_string(),
+                candidates: Vec::new(),
+                session_id: None,
+                probe_ephemeral_public_key: None,
+                candidate_sources: HashMap::new(),
+                candidate_generation: offer_generation + 1,
+                candidates_expires_at_ms: None,
+                handshake_response: response.to_bytes(),
+                punch_at_ms: None,
+                punch_at_server_ms: None,
+                sender_public_key: Some(public_key),
+            }),
+            receipt: receipt.clone(),
+        })
+        .unwrap();
+    timeout(Duration::from_secs(1), async {
+        while !timeline
+            .snapshot()
+            .events
+            .iter()
+            .any(|event| event.event == "peer_answer_received")
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the real Answer branch did not enter its serial commit");
+    assert_eq!(receipt.current(), control::SignalApplyOutcome::Pending);
+    // The first writer is now granted, but only this actor can poll it. A
+    // bare await in PeerAnswer would park the actor behind its own candidate
+    // future forever, including after the external reader is released.
+    drop(connection_reader);
+    let result = timeout(Duration::from_secs(1), receipt.wait()).await;
+    if result.is_err() {
+        loop_task.abort();
+        let _ = loop_task.await;
+        panic!("PeerAnswer stopped polling its granted candidate target writer");
+    }
+    assert_eq!(result.unwrap(), control::SignalApplyOutcome::Applied);
+    assert!(
+        transport.has_session(peer_id).await,
+        "the authenticated Answer must install its session"
+    );
+    timeout(Duration::from_secs(1), async {
+        while pending.lock().has_candidate_offer_work_for_test(peer_id) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("candidate owner was not released after its queued writer completed");
+    drop(
+        timeout(Duration::from_secs(1), connection_map.write())
+            .await
+            .expect("the actor left the connection writer permanently unavailable"),
+    );
+    attempts.cancel(peer_id);
+    let _ = shutdown.send(true);
+    timeout(Duration::from_secs(1), loop_task)
+        .await
+        .expect("control event loop did not stop")
+        .expect("control event loop task panicked");
+}
+
+#[tokio::test]
 async fn control_event_loop_processes_critical_event_while_candidate_refresh_is_blocked() {
     let config = Config::generate_default("http://127.0.0.1:1", "net1").unwrap();
     let daemon = Daemon::new(config);

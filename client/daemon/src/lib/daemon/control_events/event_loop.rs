@@ -1251,279 +1251,295 @@ impl Daemon {
                         punch_at_server_ms: _,
                         sender_public_key,
                     } => {
-                        let answer_delivery_receipt = signal_delivery_receipt.take();
-                        let mut answer_signal_outcome = control::SignalApplyOutcome::Applied;
-                        if let Some((signal_id, signal_seq, signal_type)) = signal_context.as_ref() {
-                            info!(
-                                "Control signal phase=dispatch_started id={} type={} seq={:?} peer={} stage=peer_answer",
-                                signal_id, signal_type, signal_seq, from_node_id
-                            );
-                        }
-                        info!(
-                            "Received peer answer from {} ({} candidates)",
-                            from_node_id,
-                            candidates.len()
-                        );
-                        // An answer may arrive before the peer-list poll registers
-                        // its sender: wake the peer poll so the pending initiator
-                        // transaction can be consumed without waiting out the
-                        // regular cadence.
-                        if !self.peers.peer_exists_sync(&from_node_id)
-                            || self.peers.peer_session_generation_sync(&from_node_id).is_none()
-                        {
-                            self.control.refresh_peers_now();
-                        }
-                        self.peers.record_direct_event_non_queuing(
-                            &from_node_id,
-                            "peer_answer_received",
-                            None,
-                            Some(candidates.len()),
-                            None,
-                            format!(
-                                "received answer handshake_bytes={} punch_at_ms={punch_at_ms:?}",
-                                handshake_response.len()
-                            ),
-                        );
-                        self.timeline.emit(
-                            "peer_answer_received",
-                            None,
-                            None,
-                            Some(format!(
-                                "peer={} candidate_generation={} handshake_bytes={} candidates={}",
-                                from_node_id,
-                                candidate_generation,
-                                handshake_response.len(),
-                                candidates.len()
-                            )),
-                        );
-                        // The answer can be the first signal observed after the
-                        // remote daemon restarted. Fence the retired transport but
-                        // preserve the exact local initiator that this answer is
-                        // about to complete.
-                        if let Some((signal_id, signal_seq, signal_type)) = signal_context.as_ref() {
-                            info!(
-                                "Control signal phase=waiting_for_resource id={} type={} seq={:?} resource=remote_incarnation_reset",
-                                signal_id, signal_type, signal_seq
-                            );
-                        }
-                        if let Some(receipt) = answer_delivery_receipt.as_ref() {
-                            receipt.record_phase("waiting_for_resource", "remote_incarnation_reset");
-                        }
-                        let remote_incarnation_reset = match self
-                            .reset_peer_for_remote_incarnation_if_needed_for_identity(
-                                &from_node_id,
-                                candidate_generation,
-                                sender_public_key.as_deref(),
-                                if handshake_response.is_empty() {
-                                    RemoteIncarnationResetWork::ClearAll
-                                } else {
-                                    RemoteIncarnationResetWork::PreserveInitiator
-                                },
-                            )
-                            .await
-                        {
-                            RemoteIncarnationResetOutcome::Changed => true,
-                            RemoteIncarnationResetOutcome::Unchanged => false,
-                            RemoteIncarnationResetOutcome::RejectedIdentity => {
-                                debug!(
-                                    "Ignored peer answer from {from_node_id}: signal sender public key is stale"
-                                );
-                                if let Some(receipt) = answer_delivery_receipt.as_ref() {
-                                    receipt.complete(control::SignalApplyOutcome::TerminalRejected);
-                                }
-                                continue;
-                            }
-                            RemoteIncarnationResetOutcome::RejectedLifecycle => {
-                                if let Some(receipt) = answer_delivery_receipt.as_ref() {
-                                    receipt.complete(
-                                        control::SignalApplyOutcome::TerminalRejected,
-                                    );
-                                }
-                                continue;
-                            }
-                            outcome if outcome.retryable() => {
-                                if let Some(receipt) = answer_delivery_receipt.as_ref() {
-                                    receipt.complete(control::SignalApplyOutcome::Retry);
-                                }
-                                continue;
-                            }
-                            _ => false,
-                        };
-                        if let Some((signal_id, signal_seq, signal_type)) = signal_context.as_ref() {
-                            info!(
-                                "Control signal phase=resource_ready id={} type={} seq={:?} resource=remote_incarnation_reset",
-                                signal_id, signal_type, signal_seq
-                            );
-                        }
-                        if let Some(receipt) = answer_delivery_receipt.as_ref() {
-                            receipt.record_phase("resource_ready", "remote_incarnation_reset");
-                        }
-                        // Consume the WireGuard answer before candidate refresh or
-                        // fresh-mapping work. Those paths may perform HTTP/STUN
-                        // I/O and must remain a background upgrade; delaying the
-                        // answer here leaves the responder staged but prevents
-                        // the initiator from ever publishing its active session.
-                        if !handshake_response.is_empty() {
+                        // All admitted lanes share this actor's poll owner. An
+                        // Answer can queue behind a lane's granted connection
+                        // lock at any commit stage, not only incarnation reset.
+                        // Drive those lanes while keeping signal intake serial.
+                        let answer_apply = async {
+                            let answer_delivery_receipt = signal_delivery_receipt.take();
+                            let mut answer_signal_outcome = control::SignalApplyOutcome::Applied;
                             if let Some((signal_id, signal_seq, signal_type)) = signal_context.as_ref() {
                                 info!(
-                                    "Control signal phase=waiting_for_resource id={} type={} seq={:?} resource=wireguard_answer_commit",
+                                    "Control signal phase=dispatch_started id={} type={} seq={:?} peer={} stage=peer_answer",
+                                    signal_id, signal_type, signal_seq, from_node_id
+                                );
+                            }
+                            info!(
+                                "Received peer answer from {} ({} candidates)",
+                                from_node_id,
+                                candidates.len()
+                            );
+                            // An answer may arrive before the peer-list poll registers
+                            // its sender: wake the peer poll so the pending initiator
+                            // transaction can be consumed without waiting out the
+                            // regular cadence.
+                            if !self.peers.peer_exists_sync(&from_node_id)
+                                || self.peers.peer_session_generation_sync(&from_node_id).is_none()
+                            {
+                                self.control.refresh_peers_now();
+                            }
+                            self.peers.record_direct_event_non_queuing(
+                                &from_node_id,
+                                "peer_answer_received",
+                                None,
+                                Some(candidates.len()),
+                                None,
+                                format!(
+                                    "received answer handshake_bytes={} punch_at_ms={punch_at_ms:?}",
+                                    handshake_response.len()
+                                ),
+                            );
+                            self.timeline.emit(
+                                "peer_answer_received",
+                                None,
+                                None,
+                                Some(format!(
+                                    "peer={} candidate_generation={} handshake_bytes={} candidates={}",
+                                    from_node_id,
+                                    candidate_generation,
+                                    handshake_response.len(),
+                                    candidates.len()
+                                )),
+                            );
+                            // The answer can be the first signal observed after the
+                            // remote daemon restarted. Fence the retired transport but
+                            // preserve the exact local initiator that this answer is
+                            // about to complete.
+                            if let Some((signal_id, signal_seq, signal_type)) = signal_context.as_ref() {
+                                info!(
+                                    "Control signal phase=waiting_for_resource id={} type={} seq={:?} resource=remote_incarnation_reset",
                                     signal_id, signal_type, signal_seq
                                 );
                             }
                             if let Some(receipt) = answer_delivery_receipt.as_ref() {
-                                receipt.record_phase("waiting_for_resource", "wireguard_answer_commit");
+                                receipt.record_phase("waiting_for_resource", "remote_incarnation_reset");
                             }
-                            self.peers
-                                .record_direct_event(
+                            let remote_incarnation_reset = match self
+                                .reset_peer_for_remote_incarnation_if_needed_for_identity(
                                     &from_node_id,
-                                    "peer_answer_dispatch_started",
-                                    None,
-                                    Some(candidates.len()),
-                                    None,
-                                    format!(
-                                        "dispatching handshake response before candidate/fresh work bytes={} session_fp={}",
-                                        handshake_response.len(),
-                                        handshake_token_fingerprint(session_id.as_deref())
-                                    ),
-                                )
-                                .await;
-                            match self
-                                .handle_peer_answer_for_identity(
-                                    &from_node_id,
-                                    &handshake_response,
-                                    session_id.clone(),
-                                    probe_ephemeral_public_key.clone(),
+                                    candidate_generation,
                                     sender_public_key.as_deref(),
+                                    if handshake_response.is_empty() {
+                                        RemoteIncarnationResetWork::ClearAll
+                                    } else {
+                                        RemoteIncarnationResetWork::PreserveInitiator
+                                    },
                                 )
                                 .await
                             {
-                                Ok(true) => {}
-                                Ok(false) => {
-                                    answer_signal_outcome =
-                                        control::SignalApplyOutcome::TerminalRejected;
+                                RemoteIncarnationResetOutcome::Changed => true,
+                                RemoteIncarnationResetOutcome::Unchanged => false,
+                                RemoteIncarnationResetOutcome::RejectedIdentity => {
+                                    debug!(
+                                        "Ignored peer answer from {from_node_id}: signal sender public key is stale"
+                                    );
+                                    if let Some(receipt) = answer_delivery_receipt.as_ref() {
+                                        receipt.complete(control::SignalApplyOutcome::TerminalRejected);
+                                    }
+                                    return None;
                                 }
-                                Err(err) => {
-                                    answer_signal_outcome =
-                                        control::SignalApplyOutcome::TerminalRejected;
-                                    warn!("Failed to handle peer answer from {from_node_id}: {err}");
+                                RemoteIncarnationResetOutcome::RejectedLifecycle => {
+                                    if let Some(receipt) = answer_delivery_receipt.as_ref() {
+                                        receipt.complete(
+                                            control::SignalApplyOutcome::TerminalRejected,
+                                        );
+                                    }
+                                    return None;
                                 }
-                            }
+                                outcome if outcome.retryable() => {
+                                    if let Some(receipt) = answer_delivery_receipt.as_ref() {
+                                        receipt.complete(control::SignalApplyOutcome::Retry);
+                                    }
+                                    return None;
+                                }
+                                _ => false,
+                            };
                             if let Some((signal_id, signal_seq, signal_type)) = signal_context.as_ref() {
                                 info!(
-                                    "Control signal phase=state_committed id={} type={} seq={:?} commit=wireguard_answer outcome={:?}",
-                                    signal_id, signal_type, signal_seq, answer_signal_outcome
+                                    "Control signal phase=resource_ready id={} type={} seq={:?} resource=remote_incarnation_reset",
+                                    signal_id, signal_type, signal_seq
                                 );
                             }
                             if let Some(receipt) = answer_delivery_receipt.as_ref() {
-                                receipt.record_phase(
-                                    match answer_signal_outcome {
-                                        control::SignalApplyOutcome::Applied => "state_committed",
-                                        control::SignalApplyOutcome::TerminalRejected => {
-                                            "terminal_rejected"
-                                        }
-                                        control::SignalApplyOutcome::Retry => "retry_decided",
-                                        control::SignalApplyOutcome::Pending => unreachable!(
-                                            "answer disposition must be terminal before receipt"
+                                receipt.record_phase("resource_ready", "remote_incarnation_reset");
+                            }
+                            // Consume the WireGuard answer before candidate refresh or
+                            // fresh-mapping work. Those paths may perform HTTP/STUN
+                            // I/O and must remain a background upgrade; delaying the
+                            // answer here leaves the responder staged but prevents
+                            // the initiator from ever publishing its active session.
+                            if !handshake_response.is_empty() {
+                                if let Some((signal_id, signal_seq, signal_type)) = signal_context.as_ref() {
+                                    info!(
+                                        "Control signal phase=waiting_for_resource id={} type={} seq={:?} resource=wireguard_answer_commit",
+                                        signal_id, signal_type, signal_seq
+                                    );
+                                }
+                                if let Some(receipt) = answer_delivery_receipt.as_ref() {
+                                    receipt.record_phase("waiting_for_resource", "wireguard_answer_commit");
+                                }
+                                self.peers
+                                    .record_direct_event(
+                                        &from_node_id,
+                                        "peer_answer_dispatch_started",
+                                        None,
+                                        Some(candidates.len()),
+                                        None,
+                                        format!(
+                                            "dispatching handshake response before candidate/fresh work bytes={} session_fp={}",
+                                            handshake_response.len(),
+                                            handshake_token_fingerprint(session_id.as_deref())
                                         ),
-                                    },
-                                    "wireguard_answer",
+                                    )
+                                    .await;
+                                match self
+                                    .handle_peer_answer_for_identity(
+                                        &from_node_id,
+                                        &handshake_response,
+                                        session_id.clone(),
+                                        probe_ephemeral_public_key.clone(),
+                                        sender_public_key.as_deref(),
+                                    )
+                                    .await
+                                {
+                                    Ok(true) => {}
+                                    Ok(false) => {
+                                        answer_signal_outcome =
+                                            control::SignalApplyOutcome::TerminalRejected;
+                                    }
+                                    Err(err) => {
+                                        answer_signal_outcome =
+                                            control::SignalApplyOutcome::TerminalRejected;
+                                        warn!("Failed to handle peer answer from {from_node_id}: {err}");
+                                    }
+                                }
+                                if let Some((signal_id, signal_seq, signal_type)) = signal_context.as_ref() {
+                                    info!(
+                                        "Control signal phase=state_committed id={} type={} seq={:?} commit=wireguard_answer outcome={:?}",
+                                        signal_id, signal_type, signal_seq, answer_signal_outcome
+                                    );
+                                }
+                                if let Some(receipt) = answer_delivery_receipt.as_ref() {
+                                    receipt.record_phase(
+                                        match answer_signal_outcome {
+                                            control::SignalApplyOutcome::Applied => "state_committed",
+                                            control::SignalApplyOutcome::TerminalRejected => {
+                                                "terminal_rejected"
+                                            }
+                                            control::SignalApplyOutcome::Retry => "retry_decided",
+                                            control::SignalApplyOutcome::Pending => unreachable!(
+                                                "answer disposition must be terminal before receipt"
+                                            ),
+                                        },
+                                        "wireguard_answer",
+                                    );
+                                }
+                            }
+                            // Fresh-prediction verification happens after the
+                            // handshake transaction and before candidate state is
+                            // used for background punching (see the offer path).
+                            if let Some((signal_id, signal_seq, signal_type)) = signal_context.as_ref() {
+                                info!(
+                                    "Control signal phase=waiting_for_resource id={} type={} seq={:?} resource=candidate_refresh",
+                                    signal_id, signal_type, signal_seq
                                 );
                             }
-                        }
-                        // Fresh-prediction verification happens after the
-                        // handshake transaction and before candidate state is
-                        // used for background punching (see the offer path).
-                        if let Some((signal_id, signal_seq, signal_type)) = signal_context.as_ref() {
-                            info!(
-                                "Control signal phase=waiting_for_resource id={} type={} seq={:?} resource=candidate_refresh",
-                                signal_id, signal_type, signal_seq
-                            );
-                        }
-                        if let Some(receipt) = answer_delivery_receipt.as_ref() {
-                            receipt.record_phase("waiting_for_resource", "candidate_refresh");
-                        }
-                        let (_fresh_verdict, candidate_apply_result, fresh_punch) = self
-                            .fresh_prediction_transaction(
-                                &from_node_id,
-                                &candidates,
-                                &candidate_sources,
-                                candidate_generation,
-                                candidates_expires_at_ms,
-                                sender_public_key.as_deref(),
-                                false,
-                            )
-                            .await;
-                        if let Some((signal_id, signal_seq, signal_type)) = signal_context.as_ref() {
-                            info!(
-                                "Control signal phase=state_committed id={} type={} seq={:?} commit=candidate_refresh result={:?}",
-                                signal_id, signal_type, signal_seq, candidate_apply_result
-                            );
-                        }
-                        if let Some(receipt) = answer_delivery_receipt.as_ref() {
-                            receipt.record_phase("state_evaluated", "candidate_refresh");
-                        }
-                        if !handshake_response.is_empty()
-                            && answer_signal_outcome == control::SignalApplyOutcome::Applied
-                        {
-                            // See the offer path above.  An encrypted answer
-                            // is authenticated liveness evidence and is the
-                            // normal signal emitted by a rekeying Android
-                            // peer; re-arm the bounded recovery window before
-                            // starting its synchronized punch.
-                            self.peers
-                                .recovery_reopen_on_evidence(
-                                    &from_node_id,
-                                    "authenticated_peer_answer",
-                                )
-                                .await;
-                        }
-                        match fresh_punch {
-                            FreshPunchDecision::Fresh(id, frozen_targets) => {
-                                self.start_hole_punch_at(
-                                    &from_node_id,
-                                    punch_at_ms,
-                                    Some(id),
-                                    Some(frozen_targets),
-                                )
-                                .await;
+                            if let Some(receipt) = answer_delivery_receipt.as_ref() {
+                                receipt.record_phase("waiting_for_resource", "candidate_refresh");
                             }
-                            FreshPunchDecision::Degraded => {
-                                if !handshake_response.is_empty() {
-                                    debug!(
-                                        "Degrading synchronized punch for {from_node_id}: the fresh snapshot is expired or empty; punching at ordinary priority"
-                                    );
+                            let (_fresh_verdict, candidate_apply_result, fresh_punch) = self
+                                .fresh_prediction_transaction(
+                                    &from_node_id,
+                                    &candidates,
+                                    &candidate_sources,
+                                    candidate_generation,
+                                    candidates_expires_at_ms,
+                                    sender_public_key.as_deref(),
+                                    false,
+                                )
+                                .await;
+                            if let Some((signal_id, signal_seq, signal_type)) = signal_context.as_ref() {
+                                info!(
+                                    "Control signal phase=state_committed id={} type={} seq={:?} commit=candidate_refresh result={:?}",
+                                    signal_id, signal_type, signal_seq, candidate_apply_result
+                                );
+                            }
+                            if let Some(receipt) = answer_delivery_receipt.as_ref() {
+                                receipt.record_phase("state_evaluated", "candidate_refresh");
+                            }
+                            if !handshake_response.is_empty()
+                                && answer_signal_outcome == control::SignalApplyOutcome::Applied
+                            {
+                                // See the offer path above.  An encrypted answer
+                                // is authenticated liveness evidence and is the
+                                // normal signal emitted by a rekeying Android
+                                // peer; re-arm the bounded recovery window before
+                                // starting its synchronized punch.
+                                self.peers
+                                    .recovery_reopen_on_evidence(
+                                        &from_node_id,
+                                        "authenticated_peer_answer",
+                                    )
+                                    .await;
+                            }
+                            match fresh_punch {
+                                FreshPunchDecision::Fresh(id, frozen_targets) => {
                                     self.start_hole_punch_at(
                                         &from_node_id,
                                         punch_at_ms,
-                                        None,
-                                        None,
+                                        Some(id),
+                                        Some(frozen_targets),
                                     )
                                     .await;
-                                } else {
-                                    debug!(
-                                        "Skipping punch for candidate-only answer from {from_node_id}: its fresh snapshot is expired or empty"
-                                    );
+                                }
+                                FreshPunchDecision::Degraded => {
+                                    if !handshake_response.is_empty() {
+                                        debug!(
+                                            "Degrading synchronized punch for {from_node_id}: the fresh snapshot is expired or empty; punching at ordinary priority"
+                                        );
+                                        self.start_hole_punch_at(
+                                            &from_node_id,
+                                            punch_at_ms,
+                                            None,
+                                            None,
+                                        )
+                                        .await;
+                                    } else {
+                                        debug!(
+                                            "Skipping punch for candidate-only answer from {from_node_id}: its fresh snapshot is expired or empty"
+                                        );
+                                    }
+                                }
+                                FreshPunchDecision::None | FreshPunchDecision::Rejected(_) => {
+                                    if candidate_signal_starts_synchronized_punch(
+                                        &handshake_response,
+                                        candidate_apply_result,
+                                    ) {
+                                        self.start_hole_punch_at(
+                                            &from_node_id,
+                                            punch_at_ms,
+                                            None,
+                                            None,
+                                        )
+                                        .await;
+                                    } else {
+                                        debug!(
+                                            "Skipping synchronized punch for rejected candidate-only answer from {from_node_id}: {candidate_apply_result:?}"
+                                        );
+                                    }
                                 }
                             }
-                            FreshPunchDecision::None | FreshPunchDecision::Rejected(_) => {
-                                if candidate_signal_starts_synchronized_punch(
-                                    &handshake_response,
-                                    candidate_apply_result,
-                                ) {
-                                    self.start_hole_punch_at(
-                                        &from_node_id,
-                                        punch_at_ms,
-                                        None,
-                                        None,
-                                    )
-                                    .await;
-                                } else {
-                                    debug!(
-                                        "Skipping synchronized punch for rejected candidate-only answer from {from_node_id}: {candidate_apply_result:?}"
-                                    );
-                                }
-                            }
-                        }
+                            Some((remote_incarnation_reset, answer_delivery_receipt, answer_signal_outcome))
+                        };
+                        let Some((remote_incarnation_reset, answer_delivery_receipt, answer_signal_outcome)) = await_peer_lifecycle_commit_while_driving_work(
+                            daemon,
+                            answer_apply,
+                            &mut slow_work,
+                            &mut retry_work,
+                            &mut responder_work,
+                            &mut candidate_work,
+                            &mut deferred_initiators,
+                        ).await else { continue; };
                         if remote_incarnation_reset {
                             // The answer proves the remote incarnation is new,
                             // but it does not carry our local candidate set. A

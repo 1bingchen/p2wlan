@@ -1260,6 +1260,11 @@ class AppStrings {
 
   String? statusMessage(String? message) {
     if (message == 'daemon_operation_failed') return daemonOperationFailed;
+    if (message == 'local_diagnostics_auth_failed') {
+      return isZh
+          ? '本地服务可以访问，但认证凭据暂不可用。请刷新重试；若持续出现，请检查本地运行目录的访问权限。'
+          : 'The local service is reachable, but its authentication credentials are unavailable. Refresh to retry; if this continues, check access to the local runtime directory.';
+    }
     if (message == null || !isZh) return message;
     if (message == 'GET /health is offline or unreadable') {
       return 'GET /health 离线或不可读';

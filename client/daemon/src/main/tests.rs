@@ -720,3 +720,5 @@ fn diagnostics_scope_returns_error(
     let result = Err(DaemonError::Config("controlled runtime error".to_string()));
     (result, path)
 }
+
+include!("diagnostics_auth_tests.rs");

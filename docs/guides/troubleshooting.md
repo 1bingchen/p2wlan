@@ -6,6 +6,7 @@
 | --- | --- | --- |
 | 无法登录 | Control URL、HTTPS 证书、账号响应、时间 | 不能仅凭 Relay 正常判断 Control 正常 |
 | 登录成功但无设备 | 房间成员、设备授权、Control 信令和本地 daemon | UI 在线不等于 TUN 已建立 |
+| 本地 `/health` 正常但 `/status` 返回 401 | 诊断密钥文件的读取权限、对应实例的运行目录、是否有不同配置共用日志目录；刷新后确认是否恢复 | 不是 Control 登录到期，也不能据此判断数据面已断开 |
 | Direct 不通 | NAT profile、候选来源、UDP 防火墙、路径 reason code | STUN 成功不等于对端可入站 |
 | 只有 Relay | Relay TLS、audience/region、ticket、/readyz、撤权 feed | Relay 路径不说明 Direct 一定有缺陷 |
 | 虚拟 IP 可见但业务不通 | 本机路由、房间租约、数据面收发计数、目标应用监听和防火墙 | 加密 ACK 或在线人数不等于业务往返 |

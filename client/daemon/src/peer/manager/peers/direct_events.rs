@@ -321,6 +321,30 @@ impl PeerManager {
         sent_probes: Option<u32>,
         detail: &str,
     ) {
+        // These finite per-attempt markers used to await a durable ring write.
+        // Keep endpoint-free evidence at the normal INFO collection level even
+        // when that ring is contended or no process timeline is installed.
+        // Do not forward the free-form detail: it can contain tokens/endpoints.
+        if matches!(
+            stage,
+            "hard_hard_probe_summary"
+                | "hard_hard_birthday_sweep_summary"
+                | "hard_hard_sweep_completed"
+                | "hard_hard_sweep_failed"
+                | "hard_hard_failed"
+                | "hard_hard_winner_selected"
+        ) {
+            tracing::info!(
+                event = stage,
+                peer_id = node_id,
+                network_generation = generation,
+                socket_index = ?socket_index,
+                candidate_count = ?candidate_count,
+                sent_probes = ?sent_probes,
+                "Hard-Hard auxiliary traversal evidence"
+            );
+            return;
+        }
         let Some(event) = direct_traversal_timeline_event(stage) else {
             return;
         };

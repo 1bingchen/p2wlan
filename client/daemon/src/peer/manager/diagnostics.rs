@@ -423,6 +423,99 @@ impl PeerManager {
 mod diagnostics_tests {
     use super::*;
 
+    #[derive(Clone)]
+    struct DiagnosticLogCapture(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for DiagnosticLogCapture {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn hard_hard_auxiliary_info_survives_writer_contention_without_sensitive_detail() {
+        let config = Config::generate_default("http://ctrl.test", "default").unwrap();
+        let manager = PeerManager::new(config);
+        let _writer = manager.connections.write().await;
+        let capture = DiagnosticLogCapture(Arc::new(std::sync::Mutex::new(Vec::new())));
+        let sink = capture.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::INFO)
+            .with_ansi(false)
+            .without_time()
+            .with_writer(move || sink.clone())
+            .finish();
+        let stages = [
+            "hard_hard_probe_summary",
+            "hard_hard_birthday_sweep_summary",
+            "hard_hard_sweep_completed",
+            "hard_hard_sweep_failed",
+            "hard_hard_failed",
+            "hard_hard_winner_selected",
+        ];
+        // Poll real recorder futures under a local subscriber. No timeline is
+        // installed, no DEBUG target is enabled, and the ring writer stays held.
+        tracing::subscriber::with_default(subscriber, || {
+            let mut context = std::task::Context::from_waker(futures_util::task::noop_waker_ref());
+            for stage in stages {
+                let mut event = Box::pin(manager.record_direct_event_for_generation_with_socket(
+                    "peer-hard-info",
+                    17,
+                    stage,
+                    Some("198.51.100.123:49200".parse().unwrap()),
+                    Some(7),
+                    Some(11),
+                    Some(13),
+                    "token=secret-probe-token owner_token=secret-owner detail=private-marker local_endpoint=192.0.2.42:41000",
+                ));
+                assert!(
+                    std::future::Future::poll(event.as_mut(), &mut context).is_ready(),
+                    "{stage} must not wait for diagnostics"
+                );
+            }
+            manager.record_direct_event_non_queuing(
+                "peer-hard-info",
+                "direct_punch_started",
+                None,
+                None,
+                None,
+                "ordinary events must not gain INFO volume",
+            );
+        });
+        let output = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+        for stage in stages {
+            assert!(output.contains(&format!("event=\"{stage}\"")), "{output}");
+        }
+        assert_eq!(output.lines().count(), stages.len(), "{output}");
+        for field in [
+            "INFO",
+            "network_generation=17",
+            "socket_index=Some(7)",
+            "candidate_count=Some(11)",
+            "sent_probes=Some(13)",
+        ] {
+            assert!(output.contains(field), "missing {field}: {output}");
+        }
+        for forbidden in [
+            "secret-probe-token",
+            "secret-owner",
+            "private-marker",
+            "198.51.100.123",
+            "192.0.2.42",
+            "endpoint=",
+            "detail=",
+            "token=",
+            "direct_punch_started",
+        ] {
+            assert!(!output.contains(forbidden), "leaked {forbidden}: {output}");
+        }
+    }
+
     #[tokio::test]
     async fn full_diagnostics_does_not_wait_for_generation_writer() {
         let config = Config::generate_default("http://ctrl.test", "default").unwrap();

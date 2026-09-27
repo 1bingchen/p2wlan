@@ -14,9 +14,9 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(test)]
 use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -31,9 +31,9 @@ use tokio::task::JoinSet;
 use tokio::time::{self, timeout};
 use tracing::{debug, error, info, warn};
 
+mod hard_hard_signal;
 mod http;
 mod timing;
-mod hard_hard_signal;
 pub(crate) use hard_hard_signal::HardHardStartAckDelivery;
 pub(crate) use timing::ControlTimingHint;
 use timing::ServerClockEstimate;

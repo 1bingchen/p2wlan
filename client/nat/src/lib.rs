@@ -35,17 +35,17 @@ pub use ice::{
     FilteringBehavior, HairpinBehavior, IceConfig, LocalNetwork, MappingBehavior, MappingLifetime,
     NatAllocation, NatFingerprintHint, NatProfile, StunObservation,
 };
+pub use mapping::allocation::{
+    infer_port_domain, infer_scoped_allocation, plan_fixed_anchor, validate_allocation_attempts,
+    AllocationAttempt, AllocationAttemptOutcome, AllocationEvidenceRejection, AllocationIdentity,
+    AllocationSample, AllocationScope, FixedAnchorPlan, PortDomainEvidence,
+    ScopedAllocationEvidence, MAX_ALLOCATION_SAMPLES,
+};
 pub use mapping::{
     build_model, build_model_for_batch, infer_allocation_model, model_is_fresh, modular_add,
     modular_difference, predict_ports, predict_ports_for_elapsed, predict_ports_with_learning,
     AllocationModel, AllocationModelKind, MappingBatch, MappingObservation, ModelRejection,
     PortModel, PortModelKind, PredictionCandidate, PredictionReason, MAX_PREDICTED_PORTS,
-};
-pub use mapping::allocation::{
-    infer_port_domain, infer_scoped_allocation, plan_fixed_anchor, validate_allocation_attempts,
-    AllocationAttempt, AllocationAttemptOutcome, AllocationEvidenceRejection,
-    AllocationIdentity, AllocationSample, AllocationScope, FixedAnchorPlan, PortDomainEvidence,
-    ScopedAllocationEvidence, MAX_ALLOCATION_SAMPLES,
 };
 pub use punch::{
     build_authenticated_punch_ack, build_authenticated_punch_packet,

@@ -795,7 +795,7 @@ pub(crate) enum OutboundProbeSweepStop {
 }
 
 impl OutboundProbeSweepStop {
-    pub(super) fn reason(self) -> &'static str {
+    pub(crate) fn reason(self) -> &'static str {
         match self {
             Self::ConfirmationCreditReserved => "hard_hard_recovery_confirmation_reserved",
             Self::EpochCreditExhausted => "epoch_budget_exhausted",

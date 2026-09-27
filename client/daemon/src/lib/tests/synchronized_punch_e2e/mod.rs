@@ -1899,33 +1899,6 @@ async fn wait_for_both_direct_compact(harness: &TwoPeerHarness) {
     }
 }
 
-async fn wait_for_current_direct_diagnostics(
-    peers: &PeerManager,
-    peer_id: &str,
-) -> peer::PeerDiagnostics {
-    timeout(Duration::from_secs(1), async {
-        loop {
-            // `diagnostics()` is deliberately nonblocking and may return its
-            // previous cached snapshot while a state commit owns the
-            // connections writer. Assertions about a just-observed Direct
-            // commit must use the current try-read snapshot instead of
-            // turning that intentional cache fallback into an Idle-vs-Direct
-            // failure under the standard parallel workspace load.
-            if let Some((_, diagnostics)) = peers
-                .diagnostic_with_path_selection(peer_id, true, false, Duration::ZERO, None)
-                .await
-            {
-                if diagnostics.state == ConnectionState::Direct {
-                    return diagnostics;
-                }
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("current Direct diagnostics must become readable after the commit")
-}
-
 struct CurrentFreshDirect {
     diagnostics: peer::PeerDiagnostics,
     socket_index: usize,
@@ -2068,11 +2041,42 @@ async fn wait_for_remote_candidates(
     }
 }
 
-async fn wait_for_both_sweep_failures(harness: &TwoPeerHarness) {
-    let (_a, _b) = tokio::join!(
-        wait_for_stage(&harness.peers_a, HARD_HARD_B, "hard_hard_sweep_failed"),
-        wait_for_stage(&harness.peers_b, HARD_HARD_A, "hard_hard_sweep_failed"),
+async fn wait_for_hard_hard_attempt_report(
+    peers: &PeerManager,
+    peer_id: &str,
+) -> peer::HardHardAttemptReport {
+    let event = wait_for_stage(peers, peer_id, "hard_hard_attempt_report").await;
+    let report = event
+        .hard_hard_attempt
+        .expect("the formal terminal event must retain its typed attempt");
+    assert_eq!(
+        report.attempt, 1,
+        "a pre-sweep report is not sweep evidence"
     );
+    assert!(
+        report.socket_index.is_some(),
+        "sweep must own an exact socket"
+    );
+    report
+}
+
+async fn wait_for_both_sweep_failures(
+    harness: &TwoPeerHarness,
+) -> [peer::HardHardAttemptReport; 2] {
+    let (a, b) = tokio::join!(
+        wait_for_hard_hard_attempt_report(&harness.peers_a, HARD_HARD_B),
+        wait_for_hard_hard_attempt_report(&harness.peers_b, HARD_HARD_A),
+    );
+    for report in [&a, &b] {
+        assert!(!report.direct_confirmed, "{report:?}");
+        assert_eq!(
+            report.terminal_reason, "no_authenticated_direct_confirmation",
+            "only an executed missed rendezvous may satisfy this gate"
+        );
+        assert!(report.counts.logical_probes_attempted > 0, "{report:?}");
+        assert!(report.counts.send_success_datagrams > 0, "{report:?}");
+    }
+    [a, b]
 }
 
 async fn summarize_hard_hard_diagnostics(

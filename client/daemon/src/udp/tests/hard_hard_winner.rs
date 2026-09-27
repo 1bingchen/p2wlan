@@ -362,21 +362,40 @@ async fn hard_hard_winner_cancelled_after_commit_does_not_leak_loser_reader_or_p
     let loser_reader = fixture.udp.socket_state.lock().await.dynamic[&fixture.indices[1]]
         .reader
         .abort_handle();
-    // Durable diagnostics intentionally suspend after the atomic commit. Drop
-    // the promotion future there: reader shutdown and exact pending cleanup
-    // must already have happened and need no detached background cleanup task.
+    // Promotion now completes even with the diagnostic writer held. Cancel
+    // the receiving caller at its next await while it still owns the epoch.
+    // Reader shutdown and exact pending cleanup must already have happened;
+    // neither needs a detached cleanup task or diagnostic write to finish.
     let writer = fixture.peers.hold_connections_writer_for_test().await;
-    let mut promotion = Box::pin(fixture.udp.promote_hard_hard_winner_for_test(
-        "peer-b",
-        TOKEN,
-        fixture.indices[0],
-        0,
-    ));
+    let committed = std::cell::Cell::new(false);
+    let mut promotion = Box::pin(async {
+        let epoch_guard = fixture.udp.network_epoch_gate.lock().await;
+        assert!(
+            fixture
+                .udp
+                .promote_hard_hard_winner_in_epoch(
+                    &epoch_guard,
+                    "peer-b",
+                    TOKEN,
+                    fixture.indices[0],
+                    0,
+                )
+                .await
+        );
+        committed.set(true);
+        std::future::pending::<()>().await;
+        drop(epoch_guard);
+    });
     std::future::poll_fn(|cx| {
         assert!(std::future::Future::poll(promotion.as_mut(), cx).is_pending());
         std::task::Poll::Ready(())
     })
     .await;
+    assert!(
+        committed.get(),
+        "the only suspension must follow the production winner transaction"
+    );
+    assert!(fixture.udp.network_epoch_gate.try_lock().is_err());
     fixture.assert_winner().await;
     assert!(!fixture
         .udp
@@ -395,6 +414,7 @@ async fn hard_hard_winner_cancelled_after_commit_does_not_leak_loser_reader_or_p
     tokio::task::yield_now().await;
     assert!(loser_reader.is_finished());
     assert!(fixture.udp.network_epoch_gate.try_lock().is_ok());
+    fixture.assert_winner().await;
     fixture.cleanup().await;
 }
 

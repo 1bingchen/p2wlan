@@ -1,6 +1,8 @@
 #[cfg(test)]
 mod hard_hard_tests {
     use super::*;
+    use tracing::instrument::WithSubscriber;
+    use tracing_subscriber::prelude::*;
 
     #[test]
     fn hard_hard_payload_expiry_is_reported_as_stale_not_unpredictable() {
@@ -1540,74 +1542,168 @@ mod hard_hard_tests {
             .expect("production Birthday send did not reach the post-send gate");
     }
 
+    // Capture only the production terminal archive for this one worker future.
+    // Retired identities cannot write into a replacement peer's current ring.
+    #[derive(Clone, Default)]
+    struct HardHardTerminalArchiveCapture(
+        Arc<std::sync::Mutex<Option<crate::peer::HardHardAttemptReport>>>,
+    );
+
+    #[derive(Default)]
+    struct HardHardTerminalArchiveFields {
+        event: Option<String>,
+        report_json: Option<String>,
+    }
+
+    impl tracing::field::Visit for HardHardTerminalArchiveFields {
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            match field.name() {
+                "event" => self.event = Some(value.to_string()),
+                "report_json" => self.report_json = Some(value.to_string()),
+                _ => {}
+            }
+        }
+
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "report_json" {
+                self.report_json = Some(format!("{value:?}"));
+            }
+        }
+    }
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for HardHardTerminalArchiveCapture {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _context: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut fields = HardHardTerminalArchiveFields::default();
+            event.record(&mut fields);
+            if fields.event.as_deref() == Some("hard_hard_attempt_report_archived") {
+                let report = serde_json::from_str(
+                    fields
+                        .report_json
+                        .as_deref()
+                        .expect("terminal archive must contain its formal report"),
+                )
+                .expect("terminal archive must contain a valid typed report");
+                assert!(
+                    self.0.lock().unwrap().replace(report).is_none(),
+                    "one worker must archive its terminal report only once"
+                );
+            }
+        }
+    }
+
+    async fn birthday_terminal_attempt(
+        peers: &PeerManager,
+        record: &crate::peer::HardHardSessionRecord,
+        archive: &HardHardTerminalArchiveCapture,
+    ) -> crate::peer::HardHardAttemptReport {
+        let (session_tag, _, _) = hard_hard_a0_stage_tags(Some(&record.session_token));
+        let reports = peers
+            .diagnostics()
+            .await
+            .into_iter()
+            .flat_map(|peer| peer.direct_events)
+            .filter_map(|event| event.hard_hard_attempt)
+            .filter(|report| {
+                report.session_tag == session_tag && report.attempt == record.attempt_count
+            })
+            .collect::<Vec<_>>();
+        let archived = archive.0.lock().unwrap().take();
+        assert_eq!(
+            reports.len() + usize::from(archived.is_some()),
+            1,
+            "the exact attempt must commit or archive one formal terminal report"
+        );
+        let report = reports.into_iter().next().or(archived).unwrap();
+        assert_eq!(report.session_tag, session_tag);
+        assert_eq!(report.attempt, record.attempt_count);
+        assert_eq!(report.network_generation, record.local_network_generation);
+        assert_eq!(report.remote_candidate_epoch, record.remote_candidate_epoch);
+        assert_eq!(
+            report.local_profile_generation,
+            record.local_profile_generation
+        );
+        assert_eq!(
+            report.remote_profile_generation,
+            record.remote_profile_generation
+        );
+        assert_eq!(
+            report.punch_generation,
+            record.fresh_socket.punch_generation
+        );
+        assert_eq!(
+            report.peer_session_generation,
+            record
+                .measurement
+                .evidence
+                .peer_session_generation()
+                .unwrap()
+                .value()
+        );
+        assert_eq!(report.socket_index, Some(record.fresh_socket.socket_index));
+        assert!(!report.direct_confirmed);
+        report
+    }
+
     fn assert_live_birthday_terminal_summary(
-        events: &[crate::peer::DirectTraversalEventDiagnostics],
+        report: &crate::peer::HardHardAttemptReport,
         stop_reason: &str,
     ) {
-        let summary = events
-            .iter()
-            .find(|event| event.stage == "hard_hard_birthday_sweep_summary")
-            .expect("terminal Birthday summary must be durable");
-        for field in [
-            "physical_datagrams_sent=",
-            "per_socket_sent=",
-            "first_send_at_ms=Some(",
-            "last_send_at_ms=Some(",
-            "unique_target_endpoints=1",
-            "waves_fully_completed=0",
-        ] {
-            assert!(
-                summary.detail.contains(field),
-                "terminal summary is missing {field}: {}",
-                summary.detail
-            );
-        }
-        assert!(
+        let summary = report
+            .birthday_sweep
+            .as_ref()
+            .expect("terminal Birthday details must be sealed");
+        assert!(summary.physical_datagrams_sent >= 1);
+        assert!(!summary.per_socket_sent.is_empty());
+        assert_eq!(
+            summary.physical_datagrams_sent,
             summary
-                .detail
-                .contains(&format!("stop_reason={stop_reason}")),
-            "terminal summary has an unexpected stop reason: {}",
-            summary.detail
+                .per_socket_sent
+                .iter()
+                .map(|(_, sent)| *sent as usize)
+                .sum::<usize>()
         );
+        assert!(summary.first_send_at_ms.is_some());
+        assert!(summary.last_send_at_ms.is_some());
+        assert_eq!(summary.unique_target_endpoints, 1);
+        assert_eq!(summary.waves_fully_completed, 0);
+        assert_eq!(summary.stop_reason.as_deref(), Some(stop_reason));
+        assert_eq!(report.terminal_reason, stop_reason);
     }
 
     fn assert_post_send_race_summary(
-        events: &[crate::peer::DirectTraversalEventDiagnostics],
+        report: &crate::peer::HardHardAttemptReport,
         stop_reason: &str,
         require_physical_error: bool,
     ) {
-        let summary = events
-            .iter()
-            .find(|event| event.stage == "hard_hard_birthday_sweep_summary")
-            .expect("post-send race must emit a durable Birthday summary");
-        let count = |key: &str| {
-            summary
-                .detail
-                .split_whitespace()
-                .find_map(|field| field.strip_prefix(key)?.parse::<u64>().ok())
-                .unwrap_or_else(|| panic!("summary is missing {key}: {}", summary.detail))
-        };
+        let summary = report
+            .birthday_sweep
+            .as_ref()
+            .expect("post-send race must seal Birthday details");
         if require_physical_error {
-            assert!(count("physical_send_errors=") >= 1);
+            assert!(summary.physical_send_errors >= 1);
         } else {
-            assert!(count("physical_datagrams_sent=") >= 1);
-            assert!(count("logical_probes_sent=") >= 1);
-            assert!(count("unique_target_endpoints=") >= 1);
-            assert!(
-                summary.detail.contains("per_socket_sent=")
-                    && !summary.detail.contains("per_socket_sent= ")
+            assert!(summary.physical_datagrams_sent >= 1);
+            assert!(summary.logical_probes_sent >= 1);
+            assert!(summary.unique_target_endpoints >= 1);
+            assert!(!summary.per_socket_sent.is_empty());
+            assert_eq!(
+                summary.physical_datagrams_sent,
+                summary
+                    .per_socket_sent
+                    .iter()
+                    .map(|(_, sent)| *sent as usize)
+                    .sum::<usize>()
             );
-            assert!(summary.detail.contains("first_send_at_ms=Some("));
-            assert!(summary.detail.contains("last_send_at_ms=Some("));
+            assert!(summary.first_send_at_ms.is_some());
+            assert!(summary.last_send_at_ms.is_some());
         }
-        assert!(summary.detail.contains("waves_fully_completed=0"));
-        assert!(
-            summary
-                .detail
-                .contains(&format!("stop_reason={stop_reason}")),
-            "terminal summary has an unexpected stop reason: {}",
-            summary.detail
-        );
+        assert_eq!(summary.waves_fully_completed, 0);
+        assert_eq!(summary.stop_reason.as_deref(), Some(stop_reason));
+        assert_eq!(report.terminal_reason, stop_reason);
     }
 
     #[tokio::test(start_paused = true)]
@@ -1623,10 +1719,24 @@ mod hard_hard_tests {
             .expect("test must own the production Hard↔Hard punch session");
         let (gate, _gate_guard) = crate::udp::install_birthday_worker_completion_gate_for_test();
         let socket_indices = vec![identity.socket_index, identity.socket_index + 1];
+        let record = peers
+            .hard_hard_begin_sweep(
+                &identity.peer_id,
+                &identity.session_token,
+                vec![remote],
+                90,
+                0,
+            )
+            .await
+            .expect("fixture must claim the actual attempt and its bound observation owner");
+        let archive = HardHardTerminalArchiveCapture::default();
+        let subscriber = tracing_subscriber::registry().with(archive.clone());
         let task = tokio::spawn({
             let udp = udp.clone();
             let peers = peers.clone();
             let identity = identity.clone();
+            let measurement = record.measurement.clone();
+            let attempt = record.attempt_count;
             async move {
                 hard_hard_wait_and_sweep(
                     udp,
@@ -1646,22 +1756,20 @@ mod hard_hard_tests {
                     (1, 7),
                     Some("probe-session-exact".to_string()),
                     "test-deadline",
-                    1,
-                    crate::peer::HardHardMeasurementObservation::default(),
+                    attempt,
+                    measurement,
                 )
                 .await
             }
+            .with_subscriber(subscriber)
         });
         wait_for_birthday_worker_gate(&gate).await;
         tokio::time::advance(HARD_HARD_SWEEP_DEADLINE).await;
         tokio::task::yield_now().await;
         assert!(!task.await.unwrap());
 
-        let events = peers.diagnostics().await[0].direct_events.clone();
-        assert_live_birthday_terminal_summary(&events, "deadline");
-        assert!(events
-            .iter()
-            .any(|event| event.stage == "hard_hard_sweep_failed"));
+        let report = birthday_terminal_attempt(&peers, &record, &archive).await;
+        assert_live_birthday_terminal_summary(&report, "deadline");
         gate.release.notify_waiters();
         udp.detach_all_dynamic_punch_sockets("test_deadline_live_progress")
             .await;
@@ -1681,10 +1789,24 @@ mod hard_hard_tests {
         let cancellation = session.cancellation_handle();
         let (gate, _gate_guard) = crate::udp::install_birthday_worker_completion_gate_for_test();
         let socket_indices = vec![identity.socket_index, identity.socket_index + 1];
+        let record = peers
+            .hard_hard_begin_sweep(
+                &identity.peer_id,
+                &identity.session_token,
+                vec![remote],
+                90,
+                0,
+            )
+            .await
+            .expect("fixture must claim the actual attempt and its bound observation owner");
+        let archive = HardHardTerminalArchiveCapture::default();
+        let subscriber = tracing_subscriber::registry().with(archive.clone());
         let task = tokio::spawn({
             let udp = udp.clone();
             let peers = peers.clone();
             let identity = identity.clone();
+            let measurement = record.measurement.clone();
+            let attempt = record.attempt_count;
             async move {
                 hard_hard_wait_and_sweep(
                     udp,
@@ -1704,20 +1826,20 @@ mod hard_hard_tests {
                     (1, 7),
                     Some("probe-session-exact".to_string()),
                     "test-cancel",
-                    1,
-                    crate::peer::HardHardMeasurementObservation::default(),
+                    attempt,
+                    measurement,
                 )
                 .await
             }
+            .with_subscriber(subscriber)
         });
         wait_for_birthday_worker_gate(&gate).await;
         cancellation.cancel_for_hard_hard_cleanup();
         tokio::task::yield_now().await;
         assert!(!task.await.unwrap());
 
-        let events = peers.diagnostics().await[0].direct_events.clone();
-        assert_live_birthday_terminal_summary(&events, "session_cancelled");
-        assert!(events.iter().any(|event| event.stage == "hard_hard_failed"));
+        let report = birthday_terminal_attempt(&peers, &record, &archive).await;
+        assert_live_birthday_terminal_summary(&report, "session_cancelled");
         gate.release.notify_waiters();
         udp.detach_all_dynamic_punch_sockets("test_cancel_live_progress")
             .await;
@@ -1736,10 +1858,24 @@ mod hard_hard_tests {
             .expect("test must own the production Hard↔Hard punch session");
         let (gate, _gate_guard) = crate::udp::install_probe_post_send_gate_for_test();
         let socket_indices = vec![identity.socket_index, identity.socket_index + 1];
+        let record = peers
+            .hard_hard_begin_sweep(
+                &identity.peer_id,
+                &identity.session_token,
+                vec![remote],
+                90,
+                0,
+            )
+            .await
+            .expect("fixture must claim the actual attempt and its bound observation owner");
+        let archive = HardHardTerminalArchiveCapture::default();
+        let subscriber = tracing_subscriber::registry().with(archive.clone());
         let task = tokio::spawn({
             let udp = udp.clone();
             let peers = peers.clone();
             let identity = identity.clone();
+            let measurement = record.measurement.clone();
+            let attempt = record.attempt_count;
             async move {
                 hard_hard_wait_and_sweep(
                     udp,
@@ -1759,19 +1895,20 @@ mod hard_hard_tests {
                     (1, 7),
                     Some("probe-session-exact".to_string()),
                     "test-post-send-deadline",
-                    1,
-                    crate::peer::HardHardMeasurementObservation::default(),
+                    attempt,
+                    measurement,
                 )
                 .await
             }
+            .with_subscriber(subscriber)
         });
         wait_for_birthday_post_send_gate(&gate).await;
         tokio::time::advance(HARD_HARD_SWEEP_DEADLINE).await;
         tokio::task::yield_now().await;
         assert!(!task.await.unwrap());
 
-        let events = peers.diagnostics().await[0].direct_events.clone();
-        assert_post_send_race_summary(&events, "deadline", false);
+        let report = birthday_terminal_attempt(&peers, &record, &archive).await;
+        assert_post_send_race_summary(&report, "deadline", false);
         gate.release.notify_waiters();
         udp.detach_all_dynamic_punch_sockets("test_post_send_deadline")
             .await;
@@ -1791,10 +1928,24 @@ mod hard_hard_tests {
         let cancellation = session.cancellation_handle();
         let (gate, _gate_guard) = crate::udp::install_probe_post_send_gate_for_test();
         let socket_indices = vec![identity.socket_index, identity.socket_index + 1];
+        let record = peers
+            .hard_hard_begin_sweep(
+                &identity.peer_id,
+                &identity.session_token,
+                vec![remote],
+                90,
+                0,
+            )
+            .await
+            .expect("fixture must claim the actual attempt and its bound observation owner");
+        let archive = HardHardTerminalArchiveCapture::default();
+        let subscriber = tracing_subscriber::registry().with(archive.clone());
         let task = tokio::spawn({
             let udp = udp.clone();
             let peers = peers.clone();
             let identity = identity.clone();
+            let measurement = record.measurement.clone();
+            let attempt = record.attempt_count;
             async move {
                 hard_hard_wait_and_sweep(
                     udp,
@@ -1814,19 +1965,20 @@ mod hard_hard_tests {
                     (1, 7),
                     Some("probe-session-exact".to_string()),
                     "test-post-send-cancel",
-                    1,
-                    crate::peer::HardHardMeasurementObservation::default(),
+                    attempt,
+                    measurement,
                 )
                 .await
             }
+            .with_subscriber(subscriber)
         });
         wait_for_birthday_post_send_gate(&gate).await;
         cancellation.cancel_for_hard_hard_cleanup();
         tokio::task::yield_now().await;
         assert!(!task.await.unwrap());
 
-        let events = peers.diagnostics().await[0].direct_events.clone();
-        assert_post_send_race_summary(&events, "session_cancelled", false);
+        let report = birthday_terminal_attempt(&peers, &record, &archive).await;
+        assert_post_send_race_summary(&report, "session_cancelled", false);
         gate.release.notify_waiters();
         udp.detach_all_dynamic_punch_sockets("test_post_send_cancellation")
             .await;
@@ -1847,10 +1999,24 @@ mod hard_hard_tests {
         let _send_failures = udp.set_probe_send_failures_for_test([1]);
         let (gate, _gate_guard) = crate::udp::install_probe_post_send_gate_for_test();
         let socket_indices = vec![identity.socket_index, identity.socket_index + 1];
+        let record = peers
+            .hard_hard_begin_sweep(
+                &identity.peer_id,
+                &identity.session_token,
+                vec![remote],
+                90,
+                0,
+            )
+            .await
+            .expect("fixture must claim the actual attempt and its bound observation owner");
+        let archive = HardHardTerminalArchiveCapture::default();
+        let subscriber = tracing_subscriber::registry().with(archive.clone());
         let task = tokio::spawn({
             let udp = udp.clone();
             let peers = peers.clone();
             let identity = identity.clone();
+            let measurement = record.measurement.clone();
+            let attempt = record.attempt_count;
             async move {
                 hard_hard_wait_and_sweep(
                     udp,
@@ -1870,19 +2036,20 @@ mod hard_hard_tests {
                     (1, 7),
                     Some("probe-session-exact".to_string()),
                     "test-primary-error-cancel",
-                    1,
-                    crate::peer::HardHardMeasurementObservation::default(),
+                    attempt,
+                    measurement,
                 )
                 .await
             }
+            .with_subscriber(subscriber)
         });
         wait_for_birthday_post_send_gate(&gate).await;
         cancellation.cancel_for_hard_hard_cleanup();
         tokio::task::yield_now().await;
         assert!(!task.await.unwrap());
 
-        let events = peers.diagnostics().await[0].direct_events.clone();
-        assert_post_send_race_summary(&events, "session_cancelled", true);
+        let report = birthday_terminal_attempt(&peers, &record, &archive).await;
+        assert_post_send_race_summary(&report, "session_cancelled", true);
         gate.release.notify_waiters();
         udp.detach_all_dynamic_punch_sockets("test_primary_error_cancel")
             .await;
@@ -2177,12 +2344,17 @@ mod hard_hard_tests {
             .unwrap();
         let report = report_for_observation_fixture(&record);
         let writer = peers.hold_connections_writer_for_test().await;
-        let mut commit = Box::pin(peers.record_hard_hard_attempt_report_with_evidence(
-            &identity.peer_id,
-            &identity.session_token,
-            report.clone(),
-            &record.measurement.evidence,
-        ));
+        let archive = HardHardTerminalArchiveCapture::default();
+        let mut commit = Box::pin(
+            peers
+                .record_hard_hard_attempt_report_with_evidence(
+                    &identity.peer_id,
+                    &identity.session_token,
+                    report.clone(),
+                    &record.measurement.evidence,
+                )
+                .with_subscriber(tracing_subscriber::registry().with(archive.clone())),
+        );
         assert!(futures_util::poll!(commit.as_mut()).is_pending());
         assert!(
             peers
@@ -2207,6 +2379,7 @@ mod hard_hard_tests {
             !commit.await,
             "the old observation may archive but cannot commit into the current ring"
         );
+        assert_eq!(archive.0.lock().unwrap().as_ref(), Some(&report));
         assert!(
             !peers
                 .record_hard_hard_attempt_report_with_evidence(

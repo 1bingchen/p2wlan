@@ -61,9 +61,11 @@ control_reconnect_counter_survives_timeline_eviction 是必须保持的回归契
 
 矩阵成本汇总使用 `probe_cost_scope=sweep_only` 明确原扫描口径，并在 `confirmation_costs` 单独给出确认成本已知部分、各字段缺失报告数与完整报告数。有效轮次与全部 requested 轮次分别统计；部分缺失不能据此推导完整打洞总成本。
 
+生日扫描的正式报告可带 `birthday_sweep`，保留同一终态快照中的 socket 可用性、计划与完成波次、目标覆盖、按 socket 的物理发送量、错误和停止原因；辅助事件环缺项不再承担这些计数的唯一存储。该对象缺失表示旧版本或没有生日扫描明细，不能解释为零发送。其 `first_send_at_ms` / `last_send_at_ms` 保留原扫描账本的本端墙钟口径；过程耗时仍使用报告 `timeline` 中的单调时间，不混用两种时钟。
+
 `target_order_tags` 保留实际目标顺序，重复目标仍重复出现；`confirmed_target_rank` 在加密验证选中的远端地址属于该计划时记录其从 0 开始的位置，不暴露地址，空值表示未确认 Direct 或确认的是计划外学习地址。`candidate_cap` 与 `truncation_reason` 说明裁剪边界。分类包括 `measurement_insufficient`、`model_unpredictable`、`budget_rejected`、`send_error`、`missed_schedule`、`candidate_not_executed`、`no_response`、`probe_hit_validation_failed`、`cancelled_generation_changed`、`encrypted_validation_completed` 和证据不足时的 `unknown`。最后一个验证阶段不是业务成功；采集器只有在真实业务 ingress 存在时才派生 `direct_business_succeeded`。探测命中不等于加密验证，验证也不等于业务已可用。
 
-时间字段全部来自同一 daemon 进程的单调时钟。`planned_send_at_ms` 在 `hh2` 完成最终首发协商时更新为约定时间，发送偏差不再与此前的最晚截止比较。`candidate_signal_accepted_at_ms` 表示本端发布流程获得接受证据的观察时刻：证据可以是信令 API 成功返回，也可以是同一 `hh2` 轮次已通过身份检查的后续消息。它不是服务端持久化或对端实际接收的时间戳，也不表示双方已经完成整个交换，不能用它计算 HTTP RTT。`probe_last_hit_at_ms` 与 `probe_last_hit_source` 表示验证前最后一次认证 Probe 或匹配 ACK，不是首次命中。`measurement_age_at_send_ms`、`measurement_to_first_send_ms`、`last_probe_hit_to_validation_ms` 使用非负差值；缺时间或顺序逆置时为空，不把异常压成零。它们分别描述测量新鲜度、测量到首发、最后命中到验证。最终 SYNC_ACK 的本地入队、服务端接受与对端实际接收是不同证据；本地入队不会授予 Direct，也不能单独作为无响应策略失败的依据。
+`timeline` 时间字段来自同一 daemon 进程的单调时钟。`planned_send_at_ms` 在 `hh2` 完成最终首发协商时更新为约定时间，发送偏差不再与此前的最晚截止比较。`candidate_signal_accepted_at_ms` 表示本端发布流程获得接受证据的观察时刻：证据可以是信令 API 成功返回，也可以是同一 `hh2` 轮次已通过身份检查的后续消息。它不是服务端持久化或对端实际接收的时间戳，也不表示双方已经完成整个交换，不能用它计算 HTTP RTT。`probe_last_hit_at_ms` 与 `probe_last_hit_source` 表示验证前最后一次认证 Probe 或匹配 ACK，不是首次命中。`measurement_age_at_send_ms`、`measurement_to_first_send_ms`、`last_probe_hit_to_validation_ms` 使用非负差值；缺时间或顺序逆置时为空，不把异常压成零。它们分别描述测量新鲜度、测量到首发、最后命中到验证。最终 SYNC_ACK 的本地入队、服务端接受与对端实际接收是不同证据；本地入队不会授予 Direct，也不能单独作为无响应策略失败的依据。
 
 矩阵采集器只在验证 session、Direct commit sequence、transport instance 和 socket index 全部与对应 timeline 事件一致时，才把业务里程碑归给该 attempt。仅有 peer/network generation，或任一身份字段缺失/不匹配时，`business_ready_at_ms`、`first_business_success_at_ms` 和派生的 `validation_to_first_business_ms` 保持未知并标为 `not_attributable`；不从同 generation 的其他 attempt 回填。`connection_to_first_business_ms` 目前缺少可与该 attempt 精确关联的连接开始身份，因此保持未知。请求级真实双向业务证据仍由既有 `first_usable_summaries` 判定，两种统计口径不得互相替代。
 

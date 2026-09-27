@@ -807,20 +807,20 @@ async fn hard_hard_two_peer_success_with_stun_and_mtu(stun: HarnessStunProfile, 
     // non-owner reaches its scheduled sweep.  Require the authoritative path
     // outcome on both sides and proof that at least one real sweep owner
     // completed; do not require a redundant post-Direct sweep from both.
-    let sweep_detail = timeout(Duration::from_secs(3), async {
+    let (report_peer_id, sweep_report) = timeout(Duration::from_secs(3), async {
         loop {
             for (peers, peer_id) in [
                 (&harness.peers_a, HARD_HARD_B),
                 (&harness.peers_b, HARD_HARD_A),
             ] {
-                if let Some(detail) = peers.get_connection(peer_id).await.and_then(|connection| {
+                if let Some(report) = peers.get_connection(peer_id).await.and_then(|connection| {
                     connection
                         .direct_events
-                        .iter()
-                        .find(|event| event.stage == "hard_hard_sweep_completed")
-                        .map(|event| event.detail.clone())
+                        .into_iter()
+                        .filter_map(|event| event.hard_hard_attempt)
+                        .find(|report| report.attempt == 1 && report.direct_confirmed)
                 }) {
-                    return detail;
+                    return (peer_id, report);
                 }
             }
             sleep(Duration::from_millis(20)).await;
@@ -828,8 +828,11 @@ async fn hard_hard_two_peer_success_with_stun_and_mtu(stun: HarnessStunProfile, 
     })
     .await
     .expect("at least one exact-socket Hard↔Hard owner must complete its sweep");
-    assert!(sweep_detail.contains("exact_socket=true"));
-    assert!(sweep_detail.contains("direct_confirmed=true"));
+    assert_eq!(sweep_report.mode, "predictable");
+    assert_eq!(sweep_report.failure_class, "encrypted_validation_completed");
+    assert_eq!(sweep_report.terminal_reason, "direct_confirmed");
+    assert!(sweep_report.direct_confirmed);
+    assert!(sweep_report.socket_index.is_some());
 
     let fresh_direct_a =
         wait_for_current_fresh_direct(&harness.peers_a, &harness.udp_a, HARD_HARD_B).await;
@@ -844,6 +847,15 @@ async fn hard_hard_two_peer_success_with_stun_and_mtu(stun: HarnessStunProfile, 
 
     let measured_a = fresh_direct_a.socket_index;
     let measured_b = fresh_direct_b.socket_index;
+    assert_eq!(
+        sweep_report.socket_index,
+        Some(if report_peer_id == HARD_HARD_B {
+            measured_a
+        } else {
+            measured_b
+        }),
+        "the completed sweep must identify the exact current fresh Direct socket"
+    );
     assert!(!fresh_direct_a.predicted_ports.is_empty());
     assert!(!fresh_direct_b.predicted_ports.is_empty());
     assert_eq!(
@@ -1062,19 +1074,22 @@ async fn hard_hard_random_random_birthday_collision_is_full_production_e2e() {
     trigger_initial_offer(&harness).await;
     wait_for_both_direct_compact(&harness).await;
 
-    for (peers, remote_id, expected_remote) in [
+    for (peers, udp, remote_id, expected_remote) in [
         (
             &harness.peers_a,
+            &harness.udp_a,
             HARD_HARD_B,
             harness.link.b_public.local_addr().unwrap(),
         ),
         (
             &harness.peers_b,
+            &harness.udp_b,
             HARD_HARD_A,
             harness.link.a_public.local_addr().unwrap(),
         ),
     ] {
-        let peer = wait_for_current_direct_diagnostics(peers, remote_id).await;
+        let current = wait_for_current_fresh_direct(peers, udp, remote_id).await;
+        let peer = current.diagnostics;
         assert_eq!(peer.state, ConnectionState::Direct);
         assert_eq!(peer.active_path, Some(NetworkPath::Direct));
         let observed = peer
@@ -1091,23 +1106,10 @@ async fn hard_hard_random_random_birthday_collision_is_full_production_e2e() {
             assert!(observed.detail.contains("strategy=bounded_birthday"));
             assert!(observed.detail.contains("socket_count=2"));
         }
-        let winner = peer
-            .direct_events
-            .iter()
-            .find(|event| event.stage == "hard_hard_winner_selected")
-            .expect("authenticated Probe v2 evidence must select a birthday winner");
-        let winner_socket = winner.socket_index.expect("winner must name its socket");
-        let winner_phase = if remote_id == HARD_HARD_B {
-            harness
-                .udp_a
-                .dynamic_socket_phase_for_test(winner_socket)
-                .await
-        } else {
-            harness
-                .udp_b
-                .dynamic_socket_phase_for_test(winner_socket)
-                .await
-        };
+        // The exact committed fresh socket, affinity and Direct pair are
+        // authoritative even when the auxiliary winner event skips its ring.
+        let winner_socket = current.socket_index;
+        let winner_phase = udp.dynamic_socket_phase_for_test(winner_socket).await;
         assert_eq!(
             winner_phase,
             Some(crate::udp::DynamicSocketPhase::Finalized),
@@ -1172,32 +1174,30 @@ async fn hard_hard_random_random_birthday_collision_is_full_production_e2e() {
         "the session envelope must identify the HighEntropy birthday lane"
     );
 
-    let parse_count = |detail: &str, key: &str| {
-        detail
-            .split_whitespace()
-            .find_map(|field| field.strip_prefix(key)?.parse::<usize>().ok())
-    };
-    // Read the durable connection ring, not the non-blocking diagnostics
-    // cache. A reciprocal Direct promotion can still own the connections
-    // writer when this assertion runs; the cache is allowed to return its
-    // previous snapshot in that narrow interval.
-    let birthday_events = timeout(HARD_HARD_E2E_TIMEOUT, async {
+    // The formal report seals the same sender statistics as the auxiliary
+    // summary. Only this bounded terminal commit is durable under contention.
+    let birthday_reports = timeout(HARD_HARD_E2E_TIMEOUT, async {
         loop {
             for (peers, peer_id) in [
                 (&harness.peers_a, HARD_HARD_B),
                 (&harness.peers_b, HARD_HARD_A),
             ] {
                 if let Some(connection) = peers.get_connection(peer_id).await {
-                    let events = connection
+                    let reports = connection
                         .direct_events
                         .into_iter()
-                        .filter(|event| {
-                            event.stage == "hard_hard_birthday_sweep_summary"
-                                && event.detail.contains("requested_level=64")
+                        .filter_map(|event| event.hard_hard_attempt)
+                        .filter(|report| {
+                            report.attempt == 1
+                                && report.direct_confirmed
+                                && report
+                                    .birthday_sweep
+                                    .as_ref()
+                                    .is_some_and(|sweep| sweep.requested_level == 64)
                         })
                         .collect::<Vec<_>>();
-                    if !events.is_empty() {
-                        return events;
+                    if !reports.is_empty() {
+                        return reports;
                     }
                 }
             }
@@ -1206,80 +1206,59 @@ async fn hard_hard_random_random_birthday_collision_is_full_production_e2e() {
     })
     .await
     .expect("production birthday sweep must report its bounded send count");
-    let mut birthday_summaries = 0;
-    for event in &birthday_events {
-        let sent = parse_count(&event.detail, "packets_sent=")
-            .expect("birthday summary must report sent packets");
-        let unique = parse_count(&event.detail, "unique_target_endpoints=")
-            .expect("birthday summary must report unique target endpoints");
-        let effective_target_count = parse_count(&event.detail, "effective_target_count=")
-            .expect("birthday summary must report effective target count");
-        let generated_candidate_count = parse_count(&event.detail, "generated_candidate_count=")
-            .expect("birthday summary must report generated candidates");
-        let signaled_candidate_count = parse_count(&event.detail, "signaled_candidate_count=")
-            .expect("birthday summary must report signaled candidates");
-        let requested_socket_count = parse_count(&event.detail, "requested_socket_count=")
-            .expect("birthday summary must report requested sockets");
-        let attached_socket_count = parse_count(&event.detail, "attached_socket_count=")
-            .expect("birthday summary must report attached sockets");
-        let usable_socket_count = parse_count(&event.detail, "usable_socket_count=")
-            .expect("birthday summary must report usable sockets");
-        let unavailable_socket_count = parse_count(&event.detail, "unavailable_socket_count=")
-            .expect("birthday summary must report unavailable sockets");
-        let packets_planned = parse_count(&event.detail, "packets_planned=")
-            .expect("birthday summary must report planned packets");
-        let waves_planned = parse_count(&event.detail, "waves_planned=")
-            .expect("birthday summary must report planned waves");
-        let waves_started = parse_count(&event.detail, "waves_started=")
-            .expect("birthday summary must report started waves");
-        let waves_fully_completed = parse_count(&event.detail, "waves_fully_completed=")
-            .expect("birthday summary must report fully completed waves");
-        let targets_assigned = parse_count(&event.detail, "targets_assigned=")
-            .expect("birthday summary must report assigned targets");
-        let targets_examined = parse_count(&event.detail, "targets_examined=")
-            .expect("birthday summary must report examined targets");
-        let targets_attempted = parse_count(&event.detail, "targets_attempted=")
-            .expect("birthday summary must report attempted targets");
-        let logical_probes_attempted = parse_count(&event.detail, "logical_probes_attempted=")
-            .expect("birthday summary must report logical attempts");
-        let logical_probes_sent = parse_count(&event.detail, "logical_probes_sent=")
-            .expect("birthday summary must report logical probes");
-        let physical_datagrams_sent = parse_count(&event.detail, "physical_datagrams_sent=")
-            .expect("birthday summary must report physical datagrams");
-        let physical_send_errors = parse_count(&event.detail, "physical_send_errors=")
-            .expect("birthday summary must report physical send errors");
-        let targets_cancelled = parse_count(&event.detail, "targets_cancelled=")
-            .expect("birthday summary must report cancelled targets");
-        assert_eq!(waves_planned, 2);
-        assert_eq!(packets_planned, effective_target_count * 2);
-        assert!(sent <= packets_planned);
-        assert!(unique <= effective_target_count);
-        assert!(generated_candidate_count >= signaled_candidate_count);
-        assert_eq!(signaled_candidate_count, effective_target_count);
-        assert_eq!(requested_socket_count, 2);
-        assert!(attached_socket_count <= requested_socket_count);
-        assert!(usable_socket_count <= attached_socket_count);
+    for report in &birthday_reports {
+        assert_eq!(report.mode, "birthday");
+        assert_eq!(report.attempt, 1);
+        assert!(report.direct_confirmed);
+        assert!(report.socket_index.is_some());
+        assert_eq!(report.failure_class, "encrypted_validation_completed");
+        assert_eq!(report.terminal_reason, "direct_confirmed");
+        let sweep = report
+            .birthday_sweep
+            .as_ref()
+            .expect("the complete birthday statistics must accompany the formal report");
+        assert_eq!(sweep.requested_level, 64);
+        assert_eq!(sweep.waves_planned, 2);
+        assert_eq!(sweep.packets_planned, sweep.effective_target_count * 2);
+        assert!(sweep.packets_sent as usize <= sweep.packets_planned);
+        assert!(sweep.unique_target_endpoints as usize <= sweep.effective_target_count);
+        assert!(sweep.generated_candidate_count >= sweep.signaled_candidate_count);
+        assert_eq!(sweep.signaled_candidate_count, sweep.effective_target_count);
+        assert_eq!(sweep.requested_socket_count, 2);
+        assert!(sweep.attached_socket_count <= sweep.requested_socket_count);
+        assert!(sweep.usable_socket_count <= sweep.attached_socket_count);
         assert_eq!(
-            unavailable_socket_count,
-            requested_socket_count - usable_socket_count
+            sweep.unavailable_socket_count,
+            sweep.requested_socket_count - sweep.usable_socket_count
         );
-        assert!(waves_fully_completed <= waves_started);
-        assert!(waves_started <= waves_planned);
-        assert!(targets_examined <= targets_assigned);
-        assert!(targets_attempted <= targets_assigned);
-        assert!(targets_attempted <= targets_examined);
-        assert!(logical_probes_sent <= logical_probes_attempted);
-        assert!(logical_probes_sent <= effective_target_count * 2);
-        assert!(physical_datagrams_sent >= logical_probes_sent);
-        assert!(physical_send_errors <= effective_target_count * 2);
-        assert_eq!(targets_cancelled, targets_assigned - targets_attempted);
-        assert!(event.detail.contains("first_send_at_ms="));
-        assert!(event.detail.contains("last_send_at_ms="));
-        assert!(event.detail.contains("stop_reason="));
-        birthday_summaries += 1;
+        assert!(sweep.waves_fully_completed <= sweep.waves_started);
+        assert!(sweep.waves_started <= sweep.waves_planned);
+        assert!(sweep.targets_examined <= sweep.targets_assigned);
+        assert!(sweep.targets_attempted <= sweep.targets_assigned);
+        assert!(sweep.targets_attempted <= sweep.targets_examined);
+        assert!(sweep.logical_probes_sent <= sweep.logical_probes_attempted);
+        assert!(sweep.logical_probes_sent <= sweep.effective_target_count * 2);
+        let physical_datagrams_sent = sweep
+            .per_socket_sent
+            .iter()
+            .map(|(_, sent)| *sent as usize)
+            .sum::<usize>();
+        assert_eq!(physical_datagrams_sent, sweep.physical_datagrams_sent);
+        assert!(physical_datagrams_sent >= sweep.logical_probes_sent);
+        assert!(sweep.physical_send_errors <= sweep.effective_target_count * 2);
+        assert_eq!(
+            sweep.targets_cancelled,
+            sweep.targets_assigned - sweep.targets_attempted
+        );
+        // Preserve the original schema-presence checks, including nullable
+        // send times when reciprocal traffic wins before this owner's send.
+        let serialized_sweep = serde_json::to_value(sweep).unwrap();
+        for field in ["first_send_at_ms", "last_send_at_ms", "stop_reason"] {
+            assert!(serialized_sweep.get(field).is_some(), "missing {field}");
+        }
     }
     assert!(
-        birthday_summaries > 0,
+        !birthday_reports.is_empty(),
         "production birthday sweep must report its bounded send count"
     );
 
@@ -1322,38 +1301,33 @@ async fn hard_hard_physical_send_error_reaches_one_consistent_terminal_reason() 
     harness.link.set_drop_b_to_a(true);
     trigger_initial_offer(&harness).await;
 
-    let summary = wait_for_stage(
-        &harness.peers_a,
-        HARD_HARD_B,
-        "hard_hard_birthday_sweep_summary",
-    )
-    .await;
-    assert!(summary.detail.contains("physical_send_errors="));
-    assert!(
-        summary.detail.contains("stop_reason=send_error"),
-        "unexpected birthday summary: {}",
-        summary.detail
-    );
-    assert!(!summary.detail.contains("stop_reason=socket_unavailable"));
+    let report = wait_for_hard_hard_attempt_report(&harness.peers_a, HARD_HARD_B).await;
+    assert_eq!(report.mode, "birthday");
+    assert!(!report.direct_confirmed);
+    assert_eq!(report.failure_class, "send_error");
+    assert_eq!(report.terminal_reason, "send_error");
+    assert!(report.counts.send_errors > 0);
+    assert_eq!(report.counts.send_success_datagrams, 0);
+    let sweep = report
+        .birthday_sweep
+        .as_ref()
+        .expect("the failed birthday sweep must preserve its sender statistics");
+    assert_eq!(sweep.stop_reason.as_deref(), Some("send_error"));
+    assert!(sweep.physical_send_errors > 0);
+    assert_eq!(sweep.physical_datagrams_sent, 0);
 
-    let sweep_failed =
-        wait_for_stage(&harness.peers_a, HARD_HARD_B, "hard_hard_sweep_failed").await;
-    let hard_failed = wait_for_stage(&harness.peers_a, HARD_HARD_B, "hard_hard_failed").await;
-    assert!(sweep_failed.detail.contains("stop_reason=send_error"));
-    assert!(hard_failed.detail.contains("stop_reason=send_error"));
-
-    let summary_count = harness
+    let report_count = harness
         .peers_a
         .get_connection(HARD_HARD_B)
         .await
         .unwrap()
         .direct_events
         .iter()
-        .filter(|event| event.stage == "hard_hard_birthday_sweep_summary")
+        .filter(|event| event.stage == "hard_hard_attempt_report")
         .count();
     assert_eq!(
-        summary_count, 1,
-        "one session must emit one final birthday summary"
+        report_count, 1,
+        "one session must retain one authoritative terminal attempt"
     );
     harness.shutdown().await;
 }
@@ -1384,9 +1358,15 @@ async fn hard_hard_random_random_birthday_no_collision_cleans_up_without_direct(
 
     // Do not let the initial "not active and no sockets" state satisfy the
     // cleanup predicate before the control event has started either side's
-    // session.  The two durable terminal events prove both birthday sweeps
+    // session. The two formal terminal reports prove both birthday sweeps
     // actually ran; only then is it meaningful to assert complete cleanup.
-    wait_for_both_sweep_failures(&harness).await;
+    let reports = wait_for_both_sweep_failures(&harness).await;
+    for report in reports {
+        assert_eq!(report.mode, "birthday");
+        assert_eq!(report.failure_class, "no_response");
+        assert_eq!(report.authenticated_probe_packets_received, 0);
+        assert_eq!(report.matched_probe_acks, 0);
+    }
 
     timeout(Duration::from_secs(5), async {
         loop {
@@ -2380,7 +2360,17 @@ async fn hard_hard_two_peer_partial_reachability_never_stays_asymmetric_direct()
     let harness = build_two_peer_harness(true, false, false).await;
     harness.link.set_drop_b_to_a(true);
     trigger_initial_offer(&harness).await;
-    wait_for_both_sweep_failures(&harness).await;
+    let reports = wait_for_both_sweep_failures(&harness).await;
+    for report in reports {
+        assert_eq!(report.mode, "predictable");
+        assert!(
+            matches!(
+                report.failure_class.as_str(),
+                "no_response" | "probe_hit_validation_failed"
+            ),
+            "one-way reachability must fail before Direct: {report:?}"
+        );
+    }
     harness.link.set_drop_a_to_b(true);
 
     assert!(!harness.peers_a.is_direct(HARD_HARD_B).await);

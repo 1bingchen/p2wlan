@@ -730,6 +730,7 @@ fn build_hard_hard_attempt_report(
             .collect(),
         confirmed_target_rank,
         confirmation: measurement.evidence.confirmation_snapshot(),
+        birthday_sweep: hard_hard_birthday_sweep_diagnostics(punch_report),
         timeline: crate::peer::HardHardAttemptTimeline {
             measurement_started_at_ms: measurement.measurement_started_at_ms,
             last_measurement_send_at_ms: measurement.last_measurement_send_at_ms,
@@ -2146,6 +2147,70 @@ fn hard_hard_complete_unanswered_exploration(
         && received.authenticated_probe_acks_observed == 0
         && received.authenticated_probe_acks_unmatched == 0
         && received.probe_acks_received == 0
+}
+
+fn hard_hard_birthday_sweep_diagnostics(
+    report: &PunchSendReport,
+) -> Option<Box<crate::peer::HardHardBirthdaySweepDiagnostics>> {
+    let birthday = report.birthday.as_ref()?;
+    let mut per_socket_sent = report.per_socket_sent.clone();
+    per_socket_sent.sort_by_key(|(socket_index, _)| *socket_index);
+    Some(Box::new(crate::peer::HardHardBirthdaySweepDiagnostics {
+        requested_level: birthday.requested_level,
+        generated_candidate_count: birthday.generated_candidate_count,
+        signaled_candidate_count: birthday.signaled_candidate_count,
+        effective_target_count: birthday.effective_target_count,
+        requested_socket_count: birthday.requested_socket_count,
+        attached_socket_count: birthday.attached_socket_count,
+        usable_socket_count: birthday.usable_socket_count,
+        unavailable_socket_count: birthday.unavailable_socket_count,
+        socket_count: birthday.socket_count,
+        degraded_reason: birthday.degraded_reason.clone(),
+        waves_planned: birthday.waves_planned,
+        waves_started: birthday.waves_started,
+        waves_fully_completed: birthday.waves_fully_completed,
+        waves_completed: birthday.waves_completed,
+        packets_planned: birthday.packets_planned,
+        targets_assigned: birthday.targets_assigned,
+        targets_examined: birthday.targets_examined,
+        targets_attempted: birthday.targets_attempted,
+        logical_probes_attempted: birthday.logical_probes_attempted,
+        logical_probes_sent: birthday.logical_probes_sent,
+        logical_probe_send_failures: birthday.logical_probe_send_failures,
+        physical_datagrams_sent: birthday.physical_datagrams_sent,
+        physical_send_errors: birthday.physical_send_errors,
+        partial_physical_send_errors: birthday.partial_physical_send_errors,
+        targets_budget_skipped: birthday.targets_budget_skipped,
+        targets_cancelled: birthday.targets_cancelled,
+        stop_reason: birthday.stop_reason.clone(),
+        packets_sent: report.packets_sent,
+        unique_target_endpoints: report.unique_target_endpoints,
+        budget_skipped: report.budget_skipped,
+        physical_bytes_sent: report.physical_bytes_sent,
+        physical_send_error_bytes: report.physical_send_error_bytes,
+        probe_path_errors: report.probe_path_errors,
+        failure_kind: report
+            .failure_kind
+            .map(|kind| kind.stop_reason().to_string()),
+        per_socket_sent,
+        first_send_at_ms: report.first_send_at_ms,
+        last_send_at_ms: report.last_send_at_ms,
+        epoch_budget_exhausted: report.epoch_budget_exhausted,
+        candidate_iteration_capped: report.candidate_iteration_capped,
+        pacing_deadline_reached: report.pacing_deadline_reached,
+        worker_failed: report.worker_failed,
+        target_processing_completed: report.target_processing_completed,
+        sweep_budget_stop: report
+            .sweep_budget_stop
+            .map(|stop| stop.reason().to_string()),
+    }))
+}
+
+#[cfg(test)]
+mod hard_hard_birthday_diagnostics_tests {
+    use super::*;
+
+    include!("birthday_diagnostics_tests.rs");
 }
 
 fn birthday_sweep_detail(report: &PunchSendReport) -> Option<String> {

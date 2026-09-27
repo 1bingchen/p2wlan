@@ -641,10 +641,10 @@ use probe_budget::{
 pub use types::{
     ActivePathSnapshot, CandidatePair, CandidatePairSource, CandidatePairState, ConnectionState,
     DirectPathType, DirectTraversalEvent, DirectValidationEventMetadata, HardHardAttemptCounts,
-    HardHardAttemptReport, HardHardAttemptTimeline, HardHardBusinessAttributionIdentity,
-    HardHardConfirmationCosts, HardHardDatagramCost, NetworkPath, PathHealth, PathScore,
-    PathScoreDiagnostics, PathSelection, PathSelectionDiagnostics, PathSelectionEvent,
-    HARD_HARD_ATTEMPT_REPORT_SCHEMA_VERSION,
+    HardHardAttemptReport, HardHardAttemptTimeline, HardHardBirthdaySweepDiagnostics,
+    HardHardBusinessAttributionIdentity, HardHardConfirmationCosts, HardHardDatagramCost,
+    NetworkPath, PathHealth, PathScore, PathScoreDiagnostics, PathSelection,
+    PathSelectionDiagnostics, PathSelectionEvent, HARD_HARD_ATTEMPT_REPORT_SCHEMA_VERSION,
 };
 
 mod path_observability;

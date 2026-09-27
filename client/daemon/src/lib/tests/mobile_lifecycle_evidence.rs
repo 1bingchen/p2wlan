@@ -316,6 +316,8 @@ mod mobile_lifecycle_evidence {
 
     fn evidence_peer(node_id: &str, endpoint: &str) -> crate::control::PeerInfo {
         crate::control::PeerInfo {
+            capabilities: crate::control::PeerCapabilities::default(),
+            registration_seq: 0,
             node_id: node_id.to_string(),
             device_name: String::new(),
             app_version: String::new(),

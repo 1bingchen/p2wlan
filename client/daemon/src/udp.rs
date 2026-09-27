@@ -171,6 +171,13 @@ pub struct UdpTransport {
     /// v2 nonce is simply refused if its bounded session has been removed or
     /// superseded before the ACK arrives.
     hard_hard_probe_bindings: HardHardProbeBindings,
+    pub(super) hard_hard_measurement_gate: Arc<tokio::sync::Semaphore>,
+    #[cfg(test)]
+    hh2_validation_send_gate:
+        Arc<Mutex<Option<Arc<hard_hard_pair_validation::HardHardValidationSendGate>>>>,
+    #[cfg(test)]
+    hh2_probe_ack_send_gate:
+        Arc<Mutex<Option<Arc<hard_hard_pair_validation::HardHardValidationSendGate>>>>,
     stun_waiters: StunWaiters,
     /// Merged socket ownership state: dynamic punch sockets, per-peer
     /// affinity pins and the affinity epoch counter live under one mutex so
@@ -361,10 +368,19 @@ mod socket_registry;
 mod peer_cleanup;
 
 mod direct_validation;
+mod hard_hard_pair;
+mod hard_hard_pair_commit;
+mod hard_hard_pair_send;
+mod hard_hard_pair_validation;
+use hard_hard_pair_validation::{HardHardSocketMode, HardHardValidationScope};
 
 mod diagnostics;
 
 mod dynamic_punch;
+mod hard_hard_measurement;
+pub(crate) use hard_hard_measurement::HardHardPreparedMeasurement;
+mod hard_hard_measurement_gate;
+pub(crate) use hard_hard_measurement_gate::HardHardMeasurementLease;
 
 mod socket_lifecycle;
 

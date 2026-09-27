@@ -44,6 +44,14 @@ impl UdpTransport {
         // an old owner after that advance had already cleared every old
         // session.  The gate makes the check and insert one transaction.
         let _epoch_gate = self.network_epoch_gate.lock().await;
+        if self
+            .peers
+            .hard_hard_pair_validation_target(peer_id)
+            .await
+            .is_some_and(|target| !target.is_some_and(|(_, pair)| pair.remote_endpoint == endpoint))
+        {
+            return DirectValidationSessionStart::IgnoredInactive;
+        }
         let current_generation = self.peers.current_network_generation_sync();
         if current_generation != generation {
             debug!(target: "p2pnet_daemon::direct_validation",
@@ -366,6 +374,7 @@ impl UdpTransport {
         self.direct_validation.expectations.lock().await.insert(
             peer_id.to_string(),
             DirectValidationExpectation {
+                hard_hard_pair: None,
                 request_id,
                 generation,
                 peer_session_generation: self
@@ -428,6 +437,7 @@ impl UdpTransport {
         self.register_direct_validation_expectation(
             peer_id,
             DirectValidationExpectation {
+                hard_hard_pair: None,
                 request_id,
                 generation,
                 peer_session_generation,
@@ -530,14 +540,34 @@ impl UdpTransport {
         let endpoint = validation
             .request_endpoint()
             .expect("Direct validation send identity has an endpoint");
-        let (socket_index, socket, lease) = self
-            .resolve_send_socket_with_lease_for_endpoint(peer_id, Some(endpoint))
+        let resolved = match self.peers.hard_hard_pair_validation_target(peer_id).await {
+            None => {
+                self.resolve_send_socket_with_lease_for_endpoint(peer_id, Some(endpoint))
+                    .await
+            }
+            Some(Some((token, pair)))
+                if pair.remote_endpoint == endpoint
+                    && self
+                        .peers
+                        .hard_hard_pair_scope(peer_id, &token)
+                        .await
+                        .is_some() =>
+            {
+                self.resolve_dynamic_socket_index_for_send(peer_id, pair.socket_index)
+                    .await
+            }
+            Some(_) => None,
+        };
+        let (socket_index, socket, lease) = resolved.ok_or(DirectValidationSendError::NoSocket)?;
+        let hard_hard_pair = self
+            .hard_hard_validation_scope(peer_id, socket_index, endpoint)
             .await
-            .ok_or(DirectValidationSendError::NoSocket)?;
+            .map_err(|_| DirectValidationSendError::OwnerRevoked)?;
         let registered = self
             .register_direct_validation_expectation(
                 peer_id,
                 DirectValidationExpectation {
+                    hard_hard_pair,
                     request_id,
                     generation,
                     peer_session_generation,
@@ -640,6 +670,20 @@ impl UdpTransport {
         endpoint_authenticated: bool,
     ) -> std::result::Result<DirectValidationExpectation, crate::udp::DirectValidationAckRejectReason>
     {
+        let current_hh2_scope = if let Some(index) = socket_index {
+            self.hard_hard_validation_scope(peer_id, index, source)
+                .await
+                .map_err(|_| crate::udp::DirectValidationAckRejectReason::EndpointMismatch)?
+        } else if self
+            .peers
+            .hard_hard_pair_validation_target(peer_id)
+            .await
+            .is_some()
+        {
+            return Err(crate::udp::DirectValidationAckRejectReason::SocketMismatch);
+        } else {
+            None
+        };
         if token_generation != current_generation {
             return Err(crate::udp::DirectValidationAckRejectReason::TokenGenerationMismatch);
         }
@@ -657,6 +701,14 @@ impl UdpTransport {
             let Some(expectation) = expectations.get(peer_id) else {
                 return Err(crate::udp::DirectValidationAckRejectReason::NoExpectation);
             };
+            if let Some(scope) = expectation.hard_hard_pair.as_ref() {
+                if current_hh2_scope.as_ref() != Some(scope)
+                    || scope.pair.remote_endpoint != source
+                    || Some(scope.pair.socket_index) != socket_index
+                {
+                    return Err(crate::udp::DirectValidationAckRejectReason::EndpointMismatch);
+                }
+            }
             if expectation.expires_at <= now {
                 expectations.remove(peer_id);
                 return Err(crate::udp::DirectValidationAckRejectReason::ExpectationExpired);

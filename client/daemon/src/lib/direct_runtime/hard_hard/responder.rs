@@ -15,6 +15,16 @@ pub(crate) async fn spawn_hard_hard_responder(
     punch_at_server_ms: Option<u64>,
     remote_prediction: Vec<SocketAddr>,
 ) -> HardHardRemoteStart {
+    if let Some(meta) = &coordination.v2 {
+        if meta.stage != HardHardV2Stage::Offer
+            || !meta.local.is_valid(&remote_prediction)
+            || !signal.control.local_supports_hh2()
+            || !peers.peer_supports_hh2(&peer_id).await
+            || punch_at_server_ms.is_none()
+        {
+            return HardHardRemoteStart::Rejected;
+        }
+    }
     let now = hard_hard_now_ms();
     // Snapshot the exact lifecycle identity before any responder admission
     // check. Candidate refresh can consume most of the fixed 3500ms lead, so
@@ -377,6 +387,23 @@ pub(crate) async fn spawn_hard_hard_responder(
             HardHardA0Stage::LocalMeasurement,
             HardHardA0Reason::Started,
         );
+        let measurement_lease = if coordination.v2.is_some() {
+            let deadline = Instant::now()
+                + Duration::from_millis(200.min(punch_at_ms.saturating_sub(hard_hard_now_ms())));
+            let Some(lease) = udp
+                .acquire_hard_hard_measurement_lease(
+                    plan.local_network_generation,
+                    &cancellation,
+                    deadline,
+                )
+                .await
+            else {
+                return;
+            };
+            Some(lease)
+        } else {
+            None
+        };
         let mut measurement = match run_hard_hard_local_measurement(
             &udp,
             &peers,
@@ -386,6 +413,7 @@ pub(crate) async fn spawn_hard_hard_responder(
             &coordination.token,
             Some(&cancellation),
             punch_at_ms,
+            coordination.v2.is_some(),
         )
         .await
         {
@@ -481,13 +509,18 @@ pub(crate) async fn spawn_hard_hard_responder(
             return;
         }
         let HardHardMeasurementPayload {
+            v2_offer,
             candidates,
             candidate_sources,
             local_confidence,
             local_model,
             strategy_candidate_cap,
             candidate_contract,
-        } = match hard_hard_measurement_payload(&measurement, signal.boot_epoch_ms) {
+        } = match hard_hard_measurement_payload(
+            &measurement,
+            signal.boot_epoch_ms,
+            peers.current_network_generation_sync(),
+        ) {
             Ok(payload) => payload,
             Err(rejection) => {
                 let _ = record_hard_hard_pre_session_failure(
@@ -565,7 +598,7 @@ pub(crate) async fn spawn_hard_hard_responder(
                 ),
             )
             .await;
-        let response_coordination =
+        let mut response_coordination =
             coordination.as_response(current_plan, local_confidence, local_model);
         let prediction_window = hard_hard_prediction_targets(
             &candidates,
@@ -588,6 +621,72 @@ pub(crate) async fn spawn_hard_hard_responder(
             return;
         }
         let requested_birthday_level = hard_hard_measurement_requested_level(&measurement);
+        let coordinated_plan = if let Some(meta) = response_coordination.v2.as_mut() {
+            let Some(offer) = v2_offer else {
+                return;
+            };
+            let Some(server_deadline) = punch_at_server_ms else {
+                return;
+            };
+            meta.local = offer;
+            let timing = signal.control.hard_hard_timing_hint();
+            meta.rtt_ms = timing.map_or(0, |hint| hint.rtt_ms.min(u64::from(u16::MAX)) as u16);
+            meta.uncertainty_ms = timing.map_or(0, |hint| {
+                hint.uncertainty_ms.min(u64::from(u16::MAX)) as u16
+            });
+            let Some(mut agreed) = hard_hard_new_coordinated_plan(
+                &peers,
+                &signal.control,
+                &peer_id,
+                offer,
+                meta.phase,
+                punch_at_ms,
+                server_deadline,
+            )
+            .await
+            else {
+                return;
+            };
+            agreed.measurement_lease = measurement_lease.clone();
+            agreed.recovery_identity = Some(recovery_identity);
+            agreed.strategy_order = meta.strategy_order;
+            let Some(original_meta) = coordination.v2.as_ref() else {
+                return;
+            };
+            agreed.sync_uncertainty = hard_hard_sync_uncertainty(original_meta, meta);
+            let remote_offer = meta.remote;
+            let strategy = crate::peer::HardHardProbeStrategy::select_with_order(
+                offer,
+                remote_offer,
+                meta.strategy_order,
+            );
+            let Some(digest) = hard_hard_plan_digest(
+                &coordination,
+                &response_coordination,
+                &remote_prediction,
+                &prediction_window,
+                (
+                    agreed.remote_registration_seq,
+                    agreed.local_registration_seq,
+                ),
+                server_deadline,
+                strategy,
+            ) else {
+                return;
+            };
+            let agreement = crate::peer::HardHardAgreedPlan { strategy, digest };
+            if let Some(meta) = response_coordination.v2.as_mut() {
+                meta.agreement = Some(agreement);
+            }
+            agreed.remote_offer = Some(remote_offer);
+            agreed.agreement = Some(agreement);
+            Some(agreed)
+        } else {
+            None
+        };
+        if HardHardCoordination::parse(&response_coordination.encode()).is_none() {
+            return;
+        }
         let birthday = hard_hard_measurement_is_birthday(&measurement);
         let (planned_sockets, planned_socket_target_combinations, planned_logical_probes) =
             hard_hard_measurement_planned_dimensions(&measurement, remote_prediction.len());
@@ -599,6 +698,8 @@ pub(crate) async fn spawn_hard_hard_responder(
             session_token: coordination.token.clone(),
             peer_id: peer_id.clone(),
             initiator: false,
+            pair_nomination: coordinated_plan.as_ref().map(|_| Default::default()),
+            coordinated_plan,
             remote_network_generation: coordination.local_network_generation,
             local_network_generation: current_plan.local_network_generation,
             remote_candidate_epoch: current_plan.remote_candidate_epoch,
@@ -624,6 +725,10 @@ pub(crate) async fn spawn_hard_hard_responder(
             created_at: Instant::now(),
             cancellation: cancellation.clone(),
         };
+        let publication_deadline = record
+            .coordinated_plan
+            .as_ref()
+            .map(|plan| plan.scheduled_start);
         let cleanup_descriptor = HardHardCleanupDescriptor::from_record(&record);
         let registered = !cancellation.is_cancelled()
             && peers.peer_session_is_current_sync(&peer_id, peer_session_generation)
@@ -663,6 +768,16 @@ pub(crate) async fn spawn_hard_hard_responder(
         // responder task must cancel the shared handle so the provisional
         // measurement guard cannot outlive a pre-ledger return.
         pending_session_cancellation.disarm();
+        if coordination.v2.is_some()
+            && !udp
+                .enable_hard_hard_pair_sockets(&peer_id, &coordination.token)
+                .await
+        {
+            peers
+                .hard_hard_retire_session(&peer_id, &session_id, &coordination.token)
+                .await;
+            return;
+        }
         if cancellation.is_cancelled()
             || !peers.peer_session_is_current_sync(&peer_id, peer_session_generation)
         {
@@ -739,22 +854,38 @@ pub(crate) async fn spawn_hard_hard_responder(
                 HardHardA0Reason::SubmitStarted,
             );
             hard_hard_experiment_signal_delay(peers.hard_hard_experiment_only()).await;
-            let accepted = matches!(
-                signal
-                    .control
-                    .send_fresh_peer_offer_with_session_and_punch_schedule(
-                        &peer_id,
-                        &candidates,
-                        &candidate_sources,
-                        &[],
-                        Some(punch_at_ms),
-                        punch_at_server_ms,
-                        Some(response_coordination.encode()),
-                        cancellation.clone(),
-                    )
-                    .await,
-                Ok(())
-            );
+            let identity_current = peers
+                .hard_hard_session_identity_is_current(&primary_socket)
+                .await;
+            let accepted = identity_current
+                && !cancellation.is_cancelled()
+                && hard_hard_measurement_publication_is_current(
+                    &measurement,
+                    &peers,
+                    &peer_id,
+                    v2_offer,
+                )
+                && hard_hard_publish_or_observe_progress(
+                    &peers,
+                    &signal.control,
+                    &peer_id,
+                    &coordination.token,
+                    false,
+                    publication_deadline,
+                    signal
+                        .control
+                        .send_fresh_peer_offer_with_session_and_punch_schedule(
+                            &peer_id,
+                            &candidates,
+                            &candidate_sources,
+                            &[],
+                            Some(punch_at_ms),
+                            punch_at_server_ms,
+                            Some(response_coordination.encode()),
+                            cancellation.clone(),
+                        ),
+                )
+                .await;
             hard_hard_a0_stage_log(
                 &peers,
                 "responder",
@@ -898,6 +1029,22 @@ pub(crate) async fn spawn_hard_hard_responder(
                 .await;
             return;
         }
+        if response_coordination.v2.is_some() {
+            let Some(record) = peers
+                .hard_hard_session_by_token(&peer_id, &coordination.token)
+                .await
+            else {
+                return;
+            };
+            if !hard_hard_exchange_ready(&peers, &signal, &record, response_coordination.clone())
+                .await
+            {
+                peers
+                    .hard_hard_retire_session(&peer_id, &session_id, &coordination.token)
+                    .await;
+                return;
+            }
+        }
         let Some(sweep_record) = peers
             .hard_hard_begin_sweep(
                 &peer_id,
@@ -1000,15 +1147,19 @@ pub(crate) async fn spawn_hard_hard_responder(
                 ),
             )
             .await;
-        let fresh_socket = sweep_record.fresh_socket;
-        let birthday_socket_indices =
-            birthday.then(|| hard_hard_measurement_socket_indices(&measurement));
+        let Some((remote_prediction, birthday_socket_indices)) =
+            hard_hard_sweep_plan(&sweep_record, &remote_prediction)
+        else {
+            return;
+        };
+        let fresh_socket = sweep_record.fresh_socket.clone();
         // hh1 initiators sweep the advertised list in its original order.
         // Only the responder changes its local send order, retaining rank zero
         // and every advertised endpoint. This also works with older hh1
         // initiators; no candidate or protocol field is invented. Apply the
         // bounded two-phase plan only to complete fixed-step windows.
-        let remote_prediction = if !birthday
+        let remote_prediction = if sweep_record.coordinated_plan.is_none()
+            && !birthday
             && response_coordination.local_prediction_model == "fixed_step"
             && response_coordination.remote_prediction_model == "fixed_step"
         {
@@ -1097,7 +1248,7 @@ pub(crate) async fn spawn_hard_hard_responder(
             {
                 Some(fresh_socket.clone())
             } else {
-                direct_on_fresh_socket.then_some(fresh_socket.clone())
+                direct_on_fresh_socket.then_some(confirmed_socket.clone())
             };
             if retained_socket.is_none() {
                 if peers.is_direct(&peer_id).await {

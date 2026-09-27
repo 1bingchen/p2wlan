@@ -1,6 +1,16 @@
 use super::*;
 
 impl UdpTransport {
+    /// Immutable hh2 classification survives detach and its ACK drain grace.
+    /// A legacy PNCH must never generate a reply from that retained socket.
+    pub(super) async fn permits_legacy_punch_on_socket(&self, socket_index: usize) -> bool {
+        let state = self.socket_state.lock().await;
+        !state.hard_hard_pair_modes.contains_key(&socket_index)
+            && state
+                .dynamic
+                .get(&socket_index)
+                .is_none_or(|entry| entry.permits_ordinary_traffic())
+    }
     pub(crate) async fn socket_index_for_peer(&self, peer_id: Option<&str>) -> usize {
         let socket_count = self.socket_count();
         let Some(peer_id) = peer_id else {
@@ -112,13 +122,16 @@ impl UdpTransport {
             return true;
         }
         let state = self.socket_state.lock().await;
-        state.dynamic.get(&socket_index).map_or(true, |entry| {
-            entry.peer_id == peer_id
-                && entry.phase.is_usable()
-                && entry.network_generation == self.peers.current_network_generation_sync()
-                && Arc::ptr_eq(&entry.socket, socket)
-                && entry.permits_ordinary_traffic()
-        })
+        state.dynamic.get(&socket_index).map_or_else(
+            || !state.hard_hard_pair_modes.contains_key(&socket_index),
+            |entry| {
+                entry.peer_id == peer_id
+                    && entry.phase.is_usable()
+                    && entry.network_generation == self.peers.current_network_generation_sync()
+                    && Arc::ptr_eq(&entry.socket, socket)
+                    && entry.permits_ordinary_traffic()
+            },
+        )
     }
 
     /// Resolve the exact socket that received an authenticated direct packet.
@@ -346,6 +359,11 @@ impl UdpTransport {
                 || !entry.phase.is_usable()
                 || entry.network_generation != generation
             {
+                return false;
+            }
+            if entry.hard_hard_pair_required && entry.hard_hard_committed_remote.is_none() {
+                // Decryption/authentication is observation, not authority
+                // to bypass the negotiated pair's validation transaction.
                 return false;
             }
             // The evidence belongs to THIS entry: peer identity, network

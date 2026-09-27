@@ -684,6 +684,8 @@ include!("peer/manager/direct_failure.rs");
 include!("peer/manager/relay.rs");
 include!("peer/manager/fresh_mapping.rs");
 include!("peer/manager/hard_hard.rs");
+include!("peer/manager/hard_hard_plan.rs");
+include!("peer/manager/hard_hard_learning.rs");
 include!("peer/manager/recovery_epoch.rs");
 include!("peer/manager/outbound_liveness.rs");
 include!("peer/manager/c0_coordination.rs");

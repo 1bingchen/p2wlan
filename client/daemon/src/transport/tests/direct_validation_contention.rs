@@ -7,6 +7,8 @@ async fn assert_validation_request_during_emit_contention(replace_session: bool)
     ));
     peers
         .add_peer(&PeerInfo {
+            capabilities: crate::control::PeerCapabilities::default(),
+            registration_seq: 0,
             node_id: "peer-a".to_string(),
             virtual_ip: "10.20.0.2".to_string(),
             online: true,

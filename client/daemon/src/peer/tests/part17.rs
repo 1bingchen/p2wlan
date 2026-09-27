@@ -234,6 +234,8 @@ async fn remote_nat_profile_generation_advance_reopens_recovery_budget_and_zero_
 ) {
     let manager = PeerManager::new(test_config());
     let mut info = PeerInfo {
+        capabilities: crate::control::PeerCapabilities::default(),
+        registration_seq: 0,
         node_id: "peer-recovery".to_string(),
         device_name: "test-device".to_string(),
         app_version: "1.0.0".to_string(),
@@ -335,6 +337,8 @@ async fn remote_nat_profile_generation_advance_reopens_recovery_budget_and_zero_
 async fn newer_same_generation_nat_observation_reopens_only_the_bounded_recovery_epoch() {
     let manager = PeerManager::new(test_config());
     let mut info = PeerInfo {
+        capabilities: crate::control::PeerCapabilities::default(),
+        registration_seq: 0,
         node_id: "peer-observation-recovery".to_string(),
         device_name: "test-device".to_string(),
         app_version: "1.0.0".to_string(),

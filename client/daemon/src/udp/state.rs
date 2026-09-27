@@ -674,6 +674,9 @@ impl DirectValidationAckRejectReason {
 /// with the single acquire inside the prepare path.
 #[derive(Debug)]
 pub(crate) struct DirectValidationExpectation {
+    /// Immutable rendezvous identity: absence of its live owner is terminal,
+    /// never permission to reinterpret this request as a legacy validation.
+    pub(crate) hard_hard_pair: Option<HardHardValidationScope>,
     pub(crate) request_id: u16,
     pub(crate) generation: u64,
     pub(crate) peer_session_generation: PeerSessionGeneration,
@@ -710,6 +713,10 @@ pub(crate) struct DirectValidationExpectation {
 /// `dynamic_sockets` and `peer_socket_affinity` maps and ABBA deadlocks are
 /// impossible by construction.
 pub(crate) struct SocketState {
+    /// Immutable mode stamps survive detach while an exact Arc is in flight.
+    /// Weak references do not retain sockets; enabling fails closed at 256
+    /// live stamps instead of evicting a stamp still used by an old sender.
+    pub(crate) hard_hard_pair_modes: HashMap<usize, HardHardSocketMode>,
     pub(crate) dynamic: HashMap<usize, DynamicPunchSocket>,
     pub(crate) affinity: HashMap<String, PeerSocketPin>,
     /// Monotonic evidence counter. Every affinity adoption and every
@@ -874,6 +881,8 @@ pub(crate) const DYNAMIC_SOCKET_LEASE_DRAIN_TIMEOUT: Duration = Duration::from_s
 /// abandoned for a different socket.
 #[derive(Debug)]
 pub(crate) struct DynamicPunchSocket {
+    pub(crate) hard_hard_pair_required: bool,
+    pub(crate) hard_hard_committed_remote: Option<SocketAddr>,
     pub(crate) socket_index: usize,
     pub(crate) socket: Arc<UdpSocket>,
     pub(crate) peer_id: String,
@@ -1055,7 +1064,8 @@ impl DynamicSocketPhase {
 
 impl DynamicPunchSocket {
     pub(crate) fn permits_ordinary_traffic(&self) -> bool {
-        !self.hard_hard_exclusive || self.authenticated_evidence > 0
+        (!self.hard_hard_exclusive || self.authenticated_evidence > 0)
+            && (!self.hard_hard_pair_required || self.hard_hard_committed_remote.is_some())
     }
 
     pub(crate) fn local_endpoint(&self) -> Option<SocketAddr> {
@@ -1191,6 +1201,8 @@ pub(crate) enum FreshMappingRejection {
     PublicIpChanged,
     /// The port sequence had no consistent linear behavior.
     UnpredictableSequence,
+    /// A physical allocation-changing send had no final observed response.
+    UnobservedAllocation,
     /// The dedicated socket could not be bound.
     BindFailed,
     /// The dynamic socket cap had no safely evictable entry, so the new
@@ -1216,6 +1228,7 @@ impl FreshMappingRejection {
             Self::BatchStale => "batch_stale",
             Self::PublicIpChanged => "public_ip_changed",
             Self::UnpredictableSequence => "unpredictable_sequence",
+            Self::UnobservedAllocation => "allocation_unobserved_send",
             Self::BindFailed => "bind_failed",
             Self::CapacityRejected => "capacity_rejected",
             Self::MissingProbeKey => "missing_probe_key",
@@ -1522,6 +1535,8 @@ impl PendingProbe {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PendingProbePurpose {
     ConnectivityCheck,
+    HardHardNomination,
+    HardHardTriggeredCheck,
     ConsentCheck,
     RelayBackoffHeartbeat,
 }

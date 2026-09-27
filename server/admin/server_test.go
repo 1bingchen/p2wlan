@@ -2,6 +2,7 @@ package admin
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io/fs"
@@ -17,6 +18,32 @@ import (
 )
 
 type fakeStore struct{}
+
+func (s fakeStore) AdminAccountSummary(_ context.Context, id string) (*database.AdminAccountSummaryResponse, error) {
+	detail, err := s.AdminAccount(id)
+	if err != nil {
+		return nil, err
+	}
+	return &database.AdminAccountSummaryResponse{Account: detail.Account}, nil
+}
+
+func (s fakeStore) AdminNetworksFiltered(_ context.Context, _ database.AdminResourceFilter, limit, offset int) (*database.AdminNetworkPage, error) {
+	return s.AdminNetworks(limit, offset)
+}
+func (s fakeStore) AdminRoomsFiltered(_ context.Context, _ database.AdminResourceFilter, limit, offset int) (*database.AdminRoomPage, error) {
+	return s.AdminRooms(limit, offset)
+}
+func (s fakeStore) AdminDevicesCursorScoped(_ context.Context, query, status, cursor string, limit int, _ string) (*database.AdminDeviceCursorPage, error) {
+	return s.AdminDevicesCursor(query, status, cursor, limit)
+}
+func (s fakeStore) AdminTopologyNetwork(_ context.Context, network string, budget int) (*database.AdminTopologyPage, error) {
+	if network == "missing" {
+		return nil, database.ErrAdminNetworkNotFound
+	}
+	page, err := s.AdminTopologyPage("", 1, budget)
+	page.Scope, page.FocusNetworkID = "network", network
+	return page, err
+}
 
 func (fakeStore) AdminOverviewSnapshot() (*database.AdminOverview, error) {
 	return &database.AdminOverview{

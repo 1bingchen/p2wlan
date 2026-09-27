@@ -220,6 +220,7 @@ impl PeerManager {
         for key in expired_keys {
             if let Some(existing) = sessions.get_mut(&key) {
                 existing.state = HardHardSessionState::Retiring;
+                existing.cancellation.cancel_for_hard_hard_cleanup();
                 retired_winners.push((existing.peer_id.clone(), existing.session_token.clone()));
                 cancelled.push(existing.cancellation.clone());
             }
@@ -246,6 +247,7 @@ impl PeerManager {
             for old_key in replaced_keys {
                 if let Some(existing) = sessions.get_mut(&old_key) {
                     existing.state = HardHardSessionState::Retiring;
+                    existing.cancellation.cancel_for_hard_hard_cleanup();
                     retired_winners
                         .push((existing.peer_id.clone(), existing.session_token.clone()));
                     cancelled.push(existing.cancellation.clone());
@@ -264,6 +266,7 @@ impl PeerManager {
                 {
                     if let Some(existing) = sessions.get_mut(&oldest_key) {
                         existing.state = HardHardSessionState::Retiring;
+                        existing.cancellation.cancel_for_hard_hard_cleanup();
                         retired_winners
                             .push((existing.peer_id.clone(), existing.session_token.clone()));
                         cancelled.push(existing.cancellation.clone());
@@ -423,8 +426,10 @@ impl PeerManager {
     /// the time its terminal report is committed, so this intentionally does
     /// not require an uncancelled token. Replacement and retiring sessions
     /// still fail closed through the exact token and generation identities.
+    /// The outer option admits the report; the inner option captures its
+    /// negotiated strategy from the same snapshot (None for legacy attempts).
     #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn hard_hard_attempt_report_identity_is_current(
+    pub(crate) async fn hard_hard_attempt_report_strategy_if_current(
         &self,
         peer_id: &str,
         token: &str,
@@ -433,7 +438,7 @@ impl PeerManager {
         punch_generation: u64,
         socket_index: usize,
         attempt: u8,
-    ) -> bool {
+    ) -> Option<Option<HardHardProbeStrategy>> {
         self.hard_hard_sessions
             .lock()
             .await
@@ -443,12 +448,18 @@ impl PeerManager {
                     && record.session_token == token
                     && record.state != HardHardSessionState::Retiring
             })
-            .is_some_and(|(_, session)| {
+            .filter(|(_, session)| {
                 session.local_network_generation == network_generation
                     && session.remote_candidate_epoch == remote_candidate_epoch
                     && session.fresh_socket.punch_generation == punch_generation
                     && session.fresh_socket.socket_index == socket_index
                     && session.attempt_count == attempt
+            })
+            .map(|(_, session)| {
+                session
+                    .coordinated_plan
+                    .as_ref()
+                    .and_then(|plan| plan.agreement.map(|agreement| agreement.strategy))
             })
     }
 
@@ -487,6 +498,13 @@ impl PeerManager {
                     || (!record.initiator && record.state == HardHardSessionState::AwaitingPeer))
         })?;
         let mut winners = self.hard_hard_winners.lock().await;
+        if record.pair_nomination.as_ref().is_some_and(|nomination| {
+            !nomination.selected.as_ref().is_some_and(|selection| {
+                selection.validated && selection.pair.socket_index == socket_index
+            })
+        }) {
+            return None;
+        }
         if let Some(existing) = winners.get(&key) {
             if *existing != socket_index {
                 return None;
@@ -766,6 +784,12 @@ impl PeerManager {
         if record.state != HardHardSessionState::AwaitingPeer || record.attempt_count >= 1 {
             return None;
         }
+        if let Some(plan) = record.coordinated_plan.as_ref() {
+            if !plan.ready(record.initiator) {
+                return None;
+            }
+            record.birthday = plan.agreement?.strategy != HardHardProbeStrategy::Predictable;
+        }
         if record.remote_network_generation != 0
             && remote_network_generation != 0
             && record.remote_network_generation != remote_network_generation
@@ -801,6 +825,9 @@ impl PeerManager {
                 return false;
             };
             record.state = HardHardSessionState::Retiring;
+            // Publish revocation before waiting for winner bookkeeping. A
+            // final syscall may only have the owner's immutable permit.
+            record.cancellation.cancel_for_hard_hard_cleanup();
             record.cancellation.clone()
         };
         self.hard_hard_winners
@@ -941,6 +968,7 @@ impl PeerManager {
             if let Some(record) = sessions.get_mut(&key) {
                 if record.state != HardHardSessionState::Retiring {
                     record.state = HardHardSessionState::Retiring;
+                    record.cancellation.cancel_for_hard_hard_cleanup();
                     cancellations.push(record.cancellation.clone());
                 }
             }
@@ -956,3 +984,5 @@ impl PeerManager {
         }
     }
 }
+
+include!("hard_hard_pair.rs");

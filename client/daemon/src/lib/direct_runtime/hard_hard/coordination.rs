@@ -104,6 +104,7 @@ pub(crate) enum HardHardRole {
 /// authentication primitive.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct HardHardCoordination {
+    pub(crate) v2: Option<HardHardV2Envelope>,
     pub(crate) role: HardHardRole,
     pub(crate) token: String,
     pub(crate) local_network_generation: u64,
@@ -125,10 +126,14 @@ pub(crate) struct HardHardCoordination {
 
 impl HardHardCoordination {
     pub(crate) fn looks_like(value: &str) -> bool {
-        value.starts_with("hh1:")
+        // Reserve the whole numeric version namespace. Unknown HH versions
+        // must be rejected, never treated as an ordinary fresh offer.
+        value.split_once(':').is_some_and(|(prefix, _)| prefix.strip_prefix("hh")
+            .is_some_and(|version| !version.is_empty() && version.bytes().all(|c| c.is_ascii_digit())))
     }
 
     pub(crate) fn parse(value: &str) -> Option<Self> {
+        if value.starts_with("hh2:") { return Self::parse_v2(value); }
         let mut fields = value.split(':');
         if fields.next()? != HARD_HARD_SESSION_PREFIX {
             return None;
@@ -173,6 +178,7 @@ impl HardHardCoordination {
             return None;
         }
         Some(Self {
+            v2: None,
             role,
             token,
             local_network_generation,
@@ -188,6 +194,11 @@ impl HardHardCoordination {
     }
 
     fn encode(&self) -> String {
+        if let Some(meta) = &self.v2 {
+            // Keep malformed internal input in the reserved namespace. Every
+            // sender checks the encoded envelope before publishing it.
+            return self.encode_v2(meta).unwrap_or_else(|| "hh2:invalid".to_string());
+        }
         format!(
             "{HARD_HARD_SESSION_PREFIX}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
             match self.role {
@@ -214,6 +225,16 @@ impl HardHardCoordination {
         local_prediction_model: String,
     ) -> Self {
         Self {
+            v2: self.v2.as_ref().map(|offer| HardHardV2Envelope {
+                stage: HardHardV2Stage::Answer,
+                local: crate::peer::HardHardOfferParameters::default(),
+                remote: offer.local,
+                phase: offer.phase,
+                strategy_order: offer.strategy_order,
+                agreement: None,
+                rtt_ms: 0,
+                uncertainty_ms: 0,
+            }),
             role: HardHardRole::Responder,
             token: self.token.clone(),
             local_network_generation: snapshot.local_network_generation,
@@ -251,6 +272,7 @@ fn hard_hard_coordination_from_plan(
     plan: crate::peer::HardHardPlanSnapshot,
 ) -> HardHardCoordination {
     HardHardCoordination {
+        v2: None,
         role,
         token,
         local_network_generation: plan.local_network_generation,

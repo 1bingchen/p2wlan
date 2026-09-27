@@ -53,6 +53,7 @@ type AdminTopology struct {
 	GraphKind                string              `json:"graph_kind"`
 	Scope                    string              `json:"scope"`
 	FocusAccountID           string              `json:"focus_account_id,omitempty"`
+	FocusNetworkID           string              `json:"focus_network_id,omitempty"`
 	PathObservationAvailable bool                `json:"path_observation_available"`
 	PathObservationNote      string              `json:"path_observation_note"`
 	Nodes                    []AdminTopologyNode `json:"nodes"`

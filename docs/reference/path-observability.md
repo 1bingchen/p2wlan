@@ -42,11 +42,13 @@ control_reconnect_counter_survives_timeline_eviction 是必须保持的回归契
 
 `/status` 的 `peers[].direct_events[]` 在 `stage=hard_hard_attempt_report` 时携带 schema 2 的 `hard_hard_attempt`。它是现有会话状态所有者导出的只读终态记录，不参与候选排序、发送准入、路径选择或取消判定。写入前会再次核对 network generation、peer session generation、remote candidate epoch、profile generation、punch generation、socket index、session token 和 attempt；旧会话的迟到结果不会记到新会话。`plan_tag` 仅用于把同一会话的单个 rendezvous 计划在两端配对，与 `session_tag` 分离。
 
+`mode` 表示当前会话实际协商的 `fixed_anchor`、`predictable` 或 `birthday`；兼容流程保留其原有模式值。模式来自同一会话的权威计划，不能仅凭 socket 数推断。
+
 身份字段包含构建源码、比较基线、build ID、实验 variant/scenario/seed、角色与 attempt。原始 session、IP 和端口不进入结构化记录；`session_tag` 与 `target_order_tags` 是会话加盐的短 SHA-256 标签，只用于同一 attempt 内关联和保留候选顺序，不能当作跨会话身份。
 
 候选与发送成本保持不同口径：
 
-- `requested`、`generated`、`unique`、`advertised` 分别表示请求、模型输出、去重和本端已交给信令 API 的候选数。`parsed_targets_for_plan` 只表示到达本端并解析后进入该计划的目标数；它不是信令原始接收量，也不表示解析前数量或裁剪前数量；
+- `requested`、`generated`、`unique`、`advertised` 分别表示请求、模型输出、去重和本端已提交且获得发布接受证据的候选数。`parsed_targets_for_plan` 只表示到达本端并解析后进入该计划的目标数；它不是信令原始接收量，也不表示解析前数量或裁剪前数量；
 - `planned_targets`、`planned_sockets`、`planned_socket_target_combinations`、`planned_logical_probes` 与 `planned_physical_datagram_cap` 描述有界计划；
 - `attempted_targets` 是至少收到一次逻辑探测的唯一远端目标数；重复波次由 `logical_probes_attempted`、`logical_probes_sent` 单独计数；
 - `send_success_datagrams` / `send_success_bytes` 与 send-error 字段描述实际 UDP 系统调用结果。一个逻辑探测可能带一个有界兼容副本，因此物理 datagram 数不能从候选数推导；
@@ -55,7 +57,7 @@ control_reconnect_counter_survives_timeline_eviction 是必须保持的回归契
 
 `target_order_tags` 保留实际目标顺序，重复目标仍重复出现；`confirmed_target_rank` 在加密验证选中的远端地址属于该计划时记录其从 0 开始的位置，不暴露地址，空值表示未确认 Direct 或确认的是计划外学习地址。`candidate_cap` 与 `truncation_reason` 说明裁剪边界。分类包括 `measurement_insufficient`、`model_unpredictable`、`budget_rejected`、`send_error`、`missed_schedule`、`candidate_not_executed`、`no_response`、`probe_hit_validation_failed`、`cancelled_generation_changed`、`encrypted_validation_completed` 和证据不足时的 `unknown`。最后一个验证阶段不是业务成功；采集器只有在真实业务 ingress 存在时才派生 `direct_business_succeeded`。探测命中不等于加密验证，验证也不等于业务已可用。
 
-时间字段全部来自同一 daemon 进程的单调时钟。`candidate_signal_accepted_at_ms` 只表示本端信令 API 接受 offer，不证明服务端持久化、对端收到信号或双方完成交换。`probe_last_hit_at_ms` 与 `probe_last_hit_source` 表示验证前最后一次认证 Probe 或匹配 ACK，不是首次命中。`measurement_age_at_send_ms`、`measurement_to_first_send_ms`、`last_probe_hit_to_validation_ms` 使用非负差值；缺时间或顺序逆置时为空，不把异常压成零。它们分别描述测量新鲜度、测量到首发、最后命中到验证。
+时间字段全部来自同一 daemon 进程的单调时钟。`planned_send_at_ms` 在 `hh2` 完成最终首发协商时更新为约定时间，发送偏差不再与此前的最晚截止比较。`candidate_signal_accepted_at_ms` 表示本端发布流程获得接受证据的观察时刻：证据可以是信令 API 成功返回，也可以是同一 `hh2` 轮次已通过身份检查的后续消息。它不是服务端持久化或对端实际接收的时间戳，也不表示双方已经完成整个交换，不能用它计算 HTTP RTT。`probe_last_hit_at_ms` 与 `probe_last_hit_source` 表示验证前最后一次认证 Probe 或匹配 ACK，不是首次命中。`measurement_age_at_send_ms`、`measurement_to_first_send_ms`、`last_probe_hit_to_validation_ms` 使用非负差值；缺时间或顺序逆置时为空，不把异常压成零。它们分别描述测量新鲜度、测量到首发、最后命中到验证。最终 SYNC_ACK 的本地入队、服务端接受与对端实际接收是不同证据；本地入队不会授予 Direct，也不能单独作为无响应策略失败的依据。
 
 矩阵采集器只在验证 session、Direct commit sequence、transport instance 和 socket index 全部与对应 timeline 事件一致时，才把业务里程碑归给该 attempt。仅有 peer/network generation，或任一身份字段缺失/不匹配时，`business_ready_at_ms`、`first_business_success_at_ms` 和派生的 `validation_to_first_business_ms` 保持未知并标为 `not_attributable`；不从同 generation 的其他 attempt 回填。`connection_to_first_business_ms` 目前缺少可与该 attempt 精确关联的连接开始身份，因此保持未知。请求级真实双向业务证据仍由既有 `first_usable_summaries` 判定，两种统计口径不得互相替代。
 

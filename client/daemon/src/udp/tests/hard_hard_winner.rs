@@ -17,19 +17,30 @@ impl WinnerFixture {
     }
 
     async fn with_role(initiator: bool) -> Self {
+        Self::with_protocol(initiator, false).await
+    }
+
+    async fn with_protocol(initiator: bool, hh2: bool) -> Self {
         let local = NodeIdentity::generate();
         let remote_identity = NodeIdentity::generate();
         let remote = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let endpoint = remote.local_addr().unwrap();
         let peers = Arc::new(PeerManager::new(config_for_identity(&local, "peer-a")));
-        peers
-            .add_peer(&peer_with_public_key(
-                "peer-b",
-                "10.20.0.2",
-                hex::encode(remote_identity.public_key()),
-                Some(endpoint),
-            ))
-            .await;
+        let mut peer = peer_with_public_key(
+            "peer-b",
+            "10.20.0.2",
+            hex::encode(remote_identity.public_key()),
+            Some(endpoint),
+        );
+        if hh2 {
+            peer.registration_seq = 1;
+            peer.capabilities = crate::control::PeerCapabilities {
+                hh2_pair_nomination: true,
+                hh2_plan_v2: true,
+            };
+            peer.nat_type = "p2v2:m=address_or_port_dependent;a=linear;d=4;c=90;f=address_dependent;h=unknown;g=1".into();
+        }
+        peers.add_peer(&peer).await;
         peers
             .update_nat_profile(hard_nat_profile().await.nat_profile)
             .await;
@@ -78,6 +89,8 @@ impl WinnerFixture {
         assert!(
             peers
                 .hard_hard_register_session(crate::peer::HardHardSessionRecord {
+                    pair_nomination: hh2.then(crate::peer::HardHardPairNomination::default),
+                    coordinated_plan: None,
                     session_id: "winner-cleanup-session".into(),
                     probe_session_id: None,
                     session_token: TOKEN.into(),
@@ -87,7 +100,7 @@ impl WinnerFixture {
                     local_network_generation: 0,
                     remote_candidate_epoch: epoch,
                     local_profile_generation: profile_generation,
-                    remote_profile_generation: 0,
+                    remote_profile_generation: if hh2 { 1 } else { 0 },
                     local_prediction_confidence: 90,
                     remote_prediction_confidence: 90,
                     requested_birthday_level: 64,
@@ -104,7 +117,7 @@ impl WinnerFixture {
                         network_generation: 0,
                         remote_candidate_epoch: epoch,
                         local_profile_generation: profile_generation,
-                        remote_profile_generation: 0,
+                        remote_profile_generation: if hh2 { 1 } else { 0 },
                         punch_generation: 1,
                         socket_index: indices[0],
                         socket_local_endpoint: sockets[0].local_addr().unwrap(),
@@ -119,6 +132,9 @@ impl WinnerFixture {
                 })
                 .await
         );
+        if hh2 {
+            assert!(udp.enable_hard_hard_pair_sockets("peer-b", TOKEN).await);
+        }
         Self {
             peers,
             udp,
@@ -171,6 +187,9 @@ impl WinnerFixture {
             .await;
     }
 }
+
+#[path = "hard_hard_pair.rs"]
+mod pair_nomination;
 
 // Real loopback I/O must use the real clock: a paused Tokio clock can jump
 // directly to the timeout before the OS reports socket readiness. The held

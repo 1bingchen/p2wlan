@@ -129,6 +129,33 @@ impl PeerManager {
         expected_remote_candidate_epoch: Option<u64>,
         validation_identity: Option<DirectValidationIdentity>,
     ) -> bool {
+        self.record_direct_success_with_commit_hooks(
+            _epoch_guard,
+            node_id,
+            endpoint,
+            generation,
+            local_endpoint,
+            validation_latency,
+            expected_remote_candidate_epoch,
+            validation_identity,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn record_direct_success_with_commit_hooks(
+        &self,
+        _epoch_guard: &tokio::sync::MutexGuard<'_, ()>,
+        node_id: &str,
+        endpoint: Option<SocketAddr>,
+        generation: u64,
+        local_endpoint: Option<SocketAddr>,
+        validation_latency: Option<Duration>,
+        expected_remote_candidate_epoch: Option<u64>,
+        validation_identity: Option<DirectValidationIdentity>,
+        mut hooks: Option<&mut (dyn DirectCommitHooks + Send)>,
+    ) -> bool {
         // The lock-free mirror is written while this very gate is held by a
         // generation advance.  Reading it here therefore cannot race an
         // advance between validation and mutation.
@@ -214,6 +241,9 @@ impl PeerManager {
             let previous_endpoint = conn.endpoint;
             let previous_generation = conn.direct_generation;
             let mut pair_success = None;
+            if hooks.as_ref().is_some_and(|hooks| !hooks.is_current()) {
+                return false;
+            }
             let outcome = conn.commit_path_transition(
                 PathEvent::DirectCommitted {
                     validation: validation_identity,
@@ -275,9 +305,9 @@ impl PeerManager {
                     conn.clear_direct_reclaim_window();
                     self.publish_direct_commit_pair(
                         node_id,
-                        generation,
-                        conn.remote_candidate_epoch(),
+                        validation_identity.epoch,
                         local_endpoint,
+                        selected_endpoint_value,
                     );
                     // Publish the Direct-set mirror before waking confirmation
                     // waiters. The pair snapshot and the active-state bit must be
@@ -419,8 +449,15 @@ impl PeerManager {
                             }
                         }
                     }
+                    if let Some(hooks) = hooks.as_mut() { hooks.committed(); }
                 },
             );
+            // commit_path_transition publishes Direct/business mirrors after
+            // the side-effect closure. The exact UDP guards must span that
+            // publication, but never the registry awaits below.
+            if let Some(hooks) = hooks.as_mut() {
+                hooks.finish();
+            }
             if !outcome.accepted() {
                 return false;
             }

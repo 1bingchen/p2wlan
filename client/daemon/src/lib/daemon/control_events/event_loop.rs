@@ -323,7 +323,7 @@ impl Daemon {
                             )),
                         );
                         let peers = self.peers.clone();
-                        await_peer_lifecycle_commit_while_driving_work(
+                        let update = await_peer_lifecycle_commit_while_driving_work(
                             daemon,
                             peers.add_peer(&peer_info),
                             &mut slow_work,
@@ -333,6 +333,15 @@ impl Daemon {
                             &mut deferred_initiators,
                         )
                         .await;
+                        // A delayed registration snapshot can appear as a join
+                        // after PeerLeft. The peer owner rejected it; do not
+                        // restart traversal or publish routing from its payload.
+                        if update.last_seen_only {
+                            if let Some(receipt) = signal_delivery_receipt.take() {
+                                receipt.complete(control::SignalApplyOutcome::Applied);
+                            }
+                            continue;
+                        }
                         let peer_state_elapsed = peer_join_started.elapsed();
                         if peer_state_elapsed >= Duration::from_millis(250) {
                             warn!(
@@ -540,19 +549,6 @@ impl Daemon {
                                 self.peers.peer_session_generation_sync(&peer_info.node_id).map(|generation| generation.value())
                             );
                         }
-                        let peer_rejoined = update.was_offline && peer_info.online;
-                        match previous_peer_session_generation {
-                            Some(previous_generation)
-                                if !peer_info.online
-                                    || update.public_key_changed
-                                    || update.virtual_ip_changed
-                                    || peer_rejoined =>
-                            {
-                                self.punch_attempts
-                                    .retire_peer_session(&peer_info.node_id, previous_generation);
-                            }
-                            _ => {}
-                        }
                         if update.last_seen_only {
                             // The roster heartbeat must reach diagnostics, but it
                             // is not new connectivity evidence. Starting another
@@ -562,6 +558,20 @@ impl Daemon {
                                 receipt.complete(control::SignalApplyOutcome::Applied);
                             }
                             continue;
+                        }
+                        let peer_rejoined = update.was_offline && peer_info.online;
+                        match previous_peer_session_generation {
+                            Some(previous_generation)
+                                if !peer_info.online
+                                    || update.public_key_changed
+                                    || update.virtual_ip_changed
+                                    || update.registration_changed
+                                    || peer_rejoined =>
+                            {
+                                self.punch_attempts
+                                    .retire_peer_session(&peer_info.node_id, previous_generation);
+                            }
+                            _ => {}
                         }
                         if !peer_info.online {
                             remove_deferred_initiator_handshake(
@@ -623,7 +633,7 @@ impl Daemon {
                             }
                             continue;
                         }
-                        if update.public_key_changed || peer_rejoined || update.virtual_ip_changed {
+                        if update.public_key_changed || peer_rejoined || update.virtual_ip_changed || update.registration_changed {
                             remove_deferred_initiator_handshake(
                                 &mut deferred_initiators,
                                 &peer_info.node_id,
@@ -632,6 +642,8 @@ impl Daemon {
                                 ("peer_address_changed", "control_events.peer_updated_address")
                             } else if peer_rejoined {
                                 ("peer_rejoined", "control_events.peer_updated_rejoined")
+                            } else if update.registration_changed {
+                                ("peer_registration_changed", "control_events.peer_updated_registration")
                             } else {
                                 (
                                     "public_key_changed",
@@ -654,6 +666,11 @@ impl Daemon {
                             } else if peer_rejoined {
                                 info!(
                                     "Peer {} rejoined after going offline; discarded the old WireGuard session and UDP lifecycle",
+                                    peer_info.node_id
+                                );
+                            } else if update.registration_changed {
+                                info!(
+                                    "Peer {} registration changed; discarded the old WireGuard session and UDP lifecycle",
                                     peer_info.node_id
                                 );
                             } else {
@@ -993,6 +1010,36 @@ impl Daemon {
                             if let Some(receipt) = delivery_receipt.as_ref() {
                                 receipt.complete(control::SignalApplyOutcome::TerminalRejected);
                             }
+                            continue;
+                        }
+
+                        // Reserved HH versions must be rejected before any
+                        // candidate-generation mutation or owner replacement.
+                        if session_id.as_deref().is_some_and(|session|
+                            HardHardCoordination::looks_like(session) && HardHardCoordination::parse(session).is_none()) {
+                            self.peers.record_direct_event_non_queuing(&from_node_id,
+                                "hard_hard_session_rejected", None, None, None,
+                                "reason=malformed_or_unsupported_hard_hard_envelope".to_string());
+                            if let Some(receipt) = delivery_receipt.as_ref() {
+                                receipt.complete(control::SignalApplyOutcome::TerminalRejected);
+                            }
+                            continue;
+                        }
+                        if let Some(coordination) = session_id.as_deref().and_then(HardHardCoordination::parse)
+                            .filter(|envelope| envelope.v2.as_ref().is_some_and(|meta|
+                                meta.stage.is_barrier()))
+                        {
+                            let outcome = if !peer_known || !peer_online || !identity_matches || !handshake_init.is_empty() {
+                                control::SignalApplyOutcome::TerminalRejected
+                            } else {
+                                match tokio::time::timeout(Duration::from_millis(50),
+                                    self.accept_hard_hard_ready_signal(&from_node_id, &coordination, &candidates, punch_at_server_ms)).await {
+                                    Ok(true) => control::SignalApplyOutcome::Applied,
+                                    Ok(false) => control::SignalApplyOutcome::TerminalRejected,
+                                    Err(_) => control::SignalApplyOutcome::Retry,
+                                }
+                            };
+                            if let Some(receipt) = delivery_receipt.as_ref() { receipt.complete(outcome); }
                             continue;
                         }
 

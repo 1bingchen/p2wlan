@@ -1,6 +1,7 @@
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn poll_peers(
     http: &reqwest::Client,
+    http_pool_id: u64,
     base_url: &str,
     token: &str,
     config: &Config,
@@ -9,7 +10,10 @@ pub(super) async fn poll_peers(
     state: &Arc<RwLock<ClientState>>,
     event_tx: &mpsc::UnboundedSender<ControlEvent>,
 ) -> Result<()> {
+    let server_clock = state.read().await.server_clock.clone();
+    let timing_identity = server_clock.request_identity(registration_seq, http_pool_id);
     let request_started = std::time::Instant::now();
+    let sent_wall_ms = unix_time_millis();
     let res = with_registration_sequence(
         http.get(format!(
             "{base_url}/api/v1/nodes?network_id={}",
@@ -22,6 +26,10 @@ pub(super) async fn poll_peers(
     .send()
     .await
     .map_err(|e| DaemonError::ControlPlane(format!("list nodes request failed: {e}")))?;
+
+    let received_at = std::time::Instant::now();
+    let received_wall_ms = unix_time_millis();
+    let request_elapsed = received_at.saturating_duration_since(request_started);
 
     if !res.status().is_success() {
         let status = res.status();
@@ -42,6 +50,18 @@ pub(super) async fn poll_peers(
         .await
         .map_err(|e| DaemonError::ControlPlane(format!("list nodes decode failed: {e}")))?;
 
+    if let (Some(identity), Some(server_time_ms)) = (timing_identity, body.server_time_ms) {
+        server_clock.observe_short_request(
+            identity,
+            server_time_ms,
+            sent_wall_ms,
+            received_wall_ms,
+            request_elapsed,
+            received_at,
+        );
+    } else {
+        server_clock.clear_timing();
+    }
     let room_authorization = state.read().await.room_authorization.clone();
     if room_authorization.enabled() {
         let local = body
@@ -89,6 +109,8 @@ pub(super) async fn poll_peers(
                 node_id: node.id.clone(),
                 device_name: node.device_name,
                 app_version: node.app_version,
+                capabilities: node.capabilities,
+                registration_seq: node.registration_seq,
                 public_key: node.public_key,
                 endpoint: node.endpoint,
                 nat_type: node.nat_type,
@@ -98,6 +120,14 @@ pub(super) async fn poll_peers(
                 relay_rtt_ms: node.relay_rtt_ms,
             };
 
+            if let Some(known) = state.peers.get(&peer.node_id) {
+                if known.public_key == peer.public_key
+                    && known.registration_seq > peer.registration_seq
+                {
+                    seen.insert(known.node_id.clone(), known.clone());
+                    continue;
+                }
+            }
             seen.insert(peer.node_id.clone(), peer.clone());
             match state.peers.get(&peer.node_id) {
                 Some(known) if peer_metadata_changed(known, &peer) => updated.push(peer.clone()),
@@ -157,6 +187,8 @@ pub(super) async fn poll_peers(
 pub(super) fn peer_metadata_changed(known: &PeerInfo, peer: &PeerInfo) -> bool {
     known.device_name != peer.device_name
         || known.app_version != peer.app_version
+        || known.capabilities != peer.capabilities
+        || known.registration_seq != peer.registration_seq
         || known.public_key != peer.public_key
         || known.endpoint != peer.endpoint
         || known.nat_type != peer.nat_type

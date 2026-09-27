@@ -190,3 +190,7 @@ include!("tests/peers.rs");
 include!("tests/messages.rs");
 include!("tests/client.rs");
 include!("tests/commands.rs");
+
+include!("tests/capabilities.rs");
+include!("tests/hard_hard_signal.rs");
+include!("tests/hard_hard_signal_retry.rs");

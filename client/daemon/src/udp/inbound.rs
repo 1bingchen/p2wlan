@@ -385,6 +385,55 @@ impl UdpTransport {
                     );
                     continue;
                 }
+                let socket_mode = self.hard_hard_socket_mode(socket_index).await;
+                let committed_ordinary = socket_mode
+                    .as_ref()
+                    .is_some_and(|mode| mode.peer == identity.source_node_id)
+                    && self
+                        .hard_hard_committed_socket_matches(
+                            &identity.source_node_id,
+                            socket_index,
+                            source,
+                        )
+                        .await;
+                let socket_token = self.hard_hard_socket_token(socket_index).await;
+                let hh2_token = if let Some(mode) = socket_mode {
+                    if mode.peer != identity.source_node_id {
+                        continue;
+                    }
+                    if self
+                        .peers
+                        .hard_hard_pair_is_enabled(&identity.source_node_id, &mode.token)
+                        .await
+                    {
+                        Some(mode.token)
+                    } else if committed_ordinary {
+                        None
+                    } else {
+                        continue;
+                    }
+                } else if let Some(token) = socket_token.as_deref() {
+                    match self
+                        .peers
+                        .hard_hard_session_by_token(&identity.source_node_id, token)
+                        .await
+                    {
+                        Some(record) if record.pair_nomination.is_some() => continue,
+                        None if self
+                            .socket_state
+                            .lock()
+                            .await
+                            .dynamic
+                            .get(&socket_index)
+                            .is_some_and(|entry| !entry.permits_ordinary_traffic()) =>
+                        {
+                            continue
+                        }
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
                 let key_candidates = self
                     .peers
                     .probe_key_candidates_for_peer(&identity.source_node_id)
@@ -401,10 +450,28 @@ impl UdpTransport {
                     );
                     continue;
                 }
-                let Some((packet, key_candidate)) =
-                    key_candidates.into_iter().find_map(|candidate| {
+                let Some((packet, key_candidate, scoped_hh2)) =
+                    key_candidates.into_iter().find_map(|mut candidate| {
+                        if let Some(token) = hh2_token.as_deref() {
+                            // HH cannot commit a pending WireGuard rekey by
+                            // bypassing its existing adoption transaction.
+                            if candidate.role != ProbeKeyRole::Active {
+                                return None;
+                            }
+                            let scoped_key =
+                                crate::peer::hard_hard_scoped_probe_key(&candidate.key, token);
+                            if let Some(packet) =
+                                decode_authenticated_punch_packet(data, &scoped_key)
+                            {
+                                candidate.key = scoped_key;
+                                return Some((packet, candidate, true));
+                            }
+                            if !committed_ordinary {
+                                return None;
+                            }
+                        }
                         decode_authenticated_punch_packet(data, &candidate.key)
-                            .map(|packet| (packet, candidate))
+                            .map(|packet| (packet, candidate, false))
                     })
                 else {
                     self.update_socket_diagnostics(socket_index, |metrics| {
@@ -425,6 +492,21 @@ impl UdpTransport {
                 let matched_probe_session_id = key_candidate.session_id.clone();
                 let peer_session_generation = key_candidate.session_generation;
                 let key = key_candidate.key;
+                if let Some(token) = hh2_token.as_deref().filter(|_| scoped_hh2) {
+                    self.handle_hard_hard_pair_packet(
+                        &identity.source_node_id,
+                        token,
+                        &packet,
+                        &key,
+                        peer_session_generation,
+                        matched_probe_session_id.as_deref(),
+                        socket_index,
+                        &socket,
+                        source,
+                    )
+                    .await;
+                    continue;
+                }
                 #[cfg(test)]
                 let authenticated_probe_verify_gate = self
                     .peers
@@ -1119,17 +1201,13 @@ impl UdpTransport {
             }
 
             if let Some(packet) = legacy_punch {
+                // Mode outlives registry detach while a reader/lease still
+                // retains the Arc. Negotiated hh2 never needs PNCH-v1; even
+                // during ACK grace it must not answer or learn from one.
                 // A legacy datagram supplies no authenticated evidence and
                 // must neither consume a reserved mapping with an ACK nor
                 // unlock it through the legacy affinity-adoption path.
-                if self
-                    .socket_state
-                    .lock()
-                    .await
-                    .dynamic
-                    .get(&socket_index)
-                    .is_some_and(|entry| !entry.permits_ordinary_traffic())
-                {
+                if !self.permits_legacy_punch_on_socket(socket_index).await {
                     continue;
                 }
                 self.update_socket_diagnostics(socket_index, |metrics| {
@@ -1499,6 +1577,16 @@ impl UdpTransport {
                 continue;
             }
 
+            // A reserved hh2 reader cannot forward traffic from an unrelated
+            // tuple or an unprepared pair into WireGuard endpoint learning.
+            if let Some(mode) = self.hard_hard_socket_mode(socket_index).await {
+                if !self
+                    .hh2_validation_pair_matches(&mode.peer, socket_index, source)
+                    .await
+                {
+                    continue;
+                }
+            }
             // Raw encrypted UDP is NOT fresh affinity evidence. It is handed
             // to the transport queue without candidate scans, PeerManager
             // locks, or awaited diagnostics. Endpoint learning occurs only

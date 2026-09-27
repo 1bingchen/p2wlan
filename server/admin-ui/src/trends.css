@@ -1,17 +1,29 @@
 .connection-trends { min-width: 0; }
 .connection-trends > .panel-v2-header { gap: 16px; flex-wrap: wrap; }
-.trend-body { padding: 16px; display: grid; gap: 16px; }
-.trend-totals { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 14px; }
-.trend-totals > div { min-width: 0; display: grid; gap: 4px; }
-.trend-totals span, .trend-detail-note, .trend-semantics { color: var(--text-3); font-size: 12px; line-height: 1.6; }
-.trend-totals strong { color: var(--text); font-size: 22px; overflow-wrap: anywhere; font-variant-numeric: tabular-nums; }
-.trend-charts { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 16px; }
-.trend-chart { min-width: 0; border: 1px solid var(--border); padding: 14px 10px 6px; border-radius: 9px; background: var(--surface); }
+.trend-body { padding: 24px 28px; display: grid; gap: 28px; }
+.trend-totals { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 24px;
+  padding-bottom: 24px;
+  border-bottom: 1px solid var(--border);
+}
+.trend-totals > div { min-width: 0; display: grid; gap: 8px; }
+.trend-totals span, .trend-detail-note, .trend-semantics { color: var(--text-3); font-size: var(--font-caption, 12px); line-height: 1.6; }
+.trend-totals strong { color: var(--text); font-size: 30px; overflow-wrap: anywhere; font-variant-numeric: tabular-nums;
+  font-weight: 500;
+  line-height: 1.2;
+  letter-spacing: -.035em;
+}
+.trend-charts { display: grid; grid-template-columns: minmax(0, 1fr); gap: 28px; }
+.trend-chart { min-width: 0; border: 0; padding: 0; border-radius: 0; background: transparent; }
 .trend-chart:first-child { grid-column: 1 / -1; }
-.trend-chart-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; flex-wrap: wrap; padding: 0 4px 10px; }
-.trend-chart h3 { margin: 0; color: var(--text); font-size: 12px; }
-.trend-chart svg { display: block; width: 100%; min-height: 150px; }
-.trend-legend { display: flex; gap: 10px; flex-wrap: wrap; font-size: 11px; color: var(--text-2); }
+.trend-chart-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; flex-wrap: wrap; padding: 0 0 16px; }
+.trend-chart h3 { margin: 0; color: var(--text); font-size: var(--font-body, 14px);
+  font-weight: 550;
+}
+/* Match the SVG viewBox width so axis text never shrinks below 12px. */
+.trend-plot-scroll { max-width: 100%; overflow-x: auto; overscroll-behavior-x: contain; scrollbar-width: thin; }
+.trend-plot-scroll:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+.trend-plot-scroll svg { display: block; width: 100%; min-width: 708px; height: auto; }
+.trend-legend { display: flex; gap: 14px; flex-wrap: wrap; font-size: var(--font-caption, 12px); color: var(--text-2); }
 .trend-legend > span { display: inline-flex; align-items: center; gap: 5px; }
 .trend-key { width: 10px; height: 3px; display: inline-block; background: currentColor; }
 .trend-direct, .trend-average { color: #2587ce; }
@@ -23,26 +35,35 @@
 .trend-bar, .trend-line circle { fill: currentColor; }
 .trend-line polyline { fill: none; stroke: currentColor; stroke-width: 2; vector-effect: non-scaling-stroke; }
 .trend-p95 polyline, .trend-relay-failure polyline { stroke-dasharray: 4 3; }
-.trend-grid { stroke: var(--border); stroke-width: 1; }
+.trend-grid { stroke: var(--border); stroke-width: 1;
+  opacity: .7;
+}
 .trend-cursor { stroke: var(--text-3); stroke-dasharray: 3 4; stroke-width: 1; }
-.trend-axis { fill: var(--text-3); font-size: 11px; }
-.trend-overflow { fill: #9164d5; font-size: 10px; }
-.trend-hour-detail { display: grid; gap: 12px; padding: 14px; background: var(--surface-subtle); border: 1px solid var(--border); border-radius: 9px; }
-.trend-hour-detail label { display: flex; flex-wrap: wrap; gap: 8px 18px; justify-content: space-between; font-size: 12px; color: var(--text-2); }
+.trend-axis { fill: var(--text-3); font-size: var(--font-caption, 12px); }
+.trend-overflow { fill: #9164d5; font-size: var(--font-caption, 12px); }
+.trend-hour-detail { display: grid; gap: 16px; padding: 20px 22px; background: var(--surface-subtle); border: 0; border-radius: 10px; }
+.trend-hour-detail label { display: flex; flex-wrap: wrap; gap: 8px 18px; justify-content: space-between; font-size: var(--font-caption, 12px); color: var(--text-2); }
 .trend-hour-detail label strong { color: var(--text); font-variant-numeric: tabular-nums; }
-.trend-hour-detail input { width: 100%; margin: 0; min-height: 24px; accent-color: var(--accent); }
-.trend-hour-detail dl { margin: 0; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
-.trend-hour-detail dt { color: var(--text-3); font-size: 11px; }
-.trend-hour-detail dd { margin: 4px 0 0; color: var(--text); font-size: 13px; font-weight: 600; overflow-wrap: anywhere; font-variant-numeric: tabular-nums; }
-.trend-empty { display: flex; gap: 9px; align-items: center; padding: 12px; border: 1px dashed var(--border); border-radius: 8px; color: var(--text-3); font-size: 12px; line-height: 1.6; }
+.trend-hour-detail input { width: 100%; margin: 0; min-height: 44px; accent-color: var(--accent); }
+.trend-hour-detail dl { margin: 0; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 20px; }
+.trend-hour-detail dt { color: var(--text-3); font-size: var(--font-caption, 12px); }
+.trend-hour-detail dd { margin: 6px 0 0; color: var(--text); font-size: var(--font-body, 14px); font-weight: 500; overflow-wrap: anywhere; font-variant-numeric: tabular-nums; }
+.trend-empty { display: flex; gap: 9px; align-items: center; padding: 16px 0; border: 0; border-radius: 0; color: var(--text-3); font-size: var(--font-caption, 12px); line-height: 1.6; }
 .trend-empty svg { flex: 0 0 auto; }
 .trend-detail-note, .trend-semantics { margin: 0; }
-.trend-semantics { border-top: 1px solid var(--border); padding-top: 12px; }
-@media (max-width: 1050px) { .trend-charts { grid-template-columns: minmax(0, 1fr); } }
+.trend-semantics { border-top: 1px solid var(--border); padding-top: 20px; }
 @media (max-width: 650px) {
-  .trend-body { padding: 12px; }
-  .trend-totals { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .trend-body { padding: 20px;
+  gap: 24px;
+}
+  .trend-totals { grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 20px;
+}
   .trend-hour-detail dl { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-  .trend-chart { padding: 12px 2px 4px; }
-  .trend-chart svg { min-height: 120px; }
+  .trend-chart { padding: 0; }
+}
+
+@media (max-width: 650px) {
+  .trend-totals strong { font-size: 28px; }
+  .trend-hour-detail { padding: 18px 16px; }
 }

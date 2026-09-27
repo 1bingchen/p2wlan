@@ -29,6 +29,16 @@ impl WireGuardTransport {
         peer_session_generation: PeerSessionGeneration,
         token: crate::transport::DirectValidationToken,
     ) {
+        if let Some(udp) = udp {
+            if let (Some(index), Some(source)) = (socket_index, source) {
+                if !udp
+                    .hh2_validation_pair_matches(peer_id, index, source)
+                    .await
+                {
+                    return;
+                }
+            }
+        }
         match token.kind {
             crate::transport::DirectValidationKind::Request => {
                 let Some(source) = source else {
@@ -245,7 +255,7 @@ impl WireGuardTransport {
                             };
                             if let Some(receive_socket) = receive_socket {
                                 send_udp
-                                    .send_encrypted_packet_on_socket(
+                                    .send_direct_validation_packet_on_socket(
                                         &receive_socket,
                                         receive_socket_index,
                                         &encrypted,
@@ -529,6 +539,12 @@ impl WireGuardTransport {
                 };
 
                 let validation_latency = expectation.sent_at.map(|sent_at| sent_at.elapsed());
+                if !udp
+                    .mark_hh2_data_validated(peer_id, expectation.hard_hard_pair.as_ref())
+                    .await
+                {
+                    return;
+                }
                 let validation_rtt_ms =
                     validation_latency.map(|latency| latency.as_millis() as u64);
 
@@ -581,28 +597,64 @@ impl WireGuardTransport {
                 // expectation is the proof that this exact generation and
                 // owner initiated the request, and the promotion remains
                 // inside the epoch guard that made the check atomic.
-                let promoted = peers
-                    .record_direct_success_for_generation_with_local_endpoint_and_latency_in_epoch_for_remote_epoch(
+                let Ok(mut hh2_commit) = udp
+                    .prepare_hh2_direct_commit(
                         &epoch_guard,
                         peer_id,
-                        Some(source),
-                        expectation.generation,
-                        local_endpoint,
-                        validation_latency,
-                        Some(expectation.remote_candidate_epoch),
-                        Some(crate::peer::DirectValidationIdentity::authenticated_ack(
-                            crate::peer::PathEpoch::new(
-                                expectation.generation,
-                                expectation.peer_session_generation,
-                                expectation.remote_candidate_epoch,
-                            ),
-                            expectation.owner_token,
-                            expectation.request_id,
-                            expectation.endpoint,
-                            source,
-                        )),
+                        expectation.hard_hard_pair.as_ref(),
                     )
-                    .await;
+                    .await
+                else {
+                    if let Some(scope) = expectation.hard_hard_pair.as_ref() {
+                        peers
+                            .hard_hard_pair_validation_deferred(peer_id, &scope.token, &scope.pair)
+                            .await;
+                    }
+                    return;
+                };
+                let commit_deadline = hh2_commit.as_ref().map(|commit| commit.deadline);
+                let commit = peers.record_direct_success_with_commit_hooks(
+                    &epoch_guard,
+                    peer_id,
+                    Some(source),
+                    expectation.generation,
+                    local_endpoint,
+                    validation_latency,
+                    Some(expectation.remote_candidate_epoch),
+                    Some(crate::peer::DirectValidationIdentity::authenticated_ack(
+                        crate::peer::PathEpoch::new(
+                            expectation.generation,
+                            expectation.peer_session_generation,
+                            expectation.remote_candidate_epoch,
+                        ),
+                        expectation.owner_token,
+                        expectation.request_id,
+                        expectation.endpoint,
+                        source,
+                    )),
+                    hh2_commit
+                        .as_mut()
+                        .map(|commit| commit as &mut (dyn crate::peer::DirectCommitHooks + Send)),
+                );
+                let promoted = if let Some(deadline) = commit_deadline {
+                    tokio::time::timeout_at(deadline, commit)
+                        .await
+                        .unwrap_or(false)
+                } else {
+                    commit.await
+                };
+                // A timeout may occur in post-commit housekeeping. The
+                // synchronous hook already published every socket effect.
+                let promoted =
+                    promoted || hh2_commit.as_ref().is_some_and(|commit| commit.committed);
+                drop(hh2_commit);
+                if !promoted {
+                    if let Some(scope) = expectation.hard_hard_pair.as_ref() {
+                        peers
+                            .hard_hard_pair_validation_deferred(peer_id, &scope.token, &scope.pair)
+                            .await;
+                    }
+                }
                 let affinity_adopted = if promoted {
                     match socket_index {
                         Some(socket_index) => {

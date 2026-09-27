@@ -1,9 +1,10 @@
-import { useId, useState, type ReactNode } from 'react'
+import { useId, type ReactNode } from 'react'
 import { useQuery } from '@tanstack/react-query'
+import { useConnectionSearchParams } from './useConnectionSearch'
 import { Activity, CircleAlert } from 'lucide-react'
 import { getLocale, tr } from './i18n'
 import { QueryStatus, useAutoRefresh } from './refresh'
-import { bucketP95, connectionTrends, lineSegments, summarizeTrends, TREND_WINDOWS, type TrendBucket } from './trends'
+import { bucketP95, connectionTrends, lineSegments, readHealthSearch, summarizeTrends, TREND_WINDOWS, type TrendBucket } from './trends'
 import './trends.css'
 
 const CHART_WIDTH = 640
@@ -34,7 +35,8 @@ function ChartFrame({ title, legend, max, buckets, selectedIndex, onSelect, chil
   const titleId = useId()
   return <div className="trend-chart">
     <div className="trend-chart-heading"><h3 id={titleId}>{title}</h3><div className="trend-legend">{legend}</div></div>
-    <svg viewBox="0 0 708 192" role="img" aria-labelledby={titleId} onPointerMove={(event) => {
+    <div className="trend-plot-scroll" role="region" aria-labelledby={titleId} tabIndex={0}>
+    <svg viewBox="0 0 708 192" role="img" aria-labelledby={titleId} onClick={(event) => {
       const bounds = event.currentTarget.getBoundingClientRect()
       const x = (event.clientX - bounds.left) / bounds.width * 708 - PLOT_LEFT
       onSelect(Math.max(0, Math.min(buckets.length - 1, Math.floor(x / CHART_WIDTH * buckets.length))))
@@ -50,6 +52,7 @@ function ChartFrame({ title, legend, max, buckets, selectedIndex, onSelect, chil
       <text x={PLOT_LEFT} y="184" className="trend-axis">{hourLabel(buckets[0].bucket_start)}</text>
       <text x={PLOT_LEFT + CHART_WIDTH} y="184" textAnchor="end" className="trend-axis">{hourLabel(buckets[buckets.length - 1].bucket_start)}</text>
     </svg>
+    </div>
   </div>
 }
 
@@ -63,13 +66,12 @@ function Lines({ values, max, kind }: { values: Array<number | null>; max: numbe
     : <polyline key={index} points={points.map(([x, y]) => `${x},${y}`).join(' ')} />)}</g>
 }
 
-function TrendCharts({ buckets }: { buckets: TrendBucket[] }) {
-  const [selectedHour, setSelectedHour] = useState<number | null>(null)
+function TrendCharts({ buckets, selectedHour, onHourChange }: { buckets: TrendBucket[]; selectedHour: number | null; onHourChange: (hour: number) => void }) {
   const sliderId = useId()
   const matchedIndex = buckets.findIndex((bucket) => bucket.bucket_start === selectedHour)
   const selectedIndex = matchedIndex < 0 ? buckets.length - 1 : matchedIndex
   const selected = buckets[selectedIndex]
-  const onSelect = (index: number) => setSelectedHour(buckets[index].bucket_start)
+  const onSelect = (index: number) => onHourChange(buckets[index].bucket_start)
   const maxSamples = Math.max(1, ...buckets.map((bucket) => bucket.accepted_observation_samples))
   const maxEvents = Math.max(1, ...buckets.flatMap((bucket) => [bucket.path_switches, bucket.direct_failures, bucket.relay_failures]))
   const average = buckets.map((bucket) => bucket.validation_rtt_samples > 0 ? bucket.average_validation_rtt_ms ?? null : null)
@@ -78,6 +80,7 @@ function TrendCharts({ buckets }: { buckets: TrendBucket[] }) {
   const p95Value = bucketP95(selected)
   const chartProps = { buckets, selectedIndex, onSelect }
   return <>
+    {selectedHour !== null && matchedIndex < 0 && <p className="connection-context-note" role="status">{tr('所选小时不在当前窗口内，下面显示最近一小时；可调整趋势窗口。')}</p>}
     <div className="trend-charts">
       <ChartFrame {...chartProps} title={tr('每小时路径观测样本')} max={maxSamples} legend={<><Legend kind="direct">Direct</Legend><Legend kind="relay">Relay</Legend><Legend kind="none">{tr('无路径')}</Legend></>}>
         {buckets.map((bucket, index) => {
@@ -123,6 +126,13 @@ export function ConnectionTrends({ networkId, windowHours, onWindowChange }: {
   windowHours: number
   onWindowChange: (hours: number) => void
 }) {
+  const [searchParams, setSearchParams] = useConnectionSearchParams()
+  const { selectedHour } = readHealthSearch(searchParams)
+  const selectHour = (hour: number) => setSearchParams((current) => {
+    const next = new URLSearchParams(current)
+    next.set('trend_hour', String(hour))
+    return next
+  }, { replace: true })
   const interval = useAutoRefresh(60_000)
   const result = useQuery({
     queryKey: ['connection-trends', networkId, windowHours],
@@ -153,7 +163,7 @@ export function ConnectionTrends({ networkId, windowHours, onWindowChange }: {
             <div><span>{tr('显式路径失败')}</span><strong>{count(totals!.failures)}</strong></div>
           </div>
           {totals!.samples === 0 && <div className="trend-empty" role="status"><Activity size={19} /><span>{tr('此窗口没有已提交的观测样本；不代表路径在线或业务可达。')}</span></div>}
-          {data.buckets.length > 0 && <TrendCharts key={`${networkId}:${windowHours}`} buckets={data.buckets} />}
+          {data.buckets.length > 0 && <TrendCharts buckets={data.buckets} selectedHour={selectedHour} onHourChange={selectHour} />}
           {totals!.rttSamples === 0 && <p className="trend-detail-note">{tr('此窗口没有 RTT 验证样本，图中保留空缺。')}</p>}
         </>}
       <p className="trend-semantics">{tr('样本占比不是在线时长、流量占比或 SLA。P95 是固定直方图的分桶上界，三角标记表示超过 10000 ms；没有样本的小时不会补成 0 ms。')}</p>

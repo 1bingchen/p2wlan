@@ -105,6 +105,23 @@ impl PeerManager {
 }
 
 impl PeerManager {
+    /// Capability is advisory until the current live registration declares it.
+    pub(crate) async fn peer_supports_hh2(&self, node_id: &str) -> bool {
+        self.peer_hh2_registration_seq(node_id).await.is_some()
+    }
+
+    pub(crate) async fn peer_hh2_registration_seq(&self, node_id: &str) -> Option<u64> {
+        let connections = self.connections.read().await;
+        let conn = connections.get(node_id)?;
+        (conn.online
+            && conn.registration_seq > 0
+            && conn.capabilities.supports_hh2()
+            && !conn.public_key.is_empty()
+            && self.peer_identity_public_key_sync(node_id).as_deref()
+                == Some(conn.public_key.as_str()))
+        .then_some(conn.registration_seq)
+    }
+
     /// Add or update a peer from control plane info.
     pub async fn add_peer(&self, info: &PeerInfo) -> PeerUpdate {
         self.add_peer_with_signal_context(info, None).await
@@ -132,6 +149,30 @@ impl PeerManager {
         // published immediately before an old ACK commits.
         let (epoch_guard, mut conns) = self.lock_peer_update_resources(&mut lock_trace).await;
         let generation = self.current_network_generation_sync();
+        // Reject a delayed roster before it can mutate even endpoint or online
+        // state. Retain this fence across PeerLeft using the existing bounded
+        // identity tombstones, without retaining capability truth separately.
+        let registration_floor = conns
+            .get(&info.node_id)
+            .filter(|conn| conn.public_key == info.public_key)
+            .map_or(0, |conn| conn.registration_seq)
+            .max(
+                self.remote_identity_ledger
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .get(&info.node_id)
+                    .filter(|identity| identity.public_key == info.public_key)
+                    .map_or(0, |identity| identity.registration_seq),
+            );
+        if info.registration_seq < registration_floor {
+            debug!(peer = %info.node_id, reason_code = "peer_registration_snapshot_stale",
+                incoming = info.registration_seq, current = registration_floor,
+                "Ignoring stale peer capability and metadata snapshot");
+            return PeerUpdate {
+                last_seen_only: true,
+                ..PeerUpdate::default()
+            };
+        }
         // Un-quarantine evidence is computed under the connection lock but the
         // quarantine map is re-opened only AFTER the lock is dropped:
         // `unquarantine_peer` records a diagnostics event that re-locks the
@@ -180,11 +221,15 @@ impl PeerManager {
         let old_online = conn.online;
         let old_device_name = conn.device_name.clone();
         let old_app_version = conn.app_version.clone();
+        let old_capabilities = conn.capabilities;
+        let old_registration_seq = conn.registration_seq;
         let old_nat_type = conn.nat_type.clone();
         let old_last_seen = conn.last_seen;
         let old_remote_relay_rtt_ms = conn.remote_relay_rtt_ms;
         let virtual_ip_changed = !is_new && old_virtual_ip != info.virtual_ip;
         let public_key_changed = !is_new && old_public_key != info.public_key;
+        let registration_changed =
+            !is_new && !public_key_changed && info.registration_seq > old_registration_seq;
         let was_offline = !is_new && !old_online;
         let previous_virtual_ip = if !is_new && !old_virtual_ip.is_empty() {
             Some(old_virtual_ip.clone())
@@ -200,6 +245,22 @@ impl PeerManager {
         conn.virtual_ip = info.virtual_ip.clone();
         conn.device_name = info.device_name.clone();
         conn.app_version = info.app_version.clone();
+        // A registration declaration is immutable. Once a bit is revoked by
+        // a same-lifecycle snapshot, a reordered snapshot cannot enable it.
+        conn.capabilities =
+            if !is_new && !public_key_changed && old_registration_seq == info.registration_seq {
+                crate::control::PeerCapabilities {
+                    hh2_pair_nomination: old_capabilities.hh2_pair_nomination
+                        && info.capabilities.hh2_pair_nomination,
+                    hh2_plan_v2: old_capabilities.hh2_plan_v2 && info.capabilities.hh2_plan_v2,
+                }
+            } else {
+                info.capabilities
+            };
+        conn.registration_seq = info.registration_seq;
+        if old_capabilities.supports_hh2() && !conn.capabilities.supports_hh2() {
+            clear_hard_hard_after_lock = true;
+        }
         if conn.public_key != info.public_key {
             conn.public_key = info.public_key.clone();
             conn.probe_mac_key = derive_probe_mac_key(&self.config, &info.public_key);
@@ -225,7 +286,9 @@ impl PeerManager {
         // first offer of the replacement incarnation fail with `Busy`.
         // `reset_for_peer_session` retains the remote candidate high-water and
         // replay floor, which must continue fencing delayed old signals.
-        if ((was_offline && info.online) || virtual_ip_changed) && !public_key_changed {
+        if ((was_offline && info.online) || virtual_ip_changed || registration_changed)
+            && !public_key_changed
+        {
             conn.reset_for_peer_session();
             cancel_heartbeat_after_lock = true;
             clear_hard_hard_after_lock = true;
@@ -277,6 +340,11 @@ impl PeerManager {
                 &info.public_key,
                 retained,
                 retained_generation,
+            );
+            identities.record_registration_seq(
+                &info.node_id,
+                &info.public_key,
+                info.registration_seq,
             );
             (changed, retained, retained_generation)
         };
@@ -333,6 +401,8 @@ impl PeerManager {
             && !endpoint_changed
             && old_device_name == info.device_name
             && old_app_version == info.app_version
+            && old_capabilities == conn.capabilities
+            && old_registration_seq == info.registration_seq
             && old_nat_type == info.nat_type
             && old_online == info.online
             && old_remote_relay_rtt_ms == info.relay_rtt_ms;
@@ -472,8 +542,11 @@ impl PeerManager {
         // work without mistaking an in-progress PeerJoined for a ready peer.
         // Rotate the process-local generation only at a structural, identity,
         // or online lifecycle boundary; metadata and endpoint churn retain it.
-        let rotate_peer_session =
-            is_new || public_key_changed || virtual_ip_changed || old_online != info.online;
+        let rotate_peer_session = is_new
+            || public_key_changed
+            || virtual_ip_changed
+            || registration_changed
+            || old_online != info.online;
         let published_generation = self
             .peer_membership
             .lock()
@@ -538,6 +611,7 @@ impl PeerManager {
             "postcommit_cleanup_completed",
         );
         PeerUpdate {
+            registration_changed,
             is_new,
             virtual_ip_changed,
             endpoint_changed,

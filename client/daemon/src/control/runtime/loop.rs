@@ -38,6 +38,7 @@ async fn run_control_loop(
 
     // Outer recovery loop: re-registers after transient disconnects.
     loop {
+        server_clock.invalidate_registration();
         // The critical lane must never reuse a node id/token from a previous
         // registration generation while this loop is reconnecting.
         let _ = critical_auth_tx.send(None);
@@ -58,11 +59,13 @@ async fn run_control_loop(
                         server_relay_servers,
                         relay_catalog,
                         registration_seq,
+                        accepted_peer_capabilities,
                     )) => {
                         let registration_seq_changed =
                             config.control.registration_seq != registration_seq;
                         config.control.registration_seq = registration_seq;
                         let _ = critical_auth_tx.send(Some(CriticalControlAuth {
+                            accepted_peer_capabilities,
                             base_url: base_url.clone(),
                             token: token.clone(),
                             self_node_id: node_id.clone(),
@@ -141,6 +144,7 @@ async fn run_control_loop(
                         // later update below replaces it atomically if the
                         // challenge issues a device credential.
                         let _ = critical_auth_tx.send(Some(CriticalControlAuth {
+                            accepted_peer_capabilities,
                             base_url: base_url.clone(),
                             token: token.clone(),
                             self_node_id: node_id.clone(),
@@ -194,6 +198,7 @@ async fn run_control_loop(
                         // handshake worker must sign as this exact
                         // server-assigned node identity, never config.node_id.
                         let _ = critical_auth_tx.send(Some(CriticalControlAuth {
+                            accepted_peer_capabilities,
                             base_url: base_url.clone(),
                             token: token.clone(),
                             self_node_id: node_id.clone(),
@@ -290,9 +295,10 @@ async fn run_control_loop(
         // ---- Polling cycle ----
         // Initial poll
         let initial_peer_poll = async {
-            let current_http = http.current()?;
+            let (current_http, http_pool_id) = http.current_with_pool_id()?;
             poll_peers(
                 &current_http,
+                http_pool_id,
                 &base_url,
                 &token,
                 &config,
@@ -476,9 +482,10 @@ async fn run_control_loop(
                 }
                 _ = peer_roster_tick.tick() => {
                     let poll_result = async {
-                        let current_http = http.current()?;
+                        let (current_http, http_pool_id) = http.current_with_pool_id()?;
                         poll_peers(
                             &current_http,
+                            http_pool_id,
                             &base_url,
                             &token,
                             &config,

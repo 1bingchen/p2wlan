@@ -14,7 +14,9 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(test)]
+use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -30,6 +32,11 @@ use tokio::time::{self, timeout};
 use tracing::{debug, error, info, warn};
 
 mod http;
+mod timing;
+mod hard_hard_signal;
+pub(crate) use hard_hard_signal::HardHardStartAckDelivery;
+pub(crate) use timing::ControlTimingHint;
+use timing::ServerClockEstimate;
 mod websocket;
 
 /// Single control-plane HTTP client builder shared by the ordinary loop and the

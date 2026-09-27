@@ -81,7 +81,17 @@ export interface AdminAccountDetail {
   rooms: AdminRoom[]
 }
 
+export interface AdminAccountSummaryResponse {
+  account: AdminAccount
+}
+
+export interface AdminResourceFilters {
+  query?: string
+  accountId?: string
+}
+
 export interface Page<T> {
+  generated_at?: number
   total: number
   limit: number
   offset: number
@@ -89,6 +99,7 @@ export interface Page<T> {
 }
 
 export interface CursorPage<T> {
+  generated_at?: number
   total: number
   limit: number
   next_cursor?: string
@@ -133,8 +144,9 @@ export interface AdminTopologyEdge {
 export interface AdminTopology {
   generated_at: number
   graph_kind: 'control_relationships'
-  scope: 'global' | 'account'
+  scope: 'global' | 'account' | 'network'
   focus_account_id?: string
+  focus_network_id?: string
   path_observation_available: boolean
   path_observation_note: string
   nodes: AdminTopologyNode[]
@@ -287,7 +299,9 @@ export interface AdminConnectionHealth {
   thresholds: AdminConnectionHealthThresholds
   summary: AdminConnectionHealthSummary
   alerts_total: number
+  alerts_unfiltered_total: number
   alerts_limit: number
+  alerts_offset: number
   alerts: AdminConnectionHealthAlert[]
 }
 
@@ -296,4 +310,6 @@ export interface AdminConnectionHealthFilters {
   accountId?: string
   deviceId?: string
   windowSeconds?: number
+  alertSignal?: string
+  offset?: number
 }

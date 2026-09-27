@@ -2,6 +2,7 @@ package database
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
@@ -96,11 +97,19 @@ func decodeAdminDeviceCursor(cursor, filter string) (string, error) {
 // the normalized search/status, not an authorization credential; the HTTP route
 // must still require the independent administrator token on every request.
 func (db *DB) AdminDevicesCursor(query, status, cursor string, limit int) (*AdminDeviceCursorPage, error) {
+	return db.AdminDevicesCursorScoped(context.Background(), query, status, cursor, limit, "")
+}
+
+func (db *DB) AdminDevicesCursorScoped(ctx context.Context, query, status, cursor string, limit int, accountID string) (*AdminDeviceCursorPage, error) {
 	query, status, err := normalizeAdminDeviceFilter(query, status)
 	if err != nil {
 		return nil, err
 	}
 	filter := adminDeviceFilterIdentity(query, status)
+	accountID = strings.TrimSpace(accountID)
+	if accountID != "" {
+		filter = fmt.Sprintf("%x", sha256.Sum256([]byte(filter+"\x00"+accountID)))
+	}
 	afterID, err := decodeAdminDeviceCursor(cursor, filter)
 	if err != nil {
 		return nil, err
@@ -109,18 +118,22 @@ func (db *DB) AdminDevicesCursor(query, status, cursor string, limit int) (*Admi
 	generatedAt := time.Now().Unix()
 	cutoff := generatedAt - DeviceOnlineTTL
 	clause, args := adminDeviceFilterSQL(query, status, cutoff)
-	tx, err := db.Begin()
+	if accountID != "" {
+		clause += ` AND d.user_id = ?`
+		args = append(args, accountID)
+	}
+	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, err
 	}
 	defer tx.Rollback()
 	page := &AdminDeviceCursorPage{Limit: limit, GeneratedAt: generatedAt, Items: []AdminDeviceSummary{}}
 	const from = ` FROM devices d JOIN users u ON u.id = d.user_id LEFT JOIN networks n ON n.id = d.network_id WHERE `
-	if err := tx.QueryRow(`SELECT COUNT(*)`+from+clause, args...).Scan(&page.Total); err != nil {
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*)`+from+clause, args...).Scan(&page.Total); err != nil {
 		return nil, fmt.Errorf("count cursor admin devices: %w", err)
 	}
 	listArgs := append(append([]any(nil), args...), afterID, limit+1)
-	rows, err := tx.Query(`SELECT `+adminDeviceColumns()+from+clause+` AND d.id > ? ORDER BY d.id ASC LIMIT ?`, listArgs...)
+	rows, err := tx.QueryContext(ctx, `SELECT `+adminDeviceColumns()+from+clause+` AND d.id > ? ORDER BY d.id ASC LIMIT ?`, listArgs...)
 	if err != nil {
 		return nil, fmt.Errorf("list cursor admin devices: %w", err)
 	}

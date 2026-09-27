@@ -16,6 +16,8 @@ async fn peer_answer_from_new_remote_incarnation_preserves_pending_initiator() {
     daemon
         .peers
         .add_peer(&control::PeerInfo {
+            capabilities: crate::control::PeerCapabilities::default(),
+            registration_seq: 0,
             node_id: peer_id.to_string(),
             device_name: String::new(),
             app_version: String::new(),
@@ -146,6 +148,8 @@ async fn stale_sender_known_offer_cannot_reset_current_identity_or_apply_candida
     daemon
         .peers
         .add_peer(&control::PeerInfo {
+            capabilities: crate::control::PeerCapabilities::default(),
+            registration_seq: 0,
             node_id: peer_id.to_string(),
             device_name: String::new(),
             app_version: String::new(),
@@ -266,6 +270,8 @@ async fn stale_sender_answer_cannot_reset_or_consume_current_initiator() {
     daemon
         .peers
         .add_peer(&control::PeerInfo {
+            capabilities: crate::control::PeerCapabilities::default(),
+            registration_seq: 0,
             node_id: peer_id.to_string(),
             device_name: String::new(),
             app_version: String::new(),
@@ -392,6 +398,8 @@ async fn stale_sender_deferred_offer_releases_owner_without_mutating_peer() {
     daemon
         .peers
         .add_peer(&control::PeerInfo {
+            capabilities: crate::control::PeerCapabilities::default(),
+            registration_seq: 0,
             node_id: peer_id.to_string(),
             device_name: String::new(),
             app_version: String::new(),
@@ -499,6 +507,8 @@ async fn peer_left_without_udp_transport_removes_membership_and_fences_same_id_r
     };
     let peer_id = "peer-left-before-udp";
     let peer_info = control::PeerInfo {
+        capabilities: crate::control::PeerCapabilities::default(),
+        registration_seq: 0,
         node_id: peer_id.to_string(),
         device_name: String::new(),
         app_version: String::new(),

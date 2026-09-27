@@ -78,6 +78,8 @@ async fn responder_cache_rejects_offer_after_peer_static_key_rotation() {
     daemon
         .peers
         .add_peer(&control::PeerInfo {
+            capabilities: crate::control::PeerCapabilities::default(),
+            registration_seq: 0,
             node_id: peer_id.to_string(),
             device_name: String::new(),
             app_version: String::new(),
@@ -155,6 +157,8 @@ async fn expired_responder_cache_conflict_does_not_poison_active_token() {
     daemon
         .peers
         .add_peer(&control::PeerInfo {
+            capabilities: crate::control::PeerCapabilities::default(),
+            registration_seq: 0,
             node_id: peer_id.to_string(),
             device_name: String::new(),
             app_version: String::new(),

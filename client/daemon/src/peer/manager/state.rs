@@ -56,19 +56,23 @@ pub(crate) struct HardHardFreshSocketIdentity {
     pub(crate) socket_local_endpoint: SocketAddr,
 }
 
-/// Lock-free snapshot of the pair selected by the latest authoritative Direct
+/// Synchronous snapshot of the pair selected by the latest authoritative Direct
 /// commit.  The snapshot is published while the network-epoch gate and the
 /// connection writer are held, then consumed by the Hard↔Hard confirmation
 /// wait without reacquiring the connection map.  The Direct-set mirror still
-/// supplies the active/inactive bit; this value only proves the exact local
-/// endpoint, remote candidate epoch and process-local commit time. The time is
+/// remains available to legacy consumers; this projection carries the exact
+/// tuple, full epoch and active reducer revision for scoped packet admission.
+/// The revision is absent until the reducer has published its mirrors. The time is
 /// observation-only and lets a terminal Hard↔Hard report preserve the actual
 /// encrypted-validation milestone instead of its later write time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct DirectCommitPairSnapshot {
     pub(crate) generation: u64,
+    pub(crate) peer_session_generation: PeerSessionGeneration,
     pub(crate) remote_candidate_epoch: u64,
     pub(crate) local_endpoint: Option<SocketAddr>,
+    pub(crate) remote_endpoint: SocketAddr,
+    pub(crate) path_revision: Option<u64>,
     pub(crate) confirmed_at_ms: Option<u64>,
 }
 
@@ -108,6 +112,10 @@ pub(crate) struct HardHardSessionRecord {
     pub(crate) session_token: String,
     pub(crate) peer_id: String,
     pub(crate) initiator: bool,
+    /// Enabled only after both peers explicitly negotiate hh2. All pair
+    /// transitions belong to this session ledger, never to UDP affinity.
+    pub(crate) pair_nomination: Option<HardHardPairNomination>,
+    pub(crate) coordinated_plan: Option<HardHardCoordinatedPlan>,
     /// The network generation observed at the other endpoint.  The initiator
     /// learns it from the responder envelope; zero means it was not known in
     /// the first directional offer.
@@ -292,6 +300,7 @@ const MAX_REMOTE_IDENTITY_TOMBSTONES: usize = 4_096;
 #[derive(Debug, Clone)]
 struct RemoteIdentityTombstone {
     public_key: String,
+    registration_seq: u64,
     candidate_incarnation_high_water: Option<u64>,
     /// Highest encoded candidate revision that must be rejected for this exact
     /// public-key identity. Usually this is the last accepted generation. While
@@ -310,6 +319,12 @@ struct RemoteIdentityLedger {
 }
 
 impl RemoteIdentityLedger {
+    fn record_registration_seq(&mut self, node_id: &str, public_key: &str, seq: u64) {
+        self.upsert_and_touch(node_id, public_key, None, 0);
+        if let Some(identity) = self.entries.get_mut(node_id) {
+            identity.registration_seq = identity.registration_seq.max(seq);
+        }
+    }
     fn get(&self, node_id: &str) -> Option<&RemoteIdentityTombstone> {
         self.entries.get(node_id)
     }
@@ -357,10 +372,16 @@ impl RemoteIdentityLedger {
                     )
                 },
             );
+        let registration_seq = self
+            .entries
+            .get(node_id)
+            .filter(|identity| identity.public_key == public_key)
+            .map_or(0, |identity| identity.registration_seq);
         self.entries.insert(
             node_id.to_string(),
             RemoteIdentityTombstone {
                 public_key: public_key.to_string(),
+                registration_seq,
                 candidate_incarnation_high_water,
                 candidate_generation_replay_floor,
             },
@@ -579,6 +600,8 @@ pub struct PeerManager {
     /// measured.  Entries are short-lived and bounded; they are not a path
     /// selector or a Direct authority.
     hard_hard_sessions: Arc<tokio::sync::Mutex<HashMap<(String, String), HardHardSessionRecord>>>,
+    /// Bounded, expiring strategy-order advice; never a path or session owner.
+    hard_hard_strategy_learning: Arc<std::sync::Mutex<HardHardStrategyLearning>>,
     /// Exact cleanup ownership claims. A duplicate registration must not
     /// start a second watcher that could later race a replacement session.
     hard_hard_cleanup_owners: Arc<tokio::sync::Mutex<HashSet<(String, String, String)>>>,
@@ -790,6 +813,7 @@ pub struct OutboundLossEvent {
 /// Metadata changes observed while applying one control-plane peer snapshot.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PeerUpdate {
+    pub registration_changed: bool,
     pub is_new: bool,
     pub virtual_ip_changed: bool,
     pub endpoint_changed: bool,

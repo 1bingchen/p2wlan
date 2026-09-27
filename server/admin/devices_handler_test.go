@@ -1,6 +1,7 @@
 package admin
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -145,6 +146,10 @@ type failingAdminDeviceCursorStore struct{ fakeStore }
 
 func (failingAdminDeviceCursorStore) AdminDevicesCursor(string, string, string, int) (*database.AdminDeviceCursorPage, error) {
 	return nil, errors.New("private database failure")
+}
+
+func (s failingAdminDeviceCursorStore) AdminDevicesCursorScoped(_ context.Context, query, status, cursor string, limit int, _ string) (*database.AdminDeviceCursorPage, error) {
+	return s.AdminDevicesCursor(query, status, cursor, limit)
 }
 
 func TestAdminDeviceCursorHTTPDatabaseFailure(t *testing.T) {

@@ -32,6 +32,9 @@ import {
 import { accountColor, accountIdentity, colorWithAlpha } from './colors'
 import { useTheme } from './theme'
 import { useOverlay } from './useOverlay'
+import { Link, useLocation } from 'react-router-dom'
+import { CopyValue } from './CopyValue'
+import { connectionLink, relationshipLink, resourceOriginState } from './pageState'
 import { TopologyViewport } from './TopologyViewport'
 import type { AdminTopology, AdminTopologyNode } from './types'
 
@@ -41,6 +44,8 @@ interface TopologyCanvasProps {
   error?: string
   search?: string
   compact?: boolean
+  accountId?: string
+  networkId?: string
 }
 
 const dimensions: Record<AdminTopologyNode['kind'], { width: number; height: number }> = {
@@ -228,7 +233,7 @@ function buildGraph(data: AdminTopology, narrow = false): { nodes: Node[]; edges
       },
       markerEnd: isSignal ? { type: MarkerType.ArrowClosed, color: '#d97706', width: 14, height: 14 } : undefined,
       label: isSignal && edge.count && edge.count > 1 ? `${edge.signal_type || 'signal'} ×${edge.count}` : undefined,
-      labelStyle: { fontSize: 11, fill: '#92400e', fontWeight: 600 },
+      labelStyle: { fontSize: 12, fill: '#92400e', fontWeight: 600 },
       labelBgStyle: { fill: '#fffbeb', fillOpacity: 0.96 },
     }
   })
@@ -236,9 +241,11 @@ function buildGraph(data: AdminTopology, narrow = false): { nodes: Node[]; edges
   return { nodes, edges }
 }
 
-function DetailPanel({ node, onClose }: { node: AdminTopologyNode; onClose: () => void }) {
+function DetailPanel({ node, onClose, accountId, networkId }: { node: AdminTopologyNode; onClose: () => void; accountId?: string; networkId?: string }) {
+  const location = useLocation()
   useOverlay(true, onClose, { lockScroll: false })
   const color = ownerColor(node)
+  const resourceId = node.kind === 'account' ? node.account_id || node.id.replace(/^account:/, '') : node.kind === 'device' ? node.id.replace(/^device:/, '') : node.network_id || node.id.replace(/^network:/, '')
   return (
     <aside className="topology-detail" aria-label={tr("关系图节点详情")}>
       <button className="icon-button topology-detail-close" onClick={onClose} aria-label={tr("关闭详情")}><X size={16} /></button>
@@ -246,15 +253,22 @@ function DetailPanel({ node, onClose }: { node: AdminTopologyNode; onClose: () =
       <h3>{node.label}</h3>
       {node.username && node.kind !== 'account' && <p className="topology-detail-owner">{tr("账号 · ")}{node.username}</p>}
       <dl>
-        {node.virtual_ip && <div><dt>{tr("Virtual IP")}</dt><dd className="mono">{node.virtual_ip}</dd></div>}
-        {node.cidr && <div><dt>{tr("CIDR")}</dt><dd className="mono">{node.cidr}</dd></div>}
-        {node.room_code && <div><dt>{tr("房间号")}</dt><dd className="mono">{node.room_code}</dd></div>}
+        <div><dt>{tr("资源 ID")}</dt><dd className="value-with-action"><code>{resourceId}</code><CopyValue value={resourceId} label="复制资源 ID" /></dd></div>
+        {node.virtual_ip && <div><dt>{tr("Virtual IP")}</dt><dd className="value-with-action"><code>{node.virtual_ip}</code><CopyValue value={node.virtual_ip} label="复制虚拟 IP" /></dd></div>}
+        {node.cidr && <div><dt>{tr("CIDR")}</dt><dd className="value-with-action"><code>{node.cidr}</code><CopyValue value={node.cidr} label="复制网段" /></dd></div>}
+        {node.room_code && <div><dt>{tr("房间号")}</dt><dd className="value-with-action"><code>{node.room_code}</code><CopyValue value={node.room_code} label="复制房间码" /></dd></div>}
         {node.platform && <div><dt>{tr("平台")}</dt><dd>{node.platform}</dd></div>}
         {node.app_version && <div><dt>{tr("版本")}</dt><dd>{node.app_version}</dd></div>}
         {node.nat_type && <div><dt>{tr("NAT")}</dt><dd>{natLabel(node.nat_type)}</dd></div>}
         {node.relay_rtt_ms !== undefined && <div><dt>{tr("Relay RTT")}</dt><dd>{node.relay_rtt_ms} {tr("ms")}</dd></div>}
         {node.online !== undefined && <div><dt>{tr("状态")}</dt><dd><span className={`status-label ${node.online ? 'online' : ''}`}><span />{tr(node.online ? '在线' : '离线')}</span></dd></div>}
       </dl>
+      <div className="topology-detail-actions">
+        {node.kind === 'account' ? <Link state={resourceOriginState(location)} className="button secondary compact" to={`/accounts/${encodeURIComponent(resourceId)}`}>{tr('查看账号')}</Link> : node.kind === 'device' ? <Link state={resourceOriginState(location)} className="button secondary compact" to={connectionLink({ deviceId: resourceId, accountId, networkId })}>{tr('查看连接')}</Link> : <>
+          {resourceId !== networkId && <Link state={resourceOriginState(location)} className="button secondary compact" to={relationshipLink(resourceId, accountId)}>{tr('查看关系')}</Link>}
+          <Link state={resourceOriginState(location)} className="button secondary compact" to={connectionLink({ networkId: resourceId, accountId })}>{tr('查看连接')}</Link>
+        </>}
+      </div>
     </aside>
   )
 }
@@ -285,7 +299,7 @@ function useNarrowViewport() {
   return narrow
 }
 
-export function TopologyCanvas({ data, loading, error, search = '', compact = false }: TopologyCanvasProps) {
+export function TopologyCanvas({ data, loading, error, search = '', compact = false, accountId, networkId }: TopologyCanvasProps) {
   const locale = useLocale()
   const theme = useTheme()
   const [fullscreen, setFullscreen] = useState(false)
@@ -376,9 +390,9 @@ export function TopologyCanvas({ data, loading, error, search = '', compact = fa
         {!compact && <>
           <button className={`topology-filter-button topology-legend-toggle ${legendOpen ? 'active' : ''}`} onClick={() => setLegendOpen((value) => !value)} aria-expanded={legendOpen} aria-controls="resource-topology-legend" title={tr('图例')}>
             <Info size={15} />{tr('图例')}</button>
-          <button className={`topology-filter-button ${showOffline ? 'active' : ''}`} onClick={() => setShowOffline((value) => !value)} title={tr("显示或隐藏离线设备")}>
+          <button className={`topology-filter-button ${showOffline ? 'active' : ''}`} aria-pressed={showOffline} onClick={() => setShowOffline((value) => !value)} title={tr("显示或隐藏离线设备")}>
             {showOffline ? <Eye size={15} /> : <EyeOff size={15} />}{tr("离线设备")}</button>
-          <button className={`topology-filter-button ${showSignals ? 'active' : ''}`} onClick={() => setShowSignals((value) => !value)} title={tr("显示或隐藏控制面的待处理信令")}>
+          <button className={`topology-filter-button ${showSignals ? 'active' : ''}`} aria-pressed={showSignals} onClick={() => setShowSignals((value) => !value)} title={tr("显示或隐藏控制面的待处理信令")}>
             <RadioTower size={15} />{tr("控制信令")}</button>
         </>}
         <button className="icon-button topology-fullscreen-button" onClick={() => { setSelectedId(null); setFullscreen((value) => !value) }} aria-label={tr(fullscreen ? '退出全屏' : '全屏')}>
@@ -388,7 +402,7 @@ export function TopologyCanvas({ data, loading, error, search = '', compact = fa
 
       {visibleData && <TopologySummary data={visibleData} />}
 
-      {selected && <DetailPanel node={selected} onClose={() => setSelectedId(null)} />}
+      {selected && <DetailPanel node={selected} accountId={accountId} networkId={networkId} onClose={() => setSelectedId(null)} />}
     </div>
   )
 }

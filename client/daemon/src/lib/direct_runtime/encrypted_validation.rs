@@ -1076,7 +1076,7 @@ async fn run_direct_encrypted_validation_session(
                         ));
                     }
                     send_udp
-                        .send_encrypted_packet_on_socket(
+                        .send_direct_validation_packet_on_socket(
                             &send_socket,
                             send_socket_index,
                             &encrypted,

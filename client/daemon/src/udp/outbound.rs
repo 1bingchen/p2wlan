@@ -832,6 +832,16 @@ impl UdpTransport {
                             );
                             break 'schedule;
                         }
+                        OutboundProbeAdmission::HardHardConfirmationRateReserved
+                        | OutboundProbeAdmission::HardHardConfirmationCreditReserved
+                        | OutboundProbeAdmission::RecoveryIdentityStale => {
+                            // The legacy entry currently cannot produce HH2
+                            // purpose results; preserve fail-closed accounting
+                            // if a future caller introduces one here.
+                            budget_skipped = budget_skipped.saturating_add(1);
+                            last_budget_reason = Some(outbound_probe_admission_reason(admission));
+                            break 'schedule;
+                        }
                         OutboundProbeAdmission::HeartbeatBudgetLimited => {
                             // The heartbeat's dedicated budget is spent for
                             // this window; the next beat retries.  This is
@@ -1706,7 +1716,7 @@ impl UdpTransport {
                     packet.peer_id
                 ))
             })?;
-        self.send_encrypted_packet_on_socket(&socket, socket_index, packet, endpoint)
+        self.send_direct_validation_packet_on_socket(&socket, socket_index, packet, endpoint)
             .await
     }
 

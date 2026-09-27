@@ -294,6 +294,7 @@ async fn hard_hard_responder_without_stun_worker_falls_back_to_admitted_fresh_pu
         .expect("fixture must retain its Hard↔Hard plan");
     let remote_prediction: SocketAddr = "198.51.100.20:42000".parse().unwrap();
     let coordination = HardHardCoordination {
+        v2: None,
         role: HardHardRole::Initiator,
         token: "feed-face".to_string(),
         local_network_generation: 0,
@@ -497,6 +498,8 @@ async fn hard_hard_response_network_generation_fence_precedes_punch_preemption()
     assert!(
         peers
             .hard_hard_register_session(peer::HardHardSessionRecord {
+                pair_nomination: None,
+                coordinated_plan: None,
                 session_id: format!("hh1:i:{token}"),
                 probe_session_id: None,
                 session_token: token.clone(),
@@ -567,6 +570,7 @@ async fn hard_hard_response_network_generation_fence_precedes_punch_preemption()
         deduplicator,
         HARD_HARD_B.to_string(),
         HardHardCoordination {
+            v2: None,
             role: HardHardRole::Responder,
             token,
             local_network_generation: 9,
@@ -1605,6 +1609,8 @@ async fn install_direct_scheduler_birthday_session(
     assert!(
         peers
             .hard_hard_register_session(peer::HardHardSessionRecord {
+                pair_nomination: None,
+                coordinated_plan: None,
                 session_id: format!("birthday-scheduler-{token}"),
                 probe_session_id: None,
                 session_token: token.to_string(),
@@ -2612,6 +2618,8 @@ async fn hard_hard_manager_peer_isolation_keeps_unrelated_session_authoritative(
             socket_local_endpoint,
         };
         peer::HardHardSessionRecord {
+            pair_nomination: None,
+            coordinated_plan: None,
             session_id: format!("hh1:i:{token}"),
             probe_session_id: None,
             session_token: token.to_string(),
@@ -2695,6 +2703,8 @@ async fn hard_hard_manager_sticky_winner_rejects_delayed_authenticated_socket() 
     let endpoint_a: SocketAddr = "127.0.0.1:31100".parse().unwrap();
     let endpoint_b: SocketAddr = "127.0.0.1:31101".parse().unwrap();
     let record = peer::HardHardSessionRecord {
+        pair_nomination: None,
+        coordinated_plan: None,
         session_id: "hh1:i:sticky-token".to_string(),
         probe_session_id: None,
         session_token: "sticky-token".to_string(),

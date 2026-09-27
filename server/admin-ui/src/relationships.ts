@@ -27,7 +27,7 @@ export function summarizeNetworks(data?: AdminTopology): NetworkSummary[] {
   if (!data) return []
   const privateAccounts = new Set(data.edges.filter((edge) => edge.kind === 'attachment' && edge.role === 'private-default').map((edge) => edge.source))
   const accounts = new Map(data.nodes.filter((node) => node.kind === 'account').map((node) => [node.id, node]))
-  return data.nodes.filter((node) => node.kind === 'network' || node.kind === 'room' || (node.kind === 'account' && privateAccounts.has(node.id))).map((node) => {
+  return data.nodes.filter((node) => node.kind === 'network' || node.kind === 'room' || (node.kind === 'account' && (privateAccounts.has(node.id) || data.scope === 'network' && data.focus_network_id === `personal:${node.account_id || node.id.slice('account:'.length)}`))).map((node) => {
     const personal = node.kind === 'account'
     const scoped = topologyForNetwork(data, node)
     const members = scoped.nodes.filter((item) => item.kind === 'account')
@@ -39,7 +39,7 @@ export function summarizeNetworks(data?: AdminTopology): NetworkSummary[] {
       memberCount: members.length,
       deviceCount: devices.length,
       onlineCount: devices.filter((device) => device.online).length,
-      searchText: [node.label, node.cidr, owner, ...members.flatMap((item) => [item.label, item.username]), ...devices.flatMap((item) => [item.label, item.virtual_ip, item.platform])].filter(Boolean).join(' ').toLowerCase(),
+      searchText: [node.id, node.network_id, node.room_code, node.label, node.cidr, owner, ...members.flatMap((item) => [item.id, item.account_id, item.label, item.username]), ...devices.flatMap((item) => [item.id, item.label, item.virtual_ip, item.platform])].filter(Boolean).join(' ').toLowerCase(),
     }
   }).sort((left, right) => left.node.label.localeCompare(right.node.label))
 }

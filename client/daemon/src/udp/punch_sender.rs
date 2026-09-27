@@ -394,10 +394,29 @@ impl UdpTransport {
                     retrying_target = false;
                     continue;
                 }
-                match self
-                    .admit_outbound_connectivity_probe(peer_id, candidate, index)
-                    .await
-                {
+                let admission = if let Some(token) = hard_hard_session_token {
+                    match self.peers.hard_hard_session_by_token(peer_id, token).await {
+                        Some(record) if record.pair_nomination.is_some() => {
+                            self.admit_hard_hard_connectivity_probe(
+                                peer_id,
+                                candidate,
+                                index,
+                                token,
+                                crate::peer::RecoveryProbePurpose::HardHardExploration,
+                            )
+                            .await
+                        }
+                        Some(_) => {
+                            self.admit_outbound_connectivity_probe(peer_id, candidate, index)
+                                .await
+                        }
+                        None => OutboundProbeAdmission::RecoveryIdentityStale,
+                    }
+                } else {
+                    self.admit_outbound_connectivity_probe(peer_id, candidate, index)
+                        .await
+                };
+                match admission {
                     OutboundProbeAdmission::Accepted => {}
                     limited => {
                         if pacing.is_some() && limited.retryable_in_sweep() {

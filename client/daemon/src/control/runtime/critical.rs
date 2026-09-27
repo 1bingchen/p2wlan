@@ -225,6 +225,8 @@ async fn run_candidate_offer_worker(
 
     while let Some(command) = rx.recv().await {
         let CandidateOfferCommand {
+            not_after,
+            prepaid_attempts,
             to_node_id,
             candidates,
             session_id,
@@ -237,7 +239,14 @@ async fn run_candidate_offer_worker(
             response_tx,
         } = command;
         let mut response_tx = response_tx;
-        let deadline = Instant::now() + CRITICAL_SIGNAL_OVERALL_DEADLINE;
+        if !(1..=HARD_HARD_START_ACK_MAX_ATTEMPTS).contains(&prepaid_attempts) {
+            let _ = response_tx.send(PeerOfferSendOutcome::Failed);
+            continue;
+        }
+        let deadline = not_after
+            .map_or(Instant::now() + CRITICAL_SIGNAL_OVERALL_DEADLINE, |limit| {
+                limit.min(Instant::now() + CRITICAL_SIGNAL_OVERALL_DEADLINE)
+            });
         let Some(auth) =
             wait_for_critical_control_auth(auth_rx.clone(), &mut response_tx, deadline).await
         else {
@@ -257,7 +266,7 @@ async fn run_candidate_offer_worker(
         let current_auth = auth_rx.borrow_and_update().clone();
         if current_auth
             .as_ref()
-            .is_some_and(|current| !auth.same_identity_as(current))
+            .is_none_or(|current| !auth.same_identity_as(current))
         {
             let _ = response_tx.send(PeerOfferSendOutcome::Failed);
             continue;
@@ -292,90 +301,123 @@ async fn run_candidate_offer_worker(
             }
         };
 
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        let result = match http.current() {
-            Err(error) => CandidateOfferAttempt::Completed(Err(error)),
-            Ok(_) if remaining.is_zero() => {
-                CandidateOfferAttempt::Completed(Err(DaemonError::ControlPlane(
-                    "candidate offer deadline exceeded; delivery status is unknown".into(),
-                )))
-            }
-            Ok(current_http) => {
-                // Keep one request future alive across duplicate auth-watch
-                // notifications.  Dropping an in-flight reqwest future does
-                // not prove that the server did not accept its POST; starting
-                // a new future here can therefore duplicate a candidate
-                // publication that already reached the control plane.
-                let request = async {
-                    crate::control::hard_hard_a0_control_stage(
-                        session_id.as_deref(),
-                        "offer_http_attempt",
-                        "request_started",
-                    );
-                    send_prepared_signal(
-                        &current_http,
-                        &auth.base_url,
-                        &auth.token,
-                        auth.registration_seq,
-                        &payload,
-                    )
-                    .await
-                };
-                tokio::pin!(request);
-                loop {
-                    let remaining = deadline.saturating_duration_since(Instant::now());
-                    if remaining.is_zero() {
-                        break CandidateOfferAttempt::Completed(Err(DaemonError::ControlPlane(
-                            "candidate offer deadline exceeded; delivery status is unknown".into(),
-                        )));
-                    }
-                    tokio::select! {
-                        biased;
-                        // Fresh ownership can be revoked while the HTTP request is
-                        // already in flight. Drop the local request future and
-                        // report ambiguous delivery so the caller rolls back the
-                        // retired socket; the server may already have accepted it.
-                        // This cancels only the current immutable command, leaving
-                        // the per-peer FIFO worker available for its replacement.
-                        _ = async {
-                            if let Some(ownership) = fresh_ownership.as_ref() {
-                                ownership.cancelled().await;
-                            } else {
-                                std::future::pending::<()>().await;
+        let mut attempt = 0;
+        let result = loop {
+            attempt += 1;
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let result = match http.current() {
+                Err(error) => CandidateOfferAttempt::Completed(Err(error)),
+                Ok(_) if remaining.is_zero() => {
+                    CandidateOfferAttempt::Completed(Err(DaemonError::ControlPlane(
+                        "candidate offer deadline exceeded; delivery status is unknown".into(),
+                    )))
+                }
+                Ok(current_http) => {
+                    // Keep one request future alive across duplicate auth-watch
+                    // notifications.  Dropping an in-flight reqwest future does
+                    // not prove that the server did not accept its POST; starting
+                    // a new future here can therefore duplicate a candidate
+                    // publication that already reached the control plane.
+                    let request_auth = auth_rx.clone();
+                    let request = async {
+                        if attempt > 1 {
+                            time::sleep(Duration::from_millis(25)).await;
+                        }
+                        if Instant::now() >= deadline
+                            || request_auth.has_changed().is_err()
+                            || request_auth
+                                .borrow()
+                                .as_ref()
+                                .is_none_or(|current| !auth.same_identity_as(current))
+                        {
+                            return Err(DaemonError::ControlPlane(
+                            "candidate offer deadline or control identity expired before delivery".into()));
+                        }
+                        crate::control::hard_hard_a0_control_stage(
+                            session_id.as_deref(),
+                            "offer_http_attempt",
+                            "request_started",
+                        );
+                        send_prepared_signal(
+                            &current_http,
+                            &auth.base_url,
+                            &auth.token,
+                            auth.registration_seq,
+                            &payload,
+                        )
+                        .await
+                    };
+                    tokio::pin!(request);
+                    loop {
+                        let remaining = deadline.saturating_duration_since(Instant::now());
+                        if remaining.is_zero() {
+                            break CandidateOfferAttempt::Completed(Err(
+                                DaemonError::ControlPlane(
+                                    "candidate offer deadline exceeded; delivery status is unknown"
+                                        .into(),
+                                ),
+                            ));
+                        }
+                        tokio::select! {
+                            biased;
+                            // Fresh ownership can be revoked while the HTTP request is
+                            // already in flight. Drop the local request future and
+                            // report ambiguous delivery so the caller rolls back the
+                            // retired socket; the server may already have accepted it.
+                            // This cancels only the current immutable command, leaving
+                            // the per-peer FIFO worker available for its replacement.
+                            _ = async {
+                                if let Some(ownership) = fresh_ownership.as_ref() {
+                                    ownership.cancelled().await;
+                                } else {
+                                    std::future::pending::<()>().await;
+                                }
+                            } => break CandidateOfferAttempt::OwnershipCancelled,
+                            // Cancelling one owner must abort only this immutable
+                            // request. Returning from the whole per-peer worker leaves
+                            // a closed sender cached in `candidate_workers`, so the
+                            // next (often post-rebind) candidate publication is lost.
+                            _ = response_tx.closed() => break CandidateOfferAttempt::ResponseClosed,
+                            result = timeout(remaining, &mut request) => break CandidateOfferAttempt::Completed(match result {
+                                Ok(result) => result,
+                                Err(_) => Err(DaemonError::ControlPlane(
+                                    "candidate offer deadline exceeded during request; delivery status is unknown".into(),
+                                )),
+                            }),
+                            changed = auth_rx.changed() => {
+                                if changed.is_err() {
+                                    break CandidateOfferAttempt::Completed(Err(DaemonError::ControlPlane(
+                                        "candidate offer control identity watch closed".into(),
+                                    )));
+                                }
+                                if auth_rx.borrow().as_ref().is_none_or(|current| {
+                                    !auth.same_identity_as(current)
+                                }) {
+                                    break CandidateOfferAttempt::Completed(Err(DaemonError::ControlPlane(
+                                        "candidate offer control identity changed during request".into(),
+                                    )));
+                                }
+                                // A duplicate publication of the same identity is
+                                // harmless, but the request may already have reached
+                                // the server. Keep polling this exact future instead
+                                // of dropping it and issuing a duplicate POST.
+                                continue;
                             }
-                        } => break CandidateOfferAttempt::OwnershipCancelled,
-                        // Cancelling one owner must abort only this immutable
-                        // request. Returning from the whole per-peer worker leaves
-                        // a closed sender cached in `candidate_workers`, so the
-                        // next (often post-rebind) candidate publication is lost.
-                        _ = response_tx.closed() => break CandidateOfferAttempt::ResponseClosed,
-                        result = timeout(remaining, &mut request) => break CandidateOfferAttempt::Completed(match result {
-                            Ok(result) => result,
-                            Err(_) => Err(DaemonError::ControlPlane(
-                                "candidate offer deadline exceeded during request; delivery status is unknown".into(),
-                            )),
-                        }),
-                        changed = auth_rx.changed() => {
-                            if changed.is_err() {
-                                break CandidateOfferAttempt::Completed(Err(DaemonError::ControlPlane(
-                                    "candidate offer control identity watch closed".into(),
-                                )));
-                            }
-                            if auth_rx.borrow().as_ref().is_some_and(|current| {
-                                !auth.same_identity_as(current)
-                            }) {
-                                break CandidateOfferAttempt::Completed(Err(DaemonError::ControlPlane(
-                                    "candidate offer control identity changed during request".into(),
-                                )));
-                            }
-                            // A duplicate publication of the same identity is
-                            // harmless, but the request may already have reached
-                            // the server. Keep polling this exact future instead
-                            // of dropping it and issuing a duplicate POST.
-                            continue;
                         }
                     }
                 }
+            };
+            let retry = matches!(&result, CandidateOfferAttempt::Completed(Err(error))
+            if attempt < prepaid_attempts
+                && !is_permanent_auth_error(&error.to_string())
+                && !is_registration_conflict_error(&error.to_string())
+                && Instant::now() < deadline
+                && !response_tx.is_closed()
+                && fresh_ownership.as_ref().is_none_or(|owner| !owner.is_cancelled())
+                && auth_rx.has_changed().is_ok()
+                && auth_rx.borrow().as_ref().is_some_and(|current| auth.same_identity_as(current)));
+            if !retry {
+                break result;
             }
         };
         let result = match result {
@@ -387,6 +429,16 @@ async fn run_candidate_offer_worker(
                 // Close the completion race in which HTTP readiness and
                 // ownership revocation become observable in the same poll.
                 let _ = response_tx.send(PeerOfferSendOutcome::Cancelled);
+                continue;
+            }
+            CandidateOfferAttempt::Completed(_)
+                if auth_rx.has_changed().is_err()
+                    || auth_rx
+                        .borrow()
+                        .as_ref()
+                        .is_none_or(|current| !auth.same_identity_as(current)) =>
+            {
+                let _ = response_tx.send(PeerOfferSendOutcome::Failed);
                 continue;
             }
             CandidateOfferAttempt::Completed(result) => result,

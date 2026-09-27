@@ -1,6 +1,7 @@
 import type {
   AdminAccount,
   AdminAccountDetail,
+  AdminAccountSummaryResponse,
   AdminConnectionFilters,
   AdminConnectionHealth,
   AdminConnectionHealthFilters,
@@ -10,6 +11,7 @@ import type {
   AdminNetwork,
   AdminOverview,
   AdminRoom,
+  AdminResourceFilters,
   AdminRuntime,
   AdminTopology,
   AdminTopologyPage,
@@ -19,6 +21,7 @@ import type {
 
 const TOKEN_KEY = 'p2wlan-admin-token'
 let sessionRevision = 0
+let sessionCleared = false
 
 export class ApiError extends Error {
   status: number
@@ -30,17 +33,23 @@ export class ApiError extends Error {
 }
 
 export function getAdminToken(): string {
-  return sessionStorage.getItem(TOKEN_KEY) ?? ''
+  if (sessionCleared) return ''
+  try { return sessionStorage.getItem(TOKEN_KEY) ?? '' } catch { return '' }
 }
 
 export function setAdminToken(token: string): void {
+  try { sessionStorage.setItem(TOKEN_KEY, token) } catch {
+    throw new Error('浏览器无法保存登录会话。请允许此站点使用会话存储后重试。')
+  }
   sessionRevision += 1
-  sessionStorage.setItem(TOKEN_KEY, token)
+  sessionCleared = false
 }
 
 export function clearAdminToken(): void {
   sessionRevision += 1
-  sessionStorage.removeItem(TOKEN_KEY)
+  // Local revocation must finish even if the browser has just blocked storage.
+  sessionCleared = true
+  try { sessionStorage.removeItem(TOKEN_KEY) } catch { /* The current session stays revoked. */ }
 }
 
 async function parseError(response: Response): Promise<string> {
@@ -52,10 +61,11 @@ async function parseError(response: Response): Promise<string> {
   }
 }
 
-export async function verifyAdminToken(token: string): Promise<void> {
+export async function verifyAdminToken(token: string, signal?: AbortSignal): Promise<void> {
   const response = await fetch('/admin/api/v1/runtime', {
     headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' },
     cache: 'no-store',
+    signal,
   })
   if (!response.ok) throw new ApiError(response.status, await parseError(response))
 }
@@ -108,7 +118,12 @@ export const adminApi = {
     return api<CursorPage<AdminAccount>>(`/accounts/cursor?${params}`, signal)
   },
   account: (id: string, signal?: AbortSignal) => api<AdminAccountDetail>(`/accounts/${encodeURIComponent(id)}`, signal),
+  accountSummary: (id: string, signal?: AbortSignal) => api<AdminAccountSummaryResponse>(`/accounts/${encodeURIComponent(id)}?view=summary`, signal),
   topology: (accountId: string, signal?: AbortSignal) => api<AdminTopology>(`/accounts/${encodeURIComponent(accountId)}/topology`, signal),
+  topologyNetwork: (networkId: string, nodeLimit = 600, signal?: AbortSignal) => {
+    const params = new URLSearchParams({ network_id: networkId, node_limit: String(nodeLimit) })
+    return api<AdminTopologyPage>(`/topology?${params}`, signal)
+  },
   topologyPage: (cursor = '', limit = 12, nodeLimit = 600, signal?: AbortSignal) => {
     const params = new URLSearchParams({ limit: String(limit), node_limit: String(nodeLimit) })
     if (cursor) params.set('cursor', cursor)
@@ -118,13 +133,26 @@ export const adminApi = {
     const params = new URLSearchParams({ q: query, status, limit: String(limit), offset: String(offset) })
     return api<Page<AdminDevice>>(`/devices?${params}`)
   },
-  devicesCursor: (query = '', status = 'all', cursor = '', limit = 25, signal?: AbortSignal) => {
+  devicesCursor: (query = '', status = 'all', cursor = '', limit = 25, signal?: AbortSignal, accountId = '') => {
     const params = new URLSearchParams({ q: query, status, limit: String(limit) })
     if (cursor) params.set('cursor', cursor)
+    if (accountId) params.set('account_id', accountId)
     return api<CursorPage<AdminDevice>>(`/devices/cursor?${params}`, signal)
   },
   networks: (limit = 50, offset = 0, signal?: AbortSignal) => api<Page<AdminNetwork>>(`/networks?limit=${limit}&offset=${offset}`, signal),
   rooms: (limit = 50, offset = 0, signal?: AbortSignal) => api<Page<AdminRoom>>(`/rooms?limit=${limit}&offset=${offset}`, signal),
+  networksPage: (filters: AdminResourceFilters = {}, limit = 25, offset = 0, signal?: AbortSignal) => {
+    const params = new URLSearchParams({ limit: String(limit), offset: String(offset) })
+    if (filters.query) params.set('q', filters.query)
+    if (filters.accountId) params.set('account_id', filters.accountId)
+    return api<Page<AdminNetwork>>(`/networks?${params}`, signal)
+  },
+  roomsPage: (filters: AdminResourceFilters = {}, limit = 25, offset = 0, signal?: AbortSignal) => {
+    const params = new URLSearchParams({ limit: String(limit), offset: String(offset) })
+    if (filters.query) params.set('q', filters.query)
+    if (filters.accountId) params.set('account_id', filters.accountId)
+    return api<Page<AdminRoom>>(`/rooms?${params}`, signal)
+  },
   connections: (filters: AdminConnectionFilters = {}, limit = 25, offset = 0, signal?: AbortSignal) => {
     const params = new URLSearchParams({ limit: String(limit), offset: String(offset) })
     if (filters.query) params.set('q', filters.query)
@@ -153,6 +181,8 @@ export const adminApi = {
     if (filters.accountId) params.set('account_id', filters.accountId)
     if (filters.deviceId) params.set('device_id', filters.deviceId)
     if (filters.windowSeconds) params.set('window_seconds', String(filters.windowSeconds))
+    if (filters.alertSignal) params.set('signal', filters.alertSignal)
+    if (filters.offset) params.set('offset', String(filters.offset))
     return api<AdminConnectionHealth>(`/connection-health?${params}`, signal)
   },
 }

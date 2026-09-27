@@ -284,7 +284,7 @@ const chinese: Record<string, string> = { 'Online': '在线', 'Offline': '离线
 
 function readInitialLocale(): AdminLocale {
   if (typeof window === 'undefined') return 'zh-CN'
-  return window.localStorage.getItem(STORAGE_KEY) === 'en-US' ? 'en-US' : 'zh-CN'
+  try { return window.localStorage.getItem(STORAGE_KEY) === 'en-US' ? 'en-US' : 'zh-CN' } catch { return 'zh-CN' }
 }
 
 let activeLocale: AdminLocale = readInitialLocale()
@@ -292,7 +292,15 @@ const listeners = new Set<() => void>()
 
 function subscribe(listener: () => void) {
   listeners.add(listener)
-  return () => listeners.delete(listener)
+  const onStorage = (event: StorageEvent) => {
+    if (event.key !== STORAGE_KEY && event.key !== null) return
+    const next = event.newValue === 'en-US' ? 'en-US' : 'zh-CN'
+    if (next === activeLocale) return
+    activeLocale = next
+    for (const subscriber of listeners) subscriber()
+  }
+  window.addEventListener('storage', onStorage)
+  return () => { listeners.delete(listener); window.removeEventListener('storage', onStorage) }
 }
 
 export function getLocale(): AdminLocale {
@@ -302,7 +310,7 @@ export function getLocale(): AdminLocale {
 export function setLocale(locale: AdminLocale) {
   if (locale === activeLocale) return
   activeLocale = locale
-  if (typeof window !== 'undefined') window.localStorage.setItem(STORAGE_KEY, locale)
+  try { if (typeof window !== 'undefined') window.localStorage.setItem(STORAGE_KEY, locale) } catch { /* Keep the selected language usable for the current page. */ }
   for (const listener of listeners) listener()
 }
 

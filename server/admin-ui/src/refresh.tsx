@@ -43,17 +43,21 @@ export function queryFreshness(queries: Pick<QueryState, 'dataUpdatedAt' | 'fetc
   }
 }
 
-export function QueryStatus({ queries }: { queries: QueryState[] }) {
+export function QueryStatus({ queries, label }: { queries: QueryState[]; label?: string }) {
   const enabled = useContext(RefreshContext).enabled
   const state = queryFreshness(queries)
   const degraded = state.paused || state.failed
   const time = state.updatedAt ? new Intl.DateTimeFormat(getLocale(), { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit' }).format(state.updatedAt) : ''
-  return <div className={`query-status${degraded ? ' degraded' : ''}`} role={degraded ? 'alert' : 'status'}>
-    {state.paused ? <WifiOff size={15} /> : <Clock3 size={15} />}
-    <span>{tr(state.paused ? '当前离线，更新已暂停。' : state.failed ? '刷新失败。' : !enabled ? '自动刷新已关闭。' : state.fetching ? '正在更新…' : '自动刷新已开启。')}
+  // Only changes to availability or refresh preference are announced. A normal
+  // polling cycle and its timestamp must not interrupt reading every 15 seconds.
+  const announcement = tr(state.paused ? '当前离线，更新已暂停。' : state.failed ? state.updatedAt ? '刷新失败。' : '读取失败，尚无成功快照。' : !enabled ? state.updatedAt ? '自动刷新已关闭，显示上次读取的快照，可手动刷新。' : '自动刷新已关闭；尚无成功快照，可手动读取。' : '自动刷新已开启。')
+  return <div className={`query-status${degraded ? ' degraded' : ''}${!enabled ? ' snapshot' : ''}`}>
+    <span className="sr-only" role="status" aria-live="polite" aria-atomic="true">{label ? `${tr(label)}：` : ''}{announcement}</span>
+    {state.paused ? <WifiOff size={15} aria-hidden /> : <Clock3 size={15} aria-hidden />}
+    <span className="query-status-copy">{label && <strong>{tr(label)} · </strong>}{state.fetching && !degraded ? tr('正在更新…') : announcement}
       {time && <> {tr('最后成功更新：')}<time dateTime={new Date(state.updatedAt).toISOString()}>{time}</time></>}
       {degraded && state.updatedAt > 0 && <> {tr('以下为缓存快照，不能确认当前状态。')}</>}
     </span>
-    {state.failed && !state.paused && <button type="button" className="button secondary compact" disabled={state.fetching} onClick={() => { for (const query of queries) void query.refetch() }}>{tr('重试')}</button>}
+    <button type="button" className="button secondary compact" disabled={state.fetching || state.paused} onClick={() => { for (const query of queries) void query.refetch() }} aria-label={label ? `${tr(state.failed ? '重试' : '刷新')}: ${tr(label)}` : tr(state.failed ? '重试' : '刷新')}><RefreshCw size={14} aria-hidden />{tr(state.failed ? '重试' : '刷新')}</button>
   </div>
 }

@@ -647,6 +647,94 @@ impl Daemon {
     /// not a cryptographic authenticator: malformed or mismatched metadata is
     /// consumed and rejected rather than silently degrading into an ordinary
     /// one-sided Hard↔Hard punch.
+    /// A READY message cannot enter the newest-candidate queue: that worker
+    /// may be waiting for this very acknowledgement under the punch owner.
+    async fn accept_hard_hard_ready_signal(
+        &self,
+        peer_id: &str,
+        coordination: &HardHardCoordination,
+        candidates: &[String],
+        punch_at_server_ms: Option<u64>,
+    ) -> bool {
+        let Some(meta) = coordination.v2.as_ref() else {
+            return false;
+        };
+        let acknowledgement = matches!(
+            meta.stage,
+            HardHardV2Stage::ReadyAck | HardHardV2Stage::SyncAck
+        );
+        let starting = matches!(meta.stage, HardHardV2Stage::Sync | HardHardV2Stage::SyncAck);
+        if !meta.stage.is_barrier() {
+            return false;
+        }
+        let Some(record) = self
+            .peers
+            .hard_hard_session_by_token(peer_id, &coordination.token)
+            .await
+        else {
+            return false;
+        };
+        let Some(plan) = record.coordinated_plan.as_ref() else {
+            return false;
+        };
+        let Some(agreement) = meta.agreement else {
+            return false;
+        };
+        if record.initiator != acknowledgement
+            || meta.phase != plan.phase
+            || meta.strategy_order != plan.strategy_order
+            || meta.remote != plan.local_offer
+            || Some(meta.local) != plan.remote_offer
+            || coordination.local_network_generation != record.remote_network_generation
+            || coordination.remote_network_generation != record.local_network_generation
+            || coordination.local_profile_generation != record.remote_profile_generation
+            || coordination.remote_profile_generation != record.local_profile_generation
+            || candidates.len() != record.remote_prediction.len()
+            || hard_hard_prediction_targets(candidates, crate::MAX_SIGNAL_CANDIDATES)
+                != record.remote_prediction
+            || !hard_hard_plan_registration_is_current(&self.peers, &self.control, peer_id, plan)
+                .await
+            || !self
+                .peers
+                .hard_hard_session_identity_is_current(&record.fresh_socket)
+                .await
+        {
+            return false;
+        }
+        if starting {
+            let Some(server_time_ms) = punch_at_server_ms else {
+                return false;
+            };
+            let Some(base) = plan.agreement else {
+                return false;
+            };
+            if agreement != crate::peer::hard_hard_start_agreement(base, server_time_ms) {
+                return false;
+            }
+            let start = crate::peer::HardHardAgreedStart {
+                server_time_ms,
+                agreement,
+            };
+            return if acknowledgement {
+                self.peers
+                    .hard_hard_confirm_start(peer_id, &coordination.token, start, true, None)
+                    .await
+            } else {
+                self.peers
+                    .hard_hard_activate_start(peer_id, &coordination.token, start)
+                    .await
+            };
+        }
+        if plan.agreement != Some(agreement)
+            || punch_at_server_ms != Some(plan.canonical_server_deadline)
+        {
+            return false;
+        }
+        self.peers
+            .hard_hard_accept_ready(peer_id, &coordination.token, agreement, acknowledgement)
+            .await
+    }
+
     async fn handle_hard_hard_fresh_offer(
         &self,
         peer_id: &str,
@@ -898,7 +986,7 @@ impl Daemon {
                         );
                     }
                 }
-                match spawn_hard_hard_initiator_response(
+                match spawn_hard_hard_initiator_response_with_signal(
                     udp,
                     self.peers.clone(),
                     self.punch_attempts.clone(),
@@ -906,6 +994,7 @@ impl Daemon {
                     coordination,
                     frozen_targets,
                     punch_at_ms,
+                    Some(signal),
                 )
                 .await
                 {

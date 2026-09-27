@@ -177,7 +177,7 @@ impl PeerManager {
         &self,
         peer_id: &str,
         session_token: &str,
-        report: HardHardAttemptReport,
+        mut report: HardHardAttemptReport,
     ) -> bool {
         if self.current_network_generation_sync() != report.network_generation
             || !self.peer_session_is_current_sync(
@@ -201,8 +201,8 @@ impl PeerManager {
         let Some(socket_index) = report.socket_index else {
             return false;
         };
-        let session_is_current = self
-            .hard_hard_attempt_report_identity_is_current(
+        let Some(strategy) = self
+            .hard_hard_attempt_report_strategy_if_current(
                 peer_id,
                 session_token,
                 report.network_generation,
@@ -211,9 +211,19 @@ impl PeerManager {
                 socket_index,
                 report.attempt,
             )
-            .await;
-        if !session_is_current {
+            .await
+        else {
             return false;
+        };
+        if let Some(strategy) = strategy {
+            // Fixed-anchor and birthday scans share a transport path. Report
+            // the agreed strategy, never infer it from that implementation.
+            report.mode = match strategy {
+                HardHardProbeStrategy::FixedAnchor => "fixed_anchor",
+                HardHardProbeStrategy::Predictable => "predictable",
+                HardHardProbeStrategy::Birthday => "birthday",
+            }
+            .to_string();
         }
         let detail = format!(
             "peer_id={peer_id} generation={} session_tag={} role={} mode={} attempt={} failure_class={} terminal_reason={} physical_datagrams_sent={} send_errors={} budget_skipped={}",

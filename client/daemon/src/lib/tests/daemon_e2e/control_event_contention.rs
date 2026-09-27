@@ -16,6 +16,8 @@ async fn assert_lifecycle_commit_drives_granted_lane(lane: ContendedLifecycleLan
         ContendedLifecycleLane::Responder => "peer-granted-responder-writer",
     };
     let mut peer_info = control::PeerInfo {
+        capabilities: crate::control::PeerCapabilities::default(),
+        registration_seq: 0,
         node_id: peer_id.to_string(),
         public_key: hex::encode(NodeIdentity::generate().public_key()),
         virtual_ip: "10.20.0.2".to_string(),
@@ -142,6 +144,8 @@ async fn control_event_loop_processes_critical_event_while_candidate_refresh_is_
         }
     };
     let peer_info = control::PeerInfo {
+        capabilities: crate::control::PeerCapabilities::default(),
+        registration_seq: 0,
         node_id: "peer-slow-candidate-refresh".to_string(),
         device_name: String::new(),
         app_version: String::new(),
@@ -216,6 +220,8 @@ async fn last_seen_only_peer_update_refreshes_diagnostics_without_handshake_rese
     };
     let peer_id = "peer-last-seen-heartbeat";
     let peer_info = control::PeerInfo {
+        capabilities: crate::control::PeerCapabilities::default(),
+        registration_seq: 0,
         node_id: peer_id.to_string(),
         device_name: "Heartbeat Peer".to_string(),
         app_version: "1.2.3".to_string(),
@@ -298,6 +304,8 @@ async fn control_event_loop_processes_peer_answer_while_peer_reflexive_work_wait
     daemon
         .peers
         .add_peer(&control::PeerInfo {
+            capabilities: crate::control::PeerCapabilities::default(),
+            registration_seq: 0,
             node_id: peer_id.to_string(),
             device_name: String::new(),
             app_version: String::new(),
@@ -394,6 +402,8 @@ async fn control_event_loop_processes_peer_offer_while_peer_reflexive_work_waits
     daemon
         .peers
         .add_peer(&control::PeerInfo {
+            capabilities: crate::control::PeerCapabilities::default(),
+            registration_seq: 0,
             node_id: peer_id.to_string(),
             device_name: String::new(),
             app_version: String::new(),
@@ -479,6 +489,8 @@ async fn control_event_loop_queues_candidate_offer_while_connection_writer_is_bl
     daemon
         .peers
         .add_peer(&control::PeerInfo {
+            capabilities: crate::control::PeerCapabilities::default(),
+            registration_seq: 0,
             node_id: peer_id.to_string(),
             device_name: String::new(),
             app_version: String::new(),
@@ -552,6 +564,8 @@ async fn control_event_loop_queues_candidate_offer_while_connection_writer_is_bl
     .await
     .expect("ordinary candidate worker did not exercise the non-queuing contention path");
     let heartbeat = control::PeerInfo {
+        capabilities: crate::control::PeerCapabilities::default(),
+        registration_seq: 0,
         node_id: peer_id.to_string(),
         device_name: String::new(),
         app_version: String::new(),
@@ -642,6 +656,8 @@ async fn fresh_candidate_lock_wait_does_not_stall_peer_update_or_queued_answer()
         }
     };
     let peer_info = control::PeerInfo {
+        capabilities: crate::control::PeerCapabilities::default(),
+        registration_seq: 0,
         node_id: peer_id.to_string(),
         public_key: hex::encode(peer_identity.public_key()),
         virtual_ip: "10.20.0.2".to_string(),
@@ -1080,6 +1096,8 @@ async fn blocking_candidate_apply_releases_epoch_before_waiting_for_writer_turn(
     daemon
         .peers
         .add_peer(&control::PeerInfo {
+            capabilities: crate::control::PeerCapabilities::default(),
+            registration_seq: 0,
             node_id: peer_id.to_string(),
             public_key: hex::encode(peer_identity.public_key()),
             virtual_ip: "10.20.0.2".to_string(),
@@ -1148,6 +1166,8 @@ async fn remote_incarnation_claim_and_finish_never_queue_writer_with_epoch() {
     daemon
         .peers
         .add_peer(&control::PeerInfo {
+            capabilities: crate::control::PeerCapabilities::default(),
+            registration_seq: 0,
             node_id: peer_id.to_string(),
             public_key: sender_public_key.clone(),
             virtual_ip: "10.20.0.2".to_string(),
@@ -1267,6 +1287,8 @@ async fn remote_incarnation_rotation_cancels_retry_and_kicks_replacement() {
     daemon
         .peers
         .add_peer(&control::PeerInfo {
+            capabilities: crate::control::PeerCapabilities::default(),
+            registration_seq: 0,
             node_id: peer_id.to_string(),
             public_key: hex::encode(peer_identity.public_key()),
             virtual_ip: "10.20.0.2".to_string(),
@@ -1369,6 +1391,8 @@ async fn candidate_receipt_and_slow_work_do_not_head_of_line_block_responder_off
     };
     let peer_id = "peer-candidate-hol-responder";
     let peer_info = control::PeerInfo {
+        capabilities: crate::control::PeerCapabilities::default(),
+        registration_seq: 0,
         node_id: peer_id.to_string(),
         public_key: hex::encode(remote_identity.public_key()),
         virtual_ip: "10.20.0.2".to_string(),
@@ -1631,6 +1655,8 @@ async fn remote_incarnation_cleanup_fence_prevents_no_reset_race() {
     let remote_identity = NodeIdentity::generate();
     let peer_id = "peer-reset-fence";
     let peer_info = control::PeerInfo {
+        capabilities: crate::control::PeerCapabilities::default(),
+        registration_seq: 0,
         node_id: peer_id.to_string(),
         public_key: hex::encode(remote_identity.public_key()),
         virtual_ip: "10.20.0.2".to_string(),

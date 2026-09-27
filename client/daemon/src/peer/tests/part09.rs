@@ -1,5 +1,7 @@
 fn flood_peer(node_id: &str, virtual_ip: &str, endpoint: SocketAddr) -> PeerInfo {
     PeerInfo {
+        capabilities: crate::control::PeerCapabilities::default(),
+        registration_seq: 0,
         node_id: node_id.to_string(),
         device_name: String::new(),
         app_version: String::new(),

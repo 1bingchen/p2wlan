@@ -9,6 +9,8 @@ async fn profile_wait_fixture() -> (
     let daemon =
         Daemon::new(Config::generate_default("http://127.0.0.1:1", "profile-wait").unwrap());
     let peer = control::PeerInfo {
+        capabilities: crate::control::PeerCapabilities::default(),
+        registration_seq: 0,
         node_id: "peer-profile-publication".to_string(),
         public_key: hex::encode(NodeIdentity::generate().public_key()),
         virtual_ip: "10.20.0.2".to_string(),
@@ -18,6 +20,7 @@ async fn profile_wait_fixture() -> (
     };
     daemon.peers.add_peer(&peer).await;
     let coordination = HardHardCoordination {
+        v2: None,
         role: HardHardRole::Initiator,
         token: "a1".to_string(),
         local_network_generation: 0,

@@ -195,6 +195,8 @@ mod tests {
         let peers = Arc::new(PeerManager::new((*config).clone()));
         peers
             .add_peer(&PeerInfo {
+                capabilities: crate::control::PeerCapabilities::default(),
+                registration_seq: 0,
                 node_id: "node-b".to_string(),
                 device_name: "Office Mac".to_string(),
                 app_version: String::new(),
@@ -579,6 +581,8 @@ mod tests {
         let peers = PeerManager::new(config);
         peers
             .add_peer(&PeerInfo {
+                capabilities: crate::control::PeerCapabilities::default(),
+                registration_seq: 0,
                 node_id: "node-shape".to_string(),
                 device_name: "Shape peer".to_string(),
                 app_version: String::new(),

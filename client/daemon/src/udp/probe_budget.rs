@@ -27,6 +27,7 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
+use crate::peer::RecoveryProbePurpose;
 use tokio::sync::Mutex;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -60,11 +61,28 @@ impl GlobalOutboundProbeBudget {
         Self::default()
     }
 
+    #[cfg(test)]
     pub(super) async fn admit(
         &self,
         peer_id: &str,
         peer_addr: SocketAddr,
         socket_index: usize,
+    ) -> OutboundProbeAdmission {
+        self.admit_with_purpose(
+            peer_id,
+            peer_addr,
+            socket_index,
+            RecoveryProbePurpose::Ordinary,
+        )
+        .await
+    }
+
+    pub(super) async fn admit_with_purpose(
+        &self,
+        peer_id: &str,
+        peer_addr: SocketAddr,
+        socket_index: usize,
+        purpose: RecoveryProbePurpose,
     ) -> OutboundProbeAdmission {
         let now = Instant::now();
         let mut budget = self.state.lock().await;
@@ -120,6 +138,53 @@ impl GlobalOutboundProbeBudget {
             >= OUTBOUND_PROBE_PERSISTENT_PER_DESTINATION_IP
         {
             return OutboundProbeAdmission::GlobalDestinationPersistentRateLimited;
+        }
+
+        let short_reserve = purpose.confirmation_short_window_reserve();
+        if short_reserve > 0
+            && [
+                (
+                    &OutboundProbeBudgetKey::Network,
+                    OUTBOUND_PROBE_BUDGET_PER_NETWORK,
+                ),
+                (&peer_key, OUTBOUND_PROBE_BUDGET_PER_PEER),
+                (&remote_ip_key, OUTBOUND_PROBE_BUDGET_PER_PEER_REMOTE_IP),
+                (&destination_key, OUTBOUND_PROBE_BUDGET_PER_DESTINATION_IP),
+            ]
+            .into_iter()
+            .any(|(key, ceiling)| {
+                short_window_len(&budget, key) >= ceiling.saturating_sub(short_reserve)
+            })
+        {
+            return OutboundProbeAdmission::HardHardConfirmationRateReserved;
+        }
+        let long_reserve = purpose.confirmation_credit_reserve() as usize;
+        if long_reserve > 0
+            && [
+                (
+                    &OutboundProbeBudgetKey::NetworkPersistent,
+                    OUTBOUND_PROBE_PERSISTENT_PER_NETWORK,
+                ),
+                (&peer_persistent_key, OUTBOUND_PROBE_PERSISTENT_PER_PEER),
+                (
+                    &remote_ip_persistent_key,
+                    OUTBOUND_PROBE_PERSISTENT_PER_PEER_REMOTE_IP,
+                ),
+                (
+                    &destination_persistent_key,
+                    OUTBOUND_PROBE_PERSISTENT_PER_DESTINATION_IP,
+                ),
+                (
+                    &socket_persistent_key,
+                    OUTBOUND_PROBE_PERSISTENT_PER_PEER_SOCKET,
+                ),
+            ]
+            .into_iter()
+            .any(|(key, ceiling)| {
+                long_window_len(&budget, key) >= ceiling.saturating_sub(long_reserve)
+            })
+        {
+            return OutboundProbeAdmission::HardHardConfirmationCreditReserved;
         }
 
         budget
@@ -673,6 +738,11 @@ pub(super) enum OutboundProbeAdmission {
     /// probes may be emitted until the epoch rotates (generation advance,
     /// Direct confirmation or the age-based re-arm).
     EpochCreditExhausted,
+    /// HH2's own exploration/triggered traffic must leave this short-window
+    /// tail available to checks/nomination. Existing totals are unchanged.
+    HardHardConfirmationRateReserved,
+    HardHardConfirmationCreditReserved,
+    RecoveryIdentityStale,
     /// The relay-backoff heartbeat's dedicated per-peer budget is exhausted;
     /// the next beat retries.
     HeartbeatBudgetLimited,
@@ -705,6 +775,13 @@ pub(super) fn outbound_probe_admission_reason(admission: OutboundProbeAdmission)
             "global_peer_socket_persistent_rate_limited"
         }
         OutboundProbeAdmission::EpochCreditExhausted => "recovery_epoch_credit_exhausted",
+        OutboundProbeAdmission::HardHardConfirmationRateReserved => {
+            "hard_hard_confirmation_rate_reserved"
+        }
+        OutboundProbeAdmission::HardHardConfirmationCreditReserved => {
+            "hard_hard_confirmation_credit_reserved"
+        }
+        OutboundProbeAdmission::RecoveryIdentityStale => "recovery_probe_identity_stale",
         OutboundProbeAdmission::HeartbeatBudgetLimited => "relay_backoff_heartbeat_budget_limited",
     }
 }
@@ -781,4 +858,117 @@ fn long_window_len(
     key: &OutboundProbeBudgetKey,
 ) -> usize {
     budget.get(key).map_or(0, VecDeque::len)
+}
+
+#[cfg(test)]
+mod confirmation_reserve_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn short_reserve_protects_checks_and_nomination_without_raising_total() {
+        let budget = GlobalOutboundProbeBudget::new();
+        let endpoint: SocketAddr = "192.0.2.1:40000".parse().unwrap();
+        let key = OutboundProbeBudgetKey::PeerRemoteIp("peer".into(), endpoint.ip());
+        let exploration = RecoveryProbePurpose::HardHardExploration;
+        let triggered = RecoveryProbePurpose::HardHardTriggered;
+        let nomination = RecoveryProbePurpose::HardHardNomination;
+        let ceiling = OUTBOUND_PROBE_BUDGET_PER_PEER_REMOTE_IP;
+        budget.state.lock().await.insert(
+            key.clone(),
+            std::iter::repeat_n(
+                Instant::now(),
+                ceiling - exploration.confirmation_short_window_reserve(),
+            )
+            .collect(),
+        );
+        assert_eq!(
+            budget
+                .admit_with_purpose("peer", endpoint, 0, exploration)
+                .await,
+            OutboundProbeAdmission::HardHardConfirmationRateReserved
+        );
+        assert_eq!(
+            budget
+                .admit_with_purpose("peer", endpoint, 0, triggered)
+                .await,
+            OutboundProbeAdmission::Accepted
+        );
+        budget.state.lock().await.insert(
+            key.clone(),
+            std::iter::repeat_n(
+                Instant::now(),
+                ceiling - triggered.confirmation_short_window_reserve(),
+            )
+            .collect(),
+        );
+        assert_eq!(
+            budget
+                .admit_with_purpose("peer", endpoint, 0, triggered)
+                .await,
+            OutboundProbeAdmission::HardHardConfirmationRateReserved
+        );
+        for _ in 0..triggered.confirmation_short_window_reserve() {
+            assert_eq!(
+                budget
+                    .admit_with_purpose("peer", endpoint, 0, nomination)
+                    .await,
+                OutboundProbeAdmission::Accepted
+            );
+        }
+        assert_eq!(
+            budget
+                .admit_with_purpose("peer", endpoint, 0, nomination)
+                .await,
+            OutboundProbeAdmission::GlobalRemoteIpRateLimited
+        );
+        assert_eq!(budget.state.lock().await[&key].len(), ceiling);
+    }
+
+    #[tokio::test]
+    async fn persistent_reserve_uses_same_balance_and_legacy_ceiling() {
+        let budget = GlobalOutboundProbeBudget::new();
+        let endpoint: SocketAddr = "192.0.2.1:40000".parse().unwrap();
+        let key = OutboundProbeBudgetKey::PeerSocketPersistent("peer".into(), 10);
+        let exploration = RecoveryProbePurpose::HardHardExploration;
+        let triggered = RecoveryProbePurpose::HardHardTriggered;
+        let ceiling = OUTBOUND_PROBE_PERSISTENT_PER_PEER_SOCKET;
+        let used = ceiling - exploration.confirmation_credit_reserve() as usize;
+        budget.state.lock().await.insert(
+            key.clone(),
+            std::iter::repeat_n(Instant::now(), used).collect(),
+        );
+        assert_eq!(
+            budget
+                .admit_with_purpose("peer", endpoint, 10, exploration)
+                .await,
+            OutboundProbeAdmission::HardHardConfirmationCreditReserved
+        );
+        assert_eq!(budget.state.lock().await[&key].len(), used);
+        assert_eq!(
+            budget
+                .admit_with_purpose("peer", endpoint, 10, triggered)
+                .await,
+            OutboundProbeAdmission::Accepted
+        );
+        budget.state.lock().await.insert(
+            key.clone(),
+            std::iter::repeat_n(Instant::now(), ceiling - 1).collect(),
+        );
+        assert_eq!(
+            budget.admit("peer", endpoint, 10).await,
+            OutboundProbeAdmission::Accepted
+        );
+        assert_eq!(
+            budget
+                .admit_with_purpose(
+                    "peer",
+                    endpoint,
+                    10,
+                    RecoveryProbePurpose::HardHardNomination
+                )
+                .await,
+            OutboundProbeAdmission::GlobalPeerSocketPersistentRateLimited
+        );
+        assert_eq!(budget.state.lock().await[&key].len(), ceiling);
+    }
 }

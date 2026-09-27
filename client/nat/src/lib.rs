@@ -41,6 +41,12 @@ pub use mapping::{
     AllocationModel, AllocationModelKind, MappingBatch, MappingObservation, ModelRejection,
     PortModel, PortModelKind, PredictionCandidate, PredictionReason, MAX_PREDICTED_PORTS,
 };
+pub use mapping::allocation::{
+    infer_port_domain, infer_scoped_allocation, plan_fixed_anchor, validate_allocation_attempts,
+    AllocationAttempt, AllocationAttemptOutcome, AllocationEvidenceRejection,
+    AllocationIdentity, AllocationSample, AllocationScope, FixedAnchorPlan, PortDomainEvidence,
+    ScopedAllocationEvidence, MAX_ALLOCATION_SAMPLES,
+};
 pub use punch::{
     build_authenticated_punch_ack, build_authenticated_punch_packet,
     build_authenticated_punch_packet_with_nomination, build_punch_ack, build_punch_packet,

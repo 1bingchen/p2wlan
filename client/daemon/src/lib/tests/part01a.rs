@@ -48,6 +48,8 @@ fn only_applied_candidate_only_signals_start_synchronized_punch() {
 
 fn deferred_initiator_test_peer(node_id: &str, endpoint: &str) -> control::PeerInfo {
     control::PeerInfo {
+        capabilities: crate::control::PeerCapabilities::default(),
+        registration_seq: 0,
         node_id: node_id.to_string(),
         device_name: String::new(),
         app_version: String::new(),
@@ -730,6 +732,8 @@ async fn start_hole_punch_waits_for_local_candidates_before_state_change() {
     daemon
         .peers
         .add_peer(&control::PeerInfo {
+            capabilities: crate::control::PeerCapabilities::default(),
+            registration_seq: 0,
             node_id: "node-b".to_string(),
             device_name: String::new(),
             app_version: String::new(),
@@ -924,6 +928,8 @@ async fn encrypted_direct_validation_uses_observed_endpoint_and_wireguard_sessio
     let observed_endpoint = remote_socket.local_addr().unwrap();
     peers
         .add_peer(&control::PeerInfo {
+            capabilities: crate::control::PeerCapabilities::default(),
+            registration_seq: 0,
             node_id: "node-b".to_string(),
             device_name: String::new(),
             app_version: String::new(),
@@ -1033,6 +1039,8 @@ async fn encrypted_direct_validation_waits_for_delayed_wireguard_session() {
     let observed_endpoint = remote_socket.local_addr().unwrap();
     peers
         .add_peer(&control::PeerInfo {
+            capabilities: crate::control::PeerCapabilities::default(),
+            registration_seq: 0,
             node_id: "node-b".to_string(),
             device_name: String::new(),
             app_version: String::new(),
@@ -1108,6 +1116,8 @@ async fn encrypted_validation_cancellation_keeps_lease_generation_and_owner_in_d
     let observed_endpoint: SocketAddr = "127.0.0.1:45801".parse().unwrap();
     peers
         .add_peer(&control::PeerInfo {
+            capabilities: crate::control::PeerCapabilities::default(),
+            registration_seq: 0,
             node_id: "node-validation-cancel".to_string(),
             device_name: String::new(),
             app_version: String::new(),
@@ -1199,6 +1209,8 @@ async fn direct_probe_loop_waits_for_local_candidates_before_background_retry() 
     let remote_endpoint: SocketAddr = "203.0.113.10:51839".parse().unwrap();
     peers
         .add_peer(&control::PeerInfo {
+            capabilities: crate::control::PeerCapabilities::default(),
+            registration_seq: 0,
             node_id: "node-b".to_string(),
             device_name: String::new(),
             app_version: String::new(),
@@ -1283,6 +1295,8 @@ async fn relay_validation_sends_encrypted_probe_through_relay() {
     ));
     peers
         .add_peer(&control::PeerInfo {
+            capabilities: crate::control::PeerCapabilities::default(),
+            registration_seq: 0,
             node_id: "node-b".to_string(),
             device_name: String::new(),
             app_version: String::new(),
@@ -1356,6 +1370,8 @@ async fn encrypted_direct_validation_skips_when_direct_is_already_confirmed() {
     let observed_endpoint = remote_socket.local_addr().unwrap();
     peers
         .add_peer(&control::PeerInfo {
+            capabilities: crate::control::PeerCapabilities::default(),
+            registration_seq: 0,
             node_id: "node-b".to_string(),
             device_name: String::new(),
             app_version: String::new(),
@@ -1418,6 +1434,8 @@ async fn scheduled_hole_punch_skips_direct_peer_even_with_live_candidates() {
     let candidates = vec![endpoint.to_string()];
     peers
         .add_peer(&control::PeerInfo {
+            capabilities: crate::control::PeerCapabilities::default(),
+            registration_seq: 0,
             node_id: "node-b".to_string(),
             device_name: String::new(),
             app_version: String::new(),
@@ -1505,6 +1523,8 @@ async fn superseded_udp_lease_cancels_old_detached_punch_without_touching_replac
     let endpoint = remote_socket.local_addr().unwrap();
     peers
         .add_peer(&control::PeerInfo {
+            capabilities: crate::control::PeerCapabilities::default(),
+            registration_seq: 0,
             node_id: "node-b".to_string(),
             device_name: String::new(),
             app_version: String::new(),
@@ -1629,6 +1649,8 @@ async fn late_hole_punch_send_error_cannot_degrade_same_node_rejoin() {
         Config::generate_default("https://ctrl.test", "hole-punch-send-error-lifecycle").unwrap(),
     ));
     let peer = control::PeerInfo {
+        capabilities: crate::control::PeerCapabilities::default(),
+        registration_seq: 0,
         node_id: "node-b".to_string(),
         device_name: String::new(),
         app_version: String::new(),
@@ -1696,6 +1718,8 @@ async fn scheduled_hole_punch_skips_without_degrading_already_direct_peer() {
     let endpoint = remote_socket.local_addr().unwrap();
     peers
         .add_peer(&control::PeerInfo {
+            capabilities: crate::control::PeerCapabilities::default(),
+            registration_seq: 0,
             node_id: "node-b".to_string(),
             device_name: String::new(),
             app_version: String::new(),
@@ -1763,6 +1787,8 @@ async fn scheduled_hole_punch_ack_timeout_keeps_retrying_without_degrading() {
     drop(unused_socket);
     peers
         .add_peer(&control::PeerInfo {
+            capabilities: crate::control::PeerCapabilities::default(),
+            registration_seq: 0,
             node_id: "node-b".to_string(),
             device_name: String::new(),
             app_version: String::new(),
@@ -1861,6 +1887,8 @@ async fn suppressed_same_epoch_offer_stashes_latest_targets_without_reclocking_f
     let refreshed_endpoint = refreshed_socket.local_addr().unwrap();
     peers
         .add_peer(&control::PeerInfo {
+            capabilities: crate::control::PeerCapabilities::default(),
+            registration_seq: 0,
             node_id: "node-b".to_string(),
             device_name: String::new(),
             app_version: String::new(),
@@ -1950,6 +1978,8 @@ async fn start_hole_punch_skipped_for_healthy_confirmed_direct() {
     daemon
         .peers
         .add_peer(&control::PeerInfo {
+            capabilities: crate::control::PeerCapabilities::default(),
+            registration_seq: 0,
             node_id: "node-b".to_string(),
             device_name: String::new(),
             app_version: String::new(),
@@ -2028,6 +2058,8 @@ async fn stale_fresh_signal_never_pollutes_candidate_set_end_to_end() {
     daemon
         .peers
         .add_peer(&control::PeerInfo {
+            capabilities: crate::control::PeerCapabilities::default(),
+            registration_seq: 0,
             node_id: "node-b".to_string(),
             device_name: String::new(),
             app_version: String::new(),
@@ -2301,6 +2333,8 @@ async fn fresh_prediction_not_applied_keeps_identity_and_retry_commits() {
 
     peers
         .add_peer(&control::PeerInfo {
+            capabilities: crate::control::PeerCapabilities::default(),
+            registration_seq: 0,
             node_id: "node-b".to_string(),
             device_name: String::new(),
             app_version: String::new(),
@@ -2472,6 +2506,8 @@ async fn frozen_fresh_target_snapshot_survives_later_ordinary_refresh() {
     daemon
         .peers
         .add_peer(&control::PeerInfo {
+            capabilities: crate::control::PeerCapabilities::default(),
+            registration_seq: 0,
             node_id: "node-b".to_string(),
             device_name: String::new(),
             app_version: String::new(),

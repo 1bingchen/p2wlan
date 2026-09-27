@@ -255,7 +255,9 @@ impl Daemon {
         {
             let pending_handshakes = pending_handshakes.clone();
             let timeline = timeline.clone();
+            let timing_control = control.clone();
             peers.set_network_generation_handshake_cancel_hook(Arc::new(move |generation| {
+                timing_control.invalidate_network_timing();
                 let (cancelled_reservations, cancelled_pending, stale_probe_bindings) =
                     pending_handshakes
                     .lock()

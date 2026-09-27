@@ -4,7 +4,7 @@ import test from 'node:test'
 import { build } from 'esbuild'
 import { createElement } from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
-import { CONNECTION_PAGE_SIZE, lastAvailableConnectionPage, readConnectionSearch, selectConnectionSearch, updateConnectionSearch } from '../src/connectionNavigation.ts'
+import { CONNECTION_PAGE_SIZE, closeConnectionDetailSearch, connectionDetailIsOpen, connectionWorkspaceSearch, connectionWorkspaceTab, isolateConnectionSearch, lastAvailableConnectionPage, readConnectionSearch, readDirectionOnlySearch, selectConnectionSearch, updateConnectionSearch } from '../src/connectionNavigation.ts'
 
 const require = createRequire(import.meta.url)
 // Share the CJS contexts used by the in-memory compiled component.
@@ -62,6 +62,38 @@ test('legacy scoped direction links remain valid and partial identities do not o
   assert.equal(readConnectionSearch(oldLink).selected, null)
 })
 
+test('closing details keeps the graph selection and clicking the direction reopens it', () => {
+  const direction = { network_id: 'n', reporting_device_id: 'a', remote_device_id: 'b' }
+  const opened = selectConnectionSearch(new URLSearchParams('tab=topology&network_id=n'), direction)
+  assert.equal(connectionDetailIsOpen(opened), true)
+  const closed = closeConnectionDetailSearch(opened)
+  assert.deepEqual(readConnectionSearch(closed).selected, direction)
+  assert.equal(connectionDetailIsOpen(closed), false)
+  assert.equal(connectionDetailIsOpen(selectConnectionSearch(closed, direction)), true)
+  assert.equal(selectConnectionSearch(closed, null).has('detail'), false)
+  assert.equal(connectionDetailIsOpen(connectionWorkspaceSearch(closed, 'all')), false)
+})
+
+test('exact-direction recovery clears conflicting filters and remains visible until explicitly cleared', () => {
+  const direction = { network_id: 'selected-network', reporting_device_id: 'a', remote_device_id: 'b' }
+  const original = new URLSearchParams('network_id=other&q=filter&path=relay&freshness=stale&account_id=u&device_id=c&page=7&alert_page=2&window_hours=168')
+  const focused = isolateConnectionSearch(original, direction)
+  assert.deepEqual(readDirectionOnlySearch(focused), direction)
+  assert.equal(focused.get('tab'), 'topology')
+  assert.equal(focused.get('detail'), 'closed')
+  for (const key of ['q', 'path', 'freshness', 'account_id', 'device_id', 'page', 'alert_page']) assert.equal(focused.has(key), false)
+  assert.equal(focused.get('window_hours'), '168')
+  assert.deepEqual(readDirectionOnlySearch(selectConnectionSearch(focused, direction)), direction)
+  assert.equal(readDirectionOnlySearch(selectConnectionSearch(focused, null)), null)
+  const incomplete = new URLSearchParams(focused)
+  incomplete.delete('remote_device_id')
+  assert.equal(readDirectionOnlySearch(incomplete), null)
+  const wrongNetwork = new URLSearchParams(focused)
+  wrongNetwork.set('network_id', 'other')
+  assert.equal(readDirectionOnlySearch(wrongNetwork), null)
+  assert.equal(original.get('q'), 'filter')
+})
+
 test('invalid URL enums and unsafe pages cannot create malformed API requests', () => {
   for (const page of ['-1', '0', '1.5', 'NaN', 'Infinity', '9007199254740991']) {
     const value = readConnectionSearch(new URLSearchParams({ page, path: 'invalid', freshness: 'invalid', view: 'invalid' }))
@@ -79,6 +111,22 @@ test('freshness expiration returns an out-of-range page to the final valid page'
   assert.equal(lastAvailableConnectionPage(4, 50), 2)
   assert.equal(lastAvailableConnectionPage(4, 0), 1)
   assert.equal(lastAvailableConnectionPage(1, 100), 1)
+})
+
+test('workspace tabs preserve directional selection and use one freshness filter', () => {
+  const original = new URLSearchParams('network_id=n&account_id=u&device_id=a&q=lab&freshness=stale&page=3&selected_network_id=n&reporting_device_id=a&remote_device_id=b')
+  for (const tab of ['health', 'all', 'topology', 'trends']) {
+    const next = connectionWorkspaceSearch(original, tab)
+    assert.equal(connectionWorkspaceTab(next), tab)
+    for (const name of ['network_id', 'account_id', 'device_id', 'q', 'freshness', 'page', 'selected_network_id', 'reporting_device_id', 'remote_device_id']) assert.equal(next.get(name), original.get(name))
+    assert.equal(readConnectionSearch(next).freshness, 'stale')
+  }
+  assert.equal(original.has('tab'), false)
+  assert.equal(connectionWorkspaceTab(new URLSearchParams(), '/health'), 'health')
+  const legacy = connectionWorkspaceSearch(new URLSearchParams('view=topology&network_id=n'), 'all')
+  assert.equal(legacy.get('freshness'), 'fresh')
+  assert.equal(legacy.has('view'), false)
+  assert.equal(readConnectionSearch(connectionWorkspaceSearch(new URLSearchParams(), 'topology')).freshness, '')
 })
 
 test('empty live topology retains the stale control so historical paths are reachable', () => {
@@ -122,6 +170,17 @@ test('background errors keep the last list visible while explicitly labelling th
   assert.match(html, /Device A/)
   assert.match(html, /刷新失败/)
   assert.match(html, /缓存快照/)
+})
+
+test('a directory snapshot cannot replace the connection snapshot update time', (t) => {
+  const { client, key } = pageClient(t)
+  const oldDirectory = new Date('2024-01-02T03:04:05Z').getTime()
+  const newConnection = new Date('2025-06-07T08:09:10Z').getTime()
+  client.getQueryCache().find({ queryKey: ['connections', 'networks'], exact: true }).setState({ dataUpdatedAt: oldDirectory })
+  client.getQueryCache().find({ queryKey: key, exact: true }).setState({ dataUpdatedAt: newConnection })
+  const html = renderPage(client)
+  assert.match(html, /datetime="2025-06-07T08:09:10\.000Z"/)
+  assert.doesNotMatch(html, /datetime="2024-01-02T03:04:05\.000Z"/)
 })
 
 test('offline polling retains the list and displays a paused snapshot warning', (t) => {

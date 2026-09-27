@@ -33,6 +33,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 pub mod rendezvous;
+pub mod allocation;
 
 /// One STUN mapping observation on a dedicated punch socket.
 ///

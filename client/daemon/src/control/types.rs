@@ -151,6 +151,29 @@ pub enum ControlMessage {
 // Peer Info
 // ============================================================
 
+/// Explicit wire capabilities, scoped to the authenticated registration lifecycle.
+/// Missing fields identify legacy clients; application versions are not capabilities.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct PeerCapabilities {
+    #[serde(default)]
+    pub hh2_pair_nomination: bool,
+    #[serde(default)]
+    pub hh2_plan_v2: bool,
+}
+
+impl PeerCapabilities {
+    pub const fn current() -> Self {
+        Self {
+            hh2_pair_nomination: true,
+            hh2_plan_v2: true,
+        }
+    }
+
+    pub const fn supports_hh2(self) -> bool {
+        self.hh2_pair_nomination && self.hh2_plan_v2
+    }
+}
+
 /// Information about a known peer.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct PeerInfo {
@@ -162,6 +185,11 @@ pub struct PeerInfo {
     /// Peer application/daemon version reported by the control plane.
     #[serde(default)]
     pub app_version: String,
+    #[serde(default)]
+    pub capabilities: PeerCapabilities,
+    /// Server-issued lifecycle for this capability snapshot; zero is legacy.
+    #[serde(default)]
+    pub registration_seq: u64,
     /// Peer public key (hex).
     pub public_key: String,
     /// Peer public endpoint (ip:port).
@@ -445,6 +473,7 @@ pub enum ControlEvent {
 /// Control plane client state.
 #[derive(Debug)]
 struct ClientState {
+    server_clock: Arc<ServerClockEstimate>,
     room_authorization: Arc<crate::rooms::RoomAuthorization>,
     /// Whether we are registered.
     registered: bool,
@@ -454,42 +483,6 @@ struct ClientState {
     virtual_ip: Option<String>,
     /// Available relay servers.
     _relay_servers: Vec<String>,
-}
-
-/// Latest bounded translation between this process' wall clock and the
-/// control server clock. Signal polling refreshes it from a timestamp written
-/// into the same response as the durable signal batch. Hard<->Hard uses the
-/// estimate only to express its existing 3500ms local deadline on the server
-/// clock before queueing an initiating offer; the server remains authoritative
-/// and the receiver independently translates that one absolute deadline.
-#[derive(Debug, Default)]
-struct ServerClockEstimate {
-    offset_ms: AtomicI64,
-    observed_at_local_ms: AtomicU64,
-}
-
-impl ServerClockEstimate {
-    const MAX_AGE_MS: u64 = 30_000;
-
-    fn observe(&self, server_time_ms: u64, local_time_ms: u64) {
-        let offset = i128::from(server_time_ms) - i128::from(local_time_ms);
-        let Ok(offset) = i64::try_from(offset) else {
-            return;
-        };
-        self.offset_ms.store(offset, Ordering::Relaxed);
-        self.observed_at_local_ms
-            .store(local_time_ms, Ordering::Release);
-    }
-
-    fn server_deadline_for_local(&self, local_deadline_ms: u64, local_now_ms: u64) -> Option<u64> {
-        let observed_at = self.observed_at_local_ms.load(Ordering::Acquire);
-        if observed_at == 0 || local_now_ms.abs_diff(observed_at) > Self::MAX_AGE_MS {
-            return None;
-        }
-        let translated = i128::from(local_deadline_ms)
-            .checked_add(i128::from(self.offset_ms.load(Ordering::Relaxed)))?;
-        u64::try_from(translated).ok()
-    }
 }
 
 /// Relay catalog entry from control plane.
@@ -506,6 +499,9 @@ pub struct RelayCatalogEntry {
 
 #[derive(Debug, Deserialize)]
 struct RegisterDeviceResponse {
+    /// Echo of this daemon registration, independent of server feature flags.
+    #[serde(default)]
+    accepted_peer_capabilities: PeerCapabilities,
     success: bool,
     node_id: Option<String>,
     virtual_ip: Option<String>,
@@ -538,6 +534,8 @@ struct ControlErrorResponse {
 #[derive(Debug, Deserialize)]
 struct ListNodesResponse {
     #[serde(default)]
+    server_time_ms: Option<u64>,
+    #[serde(default)]
     authorization_lease_seconds: u64,
     #[serde(default)]
     nodes: Vec<DeviceResponse>,
@@ -545,6 +543,10 @@ struct ListNodesResponse {
 
 #[derive(Debug, Deserialize)]
 struct DeviceResponse {
+    #[serde(default)]
+    registration_seq: u64,
+    #[serde(default)]
+    capabilities: PeerCapabilities,
     id: String,
     #[serde(default)]
     device_name: String,
@@ -675,6 +677,10 @@ struct SignalResponse {
 /// signaling, peer discovery, and configuration updates.
 #[derive(Clone)]
 pub struct ControlClient {
+    /// Existing registration owner; new-mode eligibility is never inferred locally.
+    registration_rx: watch::Receiver<Option<CriticalControlAuth>>,
+    #[cfg(test)]
+    test_registration_tx: Option<watch::Sender<Option<CriticalControlAuth>>>,
     shutdown_lifecycle: Option<Arc<ControlShutdown>>,
     /// Set by the daemon after its main control-event consumer is ready.
     ///
@@ -753,6 +759,8 @@ const CRITICAL_OFFER_QUEUE_CAPACITY: usize = 32;
 const CRITICAL_ANSWER_QUEUE_CAPACITY: usize = 32;
 const CRITICAL_CTRL_QUEUE_CAPACITY: usize = 8;
 const CANDIDATE_OFFER_QUEUE_CAPACITY: usize = 32;
+/// Final HH2 ACK retries are prepaid from the existing recovery HTTP quota.
+pub(crate) const HARD_HARD_START_ACK_MAX_ATTEMPTS: u8 = 3;
 /// In-flight ceilings per lane.  The answer lane gets a dedicated budget so
 /// it is never blocked behind offer traffic; the two lane ceilings together
 /// are the global handshake hard cap.
@@ -780,6 +788,7 @@ const CRITICAL_SIGNAL_OVERALL_DEADLINE: std::time::Duration = std::time::Duratio
 /// the configured local id is deliberately not used for signal sends.
 #[derive(Clone)]
 struct CriticalControlAuth {
+    accepted_peer_capabilities: PeerCapabilities,
     base_url: String,
     token: String,
     self_node_id: String,
@@ -798,6 +807,7 @@ impl CriticalControlAuth {
             && self.token == other.token
             && self.self_node_id == other.self_node_id
             && self.registration_seq == other.registration_seq
+            && self.accepted_peer_capabilities == other.accepted_peer_capabilities
     }
 }
 
@@ -875,6 +885,8 @@ pub(crate) enum PeerOfferSendOutcome {
 /// context; this value contains only the immutable request data and the
 /// caller's completion channel.
 struct CandidateOfferCommand {
+    not_after: Option<Instant>,
+    prepaid_attempts: u8,
     to_node_id: String,
     candidates: Vec<String>,
     session_id: Option<String>,

@@ -1,6 +1,7 @@
 package database
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -9,27 +10,32 @@ import (
 )
 
 const (
-	AdminConnectionHealthSchemaVersion          = 1
-	DefaultConnectionHealthWindowSeconds        = 3600
-	MinConnectionHealthWindowSeconds            = 60
-	MaxConnectionHealthWindowSeconds            = 86400
-	DefaultConnectionHealthAlertLimit           = 50
-	MaxConnectionHealthAlertLimit               = 100
-	ConnectionHealthFrequentSwitchThreshold     = 4
-	ConnectionHealthRepeatedFailureThreshold    = 3
+	AdminConnectionHealthSchemaVersion       = 1
+	DefaultConnectionHealthWindowSeconds     = 3600
+	MinConnectionHealthWindowSeconds         = 60
+	MaxConnectionHealthWindowSeconds         = 86400
+	DefaultConnectionHealthAlertLimit        = 50
+	MaxConnectionHealthAlertLimit            = 100
+	ConnectionHealthFrequentSwitchThreshold  = 4
+	ConnectionHealthRepeatedFailureThreshold = 3
 )
 
 var (
 	ErrInvalidConnectionHealthWindow = errors.New("connection health window_seconds out of range")
 	ErrInvalidConnectionHealthLimit  = errors.New("connection health limit out of range")
+	ErrInvalidConnectionHealthOffset = errors.New("connection health offset out of range")
+	ErrInvalidConnectionHealthSignal = errors.New("invalid connection health signal")
 )
 
 type AdminConnectionHealthFilter struct {
+	Context       context.Context
 	NetworkID     string
 	AccountID     string
 	DeviceID      string
 	WindowSeconds int
 	AlertLimit    int
+	AlertOffset   int
+	AlertSignal   string
 }
 
 type AdminConnectionHealthThresholds struct {
@@ -38,58 +44,60 @@ type AdminConnectionHealthThresholds struct {
 }
 
 type AdminConnectionHealthSummary struct {
-	TotalObservations             int     `json:"total_observations"`
-	FreshObservations             int     `json:"fresh_observations"`
-	StaleObservations             int     `json:"stale_observations"`
-	ReporterOfflineObservations   int     `json:"reporter_offline_observations"`
-	FreshDirect                   int     `json:"fresh_direct"`
-	FreshRelay                    int     `json:"fresh_relay"`
-	FreshOnlineNoPath             int     `json:"fresh_online_no_path"`
-	ValidationRTTSamples          int     `json:"validation_rtt_samples"`
-	AverageValidationRTTMS        *uint64 `json:"average_validation_rtt_ms,omitempty"`
-	MaxValidationRTTMS            *uint64 `json:"max_validation_rtt_ms,omitempty"`
-	RecentPathSwitches            int     `json:"recent_path_switches"`
-	RecentDirectFailures          int     `json:"recent_direct_failures"`
-	RecentRelayFailures           int     `json:"recent_relay_failures"`
-	FrequentSwitchingConnections  int     `json:"frequent_switching_connections"`
-	RepeatedFailureConnections    int     `json:"repeated_failure_connections"`
+	TotalObservations            int     `json:"total_observations"`
+	FreshObservations            int     `json:"fresh_observations"`
+	StaleObservations            int     `json:"stale_observations"`
+	ReporterOfflineObservations  int     `json:"reporter_offline_observations"`
+	FreshDirect                  int     `json:"fresh_direct"`
+	FreshRelay                   int     `json:"fresh_relay"`
+	FreshOnlineNoPath            int     `json:"fresh_online_no_path"`
+	ValidationRTTSamples         int     `json:"validation_rtt_samples"`
+	AverageValidationRTTMS       *uint64 `json:"average_validation_rtt_ms,omitempty"`
+	MaxValidationRTTMS           *uint64 `json:"max_validation_rtt_ms,omitempty"`
+	RecentPathSwitches           int     `json:"recent_path_switches"`
+	RecentDirectFailures         int     `json:"recent_direct_failures"`
+	RecentRelayFailures          int     `json:"recent_relay_failures"`
+	FrequentSwitchingConnections int     `json:"frequent_switching_connections"`
+	RepeatedFailureConnections   int     `json:"repeated_failure_connections"`
 }
 
 type AdminConnectionHealthAlert struct {
-	Severity              string   `json:"severity"`
-	Signals               []string `json:"signals"`
-	ReportingDeviceID     string   `json:"reporting_device_id"`
-	ReportingDeviceName   string   `json:"reporting_device_name"`
-	ReportingUserID       string   `json:"reporting_user_id"`
-	ReportingUsername     string   `json:"reporting_username"`
-	RemoteDeviceID        string   `json:"remote_device_id"`
-	RemoteDeviceName      string   `json:"remote_device_name"`
-	RemoteUserID          string   `json:"remote_user_id"`
-	RemoteUsername        string   `json:"remote_username"`
-	NetworkID             string   `json:"network_id"`
-	NetworkName           string   `json:"network_name"`
-	Lifecycle             string   `json:"lifecycle"`
-	CurrentPath           *string  `json:"current_path"`
-	Fresh                 bool     `json:"fresh"`
-	Freshness             string   `json:"freshness"`
-	ReceivedAt            int64    `json:"received_at"`
-	LastValidationRTTMS   *uint64  `json:"last_validation_rtt_ms,omitempty"`
-	RecentPathSwitches    int      `json:"recent_path_switches"`
-	RecentDirectFailures  int      `json:"recent_direct_failures"`
-	RecentRelayFailures   int      `json:"recent_relay_failures"`
-	LastTransitionAt      int64    `json:"last_transition_at,omitempty"`
+	Severity             string   `json:"severity"`
+	Signals              []string `json:"signals"`
+	ReportingDeviceID    string   `json:"reporting_device_id"`
+	ReportingDeviceName  string   `json:"reporting_device_name"`
+	ReportingUserID      string   `json:"reporting_user_id"`
+	ReportingUsername    string   `json:"reporting_username"`
+	RemoteDeviceID       string   `json:"remote_device_id"`
+	RemoteDeviceName     string   `json:"remote_device_name"`
+	RemoteUserID         string   `json:"remote_user_id"`
+	RemoteUsername       string   `json:"remote_username"`
+	NetworkID            string   `json:"network_id"`
+	NetworkName          string   `json:"network_name"`
+	Lifecycle            string   `json:"lifecycle"`
+	CurrentPath          *string  `json:"current_path"`
+	Fresh                bool     `json:"fresh"`
+	Freshness            string   `json:"freshness"`
+	ReceivedAt           int64    `json:"received_at"`
+	LastValidationRTTMS  *uint64  `json:"last_validation_rtt_ms,omitempty"`
+	RecentPathSwitches   int      `json:"recent_path_switches"`
+	RecentDirectFailures int      `json:"recent_direct_failures"`
+	RecentRelayFailures  int      `json:"recent_relay_failures"`
+	LastTransitionAt     int64    `json:"last_transition_at,omitempty"`
 }
 
 type AdminConnectionHealth struct {
-	SchemaVersion             int                             `json:"schema_version"`
-	GeneratedAt               int64                           `json:"generated_at"`
-	WindowSeconds             int                             `json:"window_seconds"`
-	HistoryLimitPerDirection  int                             `json:"history_limit_per_direction"`
-	Thresholds                AdminConnectionHealthThresholds `json:"thresholds"`
-	Summary                   AdminConnectionHealthSummary    `json:"summary"`
-	AlertsTotal               int                             `json:"alerts_total"`
-	AlertsLimit               int                             `json:"alerts_limit"`
-	Alerts                    []AdminConnectionHealthAlert    `json:"alerts"`
+	SchemaVersion            int                             `json:"schema_version"`
+	GeneratedAt              int64                           `json:"generated_at"`
+	WindowSeconds            int                             `json:"window_seconds"`
+	HistoryLimitPerDirection int                             `json:"history_limit_per_direction"`
+	Thresholds               AdminConnectionHealthThresholds `json:"thresholds"`
+	Summary                  AdminConnectionHealthSummary    `json:"summary"`
+	AlertsTotal              int                             `json:"alerts_total"`
+	AlertsUnfilteredTotal    int                             `json:"alerts_unfiltered_total"`
+	AlertsLimit              int                             `json:"alerts_limit"`
+	AlertsOffset             int                             `json:"alerts_offset"`
+	Alerts                   []AdminConnectionHealthAlert    `json:"alerts"`
 }
 
 type connectionHealthQuerier interface {
@@ -98,6 +106,18 @@ type connectionHealthQuerier interface {
 }
 
 func normalizeConnectionHealthFilter(filter AdminConnectionHealthFilter) (AdminConnectionHealthFilter, error) {
+	if filter.Context == nil {
+		filter.Context = context.Background()
+	}
+	if filter.AlertOffset < 0 {
+		return filter, ErrInvalidConnectionHealthOffset
+	}
+	filter.AlertSignal = strings.TrimSpace(filter.AlertSignal)
+	switch filter.AlertSignal {
+	case "", "reporter_offline", "stale_observation", "no_active_path", "frequent_path_switching", "repeated_path_failures":
+	default:
+		return filter, ErrInvalidConnectionHealthSignal
+	}
 	if filter.WindowSeconds == 0 {
 		filter.WindowSeconds = DefaultConnectionHealthWindowSeconds
 	}
@@ -334,142 +354,6 @@ FROM scoped
 	return alertsTotal, nil
 }
 
-func adminConnectionHealthAlerts(q connectionHealthQuerier, filter AdminConnectionHealthFilter, generatedAt int64) ([]AdminConnectionHealthAlert, error) {
-	cte, args := connectionHealthCTE(filter, generatedAt)
-	query := cte + `
-SELECT
-	reporting_device_id,
-	reporting_device_name,
-	reporting_user_id,
-	reporting_username,
-	remote_device_id,
-	remote_device_name,
-	remote_user_id,
-	remote_username,
-	network_id,
-	network_name,
-	lifecycle,
-	current_path,
-	received_at,
-	last_validation_rtt_ms,
-	reporter_online,
-	fresh,
-	recent_path_switches,
-	recent_direct_failures,
-	recent_relay_failures,
-	last_transition_at
-FROM scoped
-WHERE
-	fresh = 0
-	OR (fresh = 1 AND lifecycle = 'online' AND (current_path IS NULL OR current_path = ''))
-	OR recent_path_switches >= ?
-	OR recent_direct_failures + recent_relay_failures >= ?
-ORDER BY
-	CASE
-		WHEN (fresh = 1 AND lifecycle = 'online' AND (current_path IS NULL OR current_path = ''))
-			OR recent_path_switches >= ?
-			OR recent_direct_failures + recent_relay_failures >= ?
-		THEN 0 ELSE 1
-	END ASC,
-	CASE WHEN last_transition_at > received_at THEN last_transition_at ELSE received_at END DESC,
-	reporting_device_id ASC,
-	remote_device_id ASC
-LIMIT ?
-`
-	args = append(args,
-		ConnectionHealthFrequentSwitchThreshold,
-		ConnectionHealthRepeatedFailureThreshold,
-		ConnectionHealthFrequentSwitchThreshold,
-		ConnectionHealthRepeatedFailureThreshold,
-		filter.AlertLimit,
-	)
-
-	rows, err := q.Query(query, args...)
-	if err != nil {
-		return nil, fmt.Errorf("query connection health alerts: %w", err)
-	}
-	defer rows.Close()
-
-	alerts := make([]AdminConnectionHealthAlert, 0, filter.AlertLimit)
-	for rows.Next() {
-		var (
-			item              AdminConnectionHealthAlert
-			currentPath       sql.NullString
-			lastValidationRTT sql.NullInt64
-			reporterOnline    int
-			fresh             int
-		)
-		if err := rows.Scan(
-			&item.ReportingDeviceID,
-			&item.ReportingDeviceName,
-			&item.ReportingUserID,
-			&item.ReportingUsername,
-			&item.RemoteDeviceID,
-			&item.RemoteDeviceName,
-			&item.RemoteUserID,
-			&item.RemoteUsername,
-			&item.NetworkID,
-			&item.NetworkName,
-			&item.Lifecycle,
-			&currentPath,
-			&item.ReceivedAt,
-			&lastValidationRTT,
-			&reporterOnline,
-			&fresh,
-			&item.RecentPathSwitches,
-			&item.RecentDirectFailures,
-			&item.RecentRelayFailures,
-			&item.LastTransitionAt,
-		); err != nil {
-			return nil, fmt.Errorf("scan connection health alert: %w", err)
-		}
-
-		if currentPath.Valid && currentPath.String != "" {
-			item.CurrentPath = &currentPath.String
-		}
-		if lastValidationRTT.Valid {
-			value := uint64(lastValidationRTT.Int64)
-			item.LastValidationRTTMS = &value
-		}
-
-		item.Fresh = fresh == 1
-		switch {
-		case reporterOnline == 0:
-			item.Freshness = "reporter_offline"
-			item.Signals = append(item.Signals, "reporter_offline")
-		case !item.Fresh:
-			item.Freshness = "stale"
-			item.Signals = append(item.Signals, "stale_observation")
-		default:
-			item.Freshness = "fresh"
-		}
-
-		warning := false
-		if item.Fresh && item.Lifecycle == "online" && item.CurrentPath == nil {
-			item.Signals = append(item.Signals, "no_active_path")
-			warning = true
-		}
-		if item.RecentPathSwitches >= ConnectionHealthFrequentSwitchThreshold {
-			item.Signals = append(item.Signals, "frequent_path_switching")
-			warning = true
-		}
-		if item.RecentDirectFailures+item.RecentRelayFailures >= ConnectionHealthRepeatedFailureThreshold {
-			item.Signals = append(item.Signals, "repeated_path_failures")
-			warning = true
-		}
-		if warning {
-			item.Severity = "warning"
-		} else {
-			item.Severity = "info"
-		}
-		alerts = append(alerts, item)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate connection health alerts: %w", err)
-	}
-	return alerts, nil
-}
-
 // AdminConnectionHealth derives bounded operational signals from current
 // authoritative observations plus the retained transition history. It does not
 // persist an independent health state or infer the active path.
@@ -483,21 +367,29 @@ func (db *DB) AdminConnectionHealth(filter AdminConnectionHealthFilter) (*AdminC
 	// Keep the three aggregate reads on one SQLite snapshot. WAL allows
 	// telemetry writers to continue while this short read transaction is open,
 	// and alerts_total cannot drift away from the returned alert list mid-request.
-	tx, err := db.Begin()
+	tx, err := db.BeginTx(filter.Context, nil)
 	if err != nil {
 		return nil, fmt.Errorf("begin connection health snapshot: %w", err)
 	}
 	defer tx.Rollback()
 
-	summary, err := adminConnectionObservationHealthSummary(tx, filter, generatedAt)
+	queries := adminHealthContextQueries{ctx: filter.Context, tx: tx}
+	summary, err := adminConnectionObservationHealthSummary(queries, filter, generatedAt)
 	if err != nil {
 		return nil, err
 	}
-	alertsTotal, err := adminConnectionTransitionHealthSummary(tx, filter, generatedAt, &summary)
+	alertsUnfilteredTotal, err := adminConnectionTransitionHealthSummary(queries, filter, generatedAt, &summary)
 	if err != nil {
 		return nil, err
 	}
-	alerts, err := adminConnectionHealthAlerts(tx, filter, generatedAt)
+	alertsTotal := alertsUnfilteredTotal
+	if filter.AlertSignal != "" {
+		alertsTotal, err = adminConnectionHealthAlertCount(queries, filter, generatedAt)
+		if err != nil {
+			return nil, err
+		}
+	}
+	alerts, err := adminConnectionHealthAlerts(queries, filter, generatedAt)
 	if err != nil {
 		return nil, err
 	}
@@ -514,9 +406,11 @@ func (db *DB) AdminConnectionHealth(filter AdminConnectionHealthFilter) (*AdminC
 			FrequentPathSwitches: ConnectionHealthFrequentSwitchThreshold,
 			RepeatedPathFailures: ConnectionHealthRepeatedFailureThreshold,
 		},
-		Summary:     summary,
-		AlertsTotal: alertsTotal,
-		AlertsLimit: filter.AlertLimit,
-		Alerts:      alerts,
+		Summary:               summary,
+		AlertsTotal:           alertsTotal,
+		AlertsUnfilteredTotal: alertsUnfilteredTotal,
+		AlertsLimit:           filter.AlertLimit,
+		AlertsOffset:          filter.AlertOffset,
+		Alerts:                alerts,
 	}, nil
 }

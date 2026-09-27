@@ -57,6 +57,7 @@ impl OutboundProbeAdmission {
                 | Self::GlobalPeerRateLimited
                 | Self::GlobalRemoteIpRateLimited
                 | Self::GlobalDestinationRateLimited
+                | Self::HardHardConfirmationRateReserved
         )
     }
 }
@@ -118,11 +119,14 @@ mod tests {
             OutboundProbeAdmission::GlobalDestinationPersistentRateLimited,
             OutboundProbeAdmission::GlobalPeerSocketPersistentRateLimited,
             OutboundProbeAdmission::EpochCreditExhausted,
+            OutboundProbeAdmission::HardHardConfirmationCreditReserved,
+            OutboundProbeAdmission::RecoveryIdentityStale,
             OutboundProbeAdmission::HeartbeatBudgetLimited,
             OutboundProbeAdmission::Accepted,
         ] {
             assert!(!admission.retryable_in_sweep());
         }
         assert!(OutboundProbeAdmission::GlobalRemoteIpRateLimited.retryable_in_sweep());
+        assert!(OutboundProbeAdmission::HardHardConfirmationRateReserved.retryable_in_sweep());
     }
 }

@@ -113,13 +113,14 @@ impl CommandHarness {
     fn new(base_url: &str) -> Self {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         Self {
-            http: route_aware_control_http_clients(ControlProxyMode::Direct, base_url).0,
+            http: route_aware_control_http_clients(ControlProxyMode::Direct, base_url, None).0,
             base_url: base_url.to_string(),
             token: "dc-test-device".to_string(),
             config: test_config(),
             self_node_id: "node-a".to_string(),
             registration_seq: Some(4),
             state: Arc::new(RwLock::new(ClientState {
+                server_clock: Arc::new(ServerClockEstimate::default()),
                 room_authorization: Arc::new(crate::rooms::RoomAuthorization::new("net1")),
                 registered: true,
                 peers: HashMap::new(),

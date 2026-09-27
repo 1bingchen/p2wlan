@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { adminApi, api, clearAdminToken, getAdminToken, setAdminToken } from '../src/api.ts'
+import { adminApi, api, clearAdminToken, getAdminToken, setAdminToken, verifyAdminToken } from '../src/api.ts'
 
 function setup(t) {
   const originals = new Map(['window', 'sessionStorage', 'fetch'].map((key) => [key, Object.getOwnPropertyDescriptor(globalThis, key)]))
@@ -119,4 +119,46 @@ test('cursor, connection, history, and network queries forward cancellation sign
   for (const { options } of requests) assert.equal(options.signal, controller.signal)
   assert.match(requests[0].path, /q=alice.*cursor=next/)
   assert.match(requests[2].path, /limit=50/)
+})
+
+test('blocked session storage reads do not crash the login screen', (t) => {
+  setup(t)
+  setAdminToken('existing-token')
+  Object.defineProperty(globalThis, 'sessionStorage', { configurable: true, get: () => { throw new DOMException('Blocked', 'SecurityError') } })
+  assert.equal(getAdminToken(), '')
+})
+
+test('a failed session write leaves login revoked and reports a usable error', (t) => {
+  setup(t)
+  clearAdminToken()
+  sessionStorage.setItem = () => { throw new DOMException('Blocked', 'SecurityError') }
+  assert.throws(() => setAdminToken('new-token'), /浏览器无法保存登录会话/)
+  assert.equal(getAdminToken(), '')
+})
+
+test('revocation fences in-flight responses even when browser storage removal fails', async (t) => {
+  setup(t)
+  const response = Promise.withResolvers()
+  globalThis.fetch = () => response.promise
+  setAdminToken('old-token')
+  const pending = api('/runtime')
+  sessionStorage.removeItem = () => { throw new DOMException('Blocked', 'SecurityError') }
+  clearAdminToken()
+  assert.equal(getAdminToken(), '')
+  response.resolve(new Response('{}'))
+  await assert.rejects(pending, { name: 'AbortError' })
+  setAdminToken('new-token')
+  assert.equal(getAdminToken(), 'new-token')
+})
+
+test('login verification forwards cancellation without creating a session', async (t) => {
+  setup(t)
+  clearAdminToken()
+  const controller = new AbortController()
+  globalThis.fetch = async (_path, options) => {
+    assert.equal(options.signal, controller.signal)
+    throw new DOMException('Cancelled', 'AbortError')
+  }
+  await assert.rejects(verifyAdminToken('candidate-token', controller.signal), { name: 'AbortError' })
+  assert.equal(getAdminToken(), '')
 })

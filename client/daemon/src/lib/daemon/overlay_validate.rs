@@ -1282,6 +1282,8 @@ mod overlay_validate_tests {
         });
         manager
             .add_peer(&PeerInfo {
+                capabilities: crate::control::PeerCapabilities::default(),
+                registration_seq: 0,
                 node_id: "peer-overlay-path".to_string(),
                 public_key: "pk".to_string(),
                 endpoint: "127.0.0.1:45000".to_string(),
@@ -1337,6 +1339,8 @@ mod overlay_validate_tests {
         );
         manager
             .add_peer(&PeerInfo {
+                capabilities: crate::control::PeerCapabilities::default(),
+                registration_seq: 0,
                 node_id: "peer-strict-direct-echo".to_string(),
                 public_key: "pk".to_string(),
                 endpoint: "127.0.0.1:45001".to_string(),

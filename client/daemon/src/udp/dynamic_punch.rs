@@ -17,7 +17,18 @@ pub(crate) fn monotonic_millis() -> u64 {
 #[derive(Debug, Default)]
 pub(super) struct FreshMappingMeasurementBatch {
     pub(super) observations: Vec<MappingObservation>,
+    pub(super) attempts: Vec<p2pnet_nat::AllocationAttempt>,
     pub(super) stats: HardHardMeasurementStats,
+}
+
+pub(super) fn last_mapping_send_is_unobserved(attempts: &[p2pnet_nat::AllocationAttempt]) -> bool {
+    attempts
+        .iter()
+        .rev()
+        .find(|attempt| attempt.outcome != p2pnet_nat::AllocationAttemptOutcome::SendFailed)
+        .is_some_and(|attempt| {
+            attempt.outcome == p2pnet_nat::AllocationAttemptOutcome::SentUnobserved
+        })
 }
 
 impl UdpTransport {
@@ -74,14 +85,34 @@ impl UdpTransport {
             .filter(|observer| seen.insert(*observer))
             .take(usize::from(u16::MAX))
             .collect::<Vec<_>>();
+        let requests = observers
+            .into_iter()
+            .map(|observer| (socket.clone(), observer))
+            .collect::<Vec<_>>();
+        self.measure_ordered_mapping_requests(&requests, stun_timeout, keep_measuring)
+            .await
+    }
+
+    /// A single bounded measurement budget across a controlled socket/observer
+    /// grid. Every request waits for its response before the next pair sends.
+    /// The caller supplies fresh pairs; this collector records gaps rather
+    /// than interpreting a timeout as evidence about an allocation.
+    pub(super) async fn measure_ordered_mapping_requests(
+        &self,
+        requests: &[(Arc<UdpSocket>, SocketAddr)],
+        stun_timeout: Duration,
+        keep_measuring: impl Fn() -> bool,
+    ) -> FreshMappingMeasurementBatch {
         let started_ms = monotonic_millis();
-        let mut observations = Vec::with_capacity(observers.len());
+        let requests = &requests[..requests.len().min(p2pnet_nat::MAX_ALLOCATION_SAMPLES)];
+        let mut observations = Vec::with_capacity(requests.len());
+        let mut attempts = Vec::with_capacity(requests.len());
         let mut stun_datagrams_sent = 0u32;
         let mut stun_bytes_sent = 0u64;
         let mut stun_send_errors = 0u32;
         let mut stun_send_error_bytes = 0u64;
         let mut last_send_at_ms = None;
-        for (sequence, observer) in observers.iter().enumerate() {
+        for (sequence, (socket, observer)) in requests.iter().enumerate() {
             if !keep_measuring() {
                 debug!(
                     "Fresh-mapping STUN measurement aborted before sample {sequence}: Direct was confirmed, the session was cancelled or the network generation changed"
@@ -95,7 +126,7 @@ impl UdpTransport {
             if remaining_budget_ms == 0 {
                 break;
             }
-            let remaining_samples = observers.len().saturating_sub(sequence).max(1) as u128;
+            let remaining_samples = requests.len().saturating_sub(sequence).max(1) as u128;
             let per_sample_timeout =
                 stun_timeout
                     .min(FRESH_MAPPING_STUN_TIMEOUT)
@@ -116,13 +147,32 @@ impl UdpTransport {
                 .lock()
                 .await
                 .insert(transaction_id, response_tx);
+            if !keep_measuring() {
+                self.stun_waiters.lock().await.remove(&transaction_id);
+                break;
+            }
             let sent_at_ms = monotonic_millis();
+            let local_endpoint = socket
+                .local_addr()
+                .ok()
+                .unwrap_or_else(|| SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0));
+            attempts.push(p2pnet_nat::AllocationAttempt {
+                sequence: sequence as u16,
+                local_endpoint,
+                destination: *observer,
+                sent_at_ms,
+                datagram_bytes: encoded.len() as u32,
+                outcome: p2pnet_nat::AllocationAttemptOutcome::SendFailed,
+            });
             if let Err(error) = socket.send_to(&encoded, observer).await {
                 stun_send_errors = stun_send_errors.saturating_add(1);
                 stun_send_error_bytes = stun_send_error_bytes.saturating_add(encoded.len() as u64);
                 self.stun_waiters.lock().await.remove(&transaction_id);
                 debug!("Fresh-mapping STUN send {sequence} to {observer} failed: {error}");
                 continue;
+            }
+            if let Some(attempt) = attempts.last_mut() {
+                attempt.outcome = p2pnet_nat::AllocationAttemptOutcome::SentUnobserved;
             }
             stun_datagrams_sent = stun_datagrams_sent.saturating_add(1);
             stun_bytes_sent = stun_bytes_sent.saturating_add(encoded.len() as u64);
@@ -158,16 +208,16 @@ impl UdpTransport {
                 _ => None,
             };
             if let Some(observed) = parsed {
+                if let Some(attempt) = attempts.last_mut() {
+                    attempt.outcome = p2pnet_nat::AllocationAttemptOutcome::Observed;
+                }
                 observations.push(MappingObservation {
                     sequence: sequence as u16,
                     observer: *observer,
                     observed,
                     sent_at_ms,
                     responded_at_ms,
-                    local_endpoint: socket
-                        .local_addr()
-                        .ok()
-                        .unwrap_or_else(|| SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)),
+                    local_endpoint,
                 });
             } else {
                 debug!(
@@ -189,6 +239,7 @@ impl UdpTransport {
                 measurement_completed_at_ms: Some(finished_at_ms),
             },
             observations,
+            attempts,
         }
     }
 
@@ -478,6 +529,16 @@ impl UdpTransport {
             self.detach_dynamic_socket_by_index(socket_index, "insufficient_samples")
                 .await;
             return FreshMappingOutcome::Rejected(FreshMappingRejection::InsufficientSamples);
+        }
+
+        if last_mapping_send_is_unobserved(&measurement.attempts) {
+            self.peers.record_direct_event(
+                peer_id, "fresh_mapping_rejected", None, Some(sample_count), None,
+                "allocation_unobserved_send: the last accepted STUN request has no mapping observation",
+            ).await;
+            self.detach_dynamic_socket_by_index(socket_index, "allocation_unobserved_send")
+                .await;
+            return FreshMappingOutcome::Rejected(FreshMappingRejection::UnobservedAllocation);
         }
 
         if batch.public_ip().is_none() {

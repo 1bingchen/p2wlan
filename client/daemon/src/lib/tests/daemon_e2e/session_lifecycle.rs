@@ -442,6 +442,8 @@ async fn deferred_unknown_peer_offer_replays_candidate_admission_after_peer_join
         daemon
             .peers
             .add_peer(&control::PeerInfo {
+                capabilities: crate::control::PeerCapabilities::default(),
+                registration_seq: 0,
                 node_id: peer_id.to_string(),
                 device_name: String::new(),
                 app_version: String::new(),

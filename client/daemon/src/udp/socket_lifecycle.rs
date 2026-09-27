@@ -756,6 +756,8 @@ impl UdpTransport {
                         state.dynamic.insert(
                             socket_index,
                             DynamicPunchSocket {
+                                hard_hard_pair_required: false,
+                                hard_hard_committed_remote: None,
                                 socket_index,
                                 socket: socket.clone(),
                                 peer_id: peer_id.to_string(),
@@ -777,6 +779,8 @@ impl UdpTransport {
                     state.dynamic.insert(
                         socket_index,
                         DynamicPunchSocket {
+                            hard_hard_pair_required: false,
+                            hard_hard_committed_remote: None,
                             socket_index,
                             socket: socket.clone(),
                             peer_id: peer_id.to_string(),
@@ -957,9 +961,9 @@ impl UdpTransport {
         identity: &crate::peer::HardHardFreshSocketIdentity,
         reason: &str,
     ) {
-        let matches = {
-            let state = self.socket_state.lock().await;
-            state
+        let entry = {
+            let mut state = self.socket_state.lock().await;
+            let matches = state
                 .dynamic
                 .get(&identity.socket_index)
                 .is_some_and(|entry| {
@@ -972,12 +976,47 @@ impl UdpTransport {
                             .is_none_or(|token| token == identity.session_token)
                         && entry.phase.is_usable()
                         && entry.socket.local_addr().ok() == Some(identity.socket_local_endpoint)
-                })
+                        && !self.hh2_entry_is_current_direct(entry)
+                });
+            if !matches {
+                return;
+            }
+            let entry = state
+                .dynamic
+                .remove(&identity.socket_index)
+                .expect("checked exact entry");
+            if state
+                .affinity
+                .get(&identity.peer_id)
+                .is_some_and(|pin| pin.socket_index == identity.socket_index)
+            {
+                state.affinity.remove(&identity.peer_id);
+            }
+            entry
         };
-        if matches {
-            self.detach_dynamic_socket_by_index(identity.socket_index, reason)
-                .await;
-        }
+        self.detach_dynamic_entry(entry, reason).await;
+    }
+
+    /// A cleanup descriptor may have decided to discard a session before an
+    /// encrypted ACK committed Direct. Re-read the authoritative mirror under
+    /// the socket lock; the commit hook holds this same lock through publish.
+    fn hh2_entry_is_current_direct(&self, entry: &DynamicPunchSocket) -> bool {
+        let (Some(remote_endpoint), Ok(local_endpoint)) =
+            (entry.hard_hard_committed_remote, entry.socket.local_addr())
+        else {
+            return false;
+        };
+        entry.hard_hard_pair_required
+            && entry.authenticated_evidence > 0
+            && self.peers.hard_hard_committed_pair_is_current_sync(
+                &entry.peer_id,
+                &crate::peer::HardHardPairKey {
+                    socket_index: entry.socket_index,
+                    local_endpoint,
+                    remote_endpoint,
+                },
+                entry.network_generation,
+            )
     }
 
     /// Reserve a fresh socket before publishing its affinity. Only the owner
@@ -1015,7 +1054,14 @@ impl UdpTransport {
         let Some(entry) = state.dynamic.get_mut(&socket_index) else {
             return false;
         };
-        if entry.peer_id != peer_id || !entry.phase.is_usable() || token.is_empty() {
+        if entry.peer_id != peer_id
+            || !entry.phase.is_usable()
+            || token.is_empty()
+            || entry
+                .hard_hard_session_token
+                .as_deref()
+                .is_some_and(|old| old != token)
+        {
             return false;
         }
         entry.hard_hard_session_token = Some(token.to_string());
@@ -1107,6 +1153,7 @@ impl UdpTransport {
                     Some(**index) != preserve_socket_index
                         && entry.peer_id == peer_id
                         && entry.hard_hard_session_token.as_deref() == Some(token)
+                        && !self.hh2_entry_is_current_direct(entry)
                 })
                 .map(|(index, _)| *index)
                 .collect::<Vec<_>>();
@@ -1135,11 +1182,31 @@ impl UdpTransport {
     /// checks and the affinity switch happen in this generation transaction.
     pub(crate) async fn promote_hard_hard_winner_in_epoch(
         &self,
+        epoch_guard: &tokio::sync::MutexGuard<'_, ()>,
+        peer_id: &str,
+        token: &str,
+        socket_index: usize,
+        network_generation: u64,
+    ) -> bool {
+        self.promote_hard_hard_pair_winner_in_epoch(
+            epoch_guard,
+            peer_id,
+            token,
+            socket_index,
+            network_generation,
+            None,
+        )
+        .await
+    }
+
+    pub(super) async fn promote_hard_hard_pair_winner_in_epoch(
+        &self,
         _epoch_guard: &tokio::sync::MutexGuard<'_, ()>,
         peer_id: &str,
         token: &str,
         socket_index: usize,
         network_generation: u64,
+        pair_remote: Option<SocketAddr>,
     ) -> bool {
         let identity = {
             // Keep the exact socket entry locked across manager selection.
@@ -1157,6 +1224,7 @@ impl UdpTransport {
                 || entry.network_generation != network_generation
                 || !entry.phase.is_usable()
                 || entry.hard_hard_session_token.as_deref() != Some(token)
+                || (entry.hard_hard_pair_required && pair_remote.is_none())
             {
                 return false;
             }
@@ -1211,6 +1279,9 @@ impl UdpTransport {
                 .expect("winner entry verified above");
             winner.authenticated_evidence = winner.authenticated_evidence.saturating_add(1);
             winner.phase = DynamicSocketPhase::Finalized;
+            if winner.hard_hard_pair_required {
+                winner.hard_hard_committed_remote = pair_remote;
+            }
             // A sticky winner makes every other token-scoped socket terminal:
             // none can become the business path or adopt a late ACK. Unlike a
             // normal detach, retaining their readers for the ACK grace serves

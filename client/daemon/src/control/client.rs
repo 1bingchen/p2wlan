@@ -61,6 +61,12 @@ pub(crate) fn hard_hard_a0_control_stage(
 }
 
 impl ControlClient {
+    /// Timing from a fresh short control request; never from a long poll.
+    pub(crate) fn hard_hard_timing_hint(&self) -> Option<ControlTimingHint> {
+        self.server_clock
+            .timing_hint(Instant::now(), self.local_registration_seq()?)
+    }
+
     /// Translate one local Hard<->Hard deadline into the most recently
     /// observed control-server clock domain. A stale or missing sample fails
     /// closed; callers keep Relay and the ordinary bounded fallback rather
@@ -76,6 +82,69 @@ impl ControlClient {
             .server_deadline_for_local(local_deadline_ms, local_now_ms)
     }
 
+    /// Server-accepted live control registration, from the existing auth owner.
+    pub(crate) fn local_registration_seq(&self) -> Option<u64> {
+        if self.registration_rx.has_changed().is_err()
+            || self
+                .shutdown_lifecycle
+                .as_ref()
+                .is_some_and(|lifecycle| *lifecycle.requested.borrow())
+        {
+            return None;
+        }
+        self.registration_rx
+            .borrow()
+            .as_ref()?
+            .registration_seq
+            .filter(|seq| *seq > 0)
+    }
+
+    pub(crate) fn local_supports_hh2(&self) -> bool {
+        self.local_hh2_registration_seq().is_some()
+    }
+
+    /// Read capability and registration from one immutable auth publication.
+    pub(crate) fn local_hh2_registration_seq(&self) -> Option<u64> {
+        if !PeerCapabilities::current().supports_hh2()
+            || self.registration_rx.has_changed().is_err()
+            || self
+                .shutdown_lifecycle
+                .as_ref()
+                .is_some_and(|lifecycle| *lifecycle.requested.borrow())
+        {
+            return None;
+        }
+        let auth = self.registration_rx.borrow();
+        let auth = auth.as_ref()?;
+        auth.accepted_peer_capabilities
+            .supports_hh2()
+            .then_some(auth.registration_seq.filter(|seq| *seq > 0))
+            .flatten()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_local_registration_for_test(
+        &self,
+        sequence: Option<u64>,
+        capabilities: PeerCapabilities,
+    ) {
+        if let Some(sender) = &self.test_registration_tx {
+            sender.send_replace(sequence.map(|registration_seq| CriticalControlAuth {
+                accepted_peer_capabilities: capabilities,
+                base_url: "http://control.invalid".to_string(),
+                token: "test-registration".to_string(),
+                self_node_id: self.test_signal_from_node_id.clone(),
+                registration_seq: Some(registration_seq),
+                signal_signing_identity: None,
+            }));
+        }
+    }
+
+    /// Synchronous edge for the authoritative network-generation cancellation hook.
+    pub(crate) fn invalidate_network_timing(&self) {
+        self.server_clock.invalidate_network();
+    }
+
     pub async fn register_room_profile(config: &mut Config) -> Result<()> {
         if !config.network.network_id.starts_with("room-")
             || config.network.manual
@@ -89,7 +158,7 @@ impl ControlClient {
         // Only Android's explicit room preparation calls this method. The
         // background registration loop must never resume a remotely paused device.
         Self::request_room_device_access(&http, config).await?;
-        let (node_id, virtual_ip, cidr, relays, _, _) = register_device(
+        let (node_id, virtual_ip, cidr, relays, _, _, _) = register_device(
             &http,
             &normalize_http_base_url(&config.control.server_url),
             &config.control.auth_token,
@@ -197,6 +266,7 @@ impl ControlClient {
         let server_clock = Arc::new(ServerClockEstimate::default());
 
         let state = Arc::new(RwLock::new(ClientState {
+            server_clock: server_clock.clone(),
             room_authorization: Arc::new(crate::rooms::RoomAuthorization::new(
                 &config.network.network_id,
             )),
@@ -217,6 +287,9 @@ impl ControlClient {
         });
         let critical_lifecycle_tx = cmd_tx.clone();
         let client = Self {
+            registration_rx: critical_auth_rx.clone(),
+            #[cfg(test)]
+            test_registration_tx: None,
             shutdown_lifecycle,
             event_loop_ready: event_loop_ready.clone(),
             event_tx: event_tx.clone(),
@@ -245,6 +318,7 @@ impl ControlClient {
             let (http, candidate_http) = route_aware_control_http_clients(
                 config.control.proxy_mode,
                 &config.control.server_url,
+                Some(server_clock.clone()),
             );
             let config = config.clone();
             let event_tx = client.event_tx.clone();
@@ -364,13 +438,17 @@ impl ControlClient {
             }
         });
         let state = Arc::new(RwLock::new(ClientState {
+            server_clock: server_clock.clone(),
             room_authorization: Arc::new(crate::rooms::RoomAuthorization::new("default")),
             registered: false,
             peers: HashMap::new(),
             virtual_ip: None,
             _relay_servers: Vec::new(),
         }));
+        let (registration_tx, registration_rx) = watch::channel(None);
         Self {
+            registration_rx,
+            test_registration_tx: Some(registration_tx),
             shutdown_lifecycle: None,
             event_loop_ready: Arc::new(AtomicBool::new(false)),
             event_tx,
@@ -642,6 +720,8 @@ impl ControlClient {
         let (response_tx, response_rx) = oneshot::channel();
         self.candidate_offer_tx
             .try_send(CandidateOfferCommand {
+                not_after: None,
+                prepaid_attempts: 1,
                 to_node_id: to_node_id.to_string(),
                 candidates: candidates.to_vec(),
                 session_id: None,
@@ -758,6 +838,8 @@ impl ControlClient {
         let (response_tx, response_rx) = oneshot::channel();
         let a0_session_id = session_id.clone();
         let enqueue_result = self.candidate_offer_tx.try_send(CandidateOfferCommand {
+            not_after: None,
+            prepaid_attempts: 1,
             to_node_id: to_node_id.to_string(),
             candidates: candidates.to_vec(),
             session_id,
@@ -999,6 +1081,7 @@ impl ControlClient {
     /// optional signaling WebSocket through its normal registration path.
     #[cfg_attr(not(target_os = "android"), allow(dead_code))]
     pub(crate) fn network_changed(&self) {
+        self.invalidate_network_timing();
         let _ = self.cmd_tx.send(ControlCommand::NetworkChanged);
     }
 

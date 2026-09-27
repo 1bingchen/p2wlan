@@ -1,4 +1,5 @@
 import { api } from './api'
+import { readConnectionSearch, selectConnectionSearch } from './connectionNavigation'
 
 export interface TrendBucket {
   bucket_start: number
@@ -41,6 +42,14 @@ export interface ConnectionTrendData {
 }
 
 export const TREND_WINDOWS = [24, 168, 720] as const
+export const HEALTH_SIGNALS = ['reporter_offline', 'stale_observation', 'no_active_path', 'frequent_path_switching', 'repeated_path_failures'] as const
+export const HEALTH_PAGE_SIZE = 25
+
+/** Trend windows contain the current UTC hour plus the preceding N - 1 buckets. */
+export function trendWindowForTimestamp(createdAt: number, now = Date.now() / 1000): number {
+  const requiredBuckets = Math.max(1, Math.floor(now / 3600) - Math.floor(createdAt / 3600) + 1)
+  return TREND_WINDOWS.find((hours) => hours >= requiredBuckets) ?? TREND_WINDOWS[TREND_WINDOWS.length - 1]
+}
 
 export function connectionTrends(networkId: string, windowHours: number, signal?: AbortSignal) {
   const params = new URLSearchParams({ window_hours: String(windowHours) })
@@ -57,37 +66,33 @@ export interface HealthDirection {
 export function readHealthSearch(params: URLSearchParams) {
   const windowSeconds = Number(params.get('window_seconds'))
   const trendHours = Number(params.get('window_hours'))
-  const direction = {
-    network_id: params.get('selected_network_id') ?? '',
-    reporting_device_id: params.get('reporting_device_id') ?? '',
-    remote_device_id: params.get('remote_device_id') ?? '',
-  }
+  const alertSignal = params.get('signal') ?? ''
+  const rawPage = Number(params.get('alert_page') ?? 1)
+  const alertPage = Number.isSafeInteger(rawPage) && rawPage > 0 && Number.isSafeInteger((rawPage - 1) * HEALTH_PAGE_SIZE) ? rawPage : 1
+  const hour = Number(params.get('trend_hour'))
+  const direction = readConnectionSearch(params).selected
   return {
     networkId: params.get('network_id') ?? '',
-    accountId: params.get('account_id') ?? '',
+    accountId: params.get('account_id') || params.get('user_id') || '',
     deviceId: params.get('device_id') ?? '',
     windowSeconds: [3600, 21600, 86400].includes(windowSeconds) ? windowSeconds : 3600,
     trendHours: TREND_WINDOWS.some((hours) => hours === trendHours) ? trendHours : 24,
-    direction: Object.values(direction).every(Boolean) ? direction : null,
+    selectedHour: params.has('trend_hour') && Number.isSafeInteger(hour) && hour > 0 ? hour : null,
+    alertSignal: HEALTH_SIGNALS.some((signal) => signal === alertSignal) ? alertSignal : '',
+    alertPage,
+    direction,
   }
 }
 
 export function selectHealthDirection(params: URLSearchParams, direction: HealthDirection | null) {
-  const next = new URLSearchParams(params)
-  for (const [parameter, value] of [
-    ['selected_network_id', direction?.network_id],
-    ['reporting_device_id', direction?.reporting_device_id],
-    ['remote_device_id', direction?.remote_device_id],
-  ]) {
-    if (value) next.set(parameter!, value)
-    else next.delete(parameter!)
-  }
-  return next
+  return selectConnectionSearch(params, direction)
 }
 
 export function clearHealthScope(params: URLSearchParams, scope: 'account_id' | 'device_id' | 'all' = 'all') {
   const next = selectHealthDirection(params, null)
-  if (scope === 'all' || scope === 'account_id') next.delete('account_id')
+  next.delete('page')
+  next.delete('alert_page')
+  if (scope === 'all' || scope === 'account_id') { next.delete('account_id'); next.delete('user_id') }
   if (scope === 'all' || scope === 'device_id') next.delete('device_id')
   return next
 }

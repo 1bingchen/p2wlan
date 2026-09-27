@@ -2,6 +2,8 @@ use super::*;
 
 fn direct_first_timer_peer(node_id: &str, public_key: &str) -> control::PeerInfo {
     control::PeerInfo {
+        capabilities: crate::control::PeerCapabilities::default(),
+        registration_seq: 0,
         node_id: node_id.to_string(),
         device_name: String::new(),
         app_version: String::new(),
@@ -151,6 +153,8 @@ async fn run_direct_first_queued_business_case(establish_direct: bool) {
     let started = std::time::Instant::now();
     peers
         .add_peer(&control::PeerInfo {
+            capabilities: crate::control::PeerCapabilities::default(),
+            registration_seq: 0,
             node_id: "node-b".to_string(),
             device_name: String::new(),
             app_version: String::new(),

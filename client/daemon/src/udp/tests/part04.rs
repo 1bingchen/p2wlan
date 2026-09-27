@@ -822,6 +822,8 @@ async fn hard_hard_measurement_sweeps_from_the_same_exact_socket() {
     assert!(
         peers
             .hard_hard_register_session(crate::peer::HardHardSessionRecord {
+                    pair_nomination: None,
+                    coordinated_plan: None,
                 session_id: "exact-measurement-session".into(),
                 probe_session_id: None,
                 session_token: token.into(),

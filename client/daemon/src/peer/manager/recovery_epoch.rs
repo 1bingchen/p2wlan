@@ -43,6 +43,44 @@ use tokio::sync::Notify;
 /// for a whole episode.
 pub(crate) const RECOVERY_EPOCH_PROBE_CREDIT: u32 = 4_000;
 
+/// All purposes spend the same recovery and UDP totals. HH2 exploration
+/// stops below those ceilings so its own scan cannot starve triggered checks
+/// and nomination. Legacy traversal retains its existing admission policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RecoveryProbePurpose {
+    Ordinary,
+    HardHardExploration,
+    HardHardTriggered,
+    HardHardNomination,
+}
+
+impl RecoveryProbePurpose {
+    pub(crate) fn confirmation_credit_reserve(self) -> u32 {
+        match self {
+            Self::HardHardExploration => {
+                (HARD_HARD_PAIR_MAX_CANDIDATES as u32) * u32::from(HARD_HARD_PAIR_CHECK_ATTEMPTS)
+                    + u32::from(HARD_HARD_PAIR_CONFIRM_ATTEMPTS)
+            }
+            Self::HardHardTriggered => u32::from(HARD_HARD_PAIR_CONFIRM_ATTEMPTS),
+            Self::Ordinary | Self::HardHardNomination => 0,
+        }
+    }
+
+    pub(crate) fn confirmation_short_window_reserve(self) -> usize {
+        // A short window protects one initial check per candidate (including
+        // the nomination tail); the persistent window protects every retry.
+        (self.confirmation_credit_reserve() as usize).min(HARD_HARD_PAIR_MAX_CANDIDATES)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RecoveryProbeCreditAdmission {
+    Accepted,
+    Exhausted,
+    ConfirmationReserved,
+    IdentityStale,
+}
+
 /// Plan builds allowed per recovery epoch.
 ///
 /// The primary anti-storm control is the budget-exhausted freeze: a plan
@@ -784,6 +822,37 @@ impl PeerManager {
         true
     }
 
+    /// HH2 may spend only the exact recovery allocation which admitted its
+    /// owner. The reserve is a ceiling on exploration, not extra credits or
+    /// an independent balance that can be reset by a new offer.
+    pub(crate) async fn consume_recovery_probe_credit_for_purpose(
+        &self,
+        peer_id: &str,
+        expected: RecoveryEpochIdentity,
+        purpose: RecoveryProbePurpose,
+    ) -> RecoveryProbeCreditAdmission {
+        let mut epochs = self.recovery_epochs.write().await;
+        let Some(state) = epochs.get_mut(peer_id) else {
+            return RecoveryProbeCreditAdmission::IdentityStale;
+        };
+        if !expected.hard_hard
+            || state.epoch != expected.epoch
+            || state.network_generation != expected.network_generation
+            || state.allocation_id != expected.allocation_id
+            || self.current_network_generation_sync() != expected.network_generation
+        {
+            return RecoveryProbeCreditAdmission::IdentityStale;
+        }
+        if state.epoch_probe_credit_remaining == 0 {
+            return RecoveryProbeCreditAdmission::Exhausted;
+        }
+        if state.epoch_probe_credit_remaining <= purpose.confirmation_credit_reserve() {
+            return RecoveryProbeCreditAdmission::ConfirmationReserved;
+        }
+        state.epoch_probe_credit_remaining -= 1;
+        RecoveryProbeCreditAdmission::Accepted
+    }
+
     /// Consume the epoch's fresh-mapping generation quota (one generation,
     /// one dedicated dynamic socket per epoch).
     #[cfg(test)]
@@ -1379,9 +1448,9 @@ impl PeerManager {
     pub(crate) fn publish_direct_commit_pair(
         &self,
         peer_id: &str,
-        generation: u64,
-        remote_candidate_epoch: u64,
+        epoch: PathEpoch,
         local_endpoint: Option<SocketAddr>,
+        remote_endpoint: SocketAddr,
     ) {
         let confirmed_at_ms = self.timeline_uptime_ms();
         self.direct_commit_pair_mirror
@@ -1390,9 +1459,12 @@ impl PeerManager {
             .insert(
                 peer_id.to_string(),
                 DirectCommitPairSnapshot {
-                    generation,
-                    remote_candidate_epoch,
+                    generation: epoch.network_generation,
+                    peer_session_generation: epoch.peer_session_generation,
+                    remote_candidate_epoch: epoch.remote_candidate_epoch,
                     local_endpoint,
+                    remote_endpoint,
+                    path_revision: None,
                     confirmed_at_ms,
                 },
             );
@@ -1420,12 +1492,14 @@ impl PeerManager {
         if !self.is_direct_sync(&identity.peer_id) {
             return false;
         }
-        self.direct_commit_pair_mirror
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .get(&identity.peer_id)
+        self.direct_commit_pair_snapshot_sync(&identity.peer_id)
             .is_some_and(|snapshot| {
-                snapshot.generation == identity.network_generation
+                snapshot.path_revision.is_some()
+                    && self.peer_session_is_current_sync(
+                        &identity.peer_id,
+                        snapshot.peer_session_generation,
+                    )
+                    && snapshot.generation == identity.network_generation
                     && snapshot.remote_candidate_epoch == identity.remote_candidate_epoch
                     && snapshot.local_endpoint == Some(identity.socket_local_endpoint)
             })
@@ -1542,4 +1616,88 @@ pub(crate) struct RecoveryEpochWorkBudgetSnapshot {
     pub zero_send_streak: u32,
     pub stage: RecoveryStage,
     pub next_retry_at_ms_since_epoch: Option<u64>,
+}
+
+#[cfg(test)]
+mod hard_hard_credit_reserve_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn exact_epoch_reserve_does_not_grant_or_refill_credit() {
+        let manager = PeerManager::new_with_history(
+            Config::generate_default("https://control.invalid", "budget-test").unwrap(),
+            None,
+            TraversalHistory::default(),
+        );
+        let expected = RecoveryEpochIdentity {
+            epoch: 1,
+            network_generation: 0,
+            allocation_id: 9,
+            hard_hard: true,
+        };
+        let exploration = RecoveryProbePurpose::HardHardExploration;
+        let triggered = RecoveryProbePurpose::HardHardTriggered;
+        let nomination = RecoveryProbePurpose::HardHardNomination;
+        let mut state = RecoveryEpochState::new(1, 0, 9, Instant::now());
+        state.epoch_probe_credit_remaining = exploration.confirmation_credit_reserve();
+        manager
+            .recovery_epochs
+            .write()
+            .await
+            .insert("peer".into(), state);
+        assert_eq!(
+            manager
+                .consume_recovery_probe_credit_for_purpose("peer", expected, exploration)
+                .await,
+            RecoveryProbeCreditAdmission::ConfirmationReserved
+        );
+        let check_credit =
+            exploration.confirmation_credit_reserve() - triggered.confirmation_credit_reserve();
+        for _ in 0..check_credit {
+            assert_eq!(
+                manager
+                    .consume_recovery_probe_credit_for_purpose("peer", expected, triggered)
+                    .await,
+                RecoveryProbeCreditAdmission::Accepted
+            );
+        }
+        assert_eq!(
+            manager
+                .consume_recovery_probe_credit_for_purpose("peer", expected, triggered)
+                .await,
+            RecoveryProbeCreditAdmission::ConfirmationReserved
+        );
+        for _ in 0..triggered.confirmation_credit_reserve() {
+            assert_eq!(
+                manager
+                    .consume_recovery_probe_credit_for_purpose("peer", expected, nomination)
+                    .await,
+                RecoveryProbeCreditAdmission::Accepted
+            );
+        }
+        assert_eq!(
+            manager
+                .consume_recovery_probe_credit_for_purpose("peer", expected, nomination)
+                .await,
+            RecoveryProbeCreditAdmission::Exhausted
+        );
+        assert_eq!(
+            manager.recovery_epochs.read().await["peer"].epoch_probe_credit_remaining,
+            0
+        );
+        manager.recovery_epochs.write().await.insert(
+            "peer".into(),
+            RecoveryEpochState::new(1, 0, 10, Instant::now()),
+        );
+        assert_eq!(
+            manager
+                .consume_recovery_probe_credit_for_purpose("peer", expected, nomination)
+                .await,
+            RecoveryProbeCreditAdmission::IdentityStale
+        );
+        assert_eq!(
+            manager.recovery_epochs.read().await["peer"].epoch_probe_credit_remaining,
+            RECOVERY_EPOCH_PROBE_CREDIT
+        );
+    }
 }

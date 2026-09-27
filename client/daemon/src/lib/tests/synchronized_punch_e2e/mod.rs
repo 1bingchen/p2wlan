@@ -397,6 +397,8 @@ fn peer_info(
     nat_type: String,
 ) -> control::PeerInfo {
     control::PeerInfo {
+        capabilities: crate::control::PeerCapabilities::default(),
+        registration_seq: 0,
         node_id: node_id.to_string(),
         device_name: "phase-2-2-test".to_string(),
         app_version: "0.2.0-test".to_string(),

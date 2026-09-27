@@ -78,6 +78,7 @@ impl PeerManager {
             punch_generations: Arc::new(RwLock::new(HashMap::new())),
             local_fresh_mappings: Arc::new(RwLock::new(HashMap::new())),
             hard_hard_sessions: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            hard_hard_strategy_learning: Arc::new(std::sync::Mutex::new(HardHardStrategyLearning::default())),
             hard_hard_cleanup_owners: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
             hard_hard_winners: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             fresh_mapping_history: Arc::new(std::sync::Mutex::new(HashMap::new())),

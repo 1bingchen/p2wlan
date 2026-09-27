@@ -7,7 +7,7 @@ const listeners = new Set<() => void>()
 
 function readInitialTheme(): AdminTheme {
   if (typeof window === 'undefined') return 'light'
-  return window.localStorage.getItem(STORAGE_KEY) === 'dark' ? 'dark' : 'light'
+  try { return window.localStorage.getItem(STORAGE_KEY) === 'dark' ? 'dark' : 'light' } catch { return 'light' }
 }
 
 let activeTheme: AdminTheme = readInitialTheme()
@@ -21,8 +21,10 @@ applyTheme(activeTheme)
 function subscribe(listener: () => void) {
   listeners.add(listener)
   const onStorage = (event: StorageEvent) => {
-    if (event.key !== STORAGE_KEY) return
-    activeTheme = event.newValue === 'dark' ? 'dark' : 'light'
+    if (event.key !== STORAGE_KEY && event.key !== null) return
+    const next = event.newValue === 'dark' ? 'dark' : 'light'
+    if (next === activeTheme) return
+    activeTheme = next
     applyTheme(activeTheme)
     for (const subscriber of listeners) subscriber()
   }
@@ -40,7 +42,7 @@ export function getTheme(): AdminTheme {
 export function setTheme(theme: AdminTheme) {
   if (theme === activeTheme) return
   activeTheme = theme
-  if (typeof window !== 'undefined') window.localStorage.setItem(STORAGE_KEY, theme)
+  try { if (typeof window !== 'undefined') window.localStorage.setItem(STORAGE_KEY, theme) } catch { /* Preferences still work for this page when storage is blocked. */ }
   applyTheme(theme)
   for (const listener of listeners) listener()
 }

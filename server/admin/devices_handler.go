@@ -8,6 +8,12 @@ import (
 )
 
 func (s *Server) devicesCursor(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := adminReadRequestContext(r)
+	defer cancel()
+	filter, ok := parseAdminResourceFilter(w, r)
+	if !ok {
+		return
+	}
 	limit, err := parseBoundedInt(r.URL.Query().Get("limit"), 25, 1, 200)
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "limit must be between 1 and 200"})
@@ -18,7 +24,7 @@ func (s *Server) devicesCursor(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid device cursor; restart pagination"})
 		return
 	}
-	page, err := s.store.AdminDevicesCursor(r.URL.Query().Get("q"), r.URL.Query().Get("status"), cursor, limit)
+	page, err := s.store.AdminDevicesCursorScoped(ctx, filter.Query, r.URL.Query().Get("status"), cursor, limit, filter.AccountID)
 	switch {
 	case errors.Is(err, database.ErrInvalidAdminDeviceCursor):
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid device cursor; restart pagination"})

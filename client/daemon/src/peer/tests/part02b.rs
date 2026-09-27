@@ -74,6 +74,8 @@ async fn candidate_pair_selection_prefers_selected_endpoint_for_send() {
 
     manager
         .add_peer(&PeerInfo {
+            capabilities: crate::control::PeerCapabilities::default(),
+            registration_seq: 0,
             node_id: "peer1".to_string(),
             device_name: String::new(),
             app_version: String::new(),

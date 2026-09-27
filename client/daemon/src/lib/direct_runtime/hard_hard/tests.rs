@@ -124,6 +124,8 @@ mod hard_hard_tests {
             let peer_id = format!("peer-runtime-cap-{platform}");
             peers
                 .add_peer(&crate::control::PeerInfo {
+                    capabilities: crate::control::PeerCapabilities::default(),
+                    registration_seq: 0,
                     node_id: peer_id.clone(),
                     device_name: "runtime-cap".to_string(),
                     app_version: "test".to_string(),
@@ -173,6 +175,8 @@ mod hard_hard_tests {
             socket_local_endpoint: endpoint,
         };
         let expected = HardHardSessionRecord {
+            pair_nomination: None,
+            coordinated_plan: None,
             session_id: "hh1:i:raw-level-token:3:5:7:11:90:0:0".to_string(),
             probe_session_id: None,
             session_token: identity.session_token.clone(),
@@ -2133,6 +2137,39 @@ mod hard_hard_tests {
     }
 
     #[tokio::test]
+    async fn attempt_report_uses_only_its_current_tokens_agreed_strategy() {
+        use crate::peer::HardHardProbeStrategy::{Birthday, FixedAnchor, Predictable};
+        for (strategy, expected_mode) in [
+            (None, "legacy_custom"),
+            (Some(FixedAnchor), "fixed_anchor"),
+            (Some(Predictable), "predictable"),
+            (Some(Birthday), "birthday"),
+        ] {
+            let (peers, udp, identity, remote) =
+                exact_socket_proof_fixture_with_strategy(strategy).await;
+            let peer_session = peers.peer_session_generation_sync(&identity.peer_id).unwrap();
+            let mut report = build_hard_hard_attempt_report(
+                &peers, false, peer_session, &identity, &identity.session_token,
+                "initiator", true, 0,
+                &crate::peer::HardHardMeasurementObservation::default(), &[remote],
+                1, 1, 2, None, &PunchSendReport::default(), UdpProbeRxSnapshot::default(),
+                false, None, None, None, "session_cancelled",
+            );
+            report.mode = "legacy_custom".to_string();
+            assert!(!peers.record_hard_hard_attempt_report(
+                &identity.peer_id, "replaced-token", report.clone()).await);
+            assert!(peers.record_hard_hard_attempt_report(
+                &identity.peer_id, &identity.session_token, report).await);
+            let diagnostics = peers.diagnostics().await;
+            let event = diagnostics[0].direct_events.iter()
+                .find(|event| event.stage == "hard_hard_attempt_report").unwrap();
+            assert_eq!(event.hard_hard_attempt.as_ref().unwrap().mode, expected_mode);
+            assert!(event.detail.contains(&format!("mode={expected_mode}")));
+            udp.detach_all_dynamic_punch_sockets("attempt_report_strategy").await;
+        }
+    }
+
+    #[tokio::test]
     async fn unexecuted_live_session_response_retains_typed_terminal_evidence() {
         let (peers, udp, identity, remote) = exact_socket_proof_fixture().await;
         let peer_session_generation = peers
@@ -2232,6 +2269,17 @@ mod hard_hard_tests {
         crate::peer::HardHardFreshSocketIdentity,
         SocketAddr,
     ) {
+        exact_socket_proof_fixture_with_strategy(None).await
+    }
+
+    async fn exact_socket_proof_fixture_with_strategy(
+        strategy: Option<crate::peer::HardHardProbeStrategy>,
+    ) -> (
+        Arc<PeerManager>,
+        UdpTransport,
+        crate::peer::HardHardFreshSocketIdentity,
+        SocketAddr,
+    ) {
         let peers = Arc::new(PeerManager::new(
             Config::generate_default("https://ctrl.test", "hard-hard-exact-proof").unwrap(),
         ));
@@ -2242,6 +2290,8 @@ mod hard_hard_tests {
         let remote: SocketAddr = "198.51.100.20:41000".parse().unwrap();
         peers
             .add_peer(&crate::control::PeerInfo {
+                capabilities: crate::control::PeerCapabilities::default(),
+                registration_seq: 0,
                 node_id: "peer-exact-proof".to_string(),
                 device_name: String::new(),
                 app_version: String::new(),
@@ -2322,6 +2372,30 @@ mod hard_hard_tests {
         assert!(
             peers
                 .hard_hard_register_session(crate::peer::HardHardSessionRecord {
+                    pair_nomination: None,
+                    coordinated_plan: strategy.map(|strategy| crate::peer::HardHardCoordinatedPlan {
+                        measurement_lease: None,
+                        recovery_identity: None,
+                        strategy_order: 0,
+                        local_offer: crate::peer::HardHardOfferParameters::default(),
+                        remote_offer: None,
+                        local_registration_seq: 1,
+                        remote_registration_seq: 1,
+                        phase: false,
+                        canonical_server_deadline: now.saturating_add(5_000),
+                        scheduled_start: Instant::now() + Duration::from_secs(5),
+                        forecast_first_send_deadline: Instant::now() + Duration::from_secs(5),
+                        agreement: Some(crate::peer::HardHardAgreedPlan { strategy, digest: [1; 16] }),
+                        ready_received: false,
+                        ready_ack_received: false,
+                        ready_sent_at: None,
+                        ready_rtt: None,
+                        sync_uncertainty: Duration::ZERO,
+                        start: None,
+                        start_ack_received: false,
+                        start_ack_queued: false,
+                        start_ack_delivery: None,
+                    }),
                     session_id: "proof-session".to_string(),
                     probe_session_id: Some("probe-session-exact".to_string()),
                     session_token: identity.session_token.clone(),
@@ -2489,6 +2563,7 @@ mod hard_hard_tests {
     #[test]
     fn coordination_envelope_round_trips_directional_fences() {
         let offer = HardHardCoordination {
+            v2: None,
             role: HardHardRole::Initiator,
             token: "deadbeef01".to_string(),
             local_network_generation: 7,
@@ -2577,6 +2652,7 @@ mod hard_hard_tests {
     #[test]
     fn coordination_round_trip_exchanges_both_network_generations() {
         let offer = HardHardCoordination {
+            v2: None,
             role: HardHardRole::Initiator,
             token: "a1b2c3".to_string(),
             local_network_generation: 17,
@@ -2730,6 +2806,8 @@ mod hard_hard_tests {
                 socket_local_endpoint: endpoint,
             };
             crate::peer::HardHardSessionRecord {
+                pair_nomination: None,
+                coordinated_plan: None,
                 session_id: format!("hh1:i:{token}:1:2:3:4:90:0:0"),
                 probe_session_id: None,
                 session_token: token.to_string(),

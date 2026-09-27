@@ -42,3 +42,14 @@ export function lifecycleLabel(lifecycle: string, locale: Locale): string {
   }
   return labels[lifecycle]?.[locale] ?? (locale === 'zh-CN' ? '未知' : 'Unknown')
 }
+
+export function healthSignalLabel(signal: string, locale: Locale): string {
+  const labels: Record<string, Record<Locale, string>> = {
+    reporter_offline: { 'zh-CN': '上报端离线', 'en-US': 'Reporter offline' },
+    stale_observation: { 'zh-CN': '观测过期', 'en-US': 'Stale observation' },
+    no_active_path: { 'zh-CN': '在线但无活动路径', 'en-US': 'Online with no active path' },
+    frequent_path_switching: { 'zh-CN': '路径频繁切换', 'en-US': 'Frequent path switching' },
+    repeated_path_failures: { 'zh-CN': '路径失败重复发生', 'en-US': 'Repeated path failures' },
+  }
+  return labels[signal]?.[locale] ?? (locale === 'zh-CN' ? '未知健康信号' : 'Unknown health signal')
+}

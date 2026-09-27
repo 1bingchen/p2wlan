@@ -57,9 +57,10 @@ async fn handle_control_command(
             // burst.
             peer_roster_tick.reset();
             let poll_result = async {
-                let current_http = http.current()?;
+                let (current_http, http_pool_id) = http.current_with_pool_id()?;
                 poll_peers(
                     &current_http,
+                    http_pool_id,
                     base_url,
                     token,
                     config,

@@ -269,6 +269,8 @@ mod maintenance_retry_tests {
         let manager =
             PeerManager::new(Config::generate_default("http://127.0.0.1:1", "net1").unwrap());
         let peer = control::PeerInfo {
+            capabilities: crate::control::PeerCapabilities::default(),
+            registration_seq: 0,
             node_id: "maintenance-peer".to_string(),
             device_name: String::new(),
             app_version: String::new(),

@@ -21,13 +21,13 @@ async function source(entry, plugins = []) {
   new Function('module', 'exports', 'require', result.outputFiles[0].text)(module, module.exports, require)
   return module.exports
 }
-const { connectionTrends, clearHealthScope, readHealthSearch, selectHealthDirection, summarizeTrends, bucketP95, lineSegments } = await source('src/trends.ts')
+const { connectionTrends, clearHealthScope, readHealthSearch, selectHealthDirection, summarizeTrends, bucketP95, lineSegments, trendWindowForTimestamp } = await source('src/trends.ts')
 const { adminApi } = await source('src/api.ts')
 const { ConnectionTrends } = await source('src/ConnectionTrends.tsx')
 const { ConnectionHealthPage } = await source('src/ConnectionHealthPage.tsx', [{
   name: 'unused-drawer',
   setup(builder) {
-    builder.onResolve({ filter: /^\.\/ConnectionsPage$/ }, () => ({ path: 'drawer', namespace: 'test' }))
+    builder.onResolve({ filter: /^\.\/ConnectionDrawer$/ }, () => ({ path: 'drawer', namespace: 'test' }))
     builder.onLoad({ filter: /.*/, namespace: 'test' }, () => ({ contents: 'export function ConnectionDrawer() { return null }' }))
   },
 }])
@@ -41,6 +41,26 @@ function bucket(overrides = {}) {
     ...overrides,
   }
 }
+
+test('history links include the event hour at trend-window boundaries', () => {
+  const currentHour = 2_000_000_000 - 2_000_000_000 % 3600
+  const now = currentHour + 1
+  assert.equal(trendWindowForTimestamp(currentHour - 23 * 3600, now), 24)
+  // Less than 24 elapsed hours can still require 25 whole buckets.
+  assert.equal(trendWindowForTimestamp(currentHour - 24 * 3600 + 3599, now), 168)
+  assert.equal(trendWindowForTimestamp(currentHour - 167 * 3600, now), 168)
+  assert.equal(trendWindowForTimestamp(currentHour - 168 * 3600 + 3599, now), 720)
+})
+
+test('health accepts legacy direction links and clearing global scope resets both paginations', () => {
+  const params = new URLSearchParams('network_id=n&reporting_device_id=a&remote_device_id=b&account_id=u&page=4&alert_page=3')
+  assert.deepEqual(readHealthSearch(params).direction, { network_id: 'n', reporting_device_id: 'a', remote_device_id: 'b' })
+  const cleared = clearHealthScope(params, 'account_id')
+  assert.equal(cleared.has('page'), false)
+  assert.equal(cleared.has('alert_page'), false)
+  assert.equal(readHealthSearch(cleared).direction, null)
+  assert.equal(cleared.get('network_id'), 'n')
+})
 
 test('trends request preserves network identity, full 30-day window, and cancellation', async (t) => {
   const previous = new Map(['sessionStorage', 'fetch'].map((key) => [key, Object.getOwnPropertyDescriptor(globalThis, key)]))
@@ -64,12 +84,12 @@ test('trends request preserves network identity, full 30-day window, and cancell
 
 test('health deep links validate windows and require the full directional identity', () => {
   assert.deepEqual(readHealthSearch(new URLSearchParams('window_seconds=-1&window_hours=721&reporting_device_id=a&remote_device_id=b')), {
-    networkId: '', accountId: '', deviceId: '', windowSeconds: 3600, trendHours: 24, direction: null,
+    networkId: '', accountId: '', deviceId: '', windowSeconds: 3600, trendHours: 24, selectedHour: null, alertSignal: '', alertPage: 1, direction: null,
   })
   const params = new URLSearchParams({ network_id: 'scope', window_seconds: '21600', window_hours: '168', retained: 'yes' })
   const direction = { network_id: 'network:+&', reporting_device_id: 'source/?', remote_device_id: 'destination=尾' }
   const selected = selectHealthDirection(params, direction)
-  assert.deepEqual(readHealthSearch(new URLSearchParams(selected.toString())), { networkId: 'scope', accountId: '', deviceId: '', windowSeconds: 21600, trendHours: 168, direction })
+  assert.deepEqual(readHealthSearch(new URLSearchParams(selected.toString())), { networkId: 'scope', accountId: '', deviceId: '', windowSeconds: 21600, trendHours: 168, selectedHour: null, alertSignal: '', alertPage: 1, direction })
   const closed = selectHealthDirection(selected, null)
   assert.equal(closed.toString(), params.toString())
   assert.equal(readHealthSearch(selected).direction.reporting_device_id, direction.reporting_device_id)
@@ -103,23 +123,24 @@ test('clearing health scopes closes the selected direction and preserves network
   assert.equal(accountOnly.accountId, 'owner')
   assert.equal(accountOnly.direction, null)
   const all = readHealthSearch(clearHealthScope(params))
-  assert.deepEqual(all, { networkId: 'room', accountId: '', deviceId: '', windowSeconds: 21600, trendHours: 720, direction: null })
+  assert.deepEqual(all, { networkId: 'room', accountId: '', deviceId: '', windowSeconds: 21600, trendHours: 720, selectedHour: null, alertSignal: '', alertPage: 1, direction: null })
   assert.equal(readHealthSearch(params).deviceId, 'device')
 })
 
 test('scoped health renders its own cached summary and suppresses unsupported trend queries', (t) => {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false, staleTime: Infinity } } })
   t.after(() => client.clear())
-  client.setQueryData(['connection-health', 'room', 3600, 'owner', 'lab-stale'], {
+  client.setQueryData(['connection-health', 'room', 3600, 'owner', 'lab-stale', '', 0], {
     generated_at: 1_800_000_000, history_limit_per_direction: 50,
-    alerts_total: 0, alerts: [], thresholds: { frequent_path_switches: 4, repeated_path_failures: 3 },
+    alerts_total: 0, alerts_unfiltered_total: 0, alerts_offset: 0, alerts: [], thresholds: { frequent_path_switches: 4, repeated_path_failures: 3 },
     summary: { total_observations: 321, fresh_observations: 1, stale_observations: 320, reporter_offline_observations: 0, fresh_direct: 1, fresh_relay: 0, fresh_online_no_path: 0, recent_path_switches: 0, recent_direct_failures: 0, recent_relay_failures: 0, validation_rtt_samples: 0 },
   })
   const html = renderToStaticMarkup(createElement(QueryClientProvider, { client }, createElement(MemoryRouter, { initialEntries: ['/health?network_id=room&account_id=owner&device_id=lab-stale'] }, createElement(ConnectionHealthPage))))
   assert.match(html, /321/)
   assert.match(html, /清除账号范围: owner/)
   assert.match(html, /清除设备范围: lab-stale/)
-  assert.match(html, /历史趋势仅支持按网络汇总/)
+  assert.match(html, /趋势按网络汇总，保留当前排障上下文/)
+  assert.match(html, /account_id=owner.*device_id=lab-stale.*tab=trends/)
   assert.doesNotMatch(html, /type="range"|connection-trends/)
   assert.equal(client.getQueryCache().findAll({ queryKey: ['connection-trends'] }).length, 0)
 })
@@ -161,8 +182,22 @@ function renderTrend(t, buckets, state = {}) {
     rtt_bucket_bounds_ms: [50, 100, 250, 500, 1000, 3000, 10000], buckets,
   })
   client.getQueryCache().find({ queryKey: key, exact: true }).setState(state)
-  return renderToStaticMarkup(createElement(QueryClientProvider, { client }, createElement(ConnectionTrends, { networkId: '', windowHours: 24, onWindowChange() {} })))
+  return renderToStaticMarkup(createElement(QueryClientProvider, { client }, createElement(MemoryRouter, null, createElement(ConnectionTrends, { networkId: '', windowHours: 24, onWindowChange() {} }))))
 }
+
+test('health pagination and selected trend hours survive copied URLs without unsafe offsets', () => {
+  const selected = readHealthSearch(new URLSearchParams('user_id=legacy&signal=no_active_path&alert_page=4&trend_hour=1800000000'))
+  assert.equal(selected.accountId, 'legacy')
+  assert.equal(selected.alertSignal, 'no_active_path')
+  assert.equal(selected.alertPage, 4)
+  assert.equal(selected.selectedHour, 1800000000)
+  for (const value of ['-1', '0', '1.2', 'NaN', 'Infinity', '9007199254740991']) {
+    const invalid = readHealthSearch(new URLSearchParams({ alert_page: value, signal: 'unknown' }))
+    assert.equal(invalid.alertPage, 1)
+    assert.equal(invalid.alertSignal, '')
+  }
+  assert.equal(readHealthSearch(clearHealthScope(new URLSearchParams('user_id=legacy'), 'account_id')).accountId, '')
+})
 
 test('a failed background refresh retains rendered history and labels it as cached', (t) => {
   const html = renderTrend(t, [bucket({ accepted_observation_samples: 12, direct_observation_samples: 9 })], { status: 'error', error: new Error('temporarily unavailable') })

@@ -425,6 +425,23 @@ impl WireGuardTransport {
                     // delivery.
                     let internal_rekey_confirmation = is_rekey_confirmation_packet(&inbound.packet);
                     let direct_validation = parse_direct_validation_token(&inbound.packet);
+                    if relay_endpoint.is_none() {
+                        if let (Some(udp), Some(index), Some(remote)) =
+                            (udp.as_ref(), socket_index, source)
+                        {
+                            if !udp
+                                .permits_hh2_encrypted_ingress(
+                                    &inbound.peer_id,
+                                    index,
+                                    remote,
+                                    direct_validation.is_some(),
+                                )
+                                .await
+                            {
+                                continue;
+                            }
+                        }
+                    }
                     let direct_validation_dplpmtud_capability = direct_validation.is_some()
                         && crate::dplpmtud::direct_validation_supports_dplpmtud(&inbound.packet);
                     let dplpmtud = crate::dplpmtud::parse_control_packet(&inbound.packet);

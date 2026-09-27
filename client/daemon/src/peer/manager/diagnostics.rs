@@ -468,6 +468,8 @@ mod diagnostics_tests {
         let manager = PeerManager::new(config);
         manager
             .add_peer(&crate::control::PeerInfo {
+                capabilities: crate::control::PeerCapabilities::default(),
+                registration_seq: 0,
                 node_id: "peer-hard-lock".to_string(),
                 device_name: String::new(),
                 app_version: "0.2.0-test".to_string(),

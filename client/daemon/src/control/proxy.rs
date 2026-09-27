@@ -153,6 +153,7 @@ fn control_route_binding(mode: ControlProxyMode, server_url: Option<&str>) -> Co
 
 #[derive(Clone)]
 struct ControlHttpPoolState {
+    pool_id: u64,
     primary: Option<Arc<reqwest::Client>>,
     candidate: Option<Arc<reqwest::Client>>,
     unavailable_reason: Option<String>,
@@ -170,6 +171,8 @@ enum ControlHttpLane {
 /// route binding.
 #[derive(Clone)]
 pub(super) struct RouteAwareControlHttpClient {
+    timing: Option<Arc<ServerClockEstimate>>,
+    route_aware: bool,
     state_rx: tokio::sync::watch::Receiver<ControlHttpPoolState>,
     lane: ControlHttpLane,
     force_network_change_tx: Option<tokio::sync::mpsc::UnboundedSender<()>>,
@@ -177,12 +180,21 @@ pub(super) struct RouteAwareControlHttpClient {
 
 impl RouteAwareControlHttpClient {
     pub(super) fn current(&self) -> Result<Arc<reqwest::Client>> {
+        self.current_with_pool_id().map(|(client, _)| client)
+    }
+
+    pub(super) fn current_with_pool_id(&self) -> Result<(Arc<reqwest::Client>, u64)> {
         let state = self.state_rx.borrow();
         let client = match self.lane {
             ControlHttpLane::Primary => state.primary.clone(),
             ControlHttpLane::Candidate => state.candidate.clone(),
         };
-        client.ok_or_else(|| {
+        if !self.route_aware {
+            if let Some(clock) = &self.timing {
+                clock.activate_http_pool(state.pool_id);
+            }
+        }
+        client.map(|client| (client, state.pool_id)).ok_or_else(|| {
             DaemonError::ControlPlane(
                 state
                     .unavailable_reason
@@ -193,11 +205,16 @@ impl RouteAwareControlHttpClient {
     }
 
     pub(super) fn notify_network_changed(&self) {
+        if let Some(clock) = &self.timing {
+            clock.invalidate_network();
+        }
         if let Some(sender) = &self.force_network_change_tx {
             let _ = sender.send(());
         }
     }
 }
+
+static NEXT_CONTROL_HTTP_POOL_ID: AtomicU64 = AtomicU64::new(1);
 
 fn build_control_http_pools(
     mode: ControlProxyMode,
@@ -206,6 +223,7 @@ fn build_control_http_pools(
 ) -> ControlHttpPoolState {
     if binding.fail_closed {
         return ControlHttpPoolState {
+            pool_id: 0,
             primary: None,
             candidate: None,
             unavailable_reason: Some(
@@ -227,6 +245,9 @@ fn build_control_http_pools(
     );
     match (primary, candidate) {
         (Ok(primary), Ok(candidate)) => ControlHttpPoolState {
+            pool_id: NEXT_CONTROL_HTTP_POOL_ID
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |id| id.checked_add(1))
+                .unwrap_or(0),
             primary: Some(Arc::new(primary)),
             candidate: Some(Arc::new(candidate)),
             unavailable_reason: None,
@@ -238,6 +259,7 @@ fn build_control_http_pools(
                 .map(|error| error.to_string())
                 .unwrap_or_else(|| "unknown client construction error".to_string());
             ControlHttpPoolState {
+                pool_id: 0,
                 primary: None,
                 candidate: None,
                 unavailable_reason: Some(format!(
@@ -285,10 +307,14 @@ fn observe_stable_route_change(
 pub(super) fn route_aware_control_http_clients(
     mode: ControlProxyMode,
     server_url: &str,
+    timing: Option<Arc<ServerClockEstimate>>,
 ) -> (RouteAwareControlHttpClient, RouteAwareControlHttpClient) {
     let route_aware = mode == ControlProxyMode::Direct && !control_server_is_local(server_url);
     let initial_binding = control_route_binding(mode, Some(server_url));
     let initial_state = build_control_http_pools(mode, server_url, initial_binding.clone());
+    if let Some(clock) = &timing {
+        clock.activate_http_pool(initial_state.pool_id);
+    }
     if let Some(reason) = &initial_state.unavailable_reason {
         warn!("{reason}");
     }
@@ -296,11 +322,15 @@ pub(super) fn route_aware_control_http_clients(
     let (force_network_change_tx, mut force_network_change_rx) =
         tokio::sync::mpsc::unbounded_channel::<()>();
     let primary = RouteAwareControlHttpClient {
+        timing: timing.clone(),
+        route_aware,
         state_rx: state_rx.clone(),
         lane: ControlHttpLane::Primary,
         force_network_change_tx: route_aware.then_some(force_network_change_tx.clone()),
     };
     let candidate = RouteAwareControlHttpClient {
+        timing: timing.clone(),
+        route_aware,
         state_rx,
         lane: ControlHttpLane::Candidate,
         force_network_change_tx: route_aware.then_some(force_network_change_tx.clone()),
@@ -343,6 +373,15 @@ pub(super) fn route_aware_control_http_clients(
                         continue;
                     }
                 };
+                // Invalidate on the first observed change, before the route
+                // stability debounce or pool construction can await again.
+                if forced || observed != active_binding {
+                    if let Some(clock) = &timing {
+                        clock.invalidate_network();
+                    }
+                } else if let Some(clock) = &timing {
+                    clock.activate_http_pool(state_tx.borrow().pool_id);
+                }
                 if forced {
                     let replacement = build_control_http_pools(mode, &server_url, observed.clone());
                     if let Some(reason) = &replacement.unavailable_reason {
@@ -355,6 +394,9 @@ pub(super) fn route_aware_control_http_clients(
                     }
                     active_binding = observed;
                     pending = None;
+                    if let Some(clock) = &timing {
+                        clock.activate_http_pool(replacement.pool_id);
+                    }
                     state_tx.send_replace(replacement);
                     continue;
                 }
@@ -371,6 +413,9 @@ pub(super) fn route_aware_control_http_clients(
                         );
                     }
                     active_binding = binding;
+                    if let Some(clock) = &timing {
+                        clock.activate_http_pool(replacement.pool_id);
+                    }
                     state_tx.send_replace(replacement);
                     continue;
                 }
@@ -386,6 +431,9 @@ pub(super) fn route_aware_control_http_clients(
                     let retry = build_control_http_pools(mode, &server_url, active_binding.clone());
                     if retry.primary.is_some() {
                         info!("Recovered control-plane HTTP client construction");
+                        if let Some(clock) = &timing {
+                            clock.activate_http_pool(retry.pool_id);
+                        }
                         state_tx.send_replace(retry);
                     }
                 }

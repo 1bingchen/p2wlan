@@ -2423,6 +2423,7 @@ dependencies = [
 name = "p2wlan-daemon"
 version = "0.1.164"
 dependencies = [
+ "base64",
  "blake2",
  "bytes",
  "clap",

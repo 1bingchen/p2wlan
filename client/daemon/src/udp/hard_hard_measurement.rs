@@ -2,10 +2,11 @@
 //! Socket ownership remains in the existing provisional-socket guards.
 
 use super::*;
+use p2pnet_nat::mapping::allocation::validate_allocation_prediction_tail;
 use p2pnet_nat::{
     infer_port_domain, infer_scoped_allocation, plan_fixed_anchor, validate_allocation_attempts,
-    AllocationAttempt, AllocationAttemptOutcome, AllocationEvidenceRejection, AllocationIdentity,
-    AllocationSample, FixedAnchorPlan, PortDomainEvidence, ScopedAllocationEvidence,
+    AllocationAttempt, AllocationEvidenceRejection, AllocationIdentity, AllocationSample,
+    FixedAnchorPlan, PortDomainEvidence, ScopedAllocationEvidence,
 };
 
 pub(crate) struct HardHardPreparedMeasurement {
@@ -15,6 +16,8 @@ pub(crate) struct HardHardPreparedMeasurement {
     /// Complete bounded syscall ledger. A timeout remains SentUnobserved;
     /// successful observation counts alone cannot establish consumption.
     pub(crate) measurement_trace: Vec<AllocationAttempt>,
+    /// Immutable observations reconciled against that same bounded ledger.
+    pub(super) measurement_samples: Vec<AllocationSample>,
     pub(crate) allocation: Option<ScopedAllocationEvidence>,
     pub(crate) allocation_rejection: Option<AllocationEvidenceRejection>,
     /// Evidence-only view of the first owned socket; it owns no second guard.
@@ -92,14 +95,6 @@ impl HardHardPreparedMeasurement {
         {
             return Err(Reject::IdentityChanged);
         }
-        if self.measurement_trace.is_empty()
-            || self
-                .measurement_trace
-                .iter()
-                .any(|attempt| attempt.outcome != AllocationAttemptOutcome::Observed)
-        {
-            return Err(Reject::UnobservedAllocation);
-        }
         Ok(())
     }
 
@@ -115,6 +110,28 @@ impl HardHardPreparedMeasurement {
             .predictable
             .as_ref()
             .ok_or(AllocationEvidenceRejection::NoConsistentStep)?;
+        let primary = &self.birthday.sockets[0]; // validate_plan_identity checked it.
+        let tail = validate_allocation_prediction_tail(
+            &self.measurement_samples,
+            &self.measurement_trace,
+            primary.socket_index,
+            primary.socket_local_endpoint,
+        )?;
+        if prediction.network_generation != network_generation
+            || prediction.punch_generation != primary.punch_generation
+            || prediction.socket_index != primary.socket_index
+            || prediction.socket_local_endpoint != primary.socket_local_endpoint
+            || prediction.model.sampled_at_ms != tail[0].observation.sent_at_ms
+            || prediction.model.sequence
+                != tail
+                    .iter()
+                    .map(|sample| sample.observation.observed.port())
+                    .collect::<Vec<_>>()
+            || prediction.public_ip != Some(self.birthday.public_ip)
+            || prediction.model.public_ip != Some(self.birthday.public_ip)
+        {
+            return Err(AllocationEvidenceRejection::IdentityChanged);
+        }
         if !p2pnet_nat::model_is_fresh(
             &prediction.model,
             FRESH_MAPPING_MODEL_MAX_AGE,
@@ -144,6 +161,7 @@ impl HardHardPreparedMeasurement {
         max_prefix_allocations: usize,
     ) -> std::result::Result<FixedAnchorPlan, AllocationEvidenceRejection> {
         self.validate_plan_identity(network_generation)?;
+        validate_allocation_attempts(&self.measurement_samples, &self.measurement_trace)?;
         if socket_count > self.birthday.sockets.len() {
             return Err(AllocationEvidenceRejection::InvalidSocketCount);
         }
@@ -202,12 +220,22 @@ impl UdpTransport {
             .map(|(socket, observer)| (sockets[*socket].1.clone(), observers[*observer]))
             .collect::<Vec<_>>();
         let measurement = self
-            .measure_ordered_mapping_requests(&requests, stun_timeout, keep_measuring)
+            .measure_ordered_mapping_requests_with_primary_fallback(
+                &requests,
+                (pairs.len() == 6).then(|| &sockets[0].1),
+                stun_timeout,
+                keep_measuring,
+            )
             .await;
         let mut observations_by_socket = vec![Vec::new(); sockets.len()];
         let mut samples = Vec::new();
         for observation in measurement.observations {
-            let Some(&(position, _)) = pairs.get(usize::from(observation.sequence)) else {
+            // The collector may replace the remaining grid with a primary
+            // tail. Attribute actual observations by the bound local socket,
+            // never by the original request's now-obsolete sequence position.
+            let Some(position) = sockets.iter().position(|(_, socket)| {
+                socket.local_addr().ok() == Some(observation.local_endpoint)
+            }) else {
                 continue;
             };
             observations_by_socket[position].push(observation.clone());
@@ -229,50 +257,49 @@ impl UdpTransport {
 pub(super) fn prepared_prediction(
     samples: &[AllocationSample],
     attempts: &[AllocationAttempt],
-    primary: &[MappingObservation],
     identity: AllocationIdentity,
     socket_index: usize,
     socket_local_endpoint: SocketAddr,
     measurement: HardHardMeasurementStats,
     scheduled_send: (u64, u64),
+    now_ms: u64,
 ) -> (
     Option<ScopedAllocationEvidence>,
     Option<AllocationEvidenceRejection>,
     Option<FreshMappingResult>,
 ) {
-    let now_ms = monotonic_millis();
-    if let Err(rejection) = validate_allocation_attempts(samples, attempts) {
-        // There is no defensible last allocation when the final accepted
-        // syscall has no observation. Do not guess that it consumed exactly
-        // one mapping: retain the exact trace and use the birthday fallback.
-        return (None, Some(rejection), None);
-    }
-    let allocation_result =
-        infer_scoped_allocation(samples, identity, now_ms, FRESH_MAPPING_MODEL_MAX_AGE);
+    // Shared-allocator evidence still requires every attempted send. A later
+    // complete primary tail may rebase its own predictor after an unknown
+    // early allocation, but cannot repair the incomplete cross-socket grid.
+    let allocation_result = validate_allocation_attempts(samples, attempts).and_then(|()| {
+        infer_scoped_allocation(samples, identity, now_ms, FRESH_MAPPING_MODEL_MAX_AGE)
+    });
     let allocation_rejection = allocation_result.as_ref().err().copied();
     let allocation = allocation_result.ok();
     let delay_ms = scheduled_send.0.saturating_sub(now_ms);
     if delay_ms > scheduled_send.1 {
         return (allocation, allocation_rejection, None);
     }
-    // Only the final consecutive primary run models that socket. The early A0
-    // sample is separated by B0/B1 and must not teach a false enlarged stride.
-    let mut tail = Vec::new();
-    for observation in primary.iter().rev() {
-        if tail.first().is_some_and(|next: &&MappingObservation| {
-            observation.sequence.saturating_add(1) != next.sequence
-        }) {
-            break;
-        }
-        tail.insert(0, observation);
-    }
+    // No guessed consumption count: the first observation of this complete
+    // suffix is the new base, and the ledger proves there was no unobserved
+    // send or other socket's allocation after that suffix.
+    let Ok(samples) =
+        validate_allocation_prediction_tail(samples, attempts, socket_index, socket_local_endpoint)
+    else {
+        return (allocation, allocation_rejection, None);
+    };
+    let tail = samples
+        .iter()
+        .map(|sample| &sample.observation)
+        .collect::<Vec<_>>();
     let Some(first) = tail.first() else {
         return (allocation, allocation_rejection, None);
     };
     let Some(last) = tail.last() else {
         return (allocation, allocation_rejection, None);
     };
-    if tail.len() < 3
+    if tail.iter().any(|sample| sample.responded_at_ms > now_ms)
+        || first.sent_at_ms > now_ms
         || now_ms.saturating_sub(first.sent_at_ms) > FRESH_MAPPING_MODEL_MAX_AGE.as_millis() as u64
     {
         return (allocation, allocation_rejection, None);
@@ -359,4 +386,204 @@ pub(super) fn prepared_prediction(
         measurement,
     });
     (allocation, allocation_rejection, prediction)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use p2pnet_nat::AllocationAttemptOutcome as Outcome;
+
+    fn grid(
+        step: i32,
+    ) -> (
+        Vec<AllocationSample>,
+        Vec<AllocationAttempt>,
+        AllocationIdentity,
+    ) {
+        let pairs = [(0, 0), (1, 0), (1, 1), (0, 1), (0, 2), (0, 3)];
+        let samples = pairs
+            .iter()
+            .enumerate()
+            .map(|(sequence, (socket, observer))| AllocationSample {
+                socket_id: *socket,
+                observation: MappingObservation {
+                    sequence: sequence as u16,
+                    observer: format!("203.0.113.{}:3478", observer + 1).parse().unwrap(),
+                    observed: SocketAddr::new(
+                        "198.51.100.1".parse().unwrap(),
+                        (40000 + sequence as i32 * step) as u16,
+                    ),
+                    sent_at_ms: 100 + sequence as u64 * 10,
+                    responded_at_ms: 101 + sequence as u64 * 10,
+                    local_endpoint: format!("192.0.2.1:{}", 5000 + socket).parse().unwrap(),
+                },
+            })
+            .collect::<Vec<_>>();
+        let attempts = samples
+            .iter()
+            .map(|sample| AllocationAttempt {
+                sequence: sample.observation.sequence,
+                local_endpoint: sample.observation.local_endpoint,
+                destination: sample.observation.observer,
+                sent_at_ms: sample.observation.sent_at_ms,
+                datagram_bytes: 40,
+                outcome: Outcome::Observed,
+            })
+            .collect();
+        let identity = AllocationIdentity {
+            network_generation: 7,
+            measurement_generation: 9,
+            egress: "192.0.2.1:4000".parse().unwrap(),
+        };
+        (samples, attempts, identity)
+    }
+
+    #[test]
+    fn early_timeout_keeps_a_fresh_final_prediction_but_never_a_shared_anchor() {
+        for step in [-1, 1] {
+            let (mut samples, mut attempts, identity) = grid(step);
+            attempts[1].outcome = Outcome::SentUnobserved;
+            samples.remove(1);
+            let (allocation, rejection, prediction) = prepared_prediction(
+                &samples,
+                &attempts,
+                identity,
+                0,
+                samples[0].observation.local_endpoint,
+                HardHardMeasurementStats::default(),
+                (3500, 3500),
+                1000,
+            );
+            assert!(allocation.is_none());
+            assert_eq!(
+                rejection,
+                Some(AllocationEvidenceRejection::UnobservedAllocation)
+            );
+            let prediction =
+                prediction.expect("complete primary suffix supplies its own real base");
+            assert_eq!(prediction.model.sequence.len(), 3);
+            assert_eq!(prediction.model.sampled_at_ms, 130);
+            assert_eq!(
+                prediction.model.kind,
+                PortModelKind::FixedStep { step: step as i16 }
+            );
+            assert_eq!(prediction.predicted_ports[0], (40000 + 6 * step) as u16);
+            assert_eq!(prediction.network_generation, identity.network_generation);
+            assert_eq!(prediction.punch_generation, identity.measurement_generation);
+        }
+    }
+
+    #[test]
+    fn incomplete_tail_and_real_sample_expiry_still_disable_prediction() {
+        for missing in [3, 4, 5] {
+            let (mut samples, mut attempts, identity) = grid(1);
+            attempts[missing].outcome = Outcome::SentUnobserved;
+            samples.remove(missing);
+            let (_, _, prediction) = prepared_prediction(
+                &samples,
+                &attempts,
+                identity,
+                0,
+                samples[0].observation.local_endpoint,
+                HardHardMeasurementStats::default(),
+                (3500, 3500),
+                1000,
+            );
+            assert!(prediction.is_none());
+        }
+        let (mut samples, mut attempts, identity) = grid(1);
+        attempts[1].outcome = Outcome::SentUnobserved;
+        samples.remove(1);
+        let (_, _, prediction) = prepared_prediction(
+            &samples,
+            &attempts,
+            identity,
+            0,
+            samples[0].observation.local_endpoint,
+            HardHardMeasurementStats::default(),
+            (3500, 3500),
+            3000,
+        );
+        assert!(
+            prediction.is_none(),
+            "rebasing preserves the actual suffix sample time"
+        );
+    }
+
+    #[test]
+    fn adapted_three_response_tail_predicts_from_its_actual_last_send_without_an_anchor() {
+        let (_, _, identity) = grid(1);
+        let primary: SocketAddr = "192.0.2.1:5000".parse().unwrap();
+        let mut attempts = Vec::new();
+        let mut samples = Vec::new();
+        for sequence in 0..4u16 {
+            let observer = format!("203.0.113.{}:3478", sequence + 1).parse().unwrap();
+            let sent_at_ms = match sequence {
+                0 => 100,
+                _ => 300 + u64::from(sequence - 1) * 250,
+            };
+            attempts.push(AllocationAttempt {
+                sequence,
+                local_endpoint: primary,
+                destination: observer,
+                sent_at_ms,
+                datagram_bytes: 40,
+                outcome: if sequence == 0 {
+                    Outcome::SentUnobserved
+                } else {
+                    Outcome::Observed
+                },
+            });
+            if sequence > 0 {
+                samples.push(AllocationSample {
+                    socket_id: 0,
+                    observation: MappingObservation {
+                        sequence,
+                        observer,
+                        observed: SocketAddr::new(
+                            "198.51.100.1".parse().unwrap(),
+                            40000 + sequence,
+                        ),
+                        sent_at_ms,
+                        responded_at_ms: sent_at_ms + 250,
+                        local_endpoint: primary,
+                    },
+                });
+            }
+        }
+        let measurement = HardHardMeasurementStats {
+            stun_datagrams_sent: 4,
+            stun_bytes_sent: 160,
+            stun_responses: 3,
+            measurement_started_at_ms: Some(100),
+            last_measurement_send_at_ms: Some(800),
+            measurement_completed_at_ms: Some(1050),
+            ..HardHardMeasurementStats::default()
+        };
+        let (allocation, rejection, prediction) = prepared_prediction(
+            &samples,
+            &attempts,
+            identity,
+            0,
+            primary,
+            measurement,
+            (3500, 3500),
+            1050,
+        );
+        assert!(allocation.is_none());
+        assert_eq!(
+            rejection,
+            Some(AllocationEvidenceRejection::UnobservedAllocation)
+        );
+        let prediction =
+            prediction.expect("three consecutive actual primary observations are enough");
+        assert_eq!(prediction.model.sampled_at_ms, 300);
+        assert_eq!(prediction.predicted_ports[0], 40004);
+        assert_eq!(prediction.measurement.stun_datagrams_sent, 4);
+        assert_eq!(
+            prediction.measurement.last_measurement_send_at_ms,
+            Some(800)
+        );
+        assert_eq!(attempts[0].outcome, Outcome::SentUnobserved);
+    }
 }

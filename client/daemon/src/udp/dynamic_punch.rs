@@ -1,5 +1,9 @@
 use super::*;
 
+#[cfg(test)]
+#[path = "tests/dynamic_mapping.rs"]
+mod measurement_tests;
+
 pub(super) const MEASUREMENT_SOFTWARE_TAG: &str = "P2WLAN/0.2";
 
 pub(crate) fn monotonic_millis() -> u64 {
@@ -31,7 +35,114 @@ pub(super) fn last_mapping_send_is_unobserved(attempts: &[p2pnet_nat::Allocation
         })
 }
 
+fn primary_mapping_tail_after_gap(
+    attempts: &[p2pnet_nat::AllocationAttempt],
+    primary: SocketAddr,
+    observers: &[SocketAddr],
+    request_limit: usize,
+) -> Option<Vec<SocketAddr>> {
+    if attempts.last()?.outcome == p2pnet_nat::AllocationAttemptOutcome::Observed {
+        return None;
+    }
+    // A timed-out or failed pair is never retried as a fresh allocation. The
+    // successful suffix must use three still-uncontacted primary destinations.
+    let mut used = attempts
+        .iter()
+        .filter(|attempt| attempt.local_endpoint == primary)
+        .map(|attempt| attempt.destination)
+        .collect::<HashSet<_>>();
+    let tail = observers
+        .iter()
+        .copied()
+        .filter(|observer| used.insert(*observer))
+        .take(3)
+        .collect::<Vec<_>>();
+    (tail.len() == 3 && attempts.len().saturating_add(tail.len()) <= request_limit).then_some(tail)
+}
+
+fn ordered_mapping_request_timeout(
+    stun_timeout: Duration,
+    started_ms: u64,
+    now_ms: u64,
+    remaining_requests: usize,
+) -> Option<Duration> {
+    let remaining_ms = FRESH_MAPPING_MEASURE_BUDGET
+        .as_millis()
+        .saturating_sub(u128::from(now_ms.saturating_sub(started_ms)));
+    let timeout = stun_timeout
+        .min(FRESH_MAPPING_STUN_TIMEOUT)
+        .min(Duration::from_millis(
+            remaining_ms
+                .checked_div(remaining_requests as u128)?
+                .min(u128::from(u64::MAX)) as u64,
+        ));
+    (!timeout.is_zero()).then_some(timeout)
+}
+
+#[derive(Debug)]
+pub(super) enum MappingIoError {
+    Inactive,
+    Deadline,
+    Io(std::io::Error),
+}
+
+/// Preserve one absolute request deadline through readiness, epoch admission
+/// and response waits. The existing predicate also observes Direct promotion;
+/// a short poll is needed because that predicate has no cancellation receiver.
+pub(super) async fn wait_for_mapping_io<T>(
+    future: impl std::future::Future<Output = T>,
+    deadline: tokio::time::Instant,
+    keep_measuring: &impl Fn() -> bool,
+) -> std::result::Result<T, MappingIoError> {
+    tokio::pin!(future);
+    loop {
+        if !keep_measuring() {
+            return Err(MappingIoError::Inactive);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(MappingIoError::Deadline);
+        }
+        tokio::select! {
+            biased;
+            _ = tokio::time::sleep_until(deadline) => return Err(MappingIoError::Deadline),
+            _ = tokio::time::sleep(Duration::from_millis(25)) => {},
+            value = &mut future => {
+                // Readiness can race cancellation or an elapsed deadline.
+                if !keep_measuring() { return Err(MappingIoError::Inactive); }
+                if tokio::time::Instant::now() >= deadline { return Err(MappingIoError::Deadline); }
+                return Ok(value);
+            }
+        }
+    }
+}
+
 impl UdpTransport {
+    pub(super) async fn send_mapping_request_until(
+        &self,
+        socket: &UdpSocket,
+        encoded: &[u8],
+        observer: SocketAddr,
+        deadline: tokio::time::Instant,
+        keep_measuring: &impl Fn() -> bool,
+    ) -> std::result::Result<u64, MappingIoError> {
+        loop {
+            wait_for_mapping_io(socket.writable(), deadline, keep_measuring)
+                .await?
+                .map_err(MappingIoError::Io)?;
+            // Generation change and actual handoff share the existing epoch
+            // gate. Readiness never retains it, and the syscall cannot await.
+            let _epoch =
+                wait_for_mapping_io(self.network_epoch_gate.lock(), deadline, keep_measuring)
+                    .await?;
+            let sent_at_ms = monotonic_millis();
+            match socket.try_send_to(encoded, observer) {
+                Ok(_) => return Ok(sent_at_ms),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(error) => return Err(MappingIoError::Io(error)),
+            }
+        }
+    }
+
     /// Bind a brand-new dedicated punch socket for one fresh-mapping generation.
     ///
     /// The socket is intentionally fresh: it has never contacted any observer
@@ -103,8 +214,41 @@ impl UdpTransport {
         stun_timeout: Duration,
         keep_measuring: impl Fn() -> bool,
     ) -> FreshMappingMeasurementBatch {
+        self.measure_ordered_mapping_requests_with_primary_fallback(
+            requests,
+            None,
+            stun_timeout,
+            keep_measuring,
+        )
+        .await
+    }
+
+    /// A failed early grid observation may spend the remaining SAME budget on
+    /// a primary-socket tail. It never retries an attempted pair, adds requests,
+    /// discards unknown sends, or grants shared-allocator evidence on a gap.
+    pub(super) async fn measure_ordered_mapping_requests_with_primary_fallback(
+        &self,
+        requests: &[(Arc<UdpSocket>, SocketAddr)],
+        primary_fallback: Option<&Arc<UdpSocket>>,
+        stun_timeout: Duration,
+        keep_measuring: impl Fn() -> bool,
+    ) -> FreshMappingMeasurementBatch {
+        let deadline = tokio::time::Instant::now() + FRESH_MAPPING_MEASURE_BUDGET;
         let started_ms = monotonic_millis();
-        let requests = &requests[..requests.len().min(p2pnet_nat::MAX_ALLOCATION_SAMPLES)];
+        let mut requests =
+            requests[..requests.len().min(p2pnet_nat::MAX_ALLOCATION_SAMPLES)].to_vec();
+        let request_limit = requests.len();
+        let mut primary_fallback = primary_fallback.and_then(|socket| {
+            Some((
+                socket.clone(),
+                socket.local_addr().ok()?,
+                requests
+                    .iter()
+                    .filter(|(candidate, _)| Arc::ptr_eq(candidate, socket))
+                    .map(|(_, observer)| *observer)
+                    .collect::<Vec<_>>(),
+            ))
+        });
         let mut observations = Vec::with_capacity(requests.len());
         let mut attempts = Vec::with_capacity(requests.len());
         let mut stun_datagrams_sent = 0u32;
@@ -112,29 +256,51 @@ impl UdpTransport {
         let mut stun_send_errors = 0u32;
         let mut stun_send_error_bytes = 0u64;
         let mut last_send_at_ms = None;
-        for (sequence, (socket, observer)) in requests.iter().enumerate() {
+        loop {
+            let sequence = attempts.len();
+            if attempts
+                .last()
+                .is_some_and(|attempt: &p2pnet_nat::AllocationAttempt| {
+                    attempt.outcome != p2pnet_nat::AllocationAttemptOutcome::Observed
+                })
+            {
+                if let Some((primary, endpoint, observers)) = primary_fallback.take() {
+                    if let Some(tail) = primary_mapping_tail_after_gap(
+                        &attempts,
+                        endpoint,
+                        &observers,
+                        request_limit,
+                    ) {
+                        requests.truncate(sequence);
+                        requests
+                            .extend(tail.into_iter().map(|observer| (primary.clone(), observer)));
+                        debug!(
+                            reason = "hard_hard_grid_primary_tail_fallback",
+                            attempts_completed = sequence,
+                            requests_remaining = requests.len().saturating_sub(sequence),
+                            "Incomplete grid will finish with unused primary-socket destinations"
+                        );
+                    }
+                }
+            }
+            let Some((socket, observer)) = requests.get(sequence) else {
+                break;
+            };
             if !keep_measuring() {
                 debug!(
                     "Fresh-mapping STUN measurement aborted before sample {sequence}: Direct was confirmed, the session was cancelled or the network generation changed"
                 );
                 break;
             }
-            let budget_elapsed_ms = monotonic_millis().saturating_sub(started_ms) as u128;
-            let remaining_budget_ms = FRESH_MAPPING_MEASURE_BUDGET
-                .as_millis()
-                .saturating_sub(budget_elapsed_ms);
-            if remaining_budget_ms == 0 {
+            let Some(per_sample_timeout) = ordered_mapping_request_timeout(
+                stun_timeout,
+                started_ms,
+                monotonic_millis(),
+                requests.len().saturating_sub(sequence),
+            ) else {
                 break;
-            }
-            let remaining_samples = requests.len().saturating_sub(sequence).max(1) as u128;
-            let per_sample_timeout =
-                stun_timeout
-                    .min(FRESH_MAPPING_STUN_TIMEOUT)
-                    .min(Duration::from_millis(
-                        remaining_budget_ms
-                            .saturating_div(remaining_samples)
-                            .min(u64::MAX as u128) as u64,
-                    ));
+            };
+            let request_deadline = deadline.min(tokio::time::Instant::now() + per_sample_timeout);
 
             let mut request = StunMessage::binding_request();
             request.add_attribute(StunAttribute::Software(
@@ -143,15 +309,19 @@ impl UdpTransport {
             let transaction_id = request.transaction_id;
             let encoded = request.encode();
             let (response_tx, response_rx) = oneshot::channel();
-            self.stun_waiters
-                .lock()
-                .await
-                .insert(transaction_id, response_tx);
-            if !keep_measuring() {
-                self.stun_waiters.lock().await.remove(&transaction_id);
+            let registration = match self.stun_waiters.register(transaction_id, response_tx) {
+                Ok(registration) => registration,
+                Err(error) => {
+                    debug!(
+                        reason = error.reason(),
+                        "Fresh-mapping STUN waiter admission failed"
+                    );
+                    break;
+                }
+            };
+            if !keep_measuring() || tokio::time::Instant::now() >= request_deadline {
                 break;
             }
-            let sent_at_ms = monotonic_millis();
             let local_endpoint = socket
                 .local_addr()
                 .ok()
@@ -160,36 +330,56 @@ impl UdpTransport {
                 sequence: sequence as u16,
                 local_endpoint,
                 destination: *observer,
-                sent_at_ms,
+                sent_at_ms: monotonic_millis(),
                 datagram_bytes: encoded.len() as u32,
                 outcome: p2pnet_nat::AllocationAttemptOutcome::SendFailed,
             });
-            if let Err(error) = socket.send_to(&encoded, observer).await {
-                stun_send_errors = stun_send_errors.saturating_add(1);
-                stun_send_error_bytes = stun_send_error_bytes.saturating_add(encoded.len() as u64);
-                self.stun_waiters.lock().await.remove(&transaction_id);
-                debug!("Fresh-mapping STUN send {sequence} to {observer} failed: {error}");
-                continue;
-            }
+            let sent_at_ms = match self
+                .send_mapping_request_until(
+                    socket,
+                    &encoded,
+                    *observer,
+                    request_deadline,
+                    &keep_measuring,
+                )
+                .await
+            {
+                Ok(sent_at_ms) => sent_at_ms,
+                Err(MappingIoError::Inactive) => break,
+                Err(error) => {
+                    stun_send_errors = stun_send_errors.saturating_add(1);
+                    stun_send_error_bytes =
+                        stun_send_error_bytes.saturating_add(encoded.len() as u64);
+                    match error {
+                        MappingIoError::Io(error) => {
+                            debug!(reason = "mapping_send_failed", %error, sequence, "Fresh-mapping STUN handoff failed")
+                        }
+                        _ => debug!(
+                            reason = "mapping_send_deadline",
+                            sequence,
+                            "Fresh-mapping STUN handoff exceeded original request deadline"
+                        ),
+                    }
+                    continue;
+                }
+            };
             if let Some(attempt) = attempts.last_mut() {
                 attempt.outcome = p2pnet_nat::AllocationAttemptOutcome::SentUnobserved;
+                attempt.sent_at_ms = sent_at_ms;
             }
             stun_datagrams_sent = stun_datagrams_sent.saturating_add(1);
             stun_bytes_sent = stun_bytes_sent.saturating_add(encoded.len() as u64);
             last_send_at_ms = Some(sent_at_ms);
             if !keep_measuring() {
-                self.stun_waiters.lock().await.remove(&transaction_id);
                 debug!(
                     "Fresh-mapping STUN measurement aborted while waiting for sample {sequence}: Direct was confirmed, the session was cancelled or the network generation changed"
                 );
                 break;
             }
-            let result = tokio::time::timeout(per_sample_timeout, response_rx).await;
-            if result.is_err() {
-                // The waiter timed out without a response: remove its entry so
-                // a cancelled or stalled measurement never leaks waiters that
-                // can only be matched by the same (never-reused) transaction.
-                self.stun_waiters.lock().await.remove(&transaction_id);
+            let result = wait_for_mapping_io(response_rx, request_deadline, &keep_measuring).await;
+            drop(registration);
+            if matches!(result, Err(MappingIoError::Inactive)) {
+                break;
             }
             let responded_at_ms = monotonic_millis();
             let parsed = match result {

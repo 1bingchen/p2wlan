@@ -23,6 +23,21 @@ pub(crate) struct HardHardValidationScope {
     pub(crate) peer_session: PeerSessionGeneration,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct HardHardValidationWork {
+    pub(crate) scope: HardHardValidationScope,
+    pub(crate) deadline: tokio::time::Instant,
+    pub(crate) cancellation: Arc<crate::PunchSessionCancellation>,
+}
+
+impl PartialEq for HardHardValidationWork {
+    fn eq(&self, other: &Self) -> bool {
+        self.scope == other.scope
+            && self.deadline == other.deadline
+            && Arc::ptr_eq(&self.cancellation, &other.cancellation)
+    }
+}
+
 impl UdpTransport {
     /// Called after hh2 ledger registration and before publication or probing.
     /// Mode stamps survive ledger retirement and never own/retain a socket.
@@ -247,7 +262,35 @@ impl UdpTransport {
         packet: &EncryptedPeerPacket,
         endpoint: SocketAddr,
     ) -> Result<usize> {
+        self.send_direct_validation_on_socket(socket, index, packet, endpoint, false, None)
+            .await
+    }
+
+    pub(crate) async fn send_direct_validation_request_on_socket(
+        &self,
+        socket: &Arc<UdpSocket>,
+        index: usize,
+        packet: &EncryptedPeerPacket,
+        endpoint: SocketAddr,
+        scope: Option<&HardHardValidationScope>,
+    ) -> Result<usize> {
+        self.send_direct_validation_on_socket(socket, index, packet, endpoint, true, scope)
+            .await
+    }
+
+    async fn send_direct_validation_on_socket(
+        &self,
+        socket: &Arc<UdpSocket>,
+        index: usize,
+        packet: &EncryptedPeerPacket,
+        endpoint: SocketAddr,
+        request: bool,
+        expected_scope: Option<&HardHardValidationScope>,
+    ) -> Result<usize> {
         if self.hard_hard_socket_mode(index).await.is_none() {
+            if expected_scope.is_some() {
+                return Err(DaemonError::Network("hh2 validation mode retired".into()));
+            }
             if !self
                 .hh2_validation_pair_matches(&packet.peer_id, index, endpoint)
                 .await
@@ -274,6 +317,11 @@ impl UdpTransport {
                 else {
                     return Err(DaemonError::Network("hh2 validation mode changed".into()));
                 };
+                if expected_scope.is_some_and(|expected| expected != &scope) {
+                    return Err(DaemonError::Network(
+                        "hh2 validation worker scope replaced".into(),
+                    ));
+                }
                 let permit = self
                     .peers
                     .hard_hard_validation_send_permit(&packet.peer_id, &scope.token, &scope.pair)
@@ -303,10 +351,41 @@ impl UdpTransport {
                 {
                     return Err(DaemonError::Network("hh2 validation socket revoked".into()));
                 }
+                let committed = state
+                    .dynamic
+                    .get(&index)
+                    .is_some_and(|entry| entry.hard_hard_committed_remote == Some(endpoint));
+                let mut request_guard = if request && !committed {
+                    let permit = permit.ok_or_else(|| {
+                        DaemonError::Network("hh2 validation permission revoked".into())
+                    })?;
+                    let guard = self
+                        .peers
+                        .hard_hard_validation_request_guard(&packet.peer_id, &scope, permit)
+                        .await
+                        .ok_or_else(|| {
+                            DaemonError::Network(
+                                "hh2 validation request allowance exhausted or revoked".into(),
+                            )
+                        })?;
+                    if !guard.is_current(&self.peers) {
+                        return Err(DaemonError::Network(
+                            "hh2 validation deadline expired".into(),
+                        ));
+                    }
+                    Some(guard)
+                } else {
+                    None
+                };
                 // Nonblocking handoff while the epoch/socket transaction is
                 // held. Backpressure releases every guard before awaiting.
                 match socket.try_send_to(&packet.wire_bytes, endpoint) {
-                    Ok(sent) => return Ok(sent),
+                    Ok(sent) => {
+                        if let Some(guard) = request_guard.as_mut() {
+                            guard.handoff_succeeded();
+                        }
+                        return Ok(sent);
+                    }
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => continue,
                     Err(error) => return Err(DaemonError::Network(error.to_string())),
                 }
@@ -318,36 +397,5 @@ impl UdpTransport {
         self.update_socket_diagnostics(index, |m| m.encrypted_packets_sent += 1)
             .await;
         Ok(sent)
-    }
-
-    pub(crate) async fn mark_hh2_data_validated(
-        &self,
-        peer: &str,
-        scope: Option<&HardHardValidationScope>,
-    ) -> bool {
-        let Some(scope) = scope else {
-            return true;
-        };
-        if !self
-            .hard_hard_validation_scope_is_current(peer, scope)
-            .await
-        {
-            return false;
-        }
-        if self
-            .socket_state
-            .lock()
-            .await
-            .dynamic
-            .get(&scope.pair.socket_index)
-            .is_some_and(|entry| {
-                entry.hard_hard_committed_remote == Some(scope.pair.remote_endpoint)
-            })
-        {
-            return true;
-        }
-        self.peers
-            .hard_hard_pair_mark_validated(peer, &scope.token, &scope.pair)
-            .await
     }
 }

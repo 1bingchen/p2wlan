@@ -201,6 +201,99 @@ pub fn validate_allocation_attempts(
     Ok(())
 }
 
+/// Recover a same-socket prediction base after an earlier unknown allocation.
+/// Every attempt must still reconcile with the sparse observation ledger. Only
+/// the complete final run of observed, previously unused destination pairs is
+/// returned; an unobserved final send can never be hidden by an older prefix.
+/// This does not establish the shared allocator needed by a fixed anchor.
+pub fn validate_allocation_prediction_tail<'a>(
+    samples: &'a [AllocationSample],
+    attempts: &[AllocationAttempt],
+    socket_id: usize,
+    local_endpoint: SocketAddr,
+) -> Result<&'a [AllocationSample], AllocationEvidenceRejection> {
+    use AllocationEvidenceRejection as Reject;
+    if attempts.is_empty() || attempts.len() > MAX_ALLOCATION_SAMPLES {
+        return Err(Reject::SampleCount);
+    }
+    let mut sample_index = 0;
+    let mut previous_completed_at = 0;
+    let mut sockets = HashMap::new();
+    let mut pairs = HashSet::new();
+    for (index, attempt) in attempts.iter().enumerate() {
+        if usize::from(attempt.sequence) != index
+            || attempt.local_endpoint.port() == 0
+            || attempt.destination.port() == 0
+            || attempt.datagram_bytes == 0
+            || attempt.sent_at_ms < previous_completed_at
+        {
+            return Err(Reject::InconsistentOrder);
+        }
+        // Even an unobserved earlier request could have opened this mapping.
+        // Reusing that pair cannot supply a fresh allocator-step observation.
+        if !pairs.insert((attempt.local_endpoint, attempt.destination)) {
+            return Err(Reject::ReusedMappingPair);
+        }
+        previous_completed_at = attempt.sent_at_ms;
+        if attempt.outcome != AllocationAttemptOutcome::Observed {
+            continue;
+        }
+        let sample = samples.get(sample_index).ok_or(Reject::InconsistentOrder)?;
+        let observation = &sample.observation;
+        if observation.sequence != attempt.sequence
+            || observation.local_endpoint != attempt.local_endpoint
+            || observation.observer != attempt.destination
+            || observation.sent_at_ms != attempt.sent_at_ms
+            || observation.responded_at_ms == 0
+            || observation.responded_at_ms < observation.sent_at_ms
+            || observation.observed.port() == 0
+        {
+            return Err(Reject::InconsistentOrder);
+        }
+        if sockets
+            .insert(sample.socket_id, observation.local_endpoint)
+            .is_some_and(|endpoint| endpoint != observation.local_endpoint)
+        {
+            return Err(Reject::IdentityChanged);
+        }
+        previous_completed_at = observation.responded_at_ms;
+        sample_index += 1;
+    }
+    if sample_index != samples.len()
+        || sockets.values().copied().collect::<HashSet<_>>().len() != sockets.len()
+    {
+        return Err(Reject::InconsistentOrder);
+    }
+    if attempts
+        .last()
+        .is_some_and(|attempt| attempt.outcome != AllocationAttemptOutcome::Observed)
+    {
+        return Err(Reject::UnobservedAllocation);
+    }
+    let tail_len = attempts
+        .iter()
+        .rev()
+        .take_while(|attempt| {
+            attempt.outcome == AllocationAttemptOutcome::Observed
+                && attempt.local_endpoint == local_endpoint
+        })
+        .count();
+    if tail_len < 3 || tail_len > samples.len() {
+        return Err(Reject::SampleCount);
+    }
+    let tail = &samples[samples.len() - tail_len..];
+    if tail.iter().any(|sample| sample.socket_id != socket_id) {
+        return Err(Reject::IdentityChanged);
+    }
+    if samples
+        .iter()
+        .any(|sample| sample.observation.observed.ip() != tail[0].observation.observed.ip())
+    {
+        return Err(Reject::PublicIpChanged);
+    }
+    Ok(tail)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScopedAllocationEvidence {
     pub identity: AllocationIdentity,

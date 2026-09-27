@@ -218,7 +218,10 @@ impl GlobalOutboundProbeBudget {
     }
 
     pub(super) async fn foreground_burst_active(&self) -> bool {
-        let state = self.state.lock().await;
+        let mut state = self.state.lock().await;
+        // A relay-only transport may never admit another foreground probe.
+        // Its expired burst must not indefinitely suppress recovery heartbeats.
+        retain_live_budget_entries(&mut state, Instant::now());
         short_window_len(&state, &OutboundProbeBudgetKey::Network)
             >= OUTBOUND_PROBE_BUDGET_PER_NETWORK
                 .saturating_sub(RELAY_BACKOFF_HEARTBEAT_FOREGROUND_RESERVE)

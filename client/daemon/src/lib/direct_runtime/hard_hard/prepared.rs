@@ -150,6 +150,7 @@ async fn hard_hard_new_coordinated_plan(
         ready_received: false,
         ready_ack_received: false,
         ready_sent_at: None,
+        ready_retransmitted: false,
         ready_rtt: None,
         sync_uncertainty: HARD_HARD_RESPONSE_DEADLINE_TOLERANCE,
         start: None,
@@ -157,4 +158,73 @@ async fn hard_hard_new_coordinated_plan(
         start_ack_queued: false,
         start_ack_delivery: None,
     })
+}
+
+/// One already-paid initial publication. HH2 may prepay one retry while
+/// reserving both remaining barrier budgets; hh1 retains its legacy send.
+#[allow(clippy::too_many_arguments)]
+async fn hard_hard_send_initial_signal(
+    peers: &PeerManager,
+    control: &ControlClient,
+    peer: &str,
+    token: &str,
+    candidates: &[String],
+    sources: &HashMap<String, String>,
+    punch_at_ms: u64,
+    server_deadline: Option<u64>,
+    session_id: String,
+    cancellation: Arc<crate::PunchSessionCancellation>,
+    deadline: Option<Instant>,
+    recovery_identity: crate::peer::RecoveryEpochIdentity,
+) -> std::result::Result<(), crate::control::PeerOfferSendFailure> {
+    let Some(deadline) = deadline else {
+        return control
+            .send_fresh_peer_offer_with_session_and_punch_schedule(
+                peer,
+                candidates,
+                sources,
+                &[],
+                Some(punch_at_ms),
+                server_deadline,
+                Some(session_id),
+                cancellation,
+            )
+            .await;
+    };
+    let Some(record) = peers.hard_hard_session_by_token(peer, token).await else {
+        return Err(crate::control::PeerOfferSendFailure::Cancelled);
+    };
+    let Some(plan) = record.coordinated_plan.as_ref() else {
+        return Err(crate::control::PeerOfferSendFailure::Cancelled);
+    };
+    if cancellation.is_cancelled()
+        || !Arc::ptr_eq(&cancellation, &record.cancellation)
+        || server_deadline != Some(plan.canonical_server_deadline)
+        || plan.recovery_identity != Some(recovery_identity)
+        || !hard_hard_plan_registration_is_current(peers, control, peer, plan).await
+        || !peers
+            .hard_hard_session_identity_is_current(&record.fresh_socket)
+            .await
+    {
+        return Err(crate::control::PeerOfferSendFailure::Cancelled);
+    }
+    let attempts = 1 + u8::from(
+        peers
+            .reserve_hard_hard_initial_signal_retry(peer, recovery_identity)
+            .await,
+    );
+    control
+        .send_hard_hard_initial_offer(
+            peer,
+            candidates,
+            sources,
+            punch_at_ms,
+            plan.canonical_server_deadline,
+            session_id,
+            cancellation,
+            deadline,
+            attempts,
+            plan.local_registration_seq,
+        )
+        .await
 }

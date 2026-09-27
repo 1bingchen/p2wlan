@@ -519,6 +519,7 @@ mod hard_hard_wire_v2_tests {
             ready_received: false,
             ready_ack_received: false,
             ready_sent_at: None,
+            ready_retransmitted: false,
             ready_rtt: None,
             sync_uncertainty: Duration::from_millis(25),
             start: None,
@@ -693,4 +694,5 @@ mod hard_hard_wire_v2_tests {
             }
         ));
     }
+    include!("negotiation_tests.rs");
 }

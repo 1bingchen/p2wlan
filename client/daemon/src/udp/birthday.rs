@@ -567,12 +567,12 @@ impl UdpTransport {
                 super::hard_hard_measurement::prepared_prediction(
                     &grid_samples,
                     &measurement_trace,
-                    &observations_by_socket[0],
                     identity,
                     primary.0,
                     primary.4,
                     measurement_stats,
                     scheduled_send,
+                    monotonic_millis(),
                 )
             } else {
                 (None, None, None)
@@ -686,6 +686,7 @@ impl UdpTransport {
             },
             identity,
             measurement_trace,
+            measurement_samples: grid_samples,
             allocation,
             allocation_rejection,
             predictable,
@@ -699,6 +700,10 @@ impl UdpTransport {
     /// second repeats the same (socket, target) pairs after both filters can
     /// be open. Changing the socket would allocate a new APDM mapping and
     /// would not recover a lost first packet on the original reciprocal pair.
+    /// Thus L targets plan L unique socket/target pairs and 2L datagrams, not
+    /// 2L independent mappings or K*L pairs. Strict destination-dependent
+    /// mapping and filtering require a reciprocal pair on BOTH endpoints;
+    /// the usual easy/hard birthday bound is not a success estimate here.
     #[allow(clippy::too_many_arguments)]
     #[allow(dead_code)]
     pub(crate) async fn punch_hard_hard_birthday_candidates(
@@ -762,6 +767,9 @@ impl UdpTransport {
     /// Each measured socket sends to the one agreed anchor, then retransmits
     /// that exact pair. No unavailable socket may silently shrink a plan whose
     /// coverage depended on all K consecutive allocations.
+    /// This plans K unique pairs and 2K datagrams. The local HH lease cannot
+    /// prevent ordinary traffic or other NAT users consuming the anchor
+    /// between those first-wave allocations; K-1 covers prefix drift only.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn punch_hard_hard_fixed_anchor_with_metadata(
         &self,

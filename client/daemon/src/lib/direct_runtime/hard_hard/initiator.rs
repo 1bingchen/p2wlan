@@ -257,7 +257,7 @@ pub(crate) async fn spawn_hard_hard_initiator(
         );
         return HardHardInitiatorStart::NotStarted(HardHardInitiatorNotStarted::RecoverySuperseded);
     };
-    let (session, recovery_identity) = match claim {
+    let session = match claim {
         RendezvousPunchClaim::Claimed(session) => {
             if !hard_hard_plan_claim_fence_is_current(
                 &peers,
@@ -282,9 +282,7 @@ pub(crate) async fn spawn_hard_hard_initiator(
                     HardHardInitiatorNotStarted::PlanChanged,
                 );
             }
-            let recovery_identity = fresh_generation_reservation.identity();
-            fresh_generation_reservation.commit();
-            (session, recovery_identity)
+            session
         }
         RendezvousPunchClaim::Deferred(deferred) => {
             fresh_generation_reservation.refund().await;
@@ -325,6 +323,7 @@ pub(crate) async fn spawn_hard_hard_initiator(
             );
         }
     };
+    let recovery_identity = fresh_generation_reservation.identity();
     let coordinated =
         signal.control.local_supports_hh2() && peers.peer_supports_hh2(&peer_id).await;
     let token = if coordinated {
@@ -388,12 +387,50 @@ pub(crate) async fn spawn_hard_hard_initiator(
                 )
                 .await
             else {
+                // No STUN has been sent while waiting for this shared lane.
+                // Refund only the reservation owned by this exact epoch.
+                fresh_generation_reservation.refund().await;
+                hard_hard_a0_stage_log(
+                    &peers,
+                    "initiator",
+                    Some(&coordination.token),
+                    HardHardA0Stage::LocalMeasurement,
+                    HardHardA0Reason::MeasurementAdmissionDeferred,
+                );
+                peers
+                    .record_direct_event(
+                        &peer_id,
+                        "hard_hard_measurement_not_started",
+                        None,
+                        None,
+                        Some(0),
+                        "reason_code=measurement_admission_deferred; no STUN sent; exact generation reservation refunded",
+                    )
+                    .await;
                 return;
             };
             Some(lease)
         } else {
             None
         };
+        // Queueing does not spend a fresh generation. Revalidate the original
+        // owner/plan before crossing into the actual measurement operation.
+        let plan_current = hard_hard_plan_claim_fence_is_current(
+            &peers,
+            &peer_id,
+            peer_session_generation,
+            plan,
+            epoch,
+            punch_at_ms,
+        )
+        .await;
+        // The plan fence can await locks. Observe cancellation afterwards so
+        // a revoked invocation cannot commit its still-unused reservation.
+        if cancellation.is_cancelled() || !plan_current {
+            fresh_generation_reservation.refund().await;
+            return;
+        }
+        fresh_generation_reservation.commit();
         let mut measurement = match run_hard_hard_local_measurement(
             &udp,
             &peers,
@@ -798,18 +835,20 @@ pub(crate) async fn spawn_hard_hard_initiator(
                     &coordination.token,
                     true,
                     publication_deadline,
-                    signal
-                        .control
-                        .send_fresh_peer_offer_with_session_and_punch_schedule(
-                            &peer_id,
-                            &candidates,
-                            &candidate_sources,
-                            &[],
-                            Some(punch_at_ms),
-                            Some(punch_at_server_ms),
-                            Some(session_id.clone()),
-                            cancellation.clone(),
-                        ),
+                    hard_hard_send_initial_signal(
+                        &peers,
+                        &signal.control,
+                        &peer_id,
+                        &coordination.token,
+                        &candidates,
+                        &candidate_sources,
+                        punch_at_ms,
+                        Some(punch_at_server_ms),
+                        session_id.clone(),
+                        cancellation.clone(),
+                        publication_deadline,
+                        recovery_identity,
+                    ),
                 )
                 .await;
             hard_hard_a0_stage_log(
@@ -1149,7 +1188,7 @@ pub(crate) async fn spawn_hard_hard_initiator_response_with_signal(
         );
         return HardHardRemoteStart::Rejected;
     }
-    let Some(record) = peers
+    let Some(mut record) = peers
         .hard_hard_session_by_token(&peer_id, &coordination.token)
         .await
     else {
@@ -1326,7 +1365,7 @@ pub(crate) async fn spawn_hard_hard_initiator_response_with_signal(
         let Some(signal) = signal.as_ref() else {
             return HardHardRemoteStart::Rejected;
         };
-        let Some(ready) = hard_hard_accept_answer(
+        let Some((ready, committed)) = hard_hard_accept_answer(
             &peers,
             &signal.control,
             &record,
@@ -1337,6 +1376,7 @@ pub(crate) async fn spawn_hard_hard_initiator_response_with_signal(
         else {
             return HardHardRemoteStart::Rejected;
         };
+        record = committed;
         Some(ready)
     } else {
         None

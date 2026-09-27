@@ -5,6 +5,16 @@ use super::*;
 
 const HARD_HARD_PROBE_SPACING: Duration = Duration::from_millis(5);
 
+/// Scheduling allowance for the bounded first wave, before the immutable
+/// forecast expires. Admission contention may still reject sends; this is
+/// not a credit reservation and never extends the physical-send deadline.
+pub(crate) fn hard_hard_first_wave_pacing_margin(new_pairs: usize) -> Duration {
+    HARD_HARD_PROBE_SPACING
+        .max(OUTBOUND_CONNECTIVITY_PROBE_PRODUCTION_SPACING)
+        .saturating_mul(new_pairs.min(32) as u32)
+        + Duration::from_millis(50)
+}
+
 pub(super) struct HardHardProbePacer {
     next: StdMutex<tokio::time::Instant>,
     deadline: tokio::time::Instant,

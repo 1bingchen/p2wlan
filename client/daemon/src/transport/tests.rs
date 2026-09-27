@@ -3851,6 +3851,7 @@ mod tests {
                 peers
                     .peer_session_generation_sync("peer-a")
                     .expect("peer lifecycle must be online"),
+                None,
                 token,
             )
             .await;
@@ -3967,6 +3968,7 @@ mod tests {
                         Some(0),
                         None,
                         old_peer_session_generation,
+                        None,
                         token,
                     )
                     .await;
@@ -4099,6 +4101,7 @@ mod tests {
                 peers
                     .peer_session_generation_sync("peer-a")
                     .expect("peer lifecycle must be online"),
+                None,
                 token,
             )
             .await;
@@ -4185,6 +4188,7 @@ mod tests {
                 peers
                     .peer_session_generation_sync("peer-a")
                     .expect("peer lifecycle must be online"),
+                None,
                 token,
             )
             .await;

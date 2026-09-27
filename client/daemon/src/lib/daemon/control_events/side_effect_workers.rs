@@ -606,6 +606,25 @@ impl Daemon {
                 continue;
             }
 
+            // An owned HH2 token is immutable before either candidate or
+            // incarnation mutation. A conflicting replay must not retire the
+            // valid owner merely by changing its generation declaration.
+            if self
+                .handle_hard_hard_repeated_signal(&offer)
+                .await
+                .is_some()
+            {
+                let Some(next) = self
+                    .pending_handshakes
+                    .lock()
+                    .finish_candidate_offer_work(&peer_id, reservation.owner)
+                else {
+                    return;
+                };
+                offer = next;
+                continue;
+            }
+
             let mut retry_attempt = 0u8;
             let remote_incarnation_reset = loop {
                 let outcome = self

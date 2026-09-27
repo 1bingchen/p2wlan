@@ -320,7 +320,7 @@ impl UdpTransport {
             // slow peer/diagnostic lock must not make a healthy observer look
             // like `UdpBlocked` after the bounded startup deadline.
             if let Some(transaction_id) = stun_transaction_id(data) {
-                let waiter = self.stun_waiters.lock().await.remove(&transaction_id);
+                let waiter = self.stun_waiters.take(&transaction_id);
                 if let Some(waiter) = waiter {
                     let _ = waiter.send(StunResponse {
                         data: data.to_vec(),

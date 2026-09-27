@@ -6,7 +6,6 @@ struct StunResponse {
     data: Vec<u8>,
     source: SocketAddr,
 }
-type StunWaiters = Arc<Mutex<HashMap<StunTransactionId, oneshot::Sender<StunResponse>>>>;
 /// Bounded, per-peer newest-wins ingress for peer-reflexive observations.
 ///
 /// The UDP reader cannot await a downstream worker or enqueue one task per
@@ -585,6 +584,7 @@ pub(crate) struct DirectValidationTarget {
 /// completed or cancelled session.
 pub(crate) struct DirectValidationSession {
     pub(crate) target_tx: watch::Sender<DirectValidationTarget>,
+    pub(crate) hard_hard: Option<HardHardValidationWork>,
 }
 
 /// Ownership lease returned exactly once when the scheduler must spawn a
@@ -594,6 +594,22 @@ pub(crate) struct DirectValidationSessionLease {
     pub(crate) peer_id: String,
     pub(crate) owner_token: u64,
     pub(crate) target_rx: watch::Receiver<DirectValidationTarget>,
+    pub(crate) hard_hard: Option<HardHardValidationWork>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DirectValidationAdmission {
+    Queued,
+    Coalesced,
+    Backpressured,
+    Inactive,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DirectValidationCompletion {
+    OwnerFinished,
+    Backpressured,
+    DeadlineExpired,
 }
 
 pub(crate) enum DirectValidationSessionStart {
@@ -779,8 +795,12 @@ const AUTH_PUNCH_RATE_LIMIT_PER_SOURCE: usize = 16;
 /// Pace connectivity checks below the per-peer/public-IP admission ceiling.
 /// A large symmetric-NAT sweep must cover the full candidate window instead
 /// of consuming its one-second budget in one burst and dropping the tail.
+// Protocol scheduling retains the real production spacing even when test
+// execution removes sleeps to keep existing fixtures deterministic.
+const OUTBOUND_CONNECTIVITY_PROBE_PRODUCTION_SPACING: Duration = Duration::from_millis(6);
 #[cfg(not(test))]
-const OUTBOUND_CONNECTIVITY_PROBE_SPACING: Duration = Duration::from_millis(6);
+const OUTBOUND_CONNECTIVITY_PROBE_SPACING: Duration =
+    OUTBOUND_CONNECTIVITY_PROBE_PRODUCTION_SPACING;
 #[cfg(test)]
 const OUTBOUND_CONNECTIVITY_PROBE_SPACING: Duration = Duration::ZERO;
 /// Hard bound on primary connectivity-check datagrams emitted by one punch

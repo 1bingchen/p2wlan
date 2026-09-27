@@ -160,13 +160,23 @@ impl UdpTransport {
         peer_addr: SocketAddr,
         socket_index: usize,
     ) -> OutboundProbeAdmission {
-        self.admit_connectivity_probe_for_purpose(peer_id, peer_addr, socket_index,
-            crate::peer::RecoveryProbePurpose::Ordinary, None).await
+        self.admit_connectivity_probe_for_purpose(
+            peer_id,
+            peer_addr,
+            socket_index,
+            crate::peer::RecoveryProbePurpose::Ordinary,
+            None,
+        )
+        .await
     }
 
     async fn admit_hard_hard_connectivity_probe(
-        &self, peer_id: &str, peer_addr: SocketAddr, socket_index: usize,
-        token: &str, purpose: crate::peer::RecoveryProbePurpose,
+        &self,
+        peer_id: &str,
+        peer_addr: SocketAddr,
+        socket_index: usize,
+        token: &str,
+        purpose: crate::peer::RecoveryProbePurpose,
     ) -> OutboundProbeAdmission {
         let Some(record) = self.peers.hard_hard_session_by_token(peer_id, token).await else {
             return OutboundProbeAdmission::RecoveryIdentityStale;
@@ -175,16 +185,30 @@ impl UdpTransport {
             || record.pair_nomination.is_none()
             || record.local_network_generation != self.peers.current_network_generation_sync()
             || !record.requested_socket_indices.contains(&socket_index)
-        { return OutboundProbeAdmission::RecoveryIdentityStale; }
-        let Some(identity) = record.coordinated_plan.and_then(|plan| plan.recovery_identity) else {
+        {
+            return OutboundProbeAdmission::RecoveryIdentityStale;
+        }
+        let Some(identity) = record
+            .coordinated_plan
+            .and_then(|plan| plan.recovery_identity)
+        else {
             return OutboundProbeAdmission::RecoveryIdentityStale;
         };
-        self.admit_connectivity_probe_for_purpose(peer_id, peer_addr, socket_index,
-            purpose, Some(identity)).await
+        self.admit_connectivity_probe_for_purpose(
+            peer_id,
+            peer_addr,
+            socket_index,
+            purpose,
+            Some(identity),
+        )
+        .await
     }
 
     async fn admit_connectivity_probe_for_purpose(
-        &self, peer_id: &str, peer_addr: SocketAddr, socket_index: usize,
+        &self,
+        peer_id: &str,
+        peer_addr: SocketAddr,
+        socket_index: usize,
         purpose: crate::peer::RecoveryProbePurpose,
         recovery_identity: Option<crate::peer::RecoveryEpochIdentity>,
     ) -> OutboundProbeAdmission {
@@ -209,16 +233,25 @@ impl UdpTransport {
         }
 
         let reserve = purpose.confirmation_short_window_reserve();
-        if reserve > 0 && [
-            (&network_key, OUTBOUND_PROBE_BUDGET_PER_NETWORK),
-            (&peer_key, OUTBOUND_PROBE_BUDGET_PER_PEER),
-            (&remote_ip_key, OUTBOUND_PROBE_BUDGET_PER_PEER_REMOTE_IP),
-        ].into_iter().any(|(key, ceiling)| budget.get(key).map_or(0, VecDeque::len)
-            >= ceiling.saturating_sub(reserve))
-        { return OutboundProbeAdmission::HardHardConfirmationRateReserved; }
+        if reserve > 0
+            && [
+                (&network_key, OUTBOUND_PROBE_BUDGET_PER_NETWORK),
+                (&peer_key, OUTBOUND_PROBE_BUDGET_PER_PEER),
+                (&remote_ip_key, OUTBOUND_PROBE_BUDGET_PER_PEER_REMOTE_IP),
+            ]
+            .into_iter()
+            .any(|(key, ceiling)| {
+                budget.get(key).map_or(0, VecDeque::len) >= ceiling.saturating_sub(reserve)
+            })
+        {
+            return OutboundProbeAdmission::HardHardConfirmationRateReserved;
+        }
 
         if let Some(global_budget) = self.global_outbound_probe_budget.as_ref() {
-            match global_budget.admit_with_purpose(peer_id, peer_addr, socket_index, purpose).await {
+            match global_budget
+                .admit_with_purpose(peer_id, peer_addr, socket_index, purpose)
+                .await
+            {
                 OutboundProbeAdmission::Accepted => {}
                 limited => return limited,
             }
@@ -230,11 +263,21 @@ impl UdpTransport {
         // punch sessions or fresh-mapping generations start.
         if let Some(identity) = recovery_identity {
             use crate::peer::RecoveryProbeCreditAdmission;
-            match self.peers.consume_recovery_probe_credit_for_purpose(peer_id, identity, purpose).await {
+            match self
+                .peers
+                .consume_recovery_probe_credit_for_purpose(peer_id, identity, purpose)
+                .await
+            {
                 RecoveryProbeCreditAdmission::Accepted => {}
-                RecoveryProbeCreditAdmission::Exhausted => return OutboundProbeAdmission::EpochCreditExhausted,
-                RecoveryProbeCreditAdmission::ConfirmationReserved => return OutboundProbeAdmission::HardHardConfirmationCreditReserved,
-                RecoveryProbeCreditAdmission::IdentityStale => return OutboundProbeAdmission::RecoveryIdentityStale,
+                RecoveryProbeCreditAdmission::Exhausted => {
+                    return OutboundProbeAdmission::EpochCreditExhausted
+                }
+                RecoveryProbeCreditAdmission::ConfirmationReserved => {
+                    return OutboundProbeAdmission::HardHardConfirmationCreditReserved
+                }
+                RecoveryProbeCreditAdmission::IdentityStale => {
+                    return OutboundProbeAdmission::RecoveryIdentityStale
+                }
             }
         } else if !self.peers.try_consume_recovery_probe_credit(peer_id).await {
             return OutboundProbeAdmission::EpochCreditExhausted;
@@ -290,7 +333,10 @@ impl UdpTransport {
         RelayBackoffHeartbeatReservationRejection,
     > {
         let local_busy = {
-            let budget = self.outbound_probe_budget.lock().await;
+            let mut budget = self.outbound_probe_budget.lock().await;
+            // Heartbeats must age this window themselves: ordinary traversal
+            // may remain frozen throughout the relay-backoff period.
+            retain_live_budget_entries(&mut budget, Instant::now());
             budget
                 .get(&OutboundProbeBudgetKey::Network)
                 .map_or(0, VecDeque::len)

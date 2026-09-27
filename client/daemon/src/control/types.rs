@@ -759,6 +759,9 @@ const CRITICAL_OFFER_QUEUE_CAPACITY: usize = 32;
 const CRITICAL_ANSWER_QUEUE_CAPACITY: usize = 32;
 const CRITICAL_CTRL_QUEUE_CAPACITY: usize = 8;
 const CANDIDATE_OFFER_QUEUE_CAPACITY: usize = 32;
+/// One serial HTTP request per lane also caps candidate HTTP concurrency at 32.
+const CANDIDATE_OFFER_MAX_LANES: usize = 32;
+const CANDIDATE_OFFER_IDLE_TIMEOUT: Duration = Duration::from_secs(1);
 /// Final HH2 ACK retries are prepaid from the existing recovery HTTP quota.
 pub(crate) const HARD_HARD_START_ACK_MAX_ATTEMPTS: u8 = 3;
 /// In-flight ceilings per lane.  The answer lane gets a dedicated budget so
@@ -885,7 +888,12 @@ pub(crate) enum PeerOfferSendOutcome {
 /// context; this value contains only the immutable request data and the
 /// caller's completion channel.
 struct CandidateOfferCommand {
+    /// HH2 transcript registration, captured before bounded queue admission.
+    expected_registration_seq: Option<u64>,
     not_after: Option<Instant>,
+    /// Starts only when the worker is ready to execute HTTP, never in either
+    /// candidate queue. The immutable `not_after` still caps the whole phase.
+    attempt_timeout: Option<Duration>,
     prepaid_attempts: u8,
     to_node_id: String,
     candidates: Vec<String>,

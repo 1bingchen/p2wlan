@@ -73,10 +73,96 @@ enum HardHardOfferHandling {
     /// ordinary fresh-punch path instead of swallowing the offer.
     Fallback,
     Rejected,
+    /// A repeated token failed transcript/identity validation. Consume this
+    /// signal without letting the generic candidate cleanup retire its owner.
+    RejectedPreservingSession,
     Started,
 }
 
 impl Daemon {
+    /// Runs under the existing per-peer candidate owner, before candidate
+    /// mutation. Same-token delivery can acknowledge the existing work, but
+    /// cannot reset its measurement, extend time, or change its transcript.
+    async fn handle_hard_hard_repeated_signal(
+        &self,
+        offer: &PendingPeerOffer,
+    ) -> Option<HardHardOfferHandling> {
+        let coordination = offer
+            .session_id
+            .as_deref()
+            .and_then(HardHardCoordination::parse)?;
+        let meta = coordination.v2.as_ref()?;
+        if !matches!(meta.stage, HardHardV2Stage::Offer | HardHardV2Stage::Answer) {
+            return None;
+        }
+        let record = self
+            .peers
+            .hard_hard_session_by_token(&offer.from_node_id, &coordination.token)
+            .await?;
+        let plan = record.coordinated_plan.as_ref()?;
+        // This is the expected first reciprocal ANSWER, not a repeated
+        // publication. Its candidate transaction and agreement must still run.
+        if record.initiator && meta.stage == HardHardV2Stage::Answer && plan.agreement.is_none() {
+            return None;
+        }
+        let identity_current = offer.network_generation == record.local_network_generation
+            && offer.peer_session_generation.is_none_or(|generation| {
+                self.peers
+                    .peer_session_is_current_sync(&offer.from_node_id, generation)
+            })
+            && self.peers.signal_sender_identity_matches_peer_sync(
+                &offer.from_node_id,
+                offer.sender_public_key.as_deref(),
+            )
+            && hard_hard_plan_registration_is_current(
+                &self.peers,
+                &self.control,
+                &offer.from_node_id,
+                plan,
+            )
+            .await
+            && self
+                .peers
+                .hard_hard_session_identity_is_current(&record.fresh_socket)
+                .await;
+        let fresh_matches = if let FreshPredictionSources::Valid(id) =
+            fresh_prediction_from_sources(&offer.candidate_sources)
+        {
+            self.peers
+                .prepare_remote_fresh_prediction(
+                    &offer.from_node_id,
+                    id,
+                    &offer.candidates,
+                    &offer.candidate_sources,
+                    offer.candidates_expires_at_ms,
+                )
+                .await
+                == crate::peer::RemoteFreshAdmission::AlreadyRecorded
+        } else {
+            false
+        };
+        let matches = identity_current
+            && fresh_matches
+            && hard_hard_repeated_transcript_matches(
+                &record,
+                &coordination,
+                &offer.candidates,
+                offer.punch_at_server_ms,
+            );
+        self.peers.record_direct_event(
+            &offer.from_node_id,
+            if matches { "hard_hard_signal_duplicate" } else { "hard_hard_signal_repeat_rejected" },
+            None, Some(offer.candidates.len()), None,
+            if matches { "same token and immutable transcript already owned; no candidate mutation or measurement restart" }
+            else { "same-token signal failed current identity or immutable transcript; existing session preserved" },
+        ).await;
+        Some(if matches {
+            HardHardOfferHandling::Started
+        } else {
+            HardHardOfferHandling::RejectedPreservingSession
+        })
+    }
+
     /// Signal delivery and roster polling are independent. Keep this exact
     /// offer in its existing bounded owner while one requested roster refresh
     /// supplies the producer's real profile identity. Never extend rendezvous
@@ -496,17 +582,24 @@ impl Daemon {
         fresh_punch: FreshPunchDecision,
         reservation: &mut CandidateOfferWorkReservation,
     ) {
-        let hard_hard_handling = self
-            .handle_hard_hard_fresh_offer(
-                &offer.from_node_id,
-                offer.session_id.as_deref(),
-                offer.punch_at_ms,
-                offer.punch_at_server_ms,
-                fresh_punch.clone(),
-            )
-            .await;
+        let hard_hard_handling =
+            if let Some(repeated) = self.handle_hard_hard_repeated_signal(offer).await {
+                repeated
+            } else {
+                self.handle_hard_hard_fresh_offer(
+                    &offer.from_node_id,
+                    offer.session_id.as_deref(),
+                    offer.punch_at_ms,
+                    offer.punch_at_server_ms,
+                    fresh_punch.clone(),
+                )
+                .await
+            };
         if candidate_apply_result == CandidateSetApplyResult::Applied
-            && hard_hard_handling != HardHardOfferHandling::Started
+            && !matches!(
+                hard_hard_handling,
+                HardHardOfferHandling::Started | HardHardOfferHandling::RejectedPreservingSession
+            )
         {
             self.peers
                 .clear_hard_hard_sessions(Some(&offer.from_node_id))
@@ -519,7 +612,9 @@ impl Daemon {
         }
         if matches!(
             hard_hard_handling,
-            HardHardOfferHandling::Rejected | HardHardOfferHandling::Started
+            HardHardOfferHandling::Rejected
+                | HardHardOfferHandling::RejectedPreservingSession
+                | HardHardOfferHandling::Started
         ) {
             return;
         }
@@ -585,17 +680,24 @@ impl Daemon {
         candidate_apply_result: CandidateSetApplyResult,
         fresh_punch: FreshPunchDecision,
     ) {
-        let hard_hard_handling = self
-            .handle_hard_hard_fresh_offer(
-                &offer.from_node_id,
-                offer.session_id.as_deref(),
-                offer.punch_at_ms,
-                offer.punch_at_server_ms,
-                fresh_punch.clone(),
-            )
-            .await;
+        let hard_hard_handling =
+            if let Some(repeated) = self.handle_hard_hard_repeated_signal(offer).await {
+                repeated
+            } else {
+                self.handle_hard_hard_fresh_offer(
+                    &offer.from_node_id,
+                    offer.session_id.as_deref(),
+                    offer.punch_at_ms,
+                    offer.punch_at_server_ms,
+                    fresh_punch.clone(),
+                )
+                .await
+            };
         if candidate_apply_result == CandidateSetApplyResult::Applied
-            && hard_hard_handling != HardHardOfferHandling::Started
+            && !matches!(
+                hard_hard_handling,
+                HardHardOfferHandling::Started | HardHardOfferHandling::RejectedPreservingSession
+            )
         {
             self.peers
                 .clear_hard_hard_sessions(Some(&offer.from_node_id))
@@ -608,7 +710,9 @@ impl Daemon {
         }
         if matches!(
             hard_hard_handling,
-            HardHardOfferHandling::Rejected | HardHardOfferHandling::Started
+            HardHardOfferHandling::Rejected
+                | HardHardOfferHandling::RejectedPreservingSession
+                | HardHardOfferHandling::Started
         ) {
             return;
         }

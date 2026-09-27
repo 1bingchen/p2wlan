@@ -720,7 +720,9 @@ impl ControlClient {
         let (response_tx, response_rx) = oneshot::channel();
         self.candidate_offer_tx
             .try_send(CandidateOfferCommand {
+                expected_registration_seq: None,
                 not_after: None,
+                attempt_timeout: None,
                 prepaid_attempts: 1,
                 to_node_id: to_node_id.to_string(),
                 candidates: candidates.to_vec(),
@@ -838,7 +840,9 @@ impl ControlClient {
         let (response_tx, response_rx) = oneshot::channel();
         let a0_session_id = session_id.clone();
         let enqueue_result = self.candidate_offer_tx.try_send(CandidateOfferCommand {
+            expected_registration_seq: None,
             not_after: None,
+            attempt_timeout: None,
             prepaid_attempts: 1,
             to_node_id: to_node_id.to_string(),
             candidates: candidates.to_vec(),

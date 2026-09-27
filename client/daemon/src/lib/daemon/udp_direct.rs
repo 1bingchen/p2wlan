@@ -335,9 +335,9 @@ async fn run_udp_direct_instance(
     // observations winning within the same reachability class.
     let trigger_ingress = validation_ingress.clone();
     let trigger = std::sync::Arc::new(move |observation: PeerReflexiveObservation| {
-        trigger_ingress.submit(observation);
+        trigger_ingress.submit(observation)
     });
-    let udp = udp.with_validation_trigger(trigger);
+    let udp = udp.with_validation_admission_trigger(trigger);
     // Peer lifecycle transitions revoke heartbeat leases synchronously. The
     // transport owns the lease registry, so the callback only sends the
     // cancellation signal and never performs async work under peer locks.

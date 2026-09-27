@@ -2147,25 +2147,64 @@ mod hard_hard_tests {
         ] {
             let (peers, udp, identity, remote) =
                 exact_socket_proof_fixture_with_strategy(strategy).await;
-            let peer_session = peers.peer_session_generation_sync(&identity.peer_id).unwrap();
+            let peer_session = peers
+                .peer_session_generation_sync(&identity.peer_id)
+                .unwrap();
             let mut report = build_hard_hard_attempt_report(
-                &peers, false, peer_session, &identity, &identity.session_token,
-                "initiator", true, 0,
-                &crate::peer::HardHardMeasurementObservation::default(), &[remote],
-                1, 1, 2, None, &PunchSendReport::default(), UdpProbeRxSnapshot::default(),
-                false, None, None, None, "session_cancelled",
+                &peers,
+                false,
+                peer_session,
+                &identity,
+                &identity.session_token,
+                "initiator",
+                true,
+                0,
+                &crate::peer::HardHardMeasurementObservation::default(),
+                &[remote],
+                1,
+                1,
+                2,
+                None,
+                &PunchSendReport::default(),
+                UdpProbeRxSnapshot::default(),
+                false,
+                None,
+                None,
+                None,
+                "session_cancelled",
             );
             report.mode = "legacy_custom".to_string();
-            assert!(!peers.record_hard_hard_attempt_report(
-                &identity.peer_id, "replaced-token", report.clone()).await);
-            assert!(peers.record_hard_hard_attempt_report(
-                &identity.peer_id, &identity.session_token, report).await);
+            assert!(
+                !peers
+                    .record_hard_hard_attempt_report(
+                        &identity.peer_id,
+                        "replaced-token",
+                        report.clone()
+                    )
+                    .await
+            );
+            assert!(
+                peers
+                    .record_hard_hard_attempt_report(
+                        &identity.peer_id,
+                        &identity.session_token,
+                        report
+                    )
+                    .await
+            );
             let diagnostics = peers.diagnostics().await;
-            let event = diagnostics[0].direct_events.iter()
-                .find(|event| event.stage == "hard_hard_attempt_report").unwrap();
-            assert_eq!(event.hard_hard_attempt.as_ref().unwrap().mode, expected_mode);
+            let event = diagnostics[0]
+                .direct_events
+                .iter()
+                .find(|event| event.stage == "hard_hard_attempt_report")
+                .unwrap();
+            assert_eq!(
+                event.hard_hard_attempt.as_ref().unwrap().mode,
+                expected_mode
+            );
             assert!(event.detail.contains(&format!("mode={expected_mode}")));
-            udp.detach_all_dynamic_punch_sockets("attempt_report_strategy").await;
+            udp.detach_all_dynamic_punch_sockets("attempt_report_strategy")
+                .await;
         }
     }
 
@@ -2373,28 +2412,34 @@ mod hard_hard_tests {
             peers
                 .hard_hard_register_session(crate::peer::HardHardSessionRecord {
                     pair_nomination: None,
-                    coordinated_plan: strategy.map(|strategy| crate::peer::HardHardCoordinatedPlan {
-                        measurement_lease: None,
-                        recovery_identity: None,
-                        strategy_order: 0,
-                        local_offer: crate::peer::HardHardOfferParameters::default(),
-                        remote_offer: None,
-                        local_registration_seq: 1,
-                        remote_registration_seq: 1,
-                        phase: false,
-                        canonical_server_deadline: now.saturating_add(5_000),
-                        scheduled_start: Instant::now() + Duration::from_secs(5),
-                        forecast_first_send_deadline: Instant::now() + Duration::from_secs(5),
-                        agreement: Some(crate::peer::HardHardAgreedPlan { strategy, digest: [1; 16] }),
-                        ready_received: false,
-                        ready_ack_received: false,
-                        ready_sent_at: None,
-                        ready_rtt: None,
-                        sync_uncertainty: Duration::ZERO,
-                        start: None,
-                        start_ack_received: false,
-                        start_ack_queued: false,
-                        start_ack_delivery: None,
+                    coordinated_plan: strategy.map(|strategy| {
+                        crate::peer::HardHardCoordinatedPlan {
+                            measurement_lease: None,
+                            recovery_identity: None,
+                            strategy_order: 0,
+                            local_offer: crate::peer::HardHardOfferParameters::default(),
+                            remote_offer: None,
+                            local_registration_seq: 1,
+                            remote_registration_seq: 1,
+                            phase: false,
+                            canonical_server_deadline: now.saturating_add(5_000),
+                            scheduled_start: Instant::now() + Duration::from_secs(5),
+                            forecast_first_send_deadline: Instant::now() + Duration::from_secs(5),
+                            agreement: Some(crate::peer::HardHardAgreedPlan {
+                                strategy,
+                                digest: [1; 16],
+                            }),
+                            ready_received: false,
+                            ready_ack_received: false,
+                            ready_sent_at: None,
+                            ready_retransmitted: false,
+                            ready_rtt: None,
+                            sync_uncertainty: Duration::ZERO,
+                            start: None,
+                            start_ack_received: false,
+                            start_ack_queued: false,
+                            start_ack_delivery: None,
+                        }
                     }),
                     session_id: "proof-session".to_string(),
                     probe_session_id: Some("probe-session-exact".to_string()),

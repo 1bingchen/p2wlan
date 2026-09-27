@@ -14,6 +14,7 @@ impl Drop for StartAckRetryHarness {
 impl StartAckRetryHarness {
     fn new(base_url: &str) -> Self {
         let mut client = ControlClient::disabled_for_test();
+        client.set_local_registration_for_test(Some(1), PeerCapabilities::current());
         let (commands, receiver) = mpsc::channel(4);
         client.candidate_offer_tx = commands;
         let (auth_tx, auth_rx) = watch::channel(Some(CriticalControlAuth {
@@ -42,7 +43,7 @@ impl StartAckRetryHarness {
         }
     }
 
-    fn queue(
+    async fn queue(
         &self,
         attempts: u8,
         deadline: Instant,
@@ -59,7 +60,9 @@ impl StartAckRetryHarness {
                 owner,
                 deadline,
                 attempts,
+                1,
             )
+            .await
             .unwrap()
     }
 
@@ -101,11 +104,13 @@ async fn final_ack_retries_only_the_prepaid_immutable_payload() {
     })
     .await;
     let mut harness = StartAckRetryHarness::new(&format!("http://{}", server.address));
-    let delivery = harness.queue(
-        3,
-        Instant::now() + Duration::from_secs(1),
-        Arc::new(crate::PunchSessionCancellation::default()),
-    );
+    let delivery = harness
+        .queue(
+            3,
+            Instant::now() + Duration::from_secs(1),
+            Arc::new(crate::PunchSessionCancellation::default()),
+        )
+        .await;
     assert!(matches!(
         harness.completion().await,
         ControlEvent::ControlHealthy
@@ -126,11 +131,13 @@ async fn final_ack_never_exceeds_prepaid_attempts_and_ordinary_candidates_do_not
     for attempts in 1..=HARD_HARD_START_ACK_MAX_ATTEMPTS {
         let server = MockControlServer::spawn(|_, _| MockAction::Fail500).await;
         let mut harness = StartAckRetryHarness::new(&format!("http://{}", server.address));
-        let delivery = harness.queue(
-            attempts,
-            Instant::now() + Duration::from_secs(1),
-            Arc::new(crate::PunchSessionCancellation::default()),
-        );
+        let delivery = harness
+            .queue(
+                attempts,
+                Instant::now() + Duration::from_secs(1),
+                Arc::new(crate::PunchSessionCancellation::default()),
+            )
+            .await;
         assert!(matches!(
             harness.completion().await,
             ControlEvent::ServerError { .. }
@@ -167,11 +174,13 @@ async fn final_ack_permanent_auth_and_registration_conflict_are_not_retried() {
         let server = ControlStub::start(move |_| (status,
             r#"{"error":"registration conflict","error_code":"registration_conflict","registration_seq":2}"#.to_string())).await;
         let mut harness = StartAckRetryHarness::new(&server.base_url);
-        let delivery = harness.queue(
-            3,
-            Instant::now() + Duration::from_secs(1),
-            Arc::new(crate::PunchSessionCancellation::default()),
-        );
+        let delivery = harness
+            .queue(
+                3,
+                Instant::now() + Duration::from_secs(1),
+                Arc::new(crate::PunchSessionCancellation::default()),
+            )
+            .await;
         assert!(matches!(
             harness.completion().await,
             ControlEvent::ServerError { .. }
@@ -199,7 +208,9 @@ async fn final_ack_retry_stops_on_owner_drop_cancellation_or_registration_replac
         .await;
         let harness = StartAckRetryHarness::new(&format!("http://{}", server.address));
         let owner = Arc::new(crate::PunchSessionCancellation::default());
-        let delivery = harness.queue(3, Instant::now() + Duration::from_secs(1), owner.clone());
+        let delivery = harness
+            .queue(3, Instant::now() + Duration::from_secs(1), owner.clone())
+            .await;
         let mut retained_delivery = Some(delivery);
         *hook.lock().unwrap() = Some(match fence {
             0 => Box::new(move || {
@@ -243,11 +254,13 @@ async fn final_ack_retry_stops_on_owner_drop_cancellation_or_registration_replac
 async fn final_ack_original_deadline_cuts_off_remaining_prepaid_attempts() {
     let server = MockControlServer::spawn(|_, _| MockAction::Delay200).await;
     let mut harness = StartAckRetryHarness::new(&format!("http://{}", server.address));
-    let delivery = harness.queue(
-        3,
-        Instant::now() + Duration::from_millis(40),
-        Arc::new(crate::PunchSessionCancellation::default()),
-    );
+    let delivery = harness
+        .queue(
+            3,
+            Instant::now() + Duration::from_millis(40),
+            Arc::new(crate::PunchSessionCancellation::default()),
+        )
+        .await;
     assert!(matches!(
         harness.completion().await,
         ControlEvent::ServerError { .. }
@@ -256,6 +269,167 @@ async fn final_ack_original_deadline_cuts_off_remaining_prepaid_attempts() {
     // A heavily delayed worker may expire before its first HTTP poll; either
     // way it must never consume the additional prepaid attempts past start.
     assert!(server.signal_posts.lock().unwrap().len() <= 1);
+    drop(harness);
+    server.task.abort();
+}
+
+#[tokio::test]
+async fn initial_hh2_publication_retries_one_identical_payload_within_original_deadline() {
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let seen = attempts.clone();
+    let server = MockControlServer::spawn(move |_, _| {
+        if seen.fetch_add(1, Ordering::SeqCst) == 0 {
+            MockAction::Fail500
+        } else {
+            MockAction::Ok
+        }
+    })
+    .await;
+    let harness = StartAckRetryHarness::new(&format!("http://{}", server.address));
+    harness
+        .client
+        .set_local_registration_for_test(Some(1), PeerCapabilities::current());
+    assert!(harness
+        .client
+        .send_hard_hard_initial_offer(
+            "peer-ack",
+            &["192.0.2.1:41000".into()],
+            &HashMap::new(),
+            1,
+            2,
+            "initial-offer-retry-test".into(),
+            Arc::new(crate::PunchSessionCancellation::default()),
+            Instant::now() + Duration::from_secs(1),
+            2,
+            1
+        )
+        .await
+        .is_ok());
+    let posts = server.signal_posts.lock().unwrap().clone();
+    assert_eq!(posts.len(), 2);
+    assert_eq!(
+        posts[0], posts[1],
+        "the signed envelope, source generation, candidate expiry and schedule cannot change"
+    );
+    drop(harness);
+    server.task.abort();
+}
+
+#[tokio::test]
+async fn initial_hh2_publication_rejects_replaced_registration_or_cancelled_queue_owner() {
+    let server = MockControlServer::spawn(|_, _| MockAction::Ok).await;
+    let harness = StartAckRetryHarness::new(&format!("http://{}", server.address));
+    harness
+        .client
+        .set_local_registration_for_test(Some(2), PeerCapabilities::current());
+    // Both the pre-queue check and the worker's captured registration must
+    // match. Here the caller matches local seq 2 but the live worker is seq 1.
+    assert!(harness
+        .client
+        .send_hard_hard_initial_offer(
+            "peer-ack",
+            &["192.0.2.1:41000".into()],
+            &HashMap::new(),
+            1,
+            2,
+            "initial-offer-stale-auth".into(),
+            Arc::new(crate::PunchSessionCancellation::default()),
+            Instant::now() + Duration::from_secs(1),
+            2,
+            2
+        )
+        .await
+        .is_err());
+    assert!(server.signal_posts.lock().unwrap().is_empty());
+    harness
+        .client
+        .set_local_registration_for_test(Some(1), PeerCapabilities::current());
+    let owner = Arc::new(crate::PunchSessionCancellation::default());
+    owner.cancel_for_hard_hard_cleanup();
+    assert!(harness
+        .client
+        .send_hard_hard_initial_offer(
+            "peer-ack",
+            &["192.0.2.1:41000".into()],
+            &HashMap::new(),
+            1,
+            2,
+            "initial-offer-cancelled".into(),
+            owner,
+            Instant::now() + Duration::from_secs(1),
+            2,
+            1
+        )
+        .await
+        .is_err());
+    assert!(server.signal_posts.lock().unwrap().is_empty());
+    drop(harness);
+    server.task.abort();
+}
+
+#[tokio::test]
+async fn initial_hh2_publication_never_renews_a_short_original_deadline() {
+    let server = MockControlServer::spawn(|_, _| MockAction::Delay200).await;
+    let harness = StartAckRetryHarness::new(&format!("http://{}", server.address));
+    harness
+        .client
+        .set_local_registration_for_test(Some(1), PeerCapabilities::current());
+    assert!(harness
+        .client
+        .send_hard_hard_initial_offer(
+            "peer-ack",
+            &["192.0.2.1:41000".into()],
+            &HashMap::new(),
+            1,
+            2,
+            "initial-offer-expired".into(),
+            Arc::new(crate::PunchSessionCancellation::default()),
+            Instant::now() + Duration::from_millis(20),
+            2,
+            1
+        )
+        .await
+        .is_err());
+    assert!(server.signal_posts.lock().unwrap().len() <= 1);
+    drop(harness);
+    server.task.abort();
+}
+
+#[tokio::test]
+async fn hard_hard_barrier_http_slice_has_one_attempt_without_renewing_its_phase() {
+    let server = MockControlServer::spawn(|_, body| {
+        if body.contains("immutable-sync") {
+            MockAction::Stall
+        } else {
+            MockAction::Ok
+        }
+    })
+    .await;
+    let harness = StartAckRetryHarness::new(&format!("http://{}", server.address));
+    let result = timeout(
+        Duration::from_secs(1),
+        send_barrier_for_test(
+            &harness.client,
+            "sync",
+            Instant::now() + Duration::from_secs(2),
+            Arc::new(crate::PunchSessionCancellation::default()),
+        ),
+    )
+    .await
+    .expect("the HTTP slice must finish before the remaining phase, without an outer 400ms timer");
+    assert!(result.is_err(), "a stalled POST is not delivery evidence");
+    harness.flush().await;
+    assert_eq!(
+        server
+            .signal_posts
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|body| body.contains("immutable-sync"))
+            .count(),
+        1,
+        "only the original phase owner can pay for a subsequent barrier attempt"
+    );
     drop(harness);
     server.task.abort();
 }

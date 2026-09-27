@@ -82,9 +82,12 @@ impl DirectValidationIngress {
     /// peer is refused only when the bounded pending-peer set is full. Within
     /// one reachability class the newest observation wins; higher-ranked
     /// reachability evidence replaces lower-ranked evidence.
-    fn submit(&self, observation: PeerReflexiveObservation) {
+    fn submit(
+        &self,
+        observation: PeerReflexiveObservation,
+    ) -> crate::udp::DirectValidationAdmission {
         let peer_id = observation.peer_id.clone();
-        let inserted = {
+        let admission = {
             let mut state = self
                 .state
                 .lock()
@@ -99,12 +102,22 @@ impl DirectValidationIngress {
                 if is_new_peer {
                     state.order.push_back(peer_id.clone());
                 }
-                true
+                if is_new_peer {
+                    crate::udp::DirectValidationAdmission::Queued
+                } else {
+                    crate::udp::DirectValidationAdmission::Coalesced
+                }
+            } else if state.latest.contains_key(&peer_id) {
+                crate::udp::DirectValidationAdmission::Coalesced
             } else {
-                false
+                crate::udp::DirectValidationAdmission::Backpressured
             }
         };
-        if inserted {
+        if matches!(
+            admission,
+            crate::udp::DirectValidationAdmission::Queued
+                | crate::udp::DirectValidationAdmission::Coalesced
+        ) {
             // There is one authoritative scheduler consumer.  `notify_one`
             // preserves the permit if the consumer is between its map check
             // and await; it then drains the remaining FIFO entries without
@@ -117,6 +130,7 @@ impl DirectValidationIngress {
                 "dropping lower-priority direct-validation observation or a new peer because the coalesced ingress is full"
             );
         }
+        admission
     }
 
     async fn next(&self) -> PeerReflexiveObservation {
@@ -268,10 +282,58 @@ async fn run_direct_validation_scheduler_with_worker_permits(
     local_virtual_ip: String,
     worker_permits: Arc<tokio::sync::Semaphore>,
 ) {
-    let mut pending_leases = std::collections::VecDeque::new();
+    let mut pending_leases: std::collections::VecDeque<crate::udp::DirectValidationSessionLease> =
+        std::collections::VecDeque::new();
     let mut workers = tokio::task::JoinSet::new();
     loop {
+        // A saturated worker pool cannot keep expired HH ownership in the
+        // pending queue. Reap in this existing scheduler, without a timer task
+        // per peer, and never renew the negotiated deadline at worker start.
+        for _ in 0..pending_leases.len() {
+            let lease = pending_leases
+                .pop_front()
+                .expect("bounded queue length captured");
+            let expired = lease
+                .hard_hard
+                .as_ref()
+                .is_some_and(|work| tokio::time::Instant::now() >= work.deadline);
+            let cancelled = lease.target_rx.borrow().cancelled
+                || lease
+                    .hard_hard
+                    .as_ref()
+                    .is_some_and(|work| work.cancellation.is_cancelled());
+            if expired || cancelled {
+                udp.finish_direct_validation_session(&lease.peer_id, lease.owner_token)
+                    .await;
+                if let Some(work) = &lease.hard_hard {
+                    peers
+                        .hard_hard_validation_completed(
+                            &lease.peer_id,
+                            &work.scope,
+                            if expired {
+                                crate::udp::DirectValidationCompletion::DeadlineExpired
+                            } else {
+                                crate::udp::DirectValidationCompletion::OwnerFinished
+                            },
+                        )
+                        .await;
+                }
+            } else {
+                pending_leases.push_back(lease);
+            }
+        }
+        let next_hh_deadline = pending_leases
+            .iter()
+            .filter_map(|lease| lease.hard_hard.as_ref().map(|work| work.deadline))
+            .min();
         tokio::select! {
+            _ = async {
+                if let Some(deadline) = next_hh_deadline {
+                    tokio::time::sleep_until(deadline).await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            } => {}
             joined = workers.join_next(), if !workers.is_empty() => {
                 if let Some(Err(error)) = joined {
                     debug!(?error, "direct-validation worker stopped unexpectedly");
@@ -328,6 +390,12 @@ async fn run_direct_validation_scheduler_with_worker_permits(
                                     lease.owner_token,
                                 )
                                 .await;
+                            if let Some(work) = &lease.hard_hard {
+                                peers.hard_hard_validation_completed(
+                                    &lease.peer_id, &work.scope,
+                                    crate::udp::DirectValidationCompletion::Backpressured,
+                                ).await;
+                            }
                             debug!(
                                 peer_id = %lease.peer_id,
                                 max_pending_peers = MAX_PENDING_DIRECT_VALIDATION_PEERS,
@@ -554,6 +622,47 @@ async fn run_direct_encrypted_validation_session(
     transport: WireGuardTransport,
     local_virtual_ip: &str,
 ) {
+    let Some(work) = lease.hard_hard.clone() else {
+        run_direct_encrypted_validation_session_inner(
+            lease,
+            udp,
+            peers,
+            transport,
+            local_virtual_ip,
+        )
+        .await;
+        return;
+    };
+    let peer_id = lease.peer_id.clone();
+    let owner = lease.owner_token;
+    // Capacity wait does not renew the original HH confirmation window. This
+    // also bounds WireGuard readiness and diagnostic awaits inside the worker.
+    let completion = tokio::select! {
+        biased;
+        _ = work.cancellation.cancelled() => crate::udp::DirectValidationCompletion::OwnerFinished,
+        result = tokio::time::timeout_at(work.deadline,
+            run_direct_encrypted_validation_session_inner(
+                lease, udp.clone(), peers.clone(), transport, local_virtual_ip,
+            ),
+        ) => match result {
+            Ok(()) => crate::udp::DirectValidationCompletion::OwnerFinished,
+            Err(_) => crate::udp::DirectValidationCompletion::DeadlineExpired,
+        },
+    };
+    udp.finish_direct_validation_session(&peer_id, owner).await;
+    peers
+        .hard_hard_validation_completed(&peer_id, &work.scope, completion)
+        .await;
+}
+
+async fn run_direct_encrypted_validation_session_inner(
+    lease: crate::udp::DirectValidationSessionLease,
+    udp: UdpTransport,
+    peers: Arc<PeerManager>,
+    transport: WireGuardTransport,
+    local_virtual_ip: &str,
+) {
+    let hard_hard_scope = lease.hard_hard.as_ref().map(|work| work.scope.clone());
     let peer_id = lease.peer_id.clone();
     let owner_token = lease.owner_token;
     let mut target_rx = lease.target_rx;
@@ -1051,6 +1160,7 @@ async fn run_direct_encrypted_validation_session(
         let send_socket = prepared.socket.clone();
         let send_socket_index = prepared.socket_index;
         let endpoint = target.endpoint;
+        let request_hard_hard_scope = hard_hard_scope.clone();
         match transport
             .encrypt_and_emit_outbound_with_lock_timeout(
                 OutboundPacket {
@@ -1076,11 +1186,12 @@ async fn run_direct_encrypted_validation_session(
                         ));
                     }
                     send_udp
-                        .send_direct_validation_packet_on_socket(
+                        .send_direct_validation_request_on_socket(
                             &send_socket,
                             send_socket_index,
                             &encrypted,
                             endpoint,
+                            request_hard_hard_scope.as_ref(),
                         )
                         .await
                         .map(|_| ())

@@ -111,6 +111,11 @@ impl UdpTransport {
         };
         timeout(Duration::from_millis(100), send)
             .await
-            .map_err(|_| rejected())?
+            .map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "hh2 probe readiness timed out before kernel handoff",
+                )
+            })?
     }
 }

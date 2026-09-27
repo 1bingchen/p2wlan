@@ -2,7 +2,11 @@
 // socket, a candidate, extra scan credit or a Direct transition. The negotiated
 // plan must still validate the availability and budget of every chosen strategy.
 const HARD_HARD_LEARNING_CAPACITY: usize = 64;
-const HARD_HARD_LEARNING_TTL: Duration = Duration::from_secs(10 * 60);
+// A fully spent HH epoch permits its next attempt after 30 minutes. Advice
+// must survive that default cadence, without becoming a permanent preference.
+const HARD_HARD_LEARNING_TTL: Duration = Duration::from_secs(RECOVERY_EPOCH_MAX_AGE.as_secs() * 3);
+const HARD_HARD_LEARNING_DECAY_INTERVAL: Duration =
+    Duration::from_secs(RECOVERY_EPOCH_MAX_AGE.as_secs() * 2);
 
 #[derive(Debug, Clone)]
 pub(crate) enum HardHardStrategyOutcome {
@@ -29,8 +33,43 @@ struct HardHardLearningEntry {
     // Anchor, prediction, birthday. Tiny saturating scores favor observed
     // success without letting ancient attempts dominate a changed network.
     scores: [i8; 3],
+    /// Tie order starts after the last conclusive attempt. It rotates even
+    /// when all scores reach the floor, and never changes a strategy's budget.
+    tie_start: u8,
     last_token: String,
     recorded_at: Instant,
+    decayed_at: Instant,
+}
+
+impl HardHardLearningEntry {
+    fn new(scope: HardHardLearningScope, now: Instant) -> Self {
+        Self {
+            scope,
+            scores: [0; 3],
+            tie_start: 0,
+            last_token: String::new(),
+            recorded_at: now,
+            decayed_at: now,
+        }
+    }
+
+    fn decay(&mut self, now: Instant) {
+        let Some(elapsed) = now.checked_duration_since(self.decayed_at) else {
+            return;
+        };
+        let intervals = elapsed.as_secs() / HARD_HARD_LEARNING_DECAY_INTERVAL.as_secs();
+        if intervals == 0 {
+            return;
+        }
+        let decay = intervals.min(3) as i8;
+        for score in &mut self.scores {
+            *score -= score.signum() * score.abs().min(decay);
+        }
+        // Feedback refreshes the finite TTL but not this decay clock. Frequent
+        // observations therefore cannot keep old scores from aging away.
+        self.decayed_at +=
+            Duration::from_secs(intervals * HARD_HARD_LEARNING_DECAY_INTERVAL.as_secs());
+    }
 }
 
 #[derive(Debug, Default)]
@@ -48,17 +87,26 @@ impl HardHardStrategyLearning {
 
     fn order(&mut self, peer: &str, scope: HardHardLearningScope, now: Instant) -> u8 {
         self.prune(now);
-        let Some(entry) = self.entries.get(peer).filter(|entry| entry.scope == scope) else {
+        let Some(entry) = self
+            .entries
+            .get_mut(peer)
+            .filter(|entry| entry.scope == scope)
+        else {
             return 0;
         };
-        // Deterministic tie order preserves the default anchor-first policy.
-        (0..3).fold(0, |best, index| {
-            if entry.scores[index] > entry.scores[best] {
-                index
-            } else {
-                best
-            }
-        }) as u8
+        entry.decay(now);
+        // The empty-cache default remains anchor-first. Equal scores after
+        // actual attempts cycle through the three bounded preference orders.
+        let first = usize::from(entry.tie_start);
+        (1..3)
+            .map(|offset| (first + offset) % 3)
+            .fold(first, |best, index| {
+                if entry.scores[index] > entry.scores[best] {
+                    index
+                } else {
+                    best
+                }
+            }) as u8
     }
 
     fn record(
@@ -84,23 +132,14 @@ impl HardHardStrategyLearning {
         let entry = self
             .entries
             .entry(peer.to_string())
-            .or_insert_with(|| HardHardLearningEntry {
-                scope,
-                scores: [0; 3],
-                last_token: String::new(),
-                recorded_at: now,
-            });
+            .or_insert_with(|| HardHardLearningEntry::new(scope, now));
         if entry.scope != scope {
-            *entry = HardHardLearningEntry {
-                scope,
-                scores: [0; 3],
-                last_token: String::new(),
-                recorded_at: now,
-            };
+            *entry = HardHardLearningEntry::new(scope, now);
         }
         if entry.last_token == token {
             return false;
         }
+        entry.decay(now);
         let index = match strategy {
             HardHardProbeStrategy::FixedAnchor => 0,
             HardHardProbeStrategy::Predictable => 1,
@@ -116,6 +155,7 @@ impl HardHardStrategyLearning {
         } else {
             entry.scores[index] = entry.scores[index].saturating_sub(1).max(-3);
         }
+        entry.tie_start = (index as u8 + 1) % 3;
         entry.last_token = token.to_string();
         entry.recorded_at = now;
         true
@@ -427,5 +467,120 @@ mod hard_hard_learning_tests {
             1
         );
         assert_eq!(cache.entries["peer-99"].recorded_at, saved);
+    }
+
+    #[test]
+    fn negative_advice_survives_the_default_recovery_cadence() {
+        let mut cache = HardHardStrategyLearning::default();
+        let now = Instant::now();
+        cache.record(
+            "peer",
+            scope(),
+            "anchor",
+            HardHardProbeStrategy::FixedAnchor,
+            false,
+            now,
+        );
+        let second = now + RECOVERY_EPOCH_MAX_AGE;
+        assert_eq!(cache.order("peer", scope(), second), 1);
+        cache.record(
+            "peer",
+            scope(),
+            "prediction",
+            HardHardProbeStrategy::Predictable,
+            false,
+            second,
+        );
+        // At 60min old scores decay, while the tie cursor still gives the
+        // as-yet-untried birthday preference its bounded opportunity.
+        let third = second + RECOVERY_EPOCH_MAX_AGE;
+        assert_eq!(cache.order("peer", scope(), third), 2);
+        cache.record(
+            "peer",
+            scope(),
+            "birthday",
+            HardHardProbeStrategy::Birthday,
+            false,
+            third,
+        );
+        assert_eq!(
+            cache.order("peer", scope(), third + RECOVERY_EPOCH_MAX_AGE),
+            0
+        );
+    }
+
+    #[test]
+    fn tied_and_saturated_negative_scores_rotate_without_new_credit() {
+        let mut cache = HardHardStrategyLearning::default();
+        let now = Instant::now();
+        let strategies = [
+            HardHardProbeStrategy::FixedAnchor,
+            HardHardProbeStrategy::Predictable,
+            HardHardProbeStrategy::Birthday,
+        ];
+        // The first nine conclusive failures reach [-3;3]. Every subsequent
+        // failure must still rotate, instead of permanently selecting anchor.
+        for attempt in 0..18 {
+            let index = attempt % 3;
+            assert_eq!(cache.order("peer", scope(), now), index as u8);
+            assert!(cache.record(
+                "peer",
+                scope(),
+                &format!("attempt-{attempt}"),
+                strategies[index],
+                false,
+                now
+            ));
+        }
+        assert_eq!(cache.entries["peer"].scores, [-3; 3]);
+        assert_eq!(cache.order("peer", scope(), now), 0);
+        let expiry = cache.entries["peer"].recorded_at;
+        assert!(!cache.record(
+            "peer",
+            scope(),
+            "attempt-17",
+            HardHardProbeStrategy::Birthday,
+            false,
+            now + RECOVERY_EPOCH_MAX_AGE
+        ));
+        assert_eq!(cache.entries["peer"].recorded_at, expiry);
+        assert_eq!(cache.order("peer", scope(), now), 0);
+    }
+
+    #[test]
+    fn feedback_does_not_restart_decay_and_reads_do_not_restart_expiry() {
+        let mut cache = HardHardStrategyLearning::default();
+        let now = Instant::now();
+        cache.record(
+            "peer",
+            scope(),
+            "success",
+            HardHardProbeStrategy::FixedAnchor,
+            true,
+            now,
+        );
+        let later = now + RECOVERY_EPOCH_MAX_AGE;
+        cache.record(
+            "peer",
+            scope(),
+            "other-failure",
+            HardHardProbeStrategy::Predictable,
+            false,
+            later,
+        );
+        assert_eq!(cache.entries["peer"].decayed_at, now);
+        let decay_at = now + HARD_HARD_LEARNING_DECAY_INTERVAL;
+        assert_eq!(cache.order("peer", scope(), decay_at), 0);
+        assert_eq!(cache.entries["peer"].scores, [2, -1, 0]);
+        assert_eq!(cache.entries["peer"].decayed_at, decay_at);
+        assert_eq!(cache.entries["peer"].recorded_at, later);
+        // Re-reading in the same interval applies no additional decay.
+        assert_eq!(cache.order("peer", scope(), decay_at), 0);
+        assert_eq!(cache.entries["peer"].scores, [2, -1, 0]);
+        assert_eq!(
+            cache.order("peer", scope(), later + HARD_HARD_LEARNING_TTL),
+            0
+        );
+        assert!(cache.entries.is_empty());
     }
 }

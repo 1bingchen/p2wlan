@@ -51,6 +51,8 @@ pub(crate) enum RecoveryProbePurpose {
     Ordinary,
     HardHardExploration,
     HardHardTriggered,
+    /// Only the responder's already selected exact pair may spend this tail.
+    HardHardSelectedCheck,
     HardHardNomination,
 }
 
@@ -62,7 +64,7 @@ impl RecoveryProbePurpose {
                     + u32::from(HARD_HARD_PAIR_CONFIRM_ATTEMPTS)
             }
             Self::HardHardTriggered => u32::from(HARD_HARD_PAIR_CONFIRM_ATTEMPTS),
-            Self::Ordinary | Self::HardHardNomination => 0,
+            Self::Ordinary | Self::HardHardSelectedCheck | Self::HardHardNomination => 0,
         }
     }
 

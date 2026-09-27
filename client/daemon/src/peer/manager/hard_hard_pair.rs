@@ -1,6 +1,12 @@
 pub(crate) const HARD_HARD_PAIR_MAX_CANDIDATES: usize = 32;
 pub(crate) const HARD_HARD_PAIR_CHECK_ATTEMPTS: u8 = 3;
 pub(crate) const HARD_HARD_PAIR_CONFIRM_ATTEMPTS: u8 = 8;
+pub(crate) const HARD_HARD_PAIR_RETRY_INTERVAL: Duration = Duration::from_millis(150);
+/// Preserve the old worst case of sixteen admitted workers, each with the
+/// existing request sequence. Coalesced/backpressured observations are free;
+/// replacement owners share this one successful-handoff total.
+const HARD_HARD_PAIR_VALIDATION_REQUEST_LIMIT: usize =
+    16 * crate::DIRECT_VALIDATION_REQUEST_DELAYS.len();
 
 /// One local view of the negotiated transport pair. The peer's socket index
 /// is deliberately absent: a matching authenticated nonce joins the two views.
@@ -16,6 +22,7 @@ struct HardHardPairCandidate {
     pair: HardHardPairKey,
     valid: bool,
     attempts: u8,
+    local_deferrals: u8,
     next_check: Instant,
 }
 
@@ -25,8 +32,11 @@ struct HardHardPairSelection {
     confirmed: bool,
     validated: bool,
     attempts: u8,
+    local_deferrals: u8,
     next_check: Instant,
-    validation_attempts: u8,
+    /// Successful encrypted Request handoffs, shared by every validation owner
+    /// for this selected pair. Queueing and merging observations spend none.
+    validation_requests: usize,
 }
 
 /// Bounded state owned exclusively by HardHardSessionRecord. A session may
@@ -66,10 +76,55 @@ pub(crate) enum HardHardPairEvidence {
 
 #[derive(Debug, Clone)]
 pub(crate) enum HardHardPairAction {
-    Check(HardHardPairKey),
-    Nominate(HardHardPairKey),
+    Send(HardHardPairKey, HardHardPairSendPhase),
     Validate(HardHardPairKey),
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HardHardPairSendPhase {
+    CandidateCheck,
+    SelectedCheck,
+    Nomination,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HardHardPairSendOutcome {
+    Sent,
+    /// Definitely no kernel handoff; only the pair attempt may be refunded.
+    RetryableNotSent,
+    /// A sliding-window budget can refill within the original phase. Do not
+    /// consume the physical retry allowance while waiting for that window.
+    BudgetDeferred,
+    /// Cancellation after entering the sender may follow a successful syscall.
+    /// Keep the attempt and every already-consumed budget credit.
+    DeliveryUnknown,
+    Stopped,
+}
+
+/// Scheduling is separate from wire attempts. A budget wait is bounded by
+/// the original phase deadline; definite local failures get at most one
+/// additional scheduling allowance per original attempt. Unknown delivery
+/// remains charged, and no branch changes UDP/recovery credits.
+fn complete_hard_hard_pair_send_attempt(
+    attempts: &mut u8,
+    deferrals: &mut u8,
+    ceiling: u8,
+    outcome: HardHardPairSendOutcome,
+) {
+    match outcome {
+        HardHardPairSendOutcome::BudgetDeferred => *attempts = attempts.saturating_sub(1),
+        HardHardPairSendOutcome::RetryableNotSent if *deferrals < ceiling => {
+            *deferrals += 1;
+            *attempts = attempts.saturating_sub(1);
+        }
+        HardHardPairSendOutcome::Stopped => *attempts = ceiling,
+        _ => {}
+    }
+}
+
+#[cfg(test)]
+#[path = "hard_hard_pair_retry_tests.rs"]
+mod hard_hard_pair_retry_tests;
 
 /// The Direct reducer invokes these synchronously while it owns the current
 /// connection. The UDP implementation holds the exact socket/session guards
@@ -113,6 +168,30 @@ pub(crate) struct HardHardExplorationHandoffGuard<'a> {
     pair: HardHardPairKey,
     track_handoff: bool,
     permit: HardHardDatagramSendPermit,
+}
+
+/// The existing HH ledger stays locked only over the nonblocking Request
+/// handoff. ACK replies do not consume this bounded Request allowance.
+pub(crate) struct HardHardValidationRequestGuard<'a> {
+    sessions: tokio::sync::MutexGuard<'a, HashMap<(String, String), HardHardSessionRecord>>,
+    record_key: (String, String),
+    permit: HardHardDatagramSendPermit,
+}
+
+impl HardHardValidationRequestGuard<'_> {
+    pub(crate) fn is_current(&self, peers: &PeerManager) -> bool {
+        self.permit.is_current(peers)
+    }
+
+    pub(crate) fn handoff_succeeded(&mut self) {
+        let selected = self
+            .sessions
+            .get_mut(&self.record_key)
+            .and_then(|record| record.pair_nomination.as_mut())
+            .and_then(|nomination| nomination.selected.as_mut())
+            .expect("selected pair remains locked through Request handoff");
+        selected.validation_requests += 1;
+    }
 }
 
 impl HardHardExplorationHandoffGuard<'_> {
@@ -197,6 +276,16 @@ impl HardHardPairCommitGuard<'_> {
         record.fresh_socket.socket_index = self.pair.socket_index;
         record.fresh_socket.socket_local_endpoint = self.pair.local_endpoint;
         record.fresh_socket.punch_generation = self.punch_generation.max(1);
+        // Publish validation only at the synchronous Direct commit. A
+        // cancelled/contended ACK transaction must leave the nominated pair
+        // eligible for another bounded encrypted validation request.
+        if let Some(selected) = record
+            .pair_nomination
+            .as_mut()
+            .and_then(|n| n.selected.as_mut())
+        {
+            selected.validated = true;
+        }
         self.winners
             .insert(self.token_key.clone(), self.pair.socket_index);
     }
@@ -211,6 +300,102 @@ pub(crate) fn hard_hard_scoped_probe_key(key: &ProbeMacKey, token: &str) -> Prob
 }
 
 impl PeerManager {
+    pub(crate) async fn hard_hard_validation_request_guard(
+        &self,
+        peer: &str,
+        scope: &crate::udp::HardHardValidationScope,
+        permit: HardHardDatagramSendPermit,
+    ) -> Option<HardHardValidationRequestGuard<'_>> {
+        if !self.peer_session_is_current_sync(peer, scope.peer_session)
+            || self.current_network_generation_sync() != scope.generation
+        {
+            return None;
+        }
+        let sessions = self.hard_hard_sessions.lock().await;
+        let (record_key, record) = sessions.iter().find(|(_, record)| {
+            record.peer_id == peer
+                && record.session_token == scope.token
+                && record.state != HardHardSessionState::Retiring
+                && !record.cancellation.is_cancelled()
+        })?;
+        let selected = record.pair_nomination.as_ref()?.selected.as_ref()?;
+        if selected.pair != scope.pair
+            || !selected.confirmed
+            || selected.validated
+            || selected.validation_requests >= HARD_HARD_PAIR_VALIDATION_REQUEST_LIMIT
+            || !permit.is_current(self)
+        {
+            return None;
+        }
+        let record_key = record_key.clone();
+        Some(HardHardValidationRequestGuard {
+            sessions,
+            record_key,
+            permit,
+        })
+    }
+
+    pub(crate) async fn hard_hard_validation_deadline(
+        &self,
+        peer: &str,
+        scope: &crate::udp::HardHardValidationScope,
+    ) -> Option<tokio::time::Instant> {
+        if !self.peer_session_is_current_sync(peer, scope.peer_session)
+            || self.current_network_generation_sync() != scope.generation
+        {
+            return None;
+        }
+        let record = self.hard_hard_pair_scope(peer, &scope.token).await?;
+        let selected = record.pair_nomination.as_ref()?.selected.as_ref()?;
+        if selected.pair != scope.pair
+            || selected.validation_requests >= HARD_HARD_PAIR_VALIDATION_REQUEST_LIMIT
+        {
+            return None;
+        }
+        Some(
+            self.hard_hard_validation_send_permit(peer, &scope.token, &scope.pair)
+                .await?
+                .deadline,
+        )
+    }
+
+    /// Completion merely permits another observation; it cannot authorize a
+    /// connection or reset any Request credits. The immutable HH scope fences
+    /// cleanup from a different token, registration lifecycle or selected pair.
+    pub(crate) async fn hard_hard_validation_completed(
+        &self,
+        peer: &str,
+        scope: &crate::udp::HardHardValidationScope,
+        completion: crate::udp::DirectValidationCompletion,
+    ) {
+        if completion == crate::udp::DirectValidationCompletion::DeadlineExpired
+            || self
+                .hard_hard_validation_deadline(peer, scope)
+                .await
+                .is_none()
+        {
+            return;
+        }
+        let mut sessions = self.hard_hard_sessions.lock().await;
+        let Some(selected) = sessions
+            .values_mut()
+            .find(|record| {
+                record.peer_id == peer
+                    && record.session_token == scope.token
+                    && !record.cancellation.is_cancelled()
+                    && record.state != HardHardSessionState::Retiring
+            })
+            .and_then(|record| record.pair_nomination.as_mut())
+            .and_then(|nomination| nomination.selected.as_mut())
+            .filter(|selected| selected.pair == scope.pair && !selected.validated)
+        else {
+            return;
+        };
+        selected.next_check = selected
+            .next_check
+            .min(Instant::now() + HARD_HARD_PAIR_RETRY_INTERVAL);
+    }
+
     pub(crate) async fn hard_hard_exploration_handoff_guard(
         &self,
         peer: &str,
@@ -350,9 +535,11 @@ impl PeerManager {
                 && record.expires_at_ms >= hard_hard_now_ms()
         })?;
         let nomination = record.pair_nomination.as_ref()?;
-        if !nomination.selected.as_ref().is_some_and(|selected| {
-            selected.confirmed && selected.validated && selected.pair == *pair
-        }) {
+        if !nomination
+            .selected
+            .as_ref()
+            .is_some_and(|selected| selected.confirmed && selected.pair == *pair)
+        {
             return None;
         }
         let deadline = nomination.confirmation_deadline?;
@@ -494,6 +681,7 @@ impl PeerManager {
                     pair: pair.clone(),
                     valid: false,
                     attempts: 0,
+                    local_deferrals: 0,
                     next_check: Instant::now(),
                 });
                 nomination.candidates.len() - 1
@@ -512,8 +700,9 @@ impl PeerManager {
                 confirmed: !controlling && nomination.candidates[candidate_index].valid,
                 validated: false,
                 attempts: 0,
+                local_deferrals: 0,
                 next_check: Instant::now(),
-                validation_attempts: 0,
+                validation_requests: 0,
             });
         }
         if let Some(selected) = nomination.selected.as_mut() {
@@ -597,28 +786,40 @@ impl PeerManager {
         let controlling = record.initiator;
         let nomination = record.pair_nomination.as_mut()?;
         let now = Instant::now();
+        let deadline = if nomination.selected.is_some() {
+            nomination.confirmation_deadline
+        } else {
+            nomination.discovery_deadline
+        }?;
+        if tokio::time::Instant::now() >= deadline {
+            return None;
+        }
         if let Some(selected) = nomination.selected.as_mut() {
             if selected.validated {
                 return None;
             }
             if selected.confirmed {
-                if selected.validation_attempts >= 16 || selected.next_check > now {
+                if selected.validation_requests >= HARD_HARD_PAIR_VALIDATION_REQUEST_LIMIT
+                    || selected.next_check > now
+                {
                     return None;
                 }
-                selected.validation_attempts += 1;
-                selected.next_check = now + Duration::from_millis(150);
+                selected.next_check = now + HARD_HARD_PAIR_RETRY_INTERVAL;
                 return Some(HardHardPairAction::Validate(selected.pair.clone()));
             }
             if selected.attempts >= HARD_HARD_PAIR_CONFIRM_ATTEMPTS || selected.next_check > now {
                 return None;
             }
             selected.attempts += 1;
-            selected.next_check = now + Duration::from_millis(150);
-            return Some(if controlling {
-                HardHardPairAction::Nominate(selected.pair.clone())
-            } else {
-                HardHardPairAction::Check(selected.pair.clone())
-            });
+            selected.next_check = now + HARD_HARD_PAIR_RETRY_INTERVAL;
+            return Some(HardHardPairAction::Send(
+                selected.pair.clone(),
+                if controlling {
+                    HardHardPairSendPhase::Nomination
+                } else {
+                    HardHardPairSendPhase::SelectedCheck
+                },
+            ));
         }
         if !discovery_open {
             return None;
@@ -627,84 +828,111 @@ impl PeerManager {
             !c.valid && c.attempts < HARD_HARD_PAIR_CHECK_ATTEMPTS && c.next_check <= now
         })?;
         candidate.attempts += 1;
-        candidate.next_check = now + Duration::from_millis(150);
-        Some(HardHardPairAction::Check(candidate.pair.clone()))
+        candidate.next_check = now + HARD_HARD_PAIR_RETRY_INTERVAL;
+        Some(HardHardPairAction::Send(
+            candidate.pair.clone(),
+            HardHardPairSendPhase::CandidateCheck,
+        ))
     }
 
-    pub(crate) async fn hard_hard_pair_mark_validated(
+    /// Complete the single worker's scheduled action. A definite local
+    /// non-send may refund its pair attempt at most the existing retry cap;
+    /// admission credits are never refunded. The original 150ms cadence and
+    /// phase deadline still apply. Phase identity prevents a late candidate
+    /// result from decrementing a newly selected pair's nomination attempts.
+    pub(crate) async fn hard_hard_pair_record_send_outcome(
         &self,
         peer: &str,
         token: &str,
         pair: &HardHardPairKey,
-    ) -> bool {
+        phase: HardHardPairSendPhase,
+        outcome: HardHardPairSendOutcome,
+    ) {
         let mut sessions = self.hard_hard_sessions.lock().await;
-        let Some(record) = sessions.values_mut().find(|r| {
-            r.peer_id == peer
-                && r.session_token == token
-                && r.state != HardHardSessionState::Retiring
-                && !r.cancellation.is_cancelled()
-                && r.expires_at_ms >= hard_hard_now_ms()
+        let Some(record) = sessions.values_mut().find(|record| {
+            record.peer_id == peer
+                && record.session_token == token
+                && record.state != HardHardSessionState::Retiring
+                && !record.cancellation.is_cancelled()
+                && record.expires_at_ms > hard_hard_now_ms()
         }) else {
-            return false;
-        };
-        let Some(selected) = record
-            .pair_nomination
-            .as_mut()
-            .and_then(|n| n.selected.as_mut())
-        else {
-            return false;
-        };
-        if !selected.confirmed || selected.pair != *pair {
-            return false;
-        }
-        selected.validated = true;
-        true
-    }
-
-    pub(crate) async fn hard_hard_pair_validation_deferred(
-        &self,
-        peer: &str,
-        token: &str,
-        pair: &HardHardPairKey,
-    ) {
-        let mut sessions = self.hard_hard_sessions.lock().await;
-        if let Some(selected) = sessions
-            .values_mut()
-            .find(|record| {
-                record.peer_id == peer
-                    && record.session_token == token
-                    && record.state != HardHardSessionState::Retiring
-            })
-            .and_then(|record| record.pair_nomination.as_mut())
-            .and_then(|nomination| nomination.selected.as_mut())
-            .filter(|selected| selected.pair == *pair)
-        {
-            selected.validated = false;
-        }
-    }
-
-    /// A short shared-budget deferral keeps the same target and does not burn
-    /// a physical retry. Its next_check remains delayed, so contention cannot
-    /// produce a busy loop; the session deadline is still authoritative.
-    pub(crate) async fn hard_hard_pair_defer_send(
-        &self,
-        peer: &str,
-        token: &str,
-        pair: &HardHardPairKey,
-    ) {
-        let mut sessions = self.hard_hard_sessions.lock().await;
-        let Some(nomination) = sessions
-            .values_mut()
-            .find(|r| r.peer_id == peer && r.session_token == token)
-            .and_then(|r| r.pair_nomination.as_mut())
-        else {
             return;
         };
-        if let Some(selected) = nomination.selected.as_mut().filter(|s| s.pair == *pair) {
-            selected.attempts = selected.attempts.saturating_sub(1);
-        } else if let Some(candidate) = nomination.candidates.iter_mut().find(|c| c.pair == *pair) {
-            candidate.attempts = candidate.attempts.saturating_sub(1);
-        }
+        let Some(nomination) = record.pair_nomination.as_mut() else {
+            return;
+        };
+        let (attempts, deferrals, ceiling) = match phase {
+            HardHardPairSendPhase::CandidateCheck => {
+                let Some(candidate) = nomination.candidates.iter_mut().find(|c| c.pair == *pair)
+                else {
+                    return;
+                };
+                (
+                    &mut candidate.attempts,
+                    &mut candidate.local_deferrals,
+                    HARD_HARD_PAIR_CHECK_ATTEMPTS,
+                )
+            }
+            HardHardPairSendPhase::SelectedCheck | HardHardPairSendPhase::Nomination => {
+                let Some(selected) = nomination.selected.as_mut().filter(|s| s.pair == *pair)
+                else {
+                    return;
+                };
+                if (phase == HardHardPairSendPhase::Nomination) != record.initiator {
+                    return;
+                }
+                (
+                    &mut selected.attempts,
+                    &mut selected.local_deferrals,
+                    HARD_HARD_PAIR_CONFIRM_ATTEMPTS,
+                )
+            }
+        };
+        complete_hard_hard_pair_send_attempt(attempts, deferrals, ceiling, outcome);
+    }
+
+    /// Derive budget purpose from the authoritative phase, not from a caller's
+    /// nomination bit. Only the selected responder pair can spend the final
+    /// confirmation credits; ordinary candidate checks retain their reserve.
+    pub(crate) async fn hard_hard_pair_send_admission(
+        &self,
+        peer: &str,
+        token: &str,
+        pair: &HardHardPairKey,
+        phase: HardHardPairSendPhase,
+    ) -> Option<(tokio::time::Instant, RecoveryProbePurpose)> {
+        let scope = self.hard_hard_pair_scope(peer, token).await?;
+        let nomination = scope.pair_nomination.as_ref()?;
+        let purpose = match (phase, nomination.selected.as_ref()) {
+            (HardHardPairSendPhase::CandidateCheck, None)
+                if nomination
+                    .candidates
+                    .iter()
+                    .any(|c| c.pair == *pair && !c.valid) =>
+            {
+                RecoveryProbePurpose::HardHardTriggered
+            }
+            (HardHardPairSendPhase::SelectedCheck, Some(selected))
+                if !scope.initiator && selected.pair == *pair && !selected.confirmed =>
+            {
+                RecoveryProbePurpose::HardHardSelectedCheck
+            }
+            (HardHardPairSendPhase::Nomination, Some(selected))
+                if scope.initiator && selected.pair == *pair && !selected.confirmed =>
+            {
+                RecoveryProbePurpose::HardHardNomination
+            }
+            _ => return None,
+        };
+        let deadline = self
+            .hard_hard_pair_send_deadline(
+                peer,
+                token,
+                pair,
+                phase == HardHardPairSendPhase::Nomination,
+            )
+            .await?;
+        Some((deadline, purpose))
     }
 
     /// Validate the immutable send intent at the final handoff. A queued

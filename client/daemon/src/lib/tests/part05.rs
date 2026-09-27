@@ -2519,6 +2519,45 @@ async fn direct_validation_ingress_preserves_non_public_over_public_churn() {
 }
 
 #[tokio::test]
+async fn direct_validation_ingress_reports_coalescing_and_backpressure_without_attempts() {
+    use crate::udp::DirectValidationAdmission;
+    let ingress = DirectValidationIngress::new();
+    let endpoint = "203.0.113.8:40123".parse().unwrap();
+    for peer in 0..MAX_PENDING_DIRECT_VALIDATION_PEERS {
+        assert_eq!(
+            ingress.submit(PeerReflexiveObservation {
+                peer_id: format!("peer-{peer}"),
+                observed_endpoint: endpoint,
+            }),
+            DirectValidationAdmission::Queued
+        );
+    }
+    assert_eq!(
+        ingress.submit(PeerReflexiveObservation {
+            peer_id: "peer-0".into(),
+            observed_endpoint: endpoint,
+        }),
+        DirectValidationAdmission::Coalesced
+    );
+    assert_eq!(
+        ingress.submit(PeerReflexiveObservation {
+            peer_id: "overflow".into(),
+            observed_endpoint: endpoint,
+        }),
+        DirectValidationAdmission::Backpressured
+    );
+    assert_eq!(ingress.pending_len(), MAX_PENDING_DIRECT_VALIDATION_PEERS);
+    ingress.next().await;
+    assert_eq!(
+        ingress.submit(PeerReflexiveObservation {
+            peer_id: "overflow".into(),
+            observed_endpoint: endpoint,
+        }),
+        DirectValidationAdmission::Queued
+    );
+}
+
+#[tokio::test]
 async fn direct_validation_ingress_does_not_prefer_off_link_private_over_public() {
     let peers = Arc::new(PeerManager::new(
         Config::generate_default("https://ctrl.test", "net1").unwrap(),

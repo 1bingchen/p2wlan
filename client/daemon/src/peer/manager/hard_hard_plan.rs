@@ -120,6 +120,8 @@ pub(crate) struct HardHardCoordinatedPlan {
     pub(crate) ready_received: bool,
     pub(crate) ready_ack_received: bool,
     pub(crate) ready_sent_at: Option<Instant>,
+    /// An ACK after retransmission cannot identify which READY it answered.
+    pub(crate) ready_retransmitted: bool,
     pub(crate) ready_rtt: Option<Duration>,
     pub(crate) sync_uncertainty: Duration,
     pub(crate) start: Option<HardHardAgreedStart>,
@@ -165,7 +167,45 @@ impl HardHardCoordinatedPlan {
     }
 }
 
+/// Convert the immutable wall-clock session expiry into a conservative
+/// latest start. Both selection and activation use the full existing runtime
+/// window. Selection adds its clock-conversion margin before publishing the
+/// wire start; acceptance enforces this full window again. This is a derived
+/// snapshot, never a renewed lifetime or another owner.
+pub(crate) fn hard_hard_latest_start_for_session(
+    expires_at_ms: u64,
+    now_ms: u64,
+    now: Instant,
+) -> Option<Instant> {
+    now.checked_add(Duration::from_millis(expires_at_ms.checked_sub(now_ms)?))?
+        .checked_sub(crate::HARD_HARD_SWEEP_DEADLINE + crate::HARD_HARD_DIRECT_CONFIRMATION_GRACE)
+}
+
 impl PeerManager {
+    /// The initial HH2 publication may retry once, but must leave the existing
+    /// three READY and three SYNC/ACK credits available in this same epoch.
+    pub(crate) async fn reserve_hard_hard_initial_signal_retry(
+        &self,
+        peer: &str,
+        expected: RecoveryEpochIdentity,
+    ) -> bool {
+        let mut epochs = self.recovery_epochs.write().await;
+        let Some(state) = epochs.get_mut(peer) else {
+            return false;
+        };
+        if state.epoch != expected.epoch
+            || state.network_generation != expected.network_generation
+            || state.allocation_id != expected.allocation_id
+            || state.epoch_http_quota_remaining
+                <= u32::from(crate::HARD_HARD_BARRIER_MAX_ATTEMPTS)
+                    + u32::from(crate::control::HARD_HARD_START_ACK_MAX_ATTEMPTS)
+        {
+            return false;
+        }
+        state.epoch_http_quota_remaining -= 1;
+        true
+    }
+
     pub(crate) async fn hard_hard_activate_start(
         &self,
         peer: &str,
@@ -182,6 +222,9 @@ impl PeerManager {
         }) else {
             return false;
         };
+        let now = Instant::now();
+        let latest_start =
+            hard_hard_latest_start_for_session(record.expires_at_ms, hard_hard_now_ms(), now);
         let Some(plan) = record.coordinated_plan.as_mut() else {
             return false;
         };
@@ -198,15 +241,38 @@ impl PeerManager {
         {
             return false;
         }
-        if let Some(prior) = plan.start {
-            return prior == start && Instant::now() < plan.scheduled_start;
-        }
-        let advance = Duration::from_millis(plan.canonical_server_deadline - start.server_time_ms);
-        let Some(scheduled_start) = plan.scheduled_start.checked_sub(advance) else {
-            return false;
+        let scheduled_start = if let Some(prior) = plan.start {
+            if prior != start {
+                return false;
+            }
+            plan.scheduled_start
+        } else {
+            let advance =
+                Duration::from_millis(plan.canonical_server_deadline - start.server_time_ms);
+            let Some(scheduled_start) = plan.scheduled_start.checked_sub(advance) else {
+                return false;
+            };
+            scheduled_start
         };
-        if Instant::now() >= scheduled_start {
+        if now >= scheduled_start {
             return false;
+        }
+        if latest_start.is_none_or(|latest| scheduled_start > latest) {
+            // No await or new lock dependency while retaining the HH ledger.
+            // Release it before best-effort diagnostic publication.
+            drop(sessions);
+            self.record_direct_event_non_queuing(
+                peer,
+                "hard_hard_start_rejected",
+                None,
+                None,
+                None,
+                "reason_code=confirmation_window_exceeds_session_ttl",
+            );
+            return false;
+        }
+        if plan.start.is_some() {
+            return true;
         }
         plan.scheduled_start = scheduled_start;
         plan.start = Some(start);
@@ -266,9 +332,9 @@ impl PeerManager {
         remote_network_generation: u64,
         remote_confidence: u8,
         sync_uncertainty: Duration,
-    ) -> bool {
+    ) -> Option<HardHardSessionRecord> {
         if !remote_offer.is_valid(remote_prediction) {
-            return false;
+            return None;
         }
         let mut sessions = self.hard_hard_sessions.lock().await;
         let Some(record) = sessions.values_mut().find(|record| {
@@ -278,20 +344,23 @@ impl PeerManager {
                 && !record.cancellation.is_cancelled()
                 && record.expires_at_ms >= hard_hard_now_ms()
         }) else {
-            return false;
+            return None;
         };
         let Some(plan) = record.coordinated_plan.as_mut() else {
-            return false;
+            return None;
         };
         if remote_network_generation == 0
             || remote_confidence == 0
             || (record.remote_network_generation != 0
                 && record.remote_network_generation != remote_network_generation)
         {
-            return false;
+            return None;
         }
         if plan.agreement.is_some_and(|prior| prior != agreement)
             || plan.remote_offer.is_some_and(|prior| prior != remote_offer)
+            || (plan.agreement.is_some()
+                && (record.remote_prediction != remote_prediction
+                    || record.remote_prediction_confidence != remote_confidence))
             || agreement.strategy
                 != HardHardProbeStrategy::select_with_order(
                     plan.local_offer,
@@ -299,7 +368,7 @@ impl PeerManager {
                     plan.strategy_order,
                 )
         {
-            return false;
+            return None;
         }
         plan.remote_offer = Some(remote_offer);
         plan.agreement = Some(agreement);
@@ -307,7 +376,9 @@ impl PeerManager {
         record.remote_prediction = remote_prediction.to_vec();
         record.remote_network_generation = remote_network_generation;
         record.remote_prediction_confidence = remote_confidence;
-        true
+        // The next owner must fence against this committed snapshot, not the
+        // pre-ANSWER values which this transaction deliberately replaced.
+        Some(record.clone())
     }
 
     pub(crate) async fn hard_hard_mark_ready_sent(&self, peer: &str, token: &str) -> bool {
@@ -328,7 +399,11 @@ impl PeerManager {
         if plan.agreement.is_none() {
             return false;
         }
-        plan.ready_sent_at.get_or_insert_with(Instant::now);
+        if plan.ready_sent_at.is_some() {
+            plan.ready_retransmitted = true;
+        } else {
+            plan.ready_sent_at = Some(Instant::now());
+        }
         true
     }
 

@@ -20,6 +20,7 @@ fn forecast_plan(strategy: HardHardProbeStrategy, upper: Instant) -> HardHardCoo
         ready_received: true,
         ready_ack_received: true,
         ready_sent_at: None,
+        ready_retransmitted: false,
         ready_rtt: None,
         sync_uncertainty: Duration::ZERO,
         start: None,
@@ -131,6 +132,7 @@ fn received_or_acknowledged_pair_does_not_fabricate_a_local_kernel_handoff() {
         pair: pair(0),
         valid: true,
         attempts: 1,
+        local_deferrals: 0,
         next_check: Instant::now(),
     });
     let (deadline, track) =

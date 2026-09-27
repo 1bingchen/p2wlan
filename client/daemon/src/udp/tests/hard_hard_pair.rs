@@ -33,6 +33,395 @@ async fn confirmed(fixture: &WinnerFixture) -> HardHardValidationScope {
 }
 
 #[tokio::test]
+async fn selected_responder_check_alone_can_spend_confirmation_tail() {
+    use crate::peer::{HardHardPairSendPhase, RecoveryProbePurpose};
+    let _serial = crate::tests::HARD_HARD_E2E_SERIAL.acquire().await.unwrap();
+    let fixture = WinnerFixture::with_protocol(false, true).await;
+    let selected = pair(&fixture, 0, fixture.remote.local_addr().unwrap());
+    assert!(observe(&fixture, &selected, HardHardPairEvidence::Observed).await);
+    let (_, purpose) = fixture
+        .peers
+        .hard_hard_pair_send_admission(
+            "peer-b",
+            TOKEN,
+            &selected,
+            HardHardPairSendPhase::CandidateCheck,
+        )
+        .await
+        .unwrap();
+    assert_eq!(purpose, RecoveryProbePurpose::HardHardTriggered);
+    assert!(purpose.confirmation_credit_reserve() > 0);
+    assert!(fixture
+        .peers
+        .hard_hard_pair_send_admission(
+            "peer-b",
+            TOKEN,
+            &selected,
+            HardHardPairSendPhase::SelectedCheck,
+        )
+        .await
+        .is_none());
+    assert!(observe(&fixture, &selected, HardHardPairEvidence::NominationRequest).await);
+    let (_, purpose) = fixture
+        .peers
+        .hard_hard_pair_send_admission(
+            "peer-b",
+            TOKEN,
+            &selected,
+            HardHardPairSendPhase::SelectedCheck,
+        )
+        .await
+        .unwrap();
+    assert_eq!(purpose, RecoveryProbePurpose::HardHardSelectedCheck);
+    assert_eq!(purpose.confirmation_credit_reserve(), 0);
+    assert_eq!(purpose.confirmation_short_window_reserve(), 0);
+    let other = pair(&fixture, 1, fixture.remote.local_addr().unwrap());
+    for phase in [
+        HardHardPairSendPhase::CandidateCheck,
+        HardHardPairSendPhase::Nomination,
+    ] {
+        assert!(fixture
+            .peers
+            .hard_hard_pair_send_admission("peer-b", TOKEN, &selected, phase)
+            .await
+            .is_none());
+    }
+    assert!(fixture
+        .peers
+        .hard_hard_pair_send_admission(
+            "peer-b",
+            TOKEN,
+            &other,
+            HardHardPairSendPhase::SelectedCheck,
+        )
+        .await
+        .is_none());
+    fixture.cleanup().await;
+}
+
+#[tokio::test]
+async fn hh2_validation_merges_and_replacement_owners_share_actual_request_budget() {
+    let _serial = crate::tests::HARD_HARD_E2E_SERIAL.acquire().await.unwrap();
+    let fixture = WinnerFixture::with_protocol(true, true).await;
+    let scope = confirmed(&fixture).await;
+    let DirectValidationSessionStart::Spawn(mut lease) = fixture
+        .udp
+        .begin_or_merge_direct_validation("peer-b", scope.pair.remote_endpoint, scope.generation)
+        .await
+    else {
+        panic!("first validation owner");
+    };
+    let work = lease.hard_hard.clone().unwrap();
+    for _ in 0..20 {
+        assert!(matches!(
+            fixture
+                .udp
+                .begin_or_merge_direct_validation(
+                    "peer-b",
+                    scope.pair.remote_endpoint,
+                    scope.generation,
+                )
+                .await,
+            DirectValidationSessionStart::Merged
+        ));
+    }
+    assert!(
+        !lease.target_rx.has_changed().unwrap(),
+        "identical merges do not bypass request delay"
+    );
+    let packet = EncryptedPeerPacket {
+        room_authorization: None,
+        peer_id: "peer-b".into(),
+        dst_ip: "10.20.0.2".into(),
+        wire_bytes: vec![0; 85],
+        is_business: false,
+    };
+    // An ACK response is not a Request and consumes none of its allowance.
+    fixture
+        .udp
+        .send_direct_validation_packet_on_socket(
+            &fixture.sockets[0],
+            scope.pair.socket_index,
+            &packet,
+            scope.pair.remote_endpoint,
+        )
+        .await
+        .unwrap();
+    let limit = 16 * crate::DIRECT_VALIDATION_REQUEST_DELAYS.len();
+    for request in 0..limit {
+        fixture
+            .udp
+            .send_direct_validation_request_on_socket(
+                &fixture.sockets[0],
+                scope.pair.socket_index,
+                &packet,
+                scope.pair.remote_endpoint,
+                Some(&scope),
+            )
+            .await
+            .unwrap();
+        if request + 1 < limit && (request + 1) % crate::DIRECT_VALIDATION_REQUEST_DELAYS.len() == 0
+        {
+            // Model an owner ending after its last ACK could not commit. A new
+            // owner may retry the same live pair, but never receives fresh HH credits.
+            fixture
+                .udp
+                .finish_direct_validation_session("peer-b", lease.owner_token)
+                .await;
+            fixture
+                .peers
+                .hard_hard_validation_completed(
+                    "peer-b",
+                    &scope,
+                    DirectValidationCompletion::OwnerFinished,
+                )
+                .await;
+            let DirectValidationSessionStart::Spawn(replacement) = fixture
+                .udp
+                .begin_or_merge_direct_validation(
+                    "peer-b",
+                    scope.pair.remote_endpoint,
+                    scope.generation,
+                )
+                .await
+            else {
+                panic!("replacement validation owner within original deadline");
+            };
+            assert_ne!(replacement.owner_token, lease.owner_token);
+            assert_eq!(replacement.hard_hard.as_ref(), Some(&work));
+            lease = replacement;
+        }
+    }
+    assert!(fixture
+        .udp
+        .send_direct_validation_request_on_socket(
+            &fixture.sockets[0],
+            scope.pair.socket_index,
+            &packet,
+            scope.pair.remote_endpoint,
+            Some(&scope)
+        )
+        .await
+        .is_err());
+    assert!(fixture
+        .peers
+        .hard_hard_pair_next_action("peer-b", TOKEN, true)
+        .await
+        .is_none());
+    fixture.cleanup().await;
+}
+
+#[tokio::test]
+async fn hh2_validation_completion_cannot_renew_deadline_or_old_scope() {
+    let _serial = crate::tests::HARD_HARD_E2E_SERIAL.acquire().await.unwrap();
+    let fixture = WinnerFixture::with_protocol(true, true).await;
+    let scope = confirmed(&fixture).await;
+    let DirectValidationSessionStart::Spawn(lease) = fixture
+        .udp
+        .begin_or_merge_direct_validation("peer-b", scope.pair.remote_endpoint, scope.generation)
+        .await
+    else {
+        panic!("validation owner");
+    };
+    let mut stale = scope.clone();
+    stale.token.push_str("-retired");
+    assert!(fixture
+        .peers
+        .hard_hard_validation_deadline("peer-b", &stale)
+        .await
+        .is_none());
+    let deadline = lease.hard_hard.as_ref().unwrap().deadline;
+    tokio::time::pause();
+    tokio::time::advance(deadline - tokio::time::Instant::now() + Duration::from_millis(1)).await;
+    fixture
+        .udp
+        .finish_direct_validation_session("peer-b", lease.owner_token)
+        .await;
+    fixture
+        .peers
+        .hard_hard_validation_completed(
+            "peer-b",
+            &scope,
+            DirectValidationCompletion::DeadlineExpired,
+        )
+        .await;
+    assert!(fixture
+        .peers
+        .hard_hard_validation_deadline("peer-b", &scope)
+        .await
+        .is_none());
+    assert!(matches!(
+        fixture
+            .udp
+            .begin_or_merge_direct_validation(
+                "peer-b",
+                scope.pair.remote_endpoint,
+                scope.generation,
+            )
+            .await,
+        DirectValidationSessionStart::IgnoredInactive
+    ));
+    tokio::time::resume();
+    fixture.cleanup().await;
+}
+
+#[tokio::test]
+async fn cancelled_validation_finish_preserves_owner_until_reducer_cleanup_can_retry() {
+    let _serial = crate::tests::HARD_HARD_E2E_SERIAL.acquire().await.unwrap();
+    // Exercise cancellation while waiting for epoch, connection state, and
+    // final expectation removal. No sleeps or timing-dependent contention.
+    for blocked_stage in 0..3 {
+        let fixture = WinnerFixture::with_protocol(true, true).await;
+        let scope = confirmed(&fixture).await;
+        let DirectValidationSessionStart::Spawn(lease) = fixture
+            .udp
+            .begin_or_merge_direct_validation(
+                "peer-b",
+                scope.pair.remote_endpoint,
+                scope.generation,
+            )
+            .await
+        else {
+            panic!("first owner");
+        };
+        let target = *lease.target_rx.borrow();
+        let identity = |owner, request| {
+            crate::peer::DirectValidationIdentity::owned(
+                crate::peer::PathEpoch::new(
+                    target.generation,
+                    target.peer_session_generation,
+                    target.remote_candidate_epoch,
+                ),
+                owner,
+                Some(request),
+                Some(target.endpoint),
+            )
+        };
+        fixture
+            .udp
+            .prepare_direct_validation_send("peer-b", identity(lease.owner_token, 19))
+            .await
+            .unwrap();
+        let epoch_gate = fixture.peers.network_epoch_gate();
+        let epoch = if blocked_stage == 0 {
+            Some(epoch_gate.lock().await)
+        } else {
+            None
+        };
+        let connections = if blocked_stage == 1 {
+            Some(fixture.peers.hold_connections_writer_for_test().await)
+        } else {
+            None
+        };
+        let expectations = if blocked_stage == 2 {
+            Some(fixture.udp.direct_validation.expectations.lock().await)
+        } else {
+            None
+        };
+        let mut finish = Box::pin(
+            fixture
+                .udp
+                .finish_direct_validation_session("peer-b", lease.owner_token),
+        );
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(finish.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        drop(finish); // The HH deadline/cancellation drops this same future.
+        drop(expectations);
+        drop(connections);
+        drop(epoch);
+        assert_eq!(
+            fixture
+                .udp
+                .direct_validation_target("peer-b")
+                .await
+                .unwrap()
+                .owner_token,
+            lease.owner_token,
+            "stage {blocked_stage}: interrupted cleanup must retain its only owner record"
+        );
+        assert!(
+            fixture
+                .udp
+                .has_direct_validation_expectation("peer-b")
+                .await
+        );
+        assert!(!lease.target_rx.borrow().cancelled);
+        assert!(
+            fixture
+                .udp
+                .finish_direct_validation_session("peer-b", lease.owner_token)
+                .await
+        );
+        assert!(fixture
+            .udp
+            .direct_validation_target("peer-b")
+            .await
+            .is_none());
+        assert!(
+            !fixture
+                .udp
+                .has_direct_validation_expectation("peer-b")
+                .await
+        );
+        assert!(lease.target_rx.borrow().cancelled);
+
+        let DirectValidationSessionStart::Spawn(replacement) = fixture
+            .udp
+            .begin_or_merge_direct_validation(
+                "peer-b",
+                scope.pair.remote_endpoint,
+                scope.generation,
+            )
+            .await
+        else {
+            panic!("replacement owner");
+        };
+        fixture
+            .udp
+            .prepare_direct_validation_send("peer-b", identity(replacement.owner_token, 20))
+            .await
+            .expect("a retired reducer owner must not reject replacement validation");
+        let before =
+            fixture.peers.hold_connections_writer_for_test().await["peer-b"].path_state_snapshot();
+        assert!(
+            !fixture
+                .udp
+                .finish_direct_validation_session("peer-b", lease.owner_token)
+                .await
+        );
+        let after =
+            fixture.peers.hold_connections_writer_for_test().await["peer-b"].path_state_snapshot();
+        assert_eq!(
+            before.state.direct, after.state.direct,
+            "late old cleanup cannot clear the replacement reducer owner"
+        );
+        assert_eq!(
+            fixture
+                .udp
+                .direct_validation_target("peer-b")
+                .await
+                .unwrap()
+                .owner_token,
+            replacement.owner_token
+        );
+        assert!(
+            fixture
+                .udp
+                .has_direct_validation_expectation("peer-b")
+                .await
+        );
+        fixture
+            .udp
+            .finish_direct_validation_session("peer-b", replacement.owner_token)
+            .await;
+        fixture.cleanup().await;
+    }
+}
+
+#[tokio::test]
 async fn hard_hard_hh2_crossed_checks_converge_only_after_one_nomination() {
     let _serial = crate::tests::HARD_HARD_E2E_SERIAL.acquire().await.unwrap();
     let controlling = WinnerFixture::with_protocol(true, true).await;
@@ -443,12 +832,6 @@ async fn hard_hard_hh2_prepare_bounds_scope_preflight_connection_contention() {
     let _serial = crate::tests::HARD_HARD_E2E_SERIAL.acquire().await.unwrap();
     let fixture = WinnerFixture::with_protocol(true, true).await;
     let scope = confirmed(&fixture).await;
-    assert!(
-        fixture
-            .udp
-            .mark_hh2_data_validated("peer-b", Some(&scope))
-            .await
-    );
     let epoch = fixture.udp.network_epoch_gate.lock().await;
     let connections = fixture.peers.hold_connections_writer_for_test().await;
     tokio::time::pause();
@@ -463,6 +846,55 @@ async fn hard_hard_hh2_prepare_bounds_scope_preflight_connection_contention() {
     drop(epoch);
     tokio::time::resume();
     assert!(!fixture.peers.is_direct_sync("peer-b"));
+    assert!(
+        matches!(
+            fixture
+                .peers
+                .hard_hard_pair_next_action("peer-b", TOKEN, true)
+                .await,
+            Some(crate::peer::HardHardPairAction::Validate(_))
+        ),
+        "a cancelled commit preparation must not strand the selected pair as validated"
+    );
+    fixture.cleanup().await;
+}
+
+#[tokio::test]
+async fn hard_hard_hh2_readiness_timeout_is_not_owner_revocation() {
+    let _serial = crate::tests::HARD_HARD_E2E_SERIAL.acquire().await.unwrap();
+    let fixture = WinnerFixture::with_protocol(true, true).await;
+    let selected = pair(&fixture, 0, fixture.remote.local_addr().unwrap());
+    assert!(observe(&fixture, &selected, HardHardPairEvidence::ConnectivityAck).await);
+    fixture.sockets[0].writable().await.unwrap();
+    let epoch = fixture.udp.network_epoch_gate.lock().await;
+    tokio::time::pause();
+    let error = fixture
+        .udp
+        .send_hh2_probe_datagram(
+            selected.socket_index,
+            &fixture.sockets[0],
+            b"not-sent",
+            "peer-b",
+            selected.remote_endpoint,
+            TOKEN,
+            PendingProbePurpose::HardHardNomination,
+            true,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+    drop(epoch);
+    tokio::time::resume();
+    let mut bytes = [0; 128];
+    assert_eq!(
+        fixture.remote.try_recv_from(&mut bytes).unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+    assert!(fixture
+        .peers
+        .hard_hard_pair_scope("peer-b", TOKEN)
+        .await
+        .is_some());
     fixture.cleanup().await;
 }
 
@@ -505,12 +937,6 @@ async fn hard_hard_hh2_direct_mirrors_precede_winner_unlock_and_stale_cleanup() 
     let _serial = crate::tests::HARD_HARD_E2E_SERIAL.acquire().await.unwrap();
     let fixture = WinnerFixture::with_protocol(true, true).await;
     let scope = confirmed(&fixture).await;
-    assert!(
-        fixture
-            .udp
-            .mark_hh2_data_validated("peer-b", Some(&scope))
-            .await
-    );
     let epoch = fixture.udp.network_epoch_gate.lock().await;
     assert!(
         fixture

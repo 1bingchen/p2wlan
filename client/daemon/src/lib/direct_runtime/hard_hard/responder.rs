@@ -377,6 +377,21 @@ pub(crate) async fn spawn_hard_hard_responder(
     );
     let cancellation = session.cancellation_handle();
     let session_id = coordination.encode();
+    // Keep the existing per-peer candidate owner until this first OFFER has
+    // installed its authoritative record. A retry must not start another
+    // measurement in the pre-ledger interval. The receipt adds no new owner.
+    let (installed_tx, installed_rx) = if coordination.v2.is_some() {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        (Some(tx), Some(rx))
+    } else {
+        (None, None)
+    };
+    let install_deadline = tokio::time::Instant::now()
+        + Duration::from_millis(punch_at_ms.saturating_sub(hard_hard_now_ms()));
+    let install_cancellation = cancellation.clone();
+    let mut install_guard = installed_rx
+        .as_ref()
+        .map(|_| PendingHardHardSessionCancellation::new(cancellation.clone()));
     tokio::spawn(async move {
         let mut pending_session_cancellation =
             PendingHardHardSessionCancellation::new(cancellation.clone());
@@ -768,6 +783,12 @@ pub(crate) async fn spawn_hard_hard_responder(
         // responder task must cancel the shared handle so the provisional
         // measurement guard cannot outlive a pre-ledger return.
         pending_session_cancellation.disarm();
+        if let Some(installed_tx) = installed_tx {
+            if cancellation.is_cancelled() || installed_tx.send(()).is_err() {
+                cancellation.cancel_for_hard_hard_cleanup();
+                return;
+            }
+        }
         if coordination.v2.is_some()
             && !udp
                 .enable_hard_hard_pair_sockets(&peer_id, &coordination.token)
@@ -872,18 +893,20 @@ pub(crate) async fn spawn_hard_hard_responder(
                     &coordination.token,
                     false,
                     publication_deadline,
-                    signal
-                        .control
-                        .send_fresh_peer_offer_with_session_and_punch_schedule(
-                            &peer_id,
-                            &candidates,
-                            &candidate_sources,
-                            &[],
-                            Some(punch_at_ms),
-                            punch_at_server_ms,
-                            Some(response_coordination.encode()),
-                            cancellation.clone(),
-                        ),
+                    hard_hard_send_initial_signal(
+                        &peers,
+                        &signal.control,
+                        &peer_id,
+                        &coordination.token,
+                        &candidates,
+                        &candidate_sources,
+                        punch_at_ms,
+                        punch_at_server_ms,
+                        response_coordination.encode(),
+                        cancellation.clone(),
+                        publication_deadline,
+                        recovery_identity,
+                    ),
                 )
                 .await;
             hard_hard_a0_stage_log(
@@ -1276,5 +1299,18 @@ pub(crate) async fn spawn_hard_hard_responder(
             }
         }
     });
+    if let Some(installed_rx) = installed_rx {
+        let installed = tokio::select! {
+            biased;
+            _ = install_cancellation.cancelled() => false,
+            receipt = tokio::time::timeout_at(install_deadline, installed_rx) => matches!(receipt, Ok(Ok(()))),
+        };
+        if !installed || install_cancellation.is_cancelled() {
+            return HardHardRemoteStart::Rejected;
+        }
+        if let Some(guard) = install_guard.as_mut() {
+            guard.disarm();
+        }
+    }
     HardHardRemoteStart::Started
 }

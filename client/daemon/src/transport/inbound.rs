@@ -833,11 +833,6 @@ impl WireGuardTransport {
                                     };
                                     let session_current = inbound.session_instance.is_none()
                                         || session_guard.is_some();
-                                    // Direct validation revalidates the exact
-                                    // peer lifecycle and owned request token.
-                                    // Release the inbound evidence fence before
-                                    // any of its async manager/UDP transactions.
-                                    drop(session_guard);
                                     if let (true, Some(peer_session_generation)) =
                                         (session_current, peer_session_generation)
                                     {
@@ -859,6 +854,7 @@ impl WireGuardTransport {
                                             socket_index,
                                             direct_socket.clone(),
                                             peer_session_generation,
+                                            session_guard,
                                             token,
                                         )
                                         .await;

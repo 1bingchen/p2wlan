@@ -51,6 +51,9 @@ use probe_budget::{
 };
 include!("udp/state.rs");
 
+mod stun_waiter;
+use stun_waiter::StunWaiters;
+
 include!("udp/admission.rs");
 include!("udp/gather.rs");
 include!("udp/fast_gather.rs");
@@ -229,7 +232,8 @@ pub struct UdpTransport {
     /// layering: `udp` is below `lib`), so the daemon registers a closure at
     /// setup.  Both matched ACK and peer-reflexive paths call this same
     /// ingress; it only queues/merges evidence and never spawns a worker.
-    validation_trigger: Option<Arc<dyn Fn(PeerReflexiveObservation) + Send + Sync>>,
+    validation_trigger:
+        Option<Arc<dyn Fn(PeerReflexiveObservation) -> DirectValidationAdmission + Send + Sync>>,
     triggered_checks: TriggeredCheckState,
     nat_maintainers: NatMaintainerState,
     /// Dedicated per-(peer, socket) budget for NAT-state binding maintainer
@@ -372,7 +376,8 @@ mod hard_hard_pair;
 mod hard_hard_pair_commit;
 mod hard_hard_pair_send;
 mod hard_hard_pair_validation;
-use hard_hard_pair_validation::{HardHardSocketMode, HardHardValidationScope};
+use hard_hard_pair_validation::HardHardSocketMode;
+pub(crate) use hard_hard_pair_validation::{HardHardValidationScope, HardHardValidationWork};
 
 mod diagnostics;
 
@@ -391,6 +396,7 @@ mod birthday;
 mod punch_sender;
 
 mod punch_pacing;
+pub(crate) use punch_pacing::hard_hard_first_wave_pacing_margin;
 use punch_pacing::HardHardProbePacer;
 
 mod punch_reports;

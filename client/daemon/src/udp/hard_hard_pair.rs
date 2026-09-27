@@ -1,5 +1,8 @@
 use super::*;
-use crate::peer::{HardHardPairAction, HardHardPairEvidence, HardHardPairKey};
+use crate::peer::{
+    HardHardPairAction, HardHardPairEvidence, HardHardPairKey, HardHardPairSendOutcome,
+    HardHardPairSendPhase, HARD_HARD_PAIR_RETRY_INTERVAL,
+};
 
 impl UdpTransport {
     /// Run inside the existing HH worker, never as a detached task. No action
@@ -67,15 +70,23 @@ impl UdpTransport {
                                         Some(pair.local_endpoint),
                                     )
                                     .await;
-                                self.trigger_encrypted_validation(peer, pair.remote_endpoint)
+                                let admission = self
+                                    .trigger_encrypted_validation(peer, pair.remote_endpoint)
                                     .await;
+                                if admission == DirectValidationAdmission::Backpressured {
+                                    trace!(peer_id = peer, token,
+                                        "HH validation observation deferred by bounded ingress; no Request allowance spent");
+                                }
                             }
                         }
-                        HardHardPairAction::Check(pair) => {
-                            self.send_hh2_pair_action(peer, token, pair, false).await
-                        }
-                        HardHardPairAction::Nominate(pair) => {
-                            self.send_hh2_pair_action(peer, token, pair, true).await
+                        HardHardPairAction::Send(pair, phase) => {
+                            let outcome =
+                                self.send_hh2_pair_action(peer, token, &pair, phase).await;
+                            self.peers
+                                .hard_hard_pair_record_send_outcome(
+                                    peer, token, &pair, phase, outcome,
+                                )
+                                .await;
                         }
                     }
                 }
@@ -86,27 +97,27 @@ impl UdpTransport {
         let _ = tokio::time::timeout_at(confirmation_deadline, worker).await;
     }
 
-    async fn send_hh2_pair_action(
+    pub(super) async fn send_hh2_pair_action(
         &self,
         peer: &str,
         token: &str,
-        pair: HardHardPairKey,
-        nominate: bool,
-    ) {
-        let Some(deadline) = self
+        pair: &HardHardPairKey,
+        phase: HardHardPairSendPhase,
+    ) -> HardHardPairSendOutcome {
+        let nominate = phase == HardHardPairSendPhase::Nomination;
+        let Some((deadline, budget_purpose)) = self
             .peers
-            .hard_hard_pair_send_deadline(peer, token, &pair, nominate)
+            .hard_hard_pair_send_admission(peer, token, pair, phase)
             .await
         else {
-            return;
+            return HardHardPairSendOutcome::Stopped;
         };
+        // Before the classified sender starts there can be no packet. After
+        // entry a timeout may interrupt post-syscall bookkeeping, so retain
+        // its attempt instead of blindly refunding an unknown delivery.
+        let mut sender_entered = false;
         let action = async {
-            let budget_purpose = if nominate {
-                crate::peer::RecoveryProbePurpose::HardHardNomination
-            } else {
-                crate::peer::RecoveryProbePurpose::HardHardTriggered
-            };
-            if self
+            let admission = self
                 .admit_hard_hard_connectivity_probe(
                     peer,
                     pair.remote_endpoint,
@@ -114,26 +125,30 @@ impl UdpTransport {
                     token,
                     budget_purpose,
                 )
-                .await
-                != OutboundProbeAdmission::Accepted
-            {
-                self.peers
-                    .hard_hard_pair_defer_send(peer, token, &pair)
-                    .await;
-                return;
+                .await;
+            if admission != OutboundProbeAdmission::Accepted {
+                return match admission {
+                    OutboundProbeAdmission::RecoveryIdentityStale
+                    | OutboundProbeAdmission::EpochCreditExhausted
+                    | OutboundProbeAdmission::HardHardConfirmationCreditReserved => {
+                        HardHardPairSendOutcome::Stopped
+                    }
+                    _ => HardHardPairSendOutcome::BudgetDeferred,
+                };
             }
             let Some((index, socket, _lease)) = self
                 .resolve_dynamic_socket_index_for_send(peer, pair.socket_index)
                 .await
             else {
-                return;
+                return HardHardPairSendOutcome::Stopped;
             };
             let purpose = if nominate {
                 PendingProbePurpose::HardHardNomination
             } else {
                 PendingProbePurpose::HardHardTriggeredCheck
             };
-            let _ = self
+            sender_entered = true;
+            match self
                 .send_probe_on_socket_result_with_hard_hard_token_classified(
                     index,
                     socket,
@@ -145,13 +160,36 @@ impl UdpTransport {
                     true,
                     None,
                 )
-                .await;
+                .await
+            {
+                Ok(_) => HardHardPairSendOutcome::Sent,
+                // HH2 sends exactly one primary datagram and no compatibility
+                // burst. This returned error proves that handoff failed; it
+                // is different from cancellation while awaiting its result.
+                Err(failure) if failure.kind == ProbeSendFailureKind::PhysicalSend => {
+                    HardHardPairSendOutcome::RetryableNotSent
+                }
+                Err(_) => HardHardPairSendOutcome::Stopped,
+            }
         };
-        let _ = tokio::time::timeout_at(
-            deadline.min(tokio::time::Instant::now() + Duration::from_millis(100)),
+        // Leave room for the sender's own 100ms readiness bound to return a
+        // definite non-send. Never extend the negotiated phase/TTL deadline.
+        let outcome = match tokio::time::timeout_at(
+            deadline.min(tokio::time::Instant::now() + HARD_HARD_PAIR_RETRY_INTERVAL),
             action,
         )
-        .await;
+        .await
+        {
+            Ok(outcome) => outcome,
+            Err(_) if sender_entered => HardHardPairSendOutcome::DeliveryUnknown,
+            Err(_) => HardHardPairSendOutcome::RetryableNotSent,
+        };
+        if outcome != HardHardPairSendOutcome::Sent {
+            debug!(event = "hard_hard_pair_send_deferred", peer_id = peer,
+                phase = ?phase, outcome = ?outcome,
+                "bounded pair send did not report a successful handoff");
+        }
+        outcome
     }
 
     /// Separate hh2 receive reducer: none of the legacy learning/affinity

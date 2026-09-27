@@ -1,3 +1,4 @@
+use p2pnet_nat::mapping::allocation::validate_allocation_prediction_tail;
 use p2pnet_nat::{
     infer_port_domain, infer_scoped_allocation, plan_fixed_anchor, validate_allocation_attempts,
     AllocationAttempt, AllocationAttemptOutcome, AllocationEvidenceRejection as Reject,
@@ -201,6 +202,123 @@ fn a_timed_out_last_send_cannot_disappear_from_a_complete_observed_prefix() {
     assert_eq!(
         validate_allocation_attempts(&samples[..5], &attempts),
         Ok(())
+    );
+}
+
+fn attempted(samples: &[AllocationSample]) -> Vec<AllocationAttempt> {
+    samples
+        .iter()
+        .map(|sample| AllocationAttempt {
+            sequence: sample.observation.sequence,
+            local_endpoint: sample.observation.local_endpoint,
+            destination: sample.observation.observer,
+            sent_at_ms: sample.observation.sent_at_ms,
+            datagram_bytes: 40,
+            outcome: AllocationAttemptOutcome::Observed,
+        })
+        .collect()
+}
+
+#[test]
+fn an_early_unknown_allocation_can_rebase_only_a_complete_final_primary_tail() {
+    for outcome in [
+        AllocationAttemptOutcome::SentUnobserved,
+        AllocationAttemptOutcome::SendFailed,
+    ] {
+        let mut samples = grid(&[40000, 40001, 40002, 40003, 40004, 40005]);
+        let mut attempts = attempted(&samples);
+        attempts[1].outcome = outcome;
+        samples.remove(1);
+        let endpoint = samples[0].observation.local_endpoint;
+        let tail = validate_allocation_prediction_tail(&samples, &attempts, 0, endpoint).unwrap();
+        assert_eq!(
+            tail.iter()
+                .map(|sample| sample.observation.sequence)
+                .collect::<Vec<_>>(),
+            [3, 4, 5]
+        );
+        assert_eq!(tail.last().unwrap().observation.observed.port(), 40005);
+        // A valid local suffix never upgrades the incomplete shared grid.
+        assert_eq!(
+            validate_allocation_attempts(&samples, &attempts),
+            Err(Reject::UnobservedAllocation)
+        );
+        assert!(
+            infer_scoped_allocation(&samples, identity(), 160, Duration::from_secs(1)).is_err()
+        );
+    }
+}
+
+#[test]
+fn prediction_tail_rejects_unknown_final_sends_and_too_short_rebases() {
+    for missing in [3, 4, 5] {
+        let mut samples = grid(&[40000, 40001, 40002, 40003, 40004, 40005]);
+        let mut attempts = attempted(&samples);
+        attempts[missing].outcome = AllocationAttemptOutcome::SentUnobserved;
+        samples.remove(missing);
+        let result = validate_allocation_prediction_tail(
+            &samples,
+            &attempts,
+            0,
+            samples[0].observation.local_endpoint,
+        );
+        assert_eq!(
+            result,
+            Err(if missing == 5 {
+                Reject::UnobservedAllocation
+            } else {
+                Reject::SampleCount
+            })
+        );
+    }
+}
+
+#[test]
+fn prediction_rebase_still_reconciles_every_pair_identity_time_and_observation() {
+    let mut samples = grid(&[40000, 40001, 40002, 40003, 40004, 40005]);
+    let mut attempts = attempted(&samples);
+    attempts[1].outcome = AllocationAttemptOutcome::SentUnobserved;
+    samples.remove(1);
+    let endpoint = samples[0].observation.local_endpoint;
+    // An unknown request must not secretly carry a sample anyway.
+    let mut extra = samples.clone();
+    extra.insert(1, grid(&[40000, 40001])[1].clone());
+    assert_eq!(
+        validate_allocation_prediction_tail(&extra, &attempts, 0, endpoint),
+        Err(Reject::InconsistentOrder)
+    );
+    let mut mismatched = samples.clone();
+    mismatched[3].observation.sent_at_ms += 1;
+    assert_eq!(
+        validate_allocation_prediction_tail(&mismatched, &attempts, 0, endpoint),
+        Err(Reject::InconsistentOrder)
+    );
+    let mut mismatched = samples.clone();
+    mismatched[3].socket_id = 9;
+    assert!(validate_allocation_prediction_tail(&mismatched, &attempts, 0, endpoint).is_err());
+    let mut late = samples.clone();
+    late[1].observation.responded_at_ms = attempts[3].sent_at_ms + 1;
+    assert_eq!(
+        validate_allocation_prediction_tail(&late, &attempts, 0, endpoint),
+        Err(Reject::InconsistentOrder)
+    );
+    let mut changed_ip = samples.clone();
+    changed_ip[4]
+        .observation
+        .observed
+        .set_ip("198.51.100.2".parse().unwrap());
+    assert_eq!(
+        validate_allocation_prediction_tail(&changed_ip, &attempts, 0, endpoint),
+        Err(Reject::PublicIpChanged)
+    );
+    // Reusing an earlier timed-out primary destination does not allocate a
+    // defensible new sample, even when three replies later look consecutive.
+    attempts[0].outcome = AllocationAttemptOutcome::SentUnobserved;
+    samples.remove(0);
+    attempts[0].destination = attempts[3].destination;
+    assert_eq!(
+        validate_allocation_prediction_tail(&samples, &attempts, 0, endpoint),
+        Err(Reject::ReusedMappingPair)
     );
 }
 

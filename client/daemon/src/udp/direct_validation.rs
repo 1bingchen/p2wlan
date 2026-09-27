@@ -44,14 +44,34 @@ impl UdpTransport {
         // an old owner after that advance had already cleared every old
         // session.  The gate makes the check and insert one transaction.
         let _epoch_gate = self.network_epoch_gate.lock().await;
-        if self
-            .peers
-            .hard_hard_pair_validation_target(peer_id)
-            .await
-            .is_some_and(|target| !target.is_some_and(|(_, pair)| pair.remote_endpoint == endpoint))
-        {
-            return DirectValidationSessionStart::IgnoredInactive;
-        }
+        let hard_hard = match self.peers.hard_hard_pair_validation_target(peer_id).await {
+            None => None,
+            Some(Some((_, pair))) if pair.remote_endpoint == endpoint => {
+                let Ok(Some(scope)) = self
+                    .hard_hard_validation_scope(peer_id, pair.socket_index, endpoint)
+                    .await
+                else {
+                    return DirectValidationSessionStart::IgnoredInactive;
+                };
+                let Some(deadline) = self
+                    .peers
+                    .hard_hard_validation_deadline(peer_id, &scope)
+                    .await
+                else {
+                    return DirectValidationSessionStart::IgnoredInactive;
+                };
+                let Some(record) = self.peers.hard_hard_pair_scope(peer_id, &scope.token).await
+                else {
+                    return DirectValidationSessionStart::IgnoredInactive;
+                };
+                Some(HardHardValidationWork {
+                    scope,
+                    deadline,
+                    cancellation: record.cancellation,
+                })
+            }
+            Some(_) => return DirectValidationSessionStart::IgnoredInactive,
+        };
         let current_generation = self.peers.current_network_generation_sync();
         if current_generation != generation {
             debug!(target: "p2pnet_daemon::direct_validation",
@@ -155,6 +175,9 @@ impl UdpTransport {
                 && current.generation == generation
                 && current.peer_session_generation == peer_session_generation
                 && current.remote_candidate_epoch == remote_candidate_epoch
+                && sessions
+                    .get(peer_id)
+                    .is_some_and(|session| session.hard_hard == hard_hard)
             {
                 let replace_target = self
                     .peers
@@ -169,7 +192,11 @@ impl UdpTransport {
                     endpoint: target_endpoint,
                     ..current
                 };
-                target_tx.send_replace(updated);
+                // Identical periodic HH observations must not wake the request
+                // delay/ACK wait as if a new target had arrived.
+                if updated != current {
+                    target_tx.send_replace(updated);
+                }
                 let target_class_upgraded = target_endpoint != current.endpoint
                     && self
                         .peers
@@ -244,7 +271,13 @@ impl UdpTransport {
             cancelled: false,
         };
         let (target_tx, target_rx) = watch::channel(target);
-        sessions.insert(peer_id.to_string(), DirectValidationSession { target_tx });
+        sessions.insert(
+            peer_id.to_string(),
+            DirectValidationSession {
+                target_tx,
+                hard_hard: hard_hard.clone(),
+            },
+        );
         debug!(target: "p2pnet_daemon::direct_validation",
             event = "direct_validation_session_spawned",
             peer_id = %peer_id,
@@ -257,6 +290,7 @@ impl UdpTransport {
             peer_id: peer_id.to_string(),
             owner_token,
             target_rx,
+            hard_hard,
         })
     }
 
@@ -303,16 +337,45 @@ impl UdpTransport {
         peer_id: &str,
         owner_token: u64,
     ) -> bool {
-        // A worker's session removal and owner-conditional expectation cleanup
-        // share one lock boundary. This prevents a replacement session from
-        // being observed between the two operations and keeps the registry
-        // lock order identical to registration and ACK consumption.
+        // Keep the old registry owner until its reducer state is retired.
+        // Every await is cancellation-safe: an interrupted worker's outer
+        // owner-only cleanup can still find and finish this same owner. The
+        // epoch gate excludes replacement admission and ACK commit throughout.
+        let epoch = self.network_epoch_gate.lock().await;
+        let owned_target = {
+            let sessions = self.direct_validation.sessions.lock().await;
+            sessions.get(peer_id).and_then(|session| {
+                let target = *session.target_tx.borrow();
+                (target.owner_token == owner_token).then_some(target)
+            })
+        };
+        if let Some(target) = owned_target {
+            // No registry lock is needed while awaiting the connection lock:
+            // every new registry owner must first acquire this epoch gate.
+            self.peers
+                .finish_direct_validation_attempt_in_epoch(
+                    &epoch,
+                    peer_id,
+                    DirectValidationIdentity::owned(
+                        crate::peer::PathEpoch::new(
+                            target.generation,
+                            target.peer_session_generation,
+                            target.remote_candidate_epoch,
+                        ),
+                        owner_token,
+                        None,
+                        Some(target.endpoint),
+                    ),
+                )
+                .await;
+        }
+        // Acquire both registry locks before any destructive change. There
+        // are no await points between owner revocation and expectation removal.
         let mut sessions = self.direct_validation.sessions.lock().await;
-        let owned_target = sessions.get(peer_id).and_then(|session| {
-            let target = *session.target_tx.borrow();
-            (target.owner_token == owner_token).then_some(target)
-        });
-        let owned = owned_target.is_some();
+        let mut expectations = self.direct_validation.expectations.lock().await;
+        let owned = sessions
+            .get(peer_id)
+            .is_some_and(|session| session.target_tx.borrow().owner_token == owner_token);
         if owned {
             // Removing the map entry is not enough: the worker owns a clone
             // of the watch receiver and can otherwise keep sending its
@@ -330,31 +393,11 @@ impl UdpTransport {
             }
             sessions.remove(peer_id);
         }
-        let mut expectations = self.direct_validation.expectations.lock().await;
         if expectations
             .get(peer_id)
             .is_some_and(|expectation| expectation.owner_token == owner_token)
         {
             expectations.remove(peer_id);
-        }
-        drop(expectations);
-        drop(sessions);
-        if let Some(target) = owned_target {
-            self.peers
-                .finish_direct_validation_attempt(
-                    peer_id,
-                    DirectValidationIdentity::owned(
-                        crate::peer::PathEpoch::new(
-                            target.generation,
-                            target.peer_session_generation,
-                            target.remote_candidate_epoch,
-                        ),
-                        owner_token,
-                        None,
-                        Some(target.endpoint),
-                    ),
-                )
-                .await;
         }
         owned
     }
@@ -839,7 +882,7 @@ impl UdpTransport {
     pub(crate) fn enqueue_direct_validation_observation(
         &self,
         observation: PeerReflexiveObservation,
-    ) {
+    ) -> DirectValidationAdmission {
         // Endpoint-aware admission below still suppresses ordinary alternate
         // candidates for a Direct peer.  Keep this ingress open so a matched
         // LAN probe ACK can request a make-before-break validation while the
@@ -850,7 +893,7 @@ impl UdpTransport {
                 observation.observed_endpoint,
             )
         {
-            return;
+            return DirectValidationAdmission::Inactive;
         }
         let Some(trigger) = self.validation_trigger.as_ref() else {
             debug!(
@@ -858,19 +901,23 @@ impl UdpTransport {
                 remote_endpoint = %observation.observed_endpoint,
                 "no direct-validation scheduler ingress registered"
             );
-            return;
+            return DirectValidationAdmission::Inactive;
         };
-        trigger(observation);
+        trigger(observation)
     }
 
     /// Feed a matched authenticated ACK into the same observation ingress as
     /// the peer-reflexive loop.  The session registry, rather than a separate
     /// endpoint cooldown, supplies the hard worker bound and newest-wins
     /// endpoint policy.
-    pub(super) async fn trigger_encrypted_validation(&self, peer_id: &str, endpoint: SocketAddr) {
+    pub(super) async fn trigger_encrypted_validation(
+        &self,
+        peer_id: &str,
+        endpoint: SocketAddr,
+    ) -> DirectValidationAdmission {
         self.enqueue_direct_validation_observation(PeerReflexiveObservation {
             peer_id: peer_id.to_string(),
             observed_endpoint: endpoint,
-        });
+        })
     }
 }

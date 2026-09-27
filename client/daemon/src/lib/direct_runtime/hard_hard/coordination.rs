@@ -18,6 +18,7 @@ const HARD_HARD_RESPONSE_DEADLINE_TOLERANCE: Duration = Duration::from_millis(25
 const HARD_HARD_DIRECT_CONFIRMATION_GRACE: Duration = Duration::from_secs(2);
 const HARD_HARD_SWEEP_INTERVAL: Duration = Duration::from_millis(20);
 const HARD_HARD_SWEEP_ATTEMPTS: u32 = 2;
+const HARD_HARD_BARRIER_MAX_ATTEMPTS: u8 = 3;
 const HARD_HARD_MAX_PREDICTION_TARGETS: usize = 32;
 const HARD_HARD_MAX_BIRTHDAY_TARGETS: usize = 256;
 const HARD_HARD_PROTECTED_CLAIM_RETRY_SLACK: Duration = Duration::from_millis(10);
@@ -128,12 +129,17 @@ impl HardHardCoordination {
     pub(crate) fn looks_like(value: &str) -> bool {
         // Reserve the whole numeric version namespace. Unknown HH versions
         // must be rejected, never treated as an ordinary fresh offer.
-        value.split_once(':').is_some_and(|(prefix, _)| prefix.strip_prefix("hh")
-            .is_some_and(|version| !version.is_empty() && version.bytes().all(|c| c.is_ascii_digit())))
+        value.split_once(':').is_some_and(|(prefix, _)| {
+            prefix.strip_prefix("hh").is_some_and(|version| {
+                !version.is_empty() && version.bytes().all(|c| c.is_ascii_digit())
+            })
+        })
     }
 
     pub(crate) fn parse(value: &str) -> Option<Self> {
-        if value.starts_with("hh2:") { return Self::parse_v2(value); }
+        if value.starts_with("hh2:") {
+            return Self::parse_v2(value);
+        }
         let mut fields = value.split(':');
         if fields.next()? != HARD_HARD_SESSION_PREFIX {
             return None;
@@ -197,7 +203,9 @@ impl HardHardCoordination {
         if let Some(meta) = &self.v2 {
             // Keep malformed internal input in the reserved namespace. Every
             // sender checks the encoded envelope before publishing it.
-            return self.encode_v2(meta).unwrap_or_else(|| "hh2:invalid".to_string());
+            return self
+                .encode_v2(meta)
+                .unwrap_or_else(|| "hh2:invalid".to_string());
         }
         format!(
             "{HARD_HARD_SESSION_PREFIX}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
@@ -392,6 +400,48 @@ fn hard_hard_plan_matches(
 
 fn hard_hard_response_deadline_matches(expected_ms: u64, received_ms: u64) -> bool {
     expected_ms.abs_diff(received_ms) <= HARD_HARD_RESPONSE_DEADLINE_TOLERANCE.as_millis() as u64
+}
+
+fn hard_hard_repeated_transcript_matches(
+    record: &HardHardSessionRecord,
+    incoming: &HardHardCoordination,
+    candidates: &[String],
+    server_deadline: Option<u64>,
+) -> bool {
+    let Some(plan) = record.coordinated_plan.as_ref() else {
+        return false;
+    };
+    let Some(original_offer) = HardHardCoordination::parse(&record.session_id) else {
+        return false;
+    };
+    let Some(meta) = incoming.v2.as_ref() else {
+        return false;
+    };
+    let remote = hard_hard_prediction_targets(candidates, crate::MAX_SIGNAL_CANDIDATES);
+    if incoming.token != record.session_token
+        || server_deadline != Some(plan.canonical_server_deadline)
+        || candidates.len() != remote.len()
+        || remote != record.remote_prediction
+    {
+        return false;
+    }
+    if !record.initiator {
+        return meta.stage == HardHardV2Stage::Offer && *incoming == original_offer;
+    }
+    let Some(agreement) = plan.agreement else {
+        return false;
+    };
+    meta.stage == HardHardV2Stage::Answer
+        && meta.agreement == Some(agreement)
+        && hard_hard_plan_digest(
+            &original_offer,
+            incoming,
+            &record.prediction_window,
+            &remote,
+            (plan.local_registration_seq, plan.remote_registration_seq),
+            plan.canonical_server_deadline,
+            agreement.strategy,
+        ) == Some(agreement.digest)
 }
 
 fn hard_hard_prediction_targets(candidates: &[String], limit: usize) -> Vec<SocketAddr> {
@@ -703,6 +753,13 @@ fn hard_hard_initiator_response_record_matches(
     current: &HardHardSessionRecord,
     expected: &HardHardSessionRecord,
 ) -> bool {
+    // Publication receipt timing is observation-only and can arrive while
+    // ANSWER admission acquires its owner. All measured facts remain fenced.
+    let mut current_measurement = current.measurement.clone();
+    current_measurement.candidate_signal_accepted_at_ms =
+        expected.measurement.candidate_signal_accepted_at_ms;
+    current_measurement.advertised_candidate_count =
+        expected.measurement.advertised_candidate_count;
     current.session_id == expected.session_id
         && current.session_token == expected.session_token
         && current.peer_id == expected.peer_id
@@ -727,7 +784,7 @@ fn hard_hard_initiator_response_record_matches(
         && current.fresh_socket == expected.fresh_socket
         && current.punch_at_ms == expected.punch_at_ms
         && current.expires_at_ms == expected.expires_at_ms
-        && current.measurement == expected.measurement
+        && current_measurement == expected.measurement
         && Arc::ptr_eq(&current.cancellation, &expected.cancellation)
         && !current.cancellation.is_cancelled()
 }

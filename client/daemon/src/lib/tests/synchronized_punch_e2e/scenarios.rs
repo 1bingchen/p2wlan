@@ -485,6 +485,101 @@ async fn hard_hard_initiator_deferred_claim_refunds_exact_fresh_quota() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn hard_hard_measurement_lane_contention_refunds_without_sending_stun() {
+    let (_daemon, peers, udp, _) = build_hard_hard_ordinary_fallback_fixture().await;
+    let remote_public: SocketAddr = "198.51.100.20:42000".parse().unwrap();
+    let mut remote = peer_info(
+        HARD_HARD_B,
+        "10.20.0.2",
+        "hard-hard-fallback-peer-key".to_string(),
+        remote_public,
+        hard_hard_profile(remote_public, 3).control_label_with_generation(1),
+    );
+    remote.registration_seq = 1;
+    remote.capabilities = control::PeerCapabilities::current();
+    peers.add_peer(&remote).await;
+    peers
+        .add_candidates_with_sources(
+            HARD_HARD_B,
+            &[remote_public.to_string()],
+            &HashMap::from([(remote_public.to_string(), "predicted".to_string())]),
+        )
+        .await;
+    peers.add_peer(&remote).await;
+    assert!(peers.peer_supports_hh2(HARD_HARD_B).await);
+    assert!(peers.hard_hard_plan_for_peer(HARD_HARD_B).await.is_some());
+    let control = ControlClient::disabled_for_test();
+    control.set_local_registration_for_test(Some(1), control::PeerCapabilities::current());
+    assert!(control.local_supports_hh2());
+    let observers = [
+        UdpSocket::bind("127.0.0.1:0").await.unwrap(),
+        UdpSocket::bind("127.0.0.1:0").await.unwrap(),
+        UdpSocket::bind("127.0.0.1:0").await.unwrap(),
+    ];
+    let signal = hard_hard_fallback_signal(
+        control,
+        1,
+        observers
+            .iter()
+            .map(|socket| socket.local_addr().unwrap())
+            .collect(),
+    );
+    let existing_owner = Arc::new(PunchSessionCancellation::default());
+    let held = udp
+        .acquire_hard_hard_measurement_lease(
+            peers.current_network_generation_sync(),
+            &existing_owner,
+            Instant::now() + Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+    let epoch = match peers.recovery_epoch_admit(HARD_HARD_B).await {
+        RecoveryAdmission::Accepted { epoch } => epoch,
+        other => panic!("fixture epoch must admit: {other:?}"),
+    };
+    let before = peers
+        .recovery_epoch_work_budget_report(HARD_HARD_B)
+        .await
+        .unwrap();
+    assert_eq!(
+        spawn_hard_hard_initiator(
+            udp,
+            peers.clone(),
+            PunchAttemptDeduplicator::default(),
+            HARD_HARD_B.to_string(),
+            signal,
+            None,
+        )
+        .await,
+        HardHardInitiatorStart::Started,
+    );
+    let event = wait_for_stage(&peers, HARD_HARD_B, "hard_hard_measurement_not_started").await;
+    assert!(event.detail.contains("measurement_admission_deferred"));
+    let after = peers
+        .recovery_epoch_work_budget_report(HARD_HARD_B)
+        .await
+        .unwrap();
+    assert_eq!(after.epoch, epoch);
+    assert_eq!(after.hard_hard_generations_remaining, 1);
+    assert_eq!(after.probe_credit_remaining, before.probe_credit_remaining);
+    assert_eq!(after.http_remaining, before.http_remaining);
+    for observer in &observers {
+        let mut packet = [0; 2048];
+        assert_eq!(
+            observer.try_recv_from(&mut packet).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
+    assert!(!existing_owner.is_cancelled());
+    held.release();
+    let retry = peers
+        .try_begin_hard_hard_generation_for_epoch(HARD_HARD_B, epoch)
+        .await
+        .expect("same epoch must retain its never-started HH opportunity");
+    retry.refund().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn hard_hard_response_network_generation_fence_precedes_punch_preemption() {
     let (_daemon, peers, udp, _control) = build_hard_hard_ordinary_fallback_fixture().await;
     let plan = peers

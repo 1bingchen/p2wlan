@@ -110,7 +110,8 @@ pub fn bounded_prediction_window(ports: &[u16], cap: usize) -> Vec<u16> {
 
 /// A toy-model ordering primitive. The protocol must keep the initiator's
 /// received candidate order unchanged (as hh1 does), and callers must prove
-/// both windows are complete, equal-width fixed-step sequences before use.
+/// both participating prefixes are complete, equal-width fixed-step sequences
+/// before use. Wider advertised windows may retain their unmodified suffix.
 /// This changes only the responder's local schedule, never the wire window.
 /// The initial clean successor stays first. Alternate phases belong to fresh
 /// socket generations, never retransmissions of already allocated mappings.
@@ -135,8 +136,16 @@ pub fn fixed_step_rendezvous_order(
 }
 
 /// Validate the exact advertised windows before applying the local schedule.
-/// No wire candidate is invented or removed. Unequal, sparse, mixed-IP,
-/// duplicate, or ambiguous half-ring windows retain the caller's old order.
+/// No wire candidate is invented or removed. When complete windows have
+/// different widths, only their common prefix participates in the proof above;
+/// the responder retains the rest of its remote targets in their original order.
+/// Old initiators already scan their received window in order, including that
+/// common prefix, so this requires no change to the negotiated transcript.
+/// Sparse, mixed-IP, duplicate, or ambiguous half-ring windows retain the
+/// caller's old order, even when their common prefixes alone look regular.
+/// A wrapped window may use the predictor's observed port domain instead of
+/// the legacy 65536 ring. The check below proves only consecutive candidate
+/// ranks in the advertised list; it never creates port-domain/NAT evidence.
 pub fn fixed_step_rendezvous_targets(
     local: &[SocketAddr],
     remote: &[SocketAddr],
@@ -153,23 +162,50 @@ pub fn fixed_step_rendezvous_targets(
         }) {
             return false;
         }
-        let step = super::modular_difference(endpoints[0].port(), endpoints[1].port());
-        step != 0
-            && step != i16::MIN
-            && endpoints
-                .windows(2)
-                .all(|pair| super::modular_difference(pair[0].port(), pair[1].port()) == step)
+        let deltas = endpoints
+            .windows(2)
+            .map(|pair| i32::from(pair[1].port()) - i32::from(pair[0].port()))
+            .collect::<Vec<_>>();
+        let Some(&min_delta) = deltas.iter().min() else {
+            return false;
+        };
+        let Some(&max_delta) = deltas.iter().max() else {
+            return false;
+        };
+        if min_delta == max_delta {
+            return min_delta != 0;
+        }
+        // A constant circular step has exactly two raw deltas, separated by
+        // its modulus W. Both have the same residue modulo W. Requiring the
+        // whole port span to fit inside W prevents a sparse multi-range list
+        // from masquerading as a cycle; no absolute pool boundary is inferred.
+        let width = max_delta - min_delta;
+        let (min_port, max_port) = endpoints
+            .iter()
+            .fold((first.port(), first.port()), |(min, max), endpoint| {
+                (min.min(endpoint.port()), max.max(endpoint.port()))
+            });
+        min_delta < 0
+            && max_delta > 0
+            && min_delta != -max_delta
+            && width <= 65_536
+            && i32::from(max_port) - i32::from(min_port) < width
+            && deltas
+                .iter()
+                .all(|delta| *delta == min_delta || *delta == max_delta)
     }
-    if local.len() != remote.len()
-        || !(3..=32).contains(&local.len())
+    if !(3..=32).contains(&local.len())
+        || !(3..=32).contains(&remote.len())
         || !complete_window(local)
         || !complete_window(remote)
     {
         return None;
     }
+    let common_width = local.len().min(remote.len());
     Some(
-        fixed_step_rendezvous_order(remote.len(), responder, alternate_phase)
+        fixed_step_rendezvous_order(common_width, responder, alternate_phase)
             .into_iter()
+            .chain(common_width..remote.len())
             .map(|rank| remote[rank])
             .collect(),
     )

@@ -822,8 +822,8 @@ async fn hard_hard_measurement_sweeps_from_the_same_exact_socket() {
     assert!(
         peers
             .hard_hard_register_session(crate::peer::HardHardSessionRecord {
-                    pair_nomination: None,
-                    coordinated_plan: None,
+                pair_nomination: None,
+                coordinated_plan: None,
                 session_id: "exact-measurement-session".into(),
                 probe_session_id: None,
                 session_token: token.into(),
@@ -1677,7 +1677,7 @@ async fn direct_promotion_cancels_in_flight_fresh_mapping() {
     );
     // Waiter, provisional socket and reader task cleanup.
     assert_eq!(
-        transport.stun_waiters.lock().await.len(),
+        transport.stun_waiters.len(),
         0,
         "no STUN waiter may remain after the cancelled generation"
     );

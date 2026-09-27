@@ -216,20 +216,23 @@ impl UdpTransport {
         let encoded = request.encode();
         let (response_tx, response_rx) = oneshot::channel();
 
-        self.stun_waiters
-            .lock()
-            .await
-            .insert(transaction_id, response_tx);
+        let _registration = self
+            .stun_waiters
+            .register(transaction_id, response_tx)
+            .map_err(|error| error.reason().to_string())?;
+        let deadline = tokio::time::Instant::now() + stun_timeout;
 
-        let result = async {
-            socket
-                .send_to(&encoded, server)
+        // Send readiness and response share one deadline. Dropping this future
+        // also drops the exact waiter lease, even when no reply ever arrives.
+        async {
+            self.send_mapping_request_until(socket, &encoded, server, deadline, &|| true)
                 .await
-                .map_err(|error| format!("send_to failed: {error}"))?;
-            let StunResponse { data, source } = timeout(stun_timeout, response_rx)
-                .await
-                .map_err(|_| format!("no response from {server} after {stun_timeout:?}"))?
-                .map_err(|_| "STUN response dispatcher closed".to_string())?;
+                .map_err(|error| format!("STUN send failed: {error:?}"))?;
+            let StunResponse { data, source } =
+                dynamic_punch::wait_for_mapping_io(response_rx, deadline, &|| true)
+                    .await
+                    .map_err(|error| format!("STUN response wait failed: {error:?}"))?
+                    .map_err(|_| "STUN response dispatcher closed".to_string())?;
             if !change_ip && !change_port && source != server {
                 return Err(format!(
                     "response source mismatch: expected {server}, received {source}"
@@ -254,10 +257,7 @@ impl UdpTransport {
                 mapped_address: response.get_reflexive_address(),
             })
         }
-        .await;
-
-        self.stun_waiters.lock().await.remove(&transaction_id);
-        result
+        .await
     }
 
     async fn append_pool_socket_candidates_direct(

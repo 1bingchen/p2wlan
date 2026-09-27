@@ -1115,6 +1115,12 @@ impl UdpTransport {
                     "hard-hard birthday worker stopped: {stop_reason}"
                 )));
             }
+            if let Some(stop) = wave_report.sweep_budget_stop {
+                birthday.stop_reason = Some(stop.reason().to_string());
+                update_birthday_sweep_counters(&mut birthday, &aggregate);
+                publish_birthday_sweep_progress(&progress, &birthday, &aggregate).await;
+                break;
+            }
             if aggregate.pacing_deadline_reached {
                 birthday.stop_reason = Some("deadline".to_string());
                 update_birthday_sweep_counters(&mut birthday, &aggregate);

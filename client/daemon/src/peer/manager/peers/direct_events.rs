@@ -9,47 +9,18 @@ impl PeerManager {
         sent_probes: Option<u32>,
         detail: impl Into<String>,
     ) {
-        // Ordinary diagnostics must never become a back-pressure point for the
-        // control event loop. A direct probe, candidate handover or relay
-        // renewal may briefly own the connection map while it commits state;
-        // the typed timeline event below remains authoritative when that map
-        // is contended. Hard↔Hard terminal markers remain durable, while the
-        // pre-send sweep marker is intentionally best-effort so it cannot
-        // delay the first UDP datagram.
-        let generation = self.current_network_generation_sync();
-        let stage = stage.into();
-        let detail = detail.into();
-        if !Self::direct_event_requires_durable_ring(&stage) {
-            self.record_direct_event_non_queuing(
-                node_id,
-                stage,
-                endpoint,
-                candidate_count,
-                sent_probes,
-                detail,
-            );
-            return;
-        }
-        let mut connections = self.connections.write().await;
-        if let Some(conn) = connections.get_mut(node_id) {
-            conn.record_direct_event(
-                generation,
-                stage.clone(),
-                endpoint,
-                candidate_count,
-                sent_probes,
-                detail.clone(),
-            );
-        }
-        self.emit_direct_traversal_debug(
+        // Auxiliary events must not delay an ACK, owner cleanup, or entry into
+        // the terminal report's bounded commit/archive transaction. In
+        // particular, winner and sweep-summary events are still emitted to the
+        // typed timeline when the best-effort connection ring is contended.
+        // Only the dedicated attempt-report API owns durable terminal evidence.
+        self.record_direct_event_non_queuing(
             node_id,
-            generation,
-            &stage,
+            stage,
             endpoint,
-            None,
             candidate_count,
             sent_probes,
-            &detail,
+            detail,
         );
     }
 
@@ -109,20 +80,7 @@ impl PeerManager {
     ) {
         let stage = stage.into();
         let detail = detail.into();
-        if Self::direct_event_requires_durable_ring(&stage) {
-            let mut connections = self.connections.write().await;
-            if let Some(conn) = connections.get_mut(node_id) {
-                conn.record_direct_event_with_socket(
-                    generation,
-                    stage.clone(),
-                    endpoint,
-                    socket_index,
-                    candidate_count,
-                    sent_probes,
-                    detail.clone(),
-                );
-            }
-        } else if let Ok(mut connections) = self.connections.try_write() {
+        if let Ok(mut connections) = self.connections.try_write() {
             if let Some(conn) = connections.get_mut(node_id) {
                 conn.record_direct_event_with_socket(
                     generation,
@@ -145,27 +103,6 @@ impl PeerManager {
             sent_probes,
             &detail,
         );
-    }
-
-    /// Hard↔Hard winner and terminal markers are acceptance evidence, not
-    /// best-effort trace noise. Wait for the connection writer for these
-    /// bounded events so reciprocal validation cannot silently drop the
-    /// selected-socket or final summary/failure evidence.
-    /// `hard_hard_sweep_started` and
-    /// `hard_hard_direct_validation_started` are deliberately excluded: both
-    /// run on the punch-at/confirmation timing path and must not hold the
-    /// first UDP send or confirmation grace behind the connection writer.
-    fn direct_event_requires_durable_ring(stage: &str) -> bool {
-        matches!(
-            stage,
-            "hard_hard_probe_summary"
-                | "hard_hard_birthday_sweep_summary"
-                | "hard_hard_attempt_report"
-                | "hard_hard_sweep_completed"
-                | "hard_hard_sweep_failed"
-                | "hard_hard_failed"
-                | "hard_hard_winner_selected"
-        )
     }
 
     /// Commit one endpoint-free Hard↔Hard attempt report to the existing

@@ -463,7 +463,7 @@ mod diagnostics_tests {
     }
 
     #[tokio::test]
-    async fn hard_sweep_started_is_nonblocking_but_terminal_summary_is_durable() {
+    async fn hard_hard_auxiliary_events_never_queue_behind_connection_writer() {
         let config = Config::generate_default("http://ctrl.test", "default").unwrap();
         let manager = PeerManager::new(config);
         manager
@@ -484,56 +484,57 @@ mod diagnostics_tests {
             .await;
 
         let connection_writer = manager.connections.write().await;
-        let started = tokio::time::timeout(
-            Duration::from_millis(100),
-            manager.record_direct_event(
-                "peer-hard-lock",
-                "hard_hard_sweep_started",
-                None,
-                Some(64),
-                None,
-                "first-send timing marker",
-            ),
-        )
-        .await;
-        assert!(started.is_ok(), "sweep start must not await the writer");
-
-        let validation_started = tokio::time::timeout(
-            Duration::from_millis(100),
-            manager.record_direct_event(
-                "peer-hard-lock",
-                "hard_hard_direct_validation_started",
-                None,
-                Some(64),
-                Some(1),
-                "confirmation grace must not await the writer",
-            ),
-        )
-        .await;
-        assert!(
-            validation_started.is_ok(),
-            "Direct confirmation start must not await the writer"
-        );
-
-        let mut terminal = Box::pin(manager.record_direct_event(
-            "peer-hard-lock",
+        let stages = [
+            "hard_hard_sweep_started",
+            "hard_hard_direct_validation_started",
+            "hard_hard_probe_summary",
             "hard_hard_birthday_sweep_summary",
-            None,
-            Some(1),
-            Some(1),
-            "stop_reason=send_error physical_send_errors=1",
-        ));
-        assert!(
-            tokio::time::timeout(Duration::from_millis(50), &mut terminal)
-                .await
-                .is_err(),
-            "terminal summary must remain durable and wait for the writer"
-        );
+            "hard_hard_sweep_completed",
+            "hard_hard_sweep_failed",
+            "hard_hard_failed",
+            "hard_hard_winner_selected",
+        ];
+        for stage in stages {
+            let mut event = Box::pin(manager.record_direct_event(
+                "peer-hard-lock",
+                stage,
+                None,
+                Some(1),
+                Some(1),
+                "diagnostic must not block packet or terminal-report handoff",
+            ));
+            assert!(futures_util::poll!(event.as_mut()).is_ready(), "{stage}");
+            let mut socket_event =
+                Box::pin(manager.record_direct_event_for_generation_with_socket(
+                    "peer-hard-lock",
+                    manager.current_network_generation_sync(),
+                    stage,
+                    None,
+                    Some(7),
+                    Some(1),
+                    Some(1),
+                    "generation-stable diagnostic must not queue either",
+                ));
+            assert!(
+                futures_util::poll!(socket_event.as_mut()).is_ready(),
+                "{stage} with exact socket"
+            );
+        }
         drop(connection_writer);
-        tokio::time::timeout(Duration::from_secs(1), terminal)
-            .await
-            .expect("terminal summary must finish after the writer is released");
-
+        // An uncontended ring still receives these events, including the exact
+        // socket metadata; contention changes diagnostic delivery, not facts.
+        manager
+            .record_direct_event_for_generation_with_socket(
+                "peer-hard-lock",
+                manager.current_network_generation_sync(),
+                "hard_hard_birthday_sweep_summary",
+                None,
+                Some(7),
+                Some(1),
+                Some(1),
+                "uncontended summary",
+            )
+            .await;
         let connection = manager
             .get_connection("peer-hard-lock")
             .await

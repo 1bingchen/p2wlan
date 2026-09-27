@@ -608,7 +608,7 @@ mod hard_hard_tests {
     }
 
     #[tokio::test]
-    async fn hard_hard_winner_promotion_commits_evidence_before_durable_diagnostics() {
+    async fn hard_hard_winner_promotion_releases_epoch_despite_contended_diagnostics() {
         let _serial = crate::tests::HARD_HARD_E2E_SERIAL.acquire().await.unwrap();
         let (peers, udp, identity, remote, _peer_session_generation) =
             exact_birthday_runtime_fixture().await;
@@ -631,9 +631,9 @@ mod hard_hard_tests {
             .expect("fixture session must enter its single sweep");
         assert_eq!(sweeping.fresh_socket, identity);
 
-        // Both winner diagnostics are durable events. Holding the connection
-        // writer parks the production promotion only after its manager winner
-        // and UDP evidence/affinity/phase transaction is complete.
+        // Promotion runs under the same epoch held by the receive path before
+        // its ACK. A contended diagnostic ring must not keep that transaction
+        // alive after winner/socket evidence is committed.
         let connections_writer = peers.hold_connections_writer_for_test().await;
         let socket_index = identity.socket_index;
         let network_generation = identity.network_generation;
@@ -651,15 +651,15 @@ mod hard_hard_tests {
                 .await
             }
         });
-        for _ in 0..256 {
-            if udp
-                .hard_hard_socket_identity_has_authenticated_evidence(&identity)
-                .await
-            {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
+        assert!(tokio::time::timeout(Duration::from_millis(100), promotion)
+            .await
+            .expect("promotion must return while the diagnostic writer remains held")
+            .expect("promotion task must not panic"));
+        let epoch_gate = peers.network_epoch_gate();
+        assert!(
+            epoch_gate.try_lock().is_ok(),
+            "winner diagnostics must release the epoch needed by ACK and cleanup"
+        );
         assert!(
             udp.hard_hard_socket_identity_has_authenticated_evidence(&identity)
                 .await
@@ -670,15 +670,7 @@ mod hard_hard_tests {
                 .await,
             Some(identity.socket_index)
         );
-        assert!(
-            !promotion.is_finished(),
-            "durable diagnostics must still be waiting on the held connection writer"
-        );
         drop(connections_writer);
-        assert!(tokio::time::timeout(Duration::from_secs(1), promotion)
-            .await
-            .expect("promotion must finish after diagnostics are released")
-            .expect("promotion task must not panic"));
         assert_eq!(
             hard_hard_authenticated_winner_for_cleanup(
                 &udp,
@@ -2243,12 +2235,42 @@ mod hard_hard_tests {
             .unwrap();
         let report = report_for_observation_fixture(&record);
         let writer = peers.hold_connections_writer_for_test().await;
-        let mut commit = Box::pin(peers.record_hard_hard_attempt_report_with_evidence(
-            &identity.peer_id,
-            &identity.session_token,
-            report.clone(),
-            &record.measurement.evidence,
-        ));
+        // Exercise the production ordering: auxiliary summaries precede the
+        // formal report. The first Pending must occur in that report's sealed
+        // commit transaction, never in a summary writer wait. Dropping here
+        // must therefore still archive and preserve one-shot ownership.
+        let mut commit = Box::pin(async {
+            peers
+                .record_direct_event_for_generation_with_socket(
+                    &identity.peer_id,
+                    identity.network_generation,
+                    "hard_hard_probe_summary",
+                    None,
+                    Some(identity.socket_index),
+                    Some(1),
+                    Some(1),
+                    "terminal summary before sealed report",
+                )
+                .await;
+            peers
+                .record_direct_event(
+                    &identity.peer_id,
+                    "hard_hard_sweep_failed",
+                    None,
+                    Some(1),
+                    Some(1),
+                    "terminal marker before sealed report",
+                )
+                .await;
+            peers
+                .record_hard_hard_attempt_report_with_evidence(
+                    &identity.peer_id,
+                    &identity.session_token,
+                    report.clone(),
+                    &record.measurement.evidence,
+                )
+                .await
+        });
         assert!(futures_util::poll!(commit.as_mut()).is_pending());
         drop(commit); // The RAII terminal owner archives while the writer is unavailable.
         drop(writer);

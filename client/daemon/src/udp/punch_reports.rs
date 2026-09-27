@@ -144,6 +144,7 @@ pub(super) fn merge_punch_send_reports(destination: &mut PunchSendReport, source
         && !destination.worker_failed
         && destination.failure_kind.is_none();
     destination.epoch_budget_exhausted |= source.epoch_budget_exhausted;
+    destination.sweep_budget_stop = destination.sweep_budget_stop.max(source.sweep_budget_stop);
     destination.pacing_deadline_reached |= source.pacing_deadline_reached;
     destination.candidate_iteration_capped |= source.candidate_iteration_capped;
     destination.first_send_at_ms = match (destination.first_send_at_ms, source.first_send_at_ms) {

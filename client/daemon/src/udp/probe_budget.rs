@@ -77,12 +77,35 @@ impl GlobalOutboundProbeBudget {
         .await
     }
 
+    #[cfg(test)]
     pub(super) async fn admit_with_purpose(
         &self,
         peer_id: &str,
         peer_addr: SocketAddr,
         socket_index: usize,
         purpose: RecoveryProbePurpose,
+    ) -> OutboundProbeAdmission {
+        self.admit_with_purpose_after(
+            peer_id,
+            peer_addr,
+            socket_index,
+            purpose,
+            std::future::ready(OutboundProbeAdmission::Accepted),
+        )
+        .await
+    }
+
+    /// Hold the existing budget lock through the recovery-credit gate. The
+    /// production caller bounds the whole local -> global -> recovery lock
+    /// transaction with one deadline. After the gate accepts, all global
+    /// counters commit synchronously: cancellation cannot split the two debits.
+    pub(super) async fn admit_with_purpose_after(
+        &self,
+        peer_id: &str,
+        peer_addr: SocketAddr,
+        socket_index: usize,
+        purpose: RecoveryProbePurpose,
+        recovery_credit: impl std::future::Future<Output = OutboundProbeAdmission>,
     ) -> OutboundProbeAdmission {
         let now = Instant::now();
         let mut budget = self.state.lock().await;
@@ -187,6 +210,12 @@ impl GlobalOutboundProbeBudget {
             return OutboundProbeAdmission::HardHardConfirmationCreditReserved;
         }
 
+        let recovery_admission = recovery_credit.await;
+        if recovery_admission != OutboundProbeAdmission::Accepted {
+            return recovery_admission;
+        }
+        // No await from the recovery debit through the global commit.
+        let now = Instant::now();
         budget
             .entry(OutboundProbeBudgetKey::Network)
             .or_default()
@@ -745,10 +774,47 @@ pub(super) enum OutboundProbeAdmission {
     /// tail available to checks/nomination. Existing totals are unchanged.
     HardHardConfirmationRateReserved,
     HardHardConfirmationCreditReserved,
+    /// Exact recovery-allocation credit, distinct from a destination's
+    /// persistent UDP reserve; no later candidate can use this tail.
+    HardHardRecoveryConfirmationReserved,
     RecoveryIdentityStale,
+    /// The bounded local/global/recovery lock transaction did not commit.
+    AdmissionDeferred,
     /// The relay-backoff heartbeat's dedicated per-peer budget is exhausted;
     /// the next beat retries.
     HeartbeatBudgetLimited,
+}
+
+/// Only exact recovery-allocation verdicts terminate every socket/target in
+/// a sweep. Destination rate limits and rolling windows retain their scopes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum OutboundProbeSweepStop {
+    ConfirmationCreditReserved,
+    EpochCreditExhausted,
+    RecoveryIdentityStale,
+}
+
+impl OutboundProbeSweepStop {
+    pub(super) fn reason(self) -> &'static str {
+        match self {
+            Self::ConfirmationCreditReserved => "hard_hard_recovery_confirmation_reserved",
+            Self::EpochCreditExhausted => "epoch_budget_exhausted",
+            Self::RecoveryIdentityStale => "recovery_probe_identity_stale",
+        }
+    }
+}
+
+impl OutboundProbeAdmission {
+    pub(super) fn sweep_stop(self) -> Option<OutboundProbeSweepStop> {
+        match self {
+            Self::EpochCreditExhausted => Some(OutboundProbeSweepStop::EpochCreditExhausted),
+            Self::HardHardRecoveryConfirmationReserved => {
+                Some(OutboundProbeSweepStop::ConfirmationCreditReserved)
+            }
+            Self::RecoveryIdentityStale => Some(OutboundProbeSweepStop::RecoveryIdentityStale),
+            _ => None,
+        }
+    }
 }
 
 #[allow(dead_code)]
@@ -784,7 +850,11 @@ pub(super) fn outbound_probe_admission_reason(admission: OutboundProbeAdmission)
         OutboundProbeAdmission::HardHardConfirmationCreditReserved => {
             "hard_hard_confirmation_credit_reserved"
         }
+        OutboundProbeAdmission::HardHardRecoveryConfirmationReserved => {
+            "hard_hard_recovery_confirmation_reserved"
+        }
         OutboundProbeAdmission::RecoveryIdentityStale => "recovery_probe_identity_stale",
+        OutboundProbeAdmission::AdmissionDeferred => "probe_admission_lock_deferred",
         OutboundProbeAdmission::HeartbeatBudgetLimited => "relay_backoff_heartbeat_budget_limited",
     }
 }

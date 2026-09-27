@@ -1303,11 +1303,10 @@ impl UdpTransport {
             identity
         };
         // The authenticated packet, affinity pin and Finalized phase are one
-        // socket-state commit.  In particular, no durable diagnostics await
-        // may sit between manager winner selection and this local evidence:
-        // timeout cleanup is allowed to inspect the winner concurrently and
-        // must never retire the exact socket merely because the event ring is
-        // contended.
+        // socket-state commit. Both diagnostic calls below use non-queuing
+        // ring writes: this function still owns the caller's epoch boundary,
+        // and the receive path must return to its ACK without waiting for a
+        // contended event ring. Formal attempt evidence is sealed separately.
         self.peers
             .record_direct_event_for_generation_with_socket(
                 peer_id,

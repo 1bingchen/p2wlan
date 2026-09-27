@@ -1954,6 +1954,9 @@ pub(crate) struct PunchSendReport {
     /// must treat a zero-send session as a budget-exhausted verdict instead
     /// of an empty success.
     pub epoch_budget_exhausted: bool,
+    /// Exact allocation verdict shared across all Hard-Hard socket workers.
+    /// It does not describe target-scoped rate limits or the sweep deadline.
+    pub(crate) sweep_budget_stop: Option<probe_budget::OutboundProbeSweepStop>,
     /// The session stopped enumerating candidates because the epoch's hard
     /// candidate-iteration budget was reached.
     pub candidate_iteration_capped: bool,

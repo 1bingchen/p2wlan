@@ -112,3 +112,6 @@ mod hard_hard_winner;
 
 #[path = "tests/hard_hard_pacing.rs"]
 mod hard_hard_pacing;
+
+#[path = "tests/probe_admission_transaction.rs"]
+mod probe_admission_transaction;

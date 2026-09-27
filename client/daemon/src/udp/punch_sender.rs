@@ -211,6 +211,7 @@ impl UdpTransport {
         let mut failure_kind = None;
         let mut pacing_deadline_reached = false;
         let mut epoch_budget_exhausted = false;
+        let mut sweep_budget_stop = None;
         let live_recorder = live.clone().map(BirthdayLiveRecorder::new);
         let commit_seq_at_start = self.peers.direct_commit_seq_sync(peer_id);
         let network_generation_at_start = self.peers.current_network_generation_sync();
@@ -239,11 +240,17 @@ impl UdpTransport {
             while let Some(&candidate) = endpoints.peek() {
                 if let Some(pacer) = pacing.as_ref() {
                     if !pacer.wait_turn().await {
-                        pacing_deadline_reached = true;
+                        sweep_budget_stop = pacer.stop_reason();
+                        epoch_budget_exhausted |= sweep_budget_stop
+                            == Some(probe_budget::OutboundProbeSweepStop::EpochCreditExhausted);
+                        pacing_deadline_reached = sweep_budget_stop.is_none();
                         target_processing_completed = false;
                         if retrying_target {
                             budget_skipped = budget_skipped.saturating_add(1);
-                            last_budget_reason = Some("probe_budget_deadline");
+                            last_budget_reason = Some(sweep_budget_stop.map_or(
+                                "probe_budget_deadline",
+                                probe_budget::OutboundProbeSweepStop::reason,
+                            ));
                             update_live_birthday_counters(&live, |counters| {
                                 counters.budget_skipped = counters.budget_skipped.saturating_add(1);
                             });
@@ -434,6 +441,14 @@ impl UdpTransport {
                         update_live_birthday_counters(&live, |counters| {
                             counters.budget_skipped = counters.budget_skipped.saturating_add(1);
                         });
+                        if let Some(stop) = limited.sweep_stop() {
+                            sweep_budget_stop = Some(stop);
+                            target_processing_completed = false;
+                            if let Some(pacer) = pacing.as_ref() {
+                                pacer.stop(stop);
+                            }
+                            break 'schedule;
+                        }
                         endpoints.next();
                         retrying_target = false;
                         continue;
@@ -569,6 +584,7 @@ impl UdpTransport {
                 .unwrap_or_default(),
             budget_skipped,
             epoch_budget_exhausted,
+            sweep_budget_stop,
             pacing_deadline_reached,
             candidate_iteration_capped: false,
             sent_target_endpoints: sent_endpoints.into_iter().collect(),

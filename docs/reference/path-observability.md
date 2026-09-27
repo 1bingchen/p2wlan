@@ -42,7 +42,7 @@ control_reconnect_counter_survives_timeline_eviction 是必须保持的回归契
 
 `/status` 的 `peers[].direct_events[]` 在 `stage=hard_hard_attempt_report` 时携带 schema 2 的 `hard_hard_attempt`。它是现有会话状态所有者导出的只读终态记录，不参与候选排序、发送准入、路径选择或取消判定。写入前会再次核对 network generation、peer session generation、remote candidate epoch、profile generation、punch generation、socket index、session token 和 attempt；旧会话的迟到结果不会记到新会话。`plan_tag` 仅用于把同一会话的单个 rendezvous 计划在两端配对，与 `session_tag` 分离。
 
-终态记录由原会话的诊断 owner 单次封存。写入当前连接时，在有界等待后持有代际与连接保护并再次核对完整身份；身份替换、锁竞争或提交等待被取消时，原记录进入独立的 `hard_hard_attempt_report_archived` 结构化日志，不写入新连接的事件环。该历史日志不参与当前路径判断。认证接收证据仅来自原 token 和所属动态 socket 的精确候选对，不使用同 peer 的普通 Probe 汇总差值。
+终态记录由原会话的诊断 owner 单次封存。写入当前连接时，在有界等待后持有代际与连接保护并再次核对完整身份；身份替换、锁竞争或提交等待被取消时，原记录进入独立的 `hard_hard_attempt_report_archived` 结构化日志，不写入新连接的事件环。该历史日志不参与当前路径判断。选中 socket、扫描汇总和完成等辅助事件始终输出结构化日志，连接事件环只作非阻塞写入；辅助记录不会阻塞确认发包或正式终态的封存。认证接收证据仅来自原 token 和所属动态 socket 的精确候选对，不使用同 peer 的普通 Probe 汇总差值。
 
 `mode` 表示当前会话实际协商的 `fixed_anchor`、`predictable` 或 `birthday`；兼容流程保留其原有模式值。模式来自同一会话的权威计划，不能仅凭 socket 数推断。
 

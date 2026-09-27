@@ -111,13 +111,19 @@ async fn uncommitted_full_discovery_does_not_disable_an_active_socket_pool() {
     let (_, udp) = gather_fence_transport().await;
     let udp = udp.with_socket_pool(2).await.unwrap();
     udp.set_socket_pool_active(true);
-    // No observers and host gathering disabled: this creates an unusable
-    // report without any network request, then exercises the actual full path.
+    // No observers and host gathering disabled: this creates an Unknown
+    // profile without any network request. Unknown cannot activate the pool,
+    // but missing observations are not evidence that UDP is blocked.
     let report = udp
         .gather_candidate_report_live_parallel_full(Vec::new(), Duration::ZERO)
         .await
         .unwrap();
-    assert!(report.nat_profile.udp_blocked);
+    assert!(report.nat_profile.observations.is_empty());
+    assert_eq!(
+        report.nat_profile.mapping_behavior,
+        p2pnet_nat::MappingBehavior::Unknown
+    );
+    assert!(!report.nat_profile.udp_blocked);
     assert!(
         udp.socket_pool_active(),
         "uncommitted reports have no pool policy effect"

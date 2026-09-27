@@ -16,8 +16,13 @@ pub(crate) fn hard_hard_first_wave_pacing_margin(new_pairs: usize) -> Duration {
 }
 
 pub(super) struct HardHardProbePacer {
-    next: StdMutex<tokio::time::Instant>,
+    state: StdMutex<HardHardProbePacerState>,
     deadline: tokio::time::Instant,
+}
+
+struct HardHardProbePacerState {
+    next: tokio::time::Instant,
+    stop: Option<probe_budget::OutboundProbeSweepStop>,
 }
 
 impl HardHardProbePacer {
@@ -28,7 +33,10 @@ impl HardHardProbePacer {
     fn with_window(window: Duration) -> Self {
         let now = tokio::time::Instant::now();
         Self {
-            next: StdMutex::new(now),
+            state: StdMutex::new(HardHardProbePacerState {
+                next: now,
+                stop: None,
+            }),
             deadline: now + window,
         }
     }
@@ -40,23 +48,36 @@ impl HardHardProbePacer {
     pub(super) async fn wait_turn(&self) -> bool {
         let slot = {
             let now = tokio::time::Instant::now();
-            let mut next = self.next.lock().unwrap_or_else(|p| p.into_inner());
-            let slot = (*next).max(now);
+            let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+            if state.stop.is_some() {
+                return false;
+            }
+            let slot = state.next.max(now);
             if slot >= self.deadline {
                 return false;
             }
-            *next = slot + HARD_HARD_PROBE_SPACING;
+            state.next = slot + HARD_HARD_PROBE_SPACING;
             slot
         };
         tokio::time::sleep_until(slot).await;
-        tokio::time::Instant::now() < self.deadline
+        self.stop_reason().is_none() && tokio::time::Instant::now() < self.deadline
+    }
+
+    pub(super) fn stop(&self, reason: probe_budget::OutboundProbeSweepStop) {
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        state.stop = state.stop.max(Some(reason));
+    }
+
+    pub(super) fn stop_reason(&self) -> Option<probe_budget::OutboundProbeSweepStop> {
+        self.state.lock().unwrap_or_else(|p| p.into_inner()).stop
     }
 }
 
 impl OutboundProbeAdmission {
     /// Only the one-second sliding windows can recover within this sweep.
-    /// Persistent limits, quarantine and recovery credit are terminal for a
-    /// target; waiting must never evade or refill them.
+    /// Persistent limits and quarantine are terminal for a target; exact
+    /// recovery verdicts stop the sweep. Lock contention can defer admission
+    /// without consuming credit, but still uses the original pacing deadline.
     pub(super) fn retryable_in_sweep(self) -> bool {
         matches!(
             self,
@@ -68,6 +89,7 @@ impl OutboundProbeAdmission {
                 | Self::GlobalRemoteIpRateLimited
                 | Self::GlobalDestinationRateLimited
                 | Self::HardHardConfirmationRateReserved
+                | Self::AdmissionDeferred
         )
     }
 }
@@ -130,6 +152,7 @@ mod tests {
             OutboundProbeAdmission::GlobalPeerSocketPersistentRateLimited,
             OutboundProbeAdmission::EpochCreditExhausted,
             OutboundProbeAdmission::HardHardConfirmationCreditReserved,
+            OutboundProbeAdmission::HardHardRecoveryConfirmationReserved,
             OutboundProbeAdmission::RecoveryIdentityStale,
             OutboundProbeAdmission::HeartbeatBudgetLimited,
             OutboundProbeAdmission::Accepted,
@@ -138,5 +161,33 @@ mod tests {
         }
         assert!(OutboundProbeAdmission::GlobalRemoteIpRateLimited.retryable_in_sweep());
         assert!(OutboundProbeAdmission::HardHardConfirmationRateReserved.retryable_in_sweep());
+        assert!(OutboundProbeAdmission::AdmissionDeferred.retryable_in_sweep());
+        assert_eq!(
+            OutboundProbeAdmission::HardHardRecoveryConfirmationReserved.sweep_stop(),
+            Some(probe_budget::OutboundProbeSweepStop::ConfirmationCreditReserved),
+        );
+        for admission in [
+            OutboundProbeAdmission::GlobalRemoteIpRateLimited,
+            OutboundProbeAdmission::HardHardConfirmationRateReserved,
+            OutboundProbeAdmission::HardHardConfirmationCreditReserved,
+            OutboundProbeAdmission::GlobalDestinationPersistentRateLimited,
+            OutboundProbeAdmission::AdmissionDeferred,
+        ] {
+            assert_eq!(admission.sweep_stop(), None);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn terminal_recovery_verdict_stops_reserved_and_future_worker_slots() {
+        let pacer = HardHardProbePacer::new();
+        assert!(pacer.wait_turn().await);
+        let mut waiting = Box::pin(pacer.wait_turn());
+        assert!(futures_util::poll!(&mut waiting).is_pending());
+        let stop = probe_budget::OutboundProbeSweepStop::ConfirmationCreditReserved;
+        pacer.stop(stop);
+        tokio::time::advance(HARD_HARD_PROBE_SPACING).await;
+        assert!(!waiting.await);
+        assert!(!pacer.wait_turn().await);
+        assert_eq!(pacer.stop_reason(), Some(stop));
     }
 }

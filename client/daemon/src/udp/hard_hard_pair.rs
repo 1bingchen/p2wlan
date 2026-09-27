@@ -130,6 +130,7 @@ impl UdpTransport {
                 return match admission {
                     OutboundProbeAdmission::RecoveryIdentityStale
                     | OutboundProbeAdmission::EpochCreditExhausted
+                    | OutboundProbeAdmission::HardHardRecoveryConfirmationReserved
                     | OutboundProbeAdmission::HardHardConfirmationCreditReserved => {
                         HardHardPairSendOutcome::Stopped
                     }

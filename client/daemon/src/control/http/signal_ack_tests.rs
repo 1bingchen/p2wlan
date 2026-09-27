@@ -71,7 +71,7 @@ fn delivery(id: &str, seq: u64, lease: &str) -> LeasedSignalDelivery {
 }
 
 #[tokio::test]
-async fn lost_ack_response_retries_same_delete_without_reapplying_or_overtaking() {
+async fn lost_ack_response_does_not_block_application_or_reorder_lease_acks() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
     let auth = registration(&base);
@@ -84,7 +84,9 @@ async fn lost_ack_response_retries_same_delete_without_reapplying_or_overtaking(
     )
     .unwrap();
     let (requests_tx, mut requests_rx) = mpsc::unbounded_channel();
+    let (release_first_tx, release_first_rx) = tokio::sync::oneshot::channel();
     let server = tokio::spawn(async move {
+        let mut release_first_rx = Some(release_first_rx);
         let mut deleted = HashSet::new();
         for attempt in 0..4 {
             let (mut stream, _) = listener.accept().await.unwrap();
@@ -95,8 +97,11 @@ async fn lost_ack_response_retries_same_delete_without_reapplying_or_overtaking(
             deleted.insert(body["signals"][0]["id"].as_str().unwrap().to_string());
             requests_tx.send(body).unwrap();
             if attempt == 0 {
-                // The DELETE committed; the response is lost. The second
-                // identical request must be harmless even though no row remains.
+                // The DELETE committed but its response cannot complete
+                // before the next signal has applied. A serialized apply/ACK
+                // loop therefore cannot pass this regression.
+                release_first_rx.take().unwrap().await.unwrap();
+                // Losing that response still retries the same idempotent lease.
                 drop(stream);
                 continue;
             }
@@ -138,6 +143,10 @@ async fn lost_ack_response_retries_same_delete_without_reapplying_or_overtaking(
         "application must precede ACK"
     );
     receipt.complete(SignalApplyOutcome::Applied);
+    let first_request = tokio::time::timeout(Duration::from_secs(3), requests_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
     let second = tokio::time::timeout(Duration::from_secs(3), events_rx.recv())
         .await
         .unwrap()
@@ -149,17 +158,24 @@ async fn lost_ack_response_retries_same_delete_without_reapplying_or_overtaking(
         panic!("expected application receipt")
     };
     assert_eq!(signal_id, "second", "redelivery must never reapply first");
-    let first_request = requests_rx.try_recv().unwrap();
-    assert_eq!(
-        requests_rx.try_recv().unwrap(),
-        first_request,
-        "retry keeps the exact lease token"
-    );
-    assert_eq!(
-        requests_rx.try_recv().unwrap()["signals"][0]["delivery_token"],
-        "lease-2"
-    );
     receipt.complete(SignalApplyOutcome::Applied);
+    release_first_tx.send(()).unwrap();
+    let retry = tokio::time::timeout(Duration::from_secs(3), requests_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(retry, first_request, "retry keeps the exact lease token");
+    let redelivered = tokio::time::timeout(Duration::from_secs(3), requests_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(redelivered["signals"][0]["delivery_token"], "lease-2");
+    let second_ack = tokio::time::timeout(Duration::from_secs(3), requests_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(second_ack["signals"][0]["id"], "second");
+    assert_eq!(second_ack["signals"][0]["delivery_token"], "lease-3");
     let deleted = tokio::time::timeout(Duration::from_secs(3), server)
         .await
         .unwrap()
@@ -206,6 +222,162 @@ async fn ack_registration_revocation_fences_before_io_and_after_response() {
     assert!(
         !ran.load(Ordering::SeqCst),
         "a revoked registration cannot start another I/O"
+    );
+}
+
+#[tokio::test]
+async fn application_retry_preserves_committed_ack_prefix_without_applying_suffix() {
+    let base = "http://127.0.0.1:1";
+    let auth = registration(base);
+    let fence = SignalAckRegistration::capture(
+        base,
+        "ack-test-token",
+        "ack-test-node",
+        Some(41),
+        auth.subscribe(),
+    )
+    .unwrap();
+    let tracker = Arc::new(tokio::sync::Mutex::new(SignalDeliveryTracker::default()));
+    let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+    let (ack_tx, mut ack_rx) = mpsc::channel(SIGNAL_ACK_PIPELINE_CAPACITY);
+    let application = tokio::spawn(apply_signal_batch(
+        fence,
+        events_tx,
+        tracker.clone(),
+        vec![
+            delivery("committed", 1, "lease-1"),
+            delivery("retry", 2, "lease-2"),
+            delivery("suffix", 3, "lease-3"),
+        ],
+        ack_tx,
+    ));
+    let first = tokio::time::timeout(Duration::from_secs(3), events_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let ControlEvent::DeliveredSignal {
+        signal_id, receipt, ..
+    } = first
+    else {
+        panic!("expected first application receipt")
+    };
+    assert_eq!(signal_id, "committed");
+    assert!(ack_rx.try_recv().is_err());
+    assert!(
+        events_rx.try_recv().is_err(),
+        "application stays sequential"
+    );
+    receipt.complete(SignalApplyOutcome::Applied);
+    let second = tokio::time::timeout(Duration::from_secs(3), events_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let ControlEvent::DeliveredSignal {
+        signal_id, receipt, ..
+    } = second
+    else {
+        panic!("expected second application receipt")
+    };
+    assert_eq!(signal_id, "retry");
+    receipt.complete(SignalApplyOutcome::Retry);
+    tokio::time::timeout(Duration::from_secs(3), application)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(ack_rx.recv().await.unwrap().ack.id, "committed");
+    assert!(ack_rx.recv().await.is_none());
+    assert!(events_rx.try_recv().is_err());
+    let tracker = tracker.lock().await;
+    assert!(tracker.already_applied("committed", "remote-peer", Some(1)));
+    assert!(!tracker.already_applied("retry", "remote-peer", Some(2)));
+    assert!(!tracker.already_applied("suffix", "remote-peer", Some(3)));
+}
+
+#[tokio::test]
+async fn ack_failure_during_tracker_contention_does_not_dispatch_the_next_signal() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let auth = registration(&base);
+    let fence = SignalAckRegistration::capture(
+        &base,
+        "ack-test-token",
+        "ack-test-node",
+        Some(41),
+        auth.subscribe(),
+    )
+    .unwrap();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let (_, body) = read_ack(&mut stream).await;
+        assert_eq!(body["signals"][0]["id"], "committed");
+        // A conclusive ACK failure closes this batch's only ACK consumer;
+        // registration itself stays current throughout the competition.
+        stream
+            .write_all(
+                b"HTTP/1.1 400 Bad Request\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}",
+            )
+            .await
+            .unwrap();
+    });
+    let tracker = Arc::new(tokio::sync::Mutex::new(SignalDeliveryTracker::default()));
+    let mut tracker_guard = tracker.lock().await;
+    tracker_guard.mark_applied("committed".into(), "remote-peer", Some(1));
+    let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+    let (ack_tx, ack_rx) = mpsc::channel(SIGNAL_ACK_PIPELINE_CAPACITY);
+    let committed = delivery("committed", 1, "lease-1");
+    ack_tx
+        .try_send(AppliedSignalAck {
+            ack: committed.ack,
+            timing: committed.ack_timing,
+            log_signal_id: "committed".into(),
+            log_from_node_id: "remote-peer".into(),
+            log_signal_type: "peer_offer".into(),
+            signal_seq: Some(1),
+        })
+        .unwrap_or_else(|_| panic!("the committed prefix must enter the ACK queue"));
+    let applying = apply_signal_batch(
+        fence.clone(),
+        events_tx,
+        tracker.clone(),
+        vec![delivery("next", 2, "lease-2")],
+        ack_tx.clone(),
+    );
+    tokio::pin!(applying);
+    // Polling up to the held tracker lock proves the initial channel-open
+    // check has passed. No sleep or scheduler guess establishes this order.
+    assert!(futures_util::poll!(&mut applying).is_pending());
+    assert!(!ack_tx.is_closed());
+    assert!(events_rx.try_recv().is_err());
+
+    let http = reqwest::Client::builder().no_proxy().build().unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(3),
+        acknowledge_signal_batch(
+            &http,
+            &base,
+            "ack-test-token",
+            "ack-test-node",
+            fence,
+            ack_rx,
+        ),
+    )
+    .await
+    .unwrap();
+    assert!(ack_tx.is_closed(), "the failed ACK owner must have exited");
+    assert!(auth.borrow().is_some(), "this is not an auth-fence test");
+    server.await.unwrap();
+    drop(tracker_guard);
+
+    tokio::time::timeout(Duration::from_secs(3), &mut applying)
+        .await
+        .unwrap();
+    assert!(events_rx.try_recv().is_err());
+    let tracker = tracker.lock().await;
+    assert!(tracker.already_applied("committed", "remote-peer", Some(1)));
+    assert!(!tracker.already_applied("next", "remote-peer", Some(2)));
+    assert!(
+        tracker.in_flight.is_empty(),
+        "the undispatched owner is retired"
     );
 }
 

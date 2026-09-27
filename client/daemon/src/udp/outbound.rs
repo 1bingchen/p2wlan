@@ -834,10 +834,12 @@ impl UdpTransport {
                         }
                         OutboundProbeAdmission::HardHardConfirmationRateReserved
                         | OutboundProbeAdmission::HardHardConfirmationCreditReserved
+                        | OutboundProbeAdmission::HardHardRecoveryConfirmationReserved
+                        | OutboundProbeAdmission::AdmissionDeferred
                         | OutboundProbeAdmission::RecoveryIdentityStale => {
-                            // The legacy entry currently cannot produce HH2
-                            // purpose results; preserve fail-closed accounting
-                            // if a future caller introduces one here.
+                            // Defer this batch when the budget locks are busy.
+                            // HH2-only verdicts also stay fail-closed if a
+                            // future caller introduces them at this entry.
                             budget_skipped = budget_skipped.saturating_add(1);
                             last_budget_reason = Some(outbound_probe_admission_reason(admission));
                             break 'schedule;

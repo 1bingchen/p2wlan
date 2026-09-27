@@ -212,6 +212,32 @@ impl UdpTransport {
         purpose: crate::peer::RecoveryProbePurpose,
         recovery_identity: Option<crate::peer::RecoveryEpochIdentity>,
     ) -> OutboundProbeAdmission {
+        // One deadline covers local -> global -> recovery acquisition. None
+        // of these owners acquires the preceding budget lock in reverse. The
+        // recovery gate and both UDP debits commit without a subsequent await,
+        // so timeout/cancellation before that point leaves all credits intact.
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            self.admit_connectivity_probe_transaction(
+                peer_id,
+                peer_addr,
+                socket_index,
+                purpose,
+                recovery_identity,
+            ),
+        )
+        .await
+        .unwrap_or(OutboundProbeAdmission::AdmissionDeferred)
+    }
+
+    async fn admit_connectivity_probe_transaction(
+        &self,
+        peer_id: &str,
+        peer_addr: SocketAddr,
+        socket_index: usize,
+        purpose: crate::peer::RecoveryProbePurpose,
+        recovery_identity: Option<crate::peer::RecoveryEpochIdentity>,
+    ) -> OutboundProbeAdmission {
         let now = Instant::now();
         let network_key = OutboundProbeBudgetKey::Network;
         let peer_key = OutboundProbeBudgetKey::Peer(peer_id.to_string());
@@ -247,42 +273,54 @@ impl UdpTransport {
             return OutboundProbeAdmission::HardHardConfirmationRateReserved;
         }
 
-        if let Some(global_budget) = self.global_outbound_probe_budget.as_ref() {
-            match global_budget
-                .admit_with_purpose(peer_id, peer_addr, socket_index, purpose)
-                .await
-            {
-                OutboundProbeAdmission::Accepted => {}
-                limited => return limited,
-            }
-        }
-
         // The recovery-epoch credit is the hard per-epoch TOTAL: it cannot be
         // refilled by per-second windows or new candidate offers, so a failing
         // peer's whole recovery episode stays bounded regardless of how many
         // punch sessions or fresh-mapping generations start.
-        if let Some(identity) = recovery_identity {
-            use crate::peer::RecoveryProbeCreditAdmission;
-            match self
-                .peers
-                .consume_recovery_probe_credit_for_purpose(peer_id, identity, purpose)
-                .await
-            {
-                RecoveryProbeCreditAdmission::Accepted => {}
-                RecoveryProbeCreditAdmission::Exhausted => {
-                    return OutboundProbeAdmission::EpochCreditExhausted
+        let recovery_credit = async {
+            if let Some(identity) = recovery_identity {
+                use crate::peer::RecoveryProbeCreditAdmission;
+                match self
+                    .peers
+                    .consume_recovery_probe_credit_for_purpose(peer_id, identity, purpose)
+                    .await
+                {
+                    RecoveryProbeCreditAdmission::Accepted => {}
+                    RecoveryProbeCreditAdmission::Exhausted => {
+                        return OutboundProbeAdmission::EpochCreditExhausted
+                    }
+                    RecoveryProbeCreditAdmission::ConfirmationReserved => {
+                        return OutboundProbeAdmission::HardHardRecoveryConfirmationReserved
+                    }
+                    RecoveryProbeCreditAdmission::IdentityStale => {
+                        return OutboundProbeAdmission::RecoveryIdentityStale
+                    }
                 }
-                RecoveryProbeCreditAdmission::ConfirmationReserved => {
-                    return OutboundProbeAdmission::HardHardConfirmationCreditReserved
-                }
-                RecoveryProbeCreditAdmission::IdentityStale => {
-                    return OutboundProbeAdmission::RecoveryIdentityStale
-                }
+            } else if !self.peers.try_consume_recovery_probe_credit(peer_id).await {
+                return OutboundProbeAdmission::EpochCreditExhausted;
             }
-        } else if !self.peers.try_consume_recovery_probe_credit(peer_id).await {
-            return OutboundProbeAdmission::EpochCreditExhausted;
+            OutboundProbeAdmission::Accepted
+        };
+
+        let admission = if let Some(global_budget) = self.global_outbound_probe_budget.as_ref() {
+            global_budget
+                .admit_with_purpose_after(
+                    peer_id,
+                    peer_addr,
+                    socket_index,
+                    purpose,
+                    recovery_credit,
+                )
+                .await
+        } else {
+            recovery_credit.await
+        };
+        if admission != OutboundProbeAdmission::Accepted {
+            return admission;
         }
 
+        // No await after the exact recovery gate or global commit.
+        let now = Instant::now();
         budget.entry(network_key).or_default().push_back(now);
         budget.entry(peer_key).or_default().push_back(now);
         budget.entry(remote_ip_key).or_default().push_back(now);

@@ -115,6 +115,12 @@ async fn first_answer_returns_the_committed_claim_snapshot_without_relaxing_iden
         hard_hard_initiator_response_record_matches(&current, &committed),
         "HTTP receipt timing is observation-only"
     );
+    let mut independent_observation = current.clone();
+    independent_observation.measurement.evidence = Default::default();
+    assert!(
+        hard_hard_initiator_response_record_matches(&independent_observation, &committed),
+        "a diagnostic owner must not change ANSWER admission"
+    );
     for field in 0..4 {
         let mut changed = current.clone();
         match field {

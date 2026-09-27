@@ -13,10 +13,10 @@ include!("candidate_dispatch.rs");
 /// - answers are dispatched from their own channel ahead of offers and have a
 ///   dedicated in-flight budget: a slow offer or its retries can never delay
 ///   a later answer;
-/// - every lane is bounded (queue capacity + in-flight semaphore);
+/// - every lane bounds both queued commands and spawned tasks;
 /// - dropping the command's response receiver (the handshake owner was
-///   cancelled or replaced) aborts queued and in-flight work: a stale owner
-///   never sends and never holds a lane slot;
+///   cancelled or replaced) skips the command at admission or aborts its
+///   in-flight work, releasing the active lane slot;
 /// - retries reuse the exact prepared payload and are cut off by one overall
 ///   deadline, so a successful round can never become a 3 x 5 s sequence.
 #[allow(clippy::too_many_arguments)]
@@ -73,7 +73,10 @@ async fn run_critical_control_loop(
             Some(completed) = candidate_tasks.join_next_with_id(), if !candidate_tasks.is_empty() => {
                 reap_candidate_offer_lane(&mut candidate_workers, completed);
             }
-            Some(command) = answer_rx.recv() => {
+            // Keep waiting commands in their bounded channels. A semaphore
+            // inside each spawned task limits HTTP, but cannot bound the
+            // number of tasks waiting for it. Each lane remains independent.
+            Some(command) = answer_rx.recv(), if answers.len() < CRITICAL_ANSWER_MAX_INFLIGHT => {
                 answers.spawn(run_critical_answer_command(
                     http.clone(),
                     command,
@@ -82,7 +85,7 @@ async fn run_critical_control_loop(
                     answer_permits.clone(),
                 ));
             }
-            Some(command) = offer_rx.recv() => {
+            Some(command) = offer_rx.recv(), if offers.len() < CRITICAL_OFFER_MAX_INFLIGHT => {
                 offers.spawn(run_critical_offer_command(
                     http.clone(),
                     command,
@@ -91,7 +94,7 @@ async fn run_critical_control_loop(
                     offer_permits.clone(),
                 ));
             }
-            Some(command) = ctrl_rx.recv() => {
+            Some(command) = ctrl_rx.recv(), if ctrls.len() < CRITICAL_CTRL_MAX_INFLIGHT => {
                 match command {
                     CriticalControlCommand::UpdateEndpoint { endpoint, nat_type, response_tx } => {
                         ctrls.spawn(run_critical_endpoint_command(
@@ -475,12 +478,16 @@ async fn run_candidate_offer_worker(
 /// the owner already dropped the response receiver (cancelled while queued).
 async fn acquire_critical_permit_or_skip<T>(
     permits: &Arc<Semaphore>,
-    response_tx: &oneshot::Sender<T>,
+    response_tx: &mut oneshot::Sender<T>,
 ) -> Option<OwnedSemaphorePermit> {
     if response_tx.is_closed() {
         return None;
     }
-    let permit = permits.clone().acquire_owned().await.ok()?;
+    let permit = tokio::select! {
+        biased;
+        _ = response_tx.closed() => return None,
+        permit = permits.clone().acquire_owned() => permit.ok()?,
+    };
     if response_tx.is_closed() {
         return None;
     }
@@ -495,7 +502,7 @@ async fn run_critical_answer_command(
     permits: Arc<Semaphore>,
 ) {
     let mut response_tx = command.response_tx;
-    let Some(_permit) = acquire_critical_permit_or_skip(&permits, &response_tx).await else {
+    let Some(_permit) = acquire_critical_permit_or_skip(&permits, &mut response_tx).await else {
         return;
     };
     let deadline = Instant::now() + CRITICAL_SIGNAL_OVERALL_DEADLINE;
@@ -544,7 +551,7 @@ async fn run_critical_offer_command(
     permits: Arc<Semaphore>,
 ) {
     let mut response_tx = command.response_tx;
-    let Some(_permit) = acquire_critical_permit_or_skip(&permits, &response_tx).await else {
+    let Some(_permit) = acquire_critical_permit_or_skip(&permits, &mut response_tx).await else {
         return;
     };
     let deadline = Instant::now() + CRITICAL_SIGNAL_OVERALL_DEADLINE;
@@ -601,7 +608,7 @@ async fn run_critical_endpoint_command(
     advertised_snapshot: Arc<std::sync::Mutex<AdvertisedEndpointSnapshot>>,
     lifecycle_tx: mpsc::UnboundedSender<ControlCommand>,
 ) {
-    let Some(_permit) = acquire_critical_permit_or_skip(&permits, &response_tx).await else {
+    let Some(_permit) = acquire_critical_permit_or_skip(&permits, &mut response_tx).await else {
         return;
     };
     let deadline = Instant::now() + CRITICAL_SIGNAL_OVERALL_DEADLINE;

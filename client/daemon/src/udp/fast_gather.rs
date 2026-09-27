@@ -32,6 +32,7 @@ impl UdpTransport {
             stun_servers,
             stun_timeout.min(crate::DIRECT_STARTUP_STUN_TIMEOUT),
             false,
+            true,
         )
         .await
     }
@@ -40,14 +41,21 @@ impl UdpTransport {
     ///
     /// This is used after the bounded startup window to obtain the full NAT
     /// profile without serializing observers or stealing encrypted datagrams
-    /// from the inbound reader.
+    /// from the inbound reader. The caller must apply the returned socket-pool
+    /// policy only after accepting this report against its candidate snapshot;
+    /// gateway discovery can otherwise let an older report finish last.
     pub async fn gather_candidate_report_live_parallel_full(
         &self,
         stun_servers: Vec<SocketAddr>,
         stun_timeout: Duration,
     ) -> Result<CandidateGatherReport> {
-        self.gather_candidate_report_live_parallel_with_timeout(stun_servers, stun_timeout, true)
-            .await
+        self.gather_candidate_report_live_parallel_with_timeout(
+            stun_servers,
+            stun_timeout,
+            true,
+            false,
+        )
+        .await
     }
 
     async fn gather_candidate_report_live_parallel_with_timeout(
@@ -55,6 +63,7 @@ impl UdpTransport {
         stun_servers: Vec<SocketAddr>,
         stun_timeout: Duration,
         probe_filtering: bool,
+        apply_socket_pool_policy: bool,
     ) -> Result<CandidateGatherReport> {
         let local_addr = self.local_addr()?;
         let primary_servers = stun_servers
@@ -160,7 +169,9 @@ impl UdpTransport {
         // not proof that UDP is blocked when a secondary bound socket has a
         // real server-reflexive mapping.  In that case the pool is the
         // available direct path and must remain active for punch/retry.
-        self.set_socket_pool_active(socket_pool_is_eligible(&report));
+        if apply_socket_pool_policy {
+            self.apply_candidate_report_socket_pool_policy(&report);
+        }
 
         if !self.peers.predicted_candidates_enabled_for_gather() {
             report
@@ -168,6 +179,10 @@ impl UdpTransport {
                 .retain(|candidate| candidate.source != p2pnet_nat::CandidateSource::Predicted);
         }
         Ok(report)
+    }
+
+    pub(crate) fn apply_candidate_report_socket_pool_policy(&self, report: &CandidateGatherReport) {
+        self.set_socket_pool_active(socket_pool_is_eligible(report));
     }
 
     async fn probe_live_filtering_behavior(

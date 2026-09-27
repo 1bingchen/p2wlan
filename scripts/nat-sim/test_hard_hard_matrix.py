@@ -753,5 +753,45 @@ class HardHardMatrixRunnerTests(unittest.TestCase):
         self.assertFalse(output.exists())
 
 
+class HardHardConfirmationCostsTests(unittest.TestCase):
+    def test_old_and_partial_reports_keep_missing_confirmation_costs_unknown(self):
+        confirmation = {
+            purpose: {"datagrams": 1, "bytes": 80}
+            for purpose in (
+                "triggered_check", "nomination", "probe_ack", "validation_request", "validation_ack"
+            )
+        }
+        confirmation.update({
+            "retryable_not_sent": 0, "budget_deferred": 2, "delivery_unknown": 0, "stopped": 0
+        })
+        reports = [
+            {"confirmation": confirmation},
+            {},
+            {"confirmation": {"probe_ack": {"datagrams": True, "bytes": -1}}},
+        ]
+        summary = MATRIX_RUNNER.confirmation_cost_summary(reports)
+        self.assertEqual(summary["observed_attempt_reports"], 3)
+        self.assertEqual(summary["complete_attempt_reports"], 1)
+        self.assertEqual(summary["known_observed_costs"]["probe_ack_datagrams"], 1)
+        self.assertEqual(summary["known_observed_costs"]["validation_request_bytes"], 80)
+        self.assertEqual(summary["known_observed_costs"]["budget_deferred"], 2)
+        self.assertEqual(summary["unknown_field_counts"]["probe_ack_datagrams"], 2)
+        self.assertEqual(summary["unknown_field_counts"]["probe_ack_bytes"], 2)
+        self.assertEqual(summary["unknown_field_counts"]["nomination_bytes"], 2)
+
+    def test_confirmation_does_not_spend_or_inflate_the_sweep_datagram_cap(self):
+        attempt = {
+            "counts": {"send_success_datagrams": 4, "planned_physical_datagram_cap": 4},
+            "confirmation": {"nomination": {"datagrams": 3, "bytes": 240}},
+        }
+        summary = MATRIX_RUNNER.cost_summary([], [attempt])
+        self.assertEqual(summary["probe_cost_scope"], "sweep_only")
+        self.assertEqual(summary["known_observed_costs"]["probe_datagrams"], 4)
+        confirmation = summary["confirmation_costs"]
+        self.assertEqual(confirmation["known_observed_costs"]["nomination_datagrams"], 3)
+        self.assertEqual(confirmation["unknown_field_counts"]["validation_ack_bytes"], 1)
+        self.assertEqual(confirmation["complete_attempt_reports"], 0)
+
+
 if __name__ == "__main__":
     unittest.main()

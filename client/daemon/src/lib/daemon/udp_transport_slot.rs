@@ -133,10 +133,6 @@ impl UdpTransportPublication {
         true
     }
 
-    async fn is_current_owner(&self, owner: UdpTransportOwner) -> bool {
-        self.inner.state.lock().await.current_owner == Some(owner)
-    }
-
     /// Withdraw whichever instance is current, used during daemon shutdown.
     async fn clear_current(&self) {
         let mut state = self.inner.state.lock().await;

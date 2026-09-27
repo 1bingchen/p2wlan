@@ -729,6 +729,7 @@ fn build_hard_hard_attempt_report(
             .map(|target| hard_hard_anonymized_tag(session_token, target))
             .collect(),
         confirmed_target_rank,
+        confirmation: measurement.evidence.confirmation_snapshot(),
         timeline: crate::peer::HardHardAttemptTimeline {
             measurement_started_at_ms: measurement.measurement_started_at_ms,
             last_measurement_send_at_ms: measurement.last_measurement_send_at_ms,
@@ -779,29 +780,41 @@ async fn record_hard_hard_terminal_attempt(
     planned_logical_probes: usize,
     send_dispatch_at_ms: Option<u64>,
     punch_report: &PunchSendReport,
-    probe_rx: UdpProbeRxSnapshot,
+    _probe_rx: UdpProbeRxSnapshot,
     direct_confirmed: bool,
     business_attribution_identity: Option<crate::peer::HardHardBusinessAttributionIdentity>,
     terminal_reason: &str,
 ) -> bool {
-    let encrypted_validation_completed_at_ms = direct_confirmed
+    if fresh_socket.peer_id != peer_id || fresh_socket.session_token != session_token {
+        return false;
+    }
+    let Some(probe_rx) = measurement.evidence.freeze_receive_snapshot(
+        fresh_socket,
+        peer_session_generation,
+        attempt,
+    ) else {
+        return false;
+    };
+    // Both milestones come from one exact committed snapshot. There is no
+    // await between the owner-fenced cutoff and one-shot terminal sealing.
+    let committed = direct_confirmed
         .then(|| peers.direct_commit_pair_snapshot_sync(peer_id))
         .flatten()
         .filter(|snapshot| {
             snapshot.generation == fresh_socket.network_generation
+                && snapshot.peer_session_generation == peer_session_generation
                 && snapshot.remote_candidate_epoch == fresh_socket.remote_candidate_epoch
                 && snapshot.local_endpoint == Some(fresh_socket.socket_local_endpoint)
+        });
+    let encrypted_validation_completed_at_ms =
+        committed.and_then(|snapshot| snapshot.confirmed_at_ms);
+    let confirmed_target_rank = committed
+        .and_then(|snapshot| {
+            targets
+                .iter()
+                .position(|target| *target == snapshot.remote_endpoint)
         })
-        .and_then(|snapshot| snapshot.confirmed_at_ms);
-    let confirmed_target_rank = if direct_confirmed {
-        peers
-            .selected_direct_endpoint_for_consent(peer_id)
-            .await
-            .and_then(|selected| targets.iter().position(|target| *target == selected))
-            .and_then(|rank| u32::try_from(rank).ok())
-    } else {
-        None
-    };
+        .and_then(|rank| u32::try_from(rank).ok());
     let report = build_hard_hard_attempt_report(
         peers,
         peers.hard_hard_experiment_only(),
@@ -826,7 +839,12 @@ async fn record_hard_hard_terminal_attempt(
         terminal_reason,
     );
     peers
-        .record_hard_hard_attempt_report(peer_id, session_token, report)
+        .record_hard_hard_attempt_report_with_evidence(
+            peer_id,
+            session_token,
+            report,
+            &measurement.evidence,
+        )
         .await
 }
 
@@ -1305,7 +1323,7 @@ async fn hard_hard_wait_and_sweep(
     punch_at_ms: u64,
     network_generation: u64,
     profile_generations: (u64, u64),
-    probe_session_id: Option<String>,
+    _probe_session_id: Option<String>,
     origin: &'static str,
     attempt: u8,
     mut measurement: crate::peer::HardHardMeasurementObservation,
@@ -1446,17 +1464,10 @@ async fn hard_hard_wait_and_sweep(
         .await;
         return false;
     }
-    // Capture receive/commit baselines before the lifecycle marker. The
+    // Capture the Direct commit baseline before the lifecycle marker. The
     // marker is intentionally nonblocking, and no diagnostics-map write is
     // allowed to sit in front of the first scheduled UDP send.
     let direct_commit_seq = peers.direct_commit_seq_sync(&peer_id);
-    let probe_rx_before = udp
-        .probe_rx_snapshot_for_peer_session(
-            &peer_id,
-            network_generation,
-            probe_session_id.as_deref(),
-        )
-        .await;
     let dispatch_monotonic = Instant::now();
     let dispatch_at_ms = session.mark_first_send_started();
     peers
@@ -1555,14 +1566,7 @@ async fn hard_hard_wait_and_sweep(
     if scan_timed_out && outcome == PunchSessionOutcome::Completed {
         outcome = PunchSessionOutcome::DeadlineExceeded;
     }
-    let probe_rx_after = udp
-        .probe_rx_snapshot_for_peer_session(
-            &peer_id,
-            network_generation,
-            probe_session_id.as_deref(),
-        )
-        .await;
-    let probe_rx_delta = probe_rx_after.delta_since(probe_rx_before);
+    let probe_rx_delta = measurement.evidence.receive_snapshot();
     let mut terminal_punch_report = PunchSendReport {
         targets_assigned: hard_hard_bounded_u32(targets.len()),
         targets_cancelled: hard_hard_bounded_u32(targets.len()),
@@ -2019,7 +2023,12 @@ async fn hard_hard_wait_and_sweep(
         peers
             .hard_hard_fresh_socket_for_token(&peer_id, &session_token)
             .await
-            .unwrap_or_else(|| fresh_socket.clone())
+            .unwrap_or_else(|| {
+                measurement
+                    .evidence
+                    .socket_snapshot()
+                    .unwrap_or_else(|| fresh_socket.clone())
+            })
     } else {
         fresh_socket.clone()
     };
@@ -2037,26 +2046,49 @@ async fn hard_hard_wait_and_sweep(
     let business_attribution_identity = terminal_direct_confirmed
         .then(|| udp.hard_hard_business_attribution_identity(&peer_id))
         .flatten();
+    // Freeze confirmation evidence for the terminal report and later learning.
+    // Seal/commit-or-archive before any best-effort learning lookup can await.
     // Confirmation may have admitted packets after the earlier sweep snapshot.
     // Only a fully executed, error-free exploration with no authenticated
     // evidence is a negative strategy sample; all other failures are unknown.
-    let probe_rx_delta = udp
-        .probe_rx_snapshot_for_peer_session(
-            &peer_id,
-            network_generation,
-            probe_session_id.as_deref(),
-        )
-        .await
-        .delta_since(probe_rx_before);
+    let probe_rx_delta = measurement.evidence.freeze_receive_snapshot(
+        &terminal_socket_identity,
+        peer_session_generation,
+        attempt,
+    );
+    let _ = record_hard_hard_terminal_attempt(
+        &peers,
+        &peer_id,
+        peer_session_generation,
+        &terminal_socket_identity,
+        &session_token,
+        origin,
+        birthday_socket_indices.is_some(),
+        attempt,
+        &measurement,
+        &targets,
+        planned_sockets,
+        planned_socket_target_combinations,
+        planned_logical_probes,
+        send_dispatch_at_ms,
+        &terminal_punch_report,
+        probe_rx_delta.unwrap_or_default(),
+        terminal_direct_confirmed,
+        business_attribution_identity,
+        &terminal_reason,
+    )
+    .await;
     if coordinated_session
         && !terminal_direct_confirmed
         && !session.is_cancelled()
         && outcome == PunchSessionOutcome::Completed
-        && hard_hard_complete_unanswered_exploration(
-            &terminal_punch_report,
-            planned_logical_probes,
-            probe_rx_delta,
-        )
+        && probe_rx_delta.is_some_and(|received| {
+            hard_hard_complete_unanswered_exploration(
+                &terminal_punch_report,
+                planned_logical_probes,
+                received,
+            )
+        })
     {
         if let Some(current) = peers
             .hard_hard_session_by_token(&peer_id, &session_token)
@@ -2087,28 +2119,6 @@ async fn hard_hard_wait_and_sweep(
             }
         }
     }
-    let _ = record_hard_hard_terminal_attempt(
-        &peers,
-        &peer_id,
-        peer_session_generation,
-        &terminal_socket_identity,
-        &session_token,
-        origin,
-        birthday_socket_indices.is_some(),
-        attempt,
-        &measurement,
-        &targets,
-        planned_sockets,
-        planned_socket_target_combinations,
-        planned_logical_probes,
-        send_dispatch_at_ms,
-        &terminal_punch_report,
-        probe_rx_delta,
-        terminal_direct_confirmed,
-        business_attribution_identity,
-        &terminal_reason,
-    )
-    .await;
     direct_result
 }
 

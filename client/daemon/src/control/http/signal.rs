@@ -190,7 +190,15 @@ pub(super) async fn poll_signals(
     wait_ms: u64,
     delivery_tracker: &Arc<tokio::sync::Mutex<SignalDeliveryTracker>>,
     server_clock: &ServerClockEstimate,
+    registration_rx: tokio::sync::watch::Receiver<Option<super::CriticalControlAuth>>,
 ) -> Result<()> {
+    let ack_registration = SignalAckRegistration::capture(
+        base_url,
+        token,
+        self_node_id,
+        registration_seq,
+        registration_rx,
+    )?;
     // ACK mode (`ack=1`): the server hands out delivery LEASES instead of
     // deleting rows at GET time, so a connection that breaks mid-body or a
     // client that dies mid-processing can never lose a signal — the lease
@@ -213,6 +221,7 @@ pub(super) async fn poll_signals(
     // decoding and executor contention must not extend a synchronized punch
     // deadline or candidate lifetime after the bytes have already arrived.
     let received_at_ms = unix_time_millis();
+    let received_at = tokio::time::Instant::now();
 
     if !res.status().is_success() {
         let status = res.status();
@@ -241,6 +250,7 @@ pub(super) async fn poll_signals(
             );
         }
     }
+    ack_registration.ensure_current()?;
     let ack_mode = body.delivery.is_some();
     if let Some(delivery) = body.delivery.as_ref() {
         debug!(
@@ -340,6 +350,7 @@ pub(super) async fn poll_signals(
                         signal_type: signal.signal_type,
                         from_node_id: signal.from_node_id,
                         ack,
+                        ack_timing: SignalAckTiming::Ordinary,
                         prepared: PreparedSignalDelivery::TerminalRejected,
                     });
             }
@@ -348,6 +359,12 @@ pub(super) async fn poll_signals(
         let punch_at_ms =
             normalize_signal_punch_at(signal.punch_at_ms, server_time_ms, received_at_ms);
         let punch_at_server_ms = signal.punch_at_ms.filter(|_| server_time_ms.is_some());
+        let ack_timing = SignalAckTiming::for_signal(
+            signal.session_id.as_deref(),
+            punch_at_ms,
+            received_at_ms,
+            received_at,
+        );
         let candidates_expires_at_ms = normalize_signal_candidate_expiry(
             signal.candidates_expires_at_ms,
             server_time_ms,
@@ -456,6 +473,7 @@ pub(super) async fn poll_signals(
                     signal_type,
                     from_node_id,
                     ack,
+                    ack_timing,
                     prepared,
                 });
             continue;
@@ -482,7 +500,7 @@ pub(super) async fn poll_signals(
             base_url.to_string(),
             token.to_string(),
             self_node_id.to_string(),
-            registration_seq,
+            ack_registration.clone(),
             event_tx.clone(),
             delivery_tracker.clone(),
             deliveries,
@@ -626,6 +644,7 @@ struct LeasedSignalDelivery {
     signal_type: String,
     from_node_id: String,
     ack: SignalAckRequest,
+    ack_timing: SignalAckTiming,
     prepared: PreparedSignalDelivery,
 }
 
@@ -776,13 +795,16 @@ fn spawn_signal_application_lane(
     base_url: String,
     token: String,
     self_node_id: String,
-    registration_seq: Option<u64>,
+    mut ack_registration: SignalAckRegistration,
     event_tx: mpsc::UnboundedSender<ControlEvent>,
     delivery_tracker: Arc<tokio::sync::Mutex<SignalDeliveryTracker>>,
     deliveries: Vec<LeasedSignalDelivery>,
 ) {
     tokio::spawn(async move {
         for delivery in deliveries {
+            if ack_registration.ensure_current().is_err() {
+                break;
+            }
             let log_signal_id = bounded_signal_log_value(&delivery.signal_id);
             let log_from_node_id = bounded_signal_log_value(&delivery.from_node_id);
             let log_signal_type = bounded_signal_log_value(&delivery.signal_type);
@@ -945,13 +967,14 @@ fn spawn_signal_application_lane(
                 break;
             }
 
-            if let Err(error) = ack_signals(
+            if let Err(error) = ack_signals_with_retry(
                 &http,
                 &base_url,
                 &token,
                 &self_node_id,
-                registration_seq,
-                std::slice::from_ref(&delivery.ack),
+                &mut ack_registration,
+                &delivery.ack,
+                delivery.ack_timing,
             )
             .await
             {
@@ -976,39 +999,7 @@ struct SignalAckRequest {
     delivery_token: String,
 }
 
-/// Acknowledge a delivered signal batch (idempotent server-side).
-async fn ack_signals(
-    http: &reqwest::Client,
-    base_url: &str,
-    token: &str,
-    self_node_id: &str,
-    registration_seq: Option<u64>,
-    acks: &[SignalAckRequest],
-) -> Result<()> {
-    let res = with_registration_sequence(
-        http.post(format!(
-            "{base_url}/api/v1/signals/ack?node_id={self_node_id}"
-        ))
-        .timeout(SIGNAL_SEND_TIMEOUT)
-        .bearer_auth(token)
-        .json(&serde_json::json!({ "signals": acks })),
-        registration_seq,
-    )
-    .send()
-    .await
-    .map_err(|e| DaemonError::ControlPlane(format!("signal ack request failed: {e}")))?;
-    if !res.status().is_success() {
-        let status = res.status();
-        let (detail, error_code, current_seq) = control_error_detail(res).await;
-        if let Some(error) = registration_conflict_error(status, error_code, current_seq, &detail) {
-            return Err(error);
-        }
-        return Err(DaemonError::ControlPlane(format!(
-            "signal ack returned HTTP {status}: {detail}",
-        )));
-    }
-    Ok(())
-}
+include!("signal_ack.rs");
 
 pub(super) fn normalize_signal_punch_at(
     punch_at_ms: Option<u64>,

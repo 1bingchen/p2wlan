@@ -14,6 +14,21 @@ fn test_no_proxy_client() -> reqwest::Client {
         .expect("test client must build")
 }
 
+fn test_signal_registration(
+    base_url: &str,
+    registration_seq: Option<u64>,
+) -> watch::Sender<Option<CriticalControlAuth>> {
+    watch::channel(Some(CriticalControlAuth {
+        accepted_peer_capabilities: PeerCapabilities::default(),
+        base_url: base_url.to_string(),
+        token: "test-token".to_string(),
+        self_node_id: "node-a".to_string(),
+        registration_seq,
+        signal_signing_identity: None,
+    }))
+    .0
+}
+
 #[test]
 fn test_control_client_creation() {
     let config = test_config();
@@ -368,6 +383,7 @@ async fn poll_signals_skips_bad_handshake_without_dropping_healthy_signals() {
 
     let (event_tx, mut event_rx) = mpsc::unbounded_channel();
     let server_clock = ServerClockEstimate::default();
+    let registration = test_signal_registration(&format!("http://{address}"), None);
     let result = poll_signals(
         &test_no_proxy_client(),
         &format!("http://{address}"),
@@ -378,6 +394,7 @@ async fn poll_signals_skips_bad_handshake_without_dropping_healthy_signals() {
         0,
         &Arc::new(tokio::sync::Mutex::new(SignalDeliveryTracker::default())),
         &server_clock,
+        registration.subscribe(),
     )
     .await;
     assert!(
@@ -489,6 +506,7 @@ async fn poll_signals_ack_mode_applies_then_acks_and_dedupes_redelivery() {
     let (event_tx, mut event_rx) = mpsc::unbounded_channel();
     let dedup = Arc::new(tokio::sync::Mutex::new(SignalDeliveryTracker::default()));
     let server_clock = ServerClockEstimate::default();
+    let registration = test_signal_registration(&format!("http://{address}"), Some(41));
 
     // First poll: the signal is decoded and dispatched, but remains durable
     // until the daemon state machine completes the receipt.
@@ -502,6 +520,7 @@ async fn poll_signals_ack_mode_applies_then_acks_and_dedupes_redelivery() {
         0,
         &dedup,
         &server_clock,
+        registration.subscribe(),
     )
     .await;
     assert!(result.is_ok(), "first poll must succeed: {result:?}");
@@ -534,6 +553,7 @@ async fn poll_signals_ack_mode_applies_then_acks_and_dedupes_redelivery() {
         0,
         &dedup,
         &server_clock,
+        registration.subscribe(),
     )
     .await;
     assert!(
@@ -575,6 +595,7 @@ async fn poll_signals_ack_mode_applies_then_acks_and_dedupes_redelivery() {
         0,
         &dedup,
         &server_clock,
+        registration.subscribe(),
     )
     .await;
     assert!(result.is_ok(), "third poll must succeed: {result:?}");

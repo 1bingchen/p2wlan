@@ -760,6 +760,9 @@ fn hard_hard_initiator_response_record_matches(
         expected.measurement.candidate_signal_accepted_at_ms;
     current_measurement.advertised_candidate_count =
         expected.measurement.advertised_candidate_count;
+    // Diagnostic ownership never authorizes or rejects ANSWER admission.
+    // Keep the pre-existing measured-fact comparison independent of its Arc.
+    current_measurement.evidence = expected.measurement.evidence.clone();
     current.session_id == expected.session_id
         && current.session_token == expected.session_token
         && current.peer_id == expected.peer_id

@@ -425,6 +425,27 @@ pub struct HardHardAttemptTimeline {
     pub business_evidence_attribution: Option<String>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HardHardDatagramCost {
+    pub datagrams: u64,
+    pub bytes: u64,
+}
+
+/// Additional HH2 confirmation traffic, separate from the unchanged sweep
+/// counters. Only successful kernel handoffs spend datagrams/bytes here.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HardHardConfirmationCosts {
+    pub triggered_check: HardHardDatagramCost,
+    pub nomination: HardHardDatagramCost,
+    pub probe_ack: HardHardDatagramCost,
+    pub validation_request: HardHardDatagramCost,
+    pub validation_ack: HardHardDatagramCost,
+    pub retryable_not_sent: u64,
+    pub budget_deferred: u64,
+    pub delivery_unknown: u64,
+    pub stopped: u64,
+}
+
 /// Endpoint-free report emitted once when a Hard↔Hard sweep reaches a
 /// terminal result. Build identity is embedded so a copied peer record still
 /// proves which binary produced it; scenario/seed/attempt identity remains in
@@ -461,6 +482,9 @@ pub struct HardHardAttemptReport {
     pub socket_index: Option<usize>,
     pub attempt: u8,
     pub counts: HardHardAttemptCounts,
+    /// None means confirmation instrumentation was unavailable (legacy/pre-session).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confirmation: Option<HardHardConfirmationCosts>,
     pub candidate_cap: u32,
     pub truncation_reason: String,
     pub target_order_tags: Vec<String>,

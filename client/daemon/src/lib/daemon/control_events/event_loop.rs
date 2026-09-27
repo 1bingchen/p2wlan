@@ -1032,12 +1032,13 @@ impl Daemon {
                             let outcome = if !peer_known || !peer_online || !identity_matches || !handshake_init.is_empty() {
                                 control::SignalApplyOutcome::TerminalRejected
                             } else {
-                                match tokio::time::timeout(Duration::from_millis(50),
-                                    self.accept_hard_hard_ready_signal(&from_node_id, &coordination, &candidates, punch_at_server_ms)).await {
-                                    Ok(true) => control::SignalApplyOutcome::Applied,
-                                    Ok(false) => control::SignalApplyOutcome::TerminalRejected,
-                                    Err(_) => control::SignalApplyOutcome::Retry,
-                                }
+                                await_peer_lifecycle_commit_while_driving_work(
+                                    daemon,
+                                    self.apply_hard_hard_barrier_signal(&from_node_id, &coordination,
+                                        &candidates, punch_at_ms, punch_at_server_ms),
+                                    &mut slow_work, &mut retry_work, &mut responder_work,
+                                    &mut candidate_work, &mut deferred_initiators,
+                                ).await
                             };
                             if let Some(receipt) = delivery_receipt.as_ref() { receipt.complete(outcome); }
                             continue;

@@ -242,27 +242,20 @@ async fn run_control_loop(
                             );
                             let _ =
                                 event_tx.send(ControlEvent::ReauthRequired { message: err_str });
-                            // Stop fast retries; wait for Shutdown or a long pause then re-check.
-                            loop {
-                                tokio::select! {
-                                    Some(cmd) = cmd_rx.recv() => {
-                                        if let ControlCommand::Shutdown { response_tx } = cmd {
-                                            let _ = response_tx.send(());
-                                            let _ = event_tx.send(ControlEvent::Disconnected);
-                                            return;
-                                        }
-                                    }
-                                    _ = tokio::time::sleep(Duration::from_secs(60)) => {
-                                        // Allow operator to fix credentials and retry once per minute.
-                                        warn!("Retrying registration after permanent-auth cooldown");
-                                        break;
-                                    }
-                                    else => {
-                                        let _ = event_tx.send(ControlEvent::Disconnected);
-                                        return;
-                                    }
-                                }
+                            if !wait_control_recovery(
+                                ControlRecoveryDelay::PermanentAuth,
+                                &http,
+                                cmd_rx,
+                                event_tx,
+                                &critical_auth_tx,
+                                &server_clock,
+                                None,
+                            )
+                            .await
+                            {
+                                return;
                             }
+                            warn!("Retrying registration after permanent-auth cooldown");
                             // After cooldown, try again (outer attempt loop).
                             continue;
                         }
@@ -272,20 +265,18 @@ async fn run_control_loop(
                         warn!(
                             "Control registration failed (attempt {attempt}); retrying in {delay:?}: {err_str}"
                         );
-                        // Interruptible sleep so Shutdown is honoured.
-                        tokio::select! {
-                            _ = tokio::time::sleep(delay) => {}
-                            Some(cmd) = cmd_rx.recv() => {
-                                if let ControlCommand::Shutdown { response_tx } = cmd {
-                                    let _ = response_tx.send(());
-                                    let _ = event_tx.send(ControlEvent::Disconnected);
-                                    return;
-                                }
-                            }
-                            else => {
-                                let _ = event_tx.send(ControlEvent::Disconnected);
-                                return;
-                            }
+                        if !wait_control_recovery(
+                            ControlRecoveryDelay::Transient(delay),
+                            &http,
+                            cmd_rx,
+                            event_tx,
+                            &critical_auth_tx,
+                            &server_clock,
+                            None,
+                        )
+                        .await
+                        {
+                            return;
                         }
                     }
                 }
@@ -344,6 +335,7 @@ async fn run_control_loop(
                 0,
                 &recent_signal_ids,
                 &server_clock,
+                critical_auth_tx.subscribe(),
             )
             .await
         }
@@ -512,19 +504,18 @@ async fn run_control_loop(
                                 let _ = event_tx.send(ControlEvent::ReauthRequired {
                                     message: err_str,
                                 });
-                                tokio::select! {
-                                    Some(cmd) = cmd_rx.recv() => {
-                                        if let ControlCommand::Shutdown { response_tx } = cmd {
-                                            let _ = response_tx.send(());
-                                            let _ = event_tx.send(ControlEvent::Disconnected);
-                                            return;
-                                        }
-                                    }
-                                    _ = tokio::time::sleep(Duration::from_secs(60)) => {}
-                                    else => {
-                                        let _ = event_tx.send(ControlEvent::Disconnected);
-                                        return;
-                                    }
+                                if !wait_control_recovery(
+                                    ControlRecoveryDelay::PermanentAuth,
+                                    &http,
+                                    cmd_rx,
+                                    event_tx,
+                                    &critical_auth_tx,
+                                    &server_clock,
+                                    signal_ws_task.as_ref(),
+                                )
+                                .await
+                                {
+                                    return;
                                 }
                                 break;
                             }
@@ -574,6 +565,7 @@ async fn run_control_loop(
                             0,
                             &recent_signal_ids,
                             &server_clock,
+                            critical_auth_tx.subscribe(),
                         )
                         .await
                     }
@@ -631,6 +623,7 @@ async fn run_control_loop(
                             wait_ms,
                             &recent_signal_ids,
                             &server_clock,
+                            critical_auth_tx.subscribe(),
                         )
                         .await
                     }
@@ -657,19 +650,18 @@ async fn run_control_loop(
                                 let _ = event_tx.send(ControlEvent::ReauthRequired {
                                     message: err_str,
                                 });
-                                tokio::select! {
-                                    Some(cmd) = cmd_rx.recv() => {
-                                        if let ControlCommand::Shutdown { response_tx } = cmd {
-                                            let _ = response_tx.send(());
-                                            let _ = event_tx.send(ControlEvent::Disconnected);
-                                            return;
-                                        }
-                                    }
-                                    _ = tokio::time::sleep(Duration::from_secs(60)) => {}
-                                    else => {
-                                        let _ = event_tx.send(ControlEvent::Disconnected);
-                                        return;
-                                    }
+                                if !wait_control_recovery(
+                                    ControlRecoveryDelay::PermanentAuth,
+                                    &http,
+                                    cmd_rx,
+                                    event_tx,
+                                    &critical_auth_tx,
+                                    &server_clock,
+                                    signal_ws_task.as_ref(),
+                                )
+                                .await
+                                {
+                                    return;
                                 }
                                 break;
                             }

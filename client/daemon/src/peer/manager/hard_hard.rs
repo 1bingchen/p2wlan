@@ -205,7 +205,10 @@ impl PeerManager {
         )
     }
 
-    pub(crate) async fn hard_hard_register_session(&self, record: HardHardSessionRecord) -> bool {
+    pub(crate) async fn hard_hard_register_session(
+        &self,
+        mut record: HardHardSessionRecord,
+    ) -> bool {
         let now = hard_hard_now_ms();
         let mut cancelled = Vec::new();
         let mut retired_winners = Vec::new();
@@ -273,6 +276,7 @@ impl PeerManager {
                     }
                 }
             }
+            self.bind_hard_hard_observations(&mut record);
             sessions.insert(key, record);
             true
         };
@@ -422,47 +426,6 @@ impl PeerManager {
         true
     }
 
-    /// Report-only identity fence. A cancellation may already be visible by
-    /// the time its terminal report is committed, so this intentionally does
-    /// not require an uncancelled token. Replacement and retiring sessions
-    /// still fail closed through the exact token and generation identities.
-    /// The outer option admits the report; the inner option captures its
-    /// negotiated strategy from the same snapshot (None for legacy attempts).
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn hard_hard_attempt_report_strategy_if_current(
-        &self,
-        peer_id: &str,
-        token: &str,
-        network_generation: u64,
-        remote_candidate_epoch: u64,
-        punch_generation: u64,
-        socket_index: usize,
-        attempt: u8,
-    ) -> Option<Option<HardHardProbeStrategy>> {
-        self.hard_hard_sessions
-            .lock()
-            .await
-            .iter()
-            .find(|((owner, _), record)| {
-                owner == peer_id
-                    && record.session_token == token
-                    && record.state != HardHardSessionState::Retiring
-            })
-            .filter(|(_, session)| {
-                session.local_network_generation == network_generation
-                    && session.remote_candidate_epoch == remote_candidate_epoch
-                    && session.fresh_socket.punch_generation == punch_generation
-                    && session.fresh_socket.socket_index == socket_index
-                    && session.attempt_count == attempt
-            })
-            .map(|(_, session)| {
-                session
-                    .coordinated_plan
-                    .as_ref()
-                    .and_then(|plan| plan.agreement.map(|agreement| agreement.strategy))
-            })
-    }
-
     /// Promote one authenticated speculative socket to the session winner.
     ///
     /// The UDP layer has already authenticated the Probe v2 packet and checked
@@ -515,6 +478,10 @@ impl PeerManager {
         record.fresh_socket.socket_index = socket_index;
         record.fresh_socket.punch_generation = punch_generation.max(1);
         record.fresh_socket.socket_local_endpoint = socket_local_endpoint;
+        record
+            .measurement
+            .evidence
+            .owner_committed_socket(&record.fresh_socket);
         Some(record.fresh_socket.clone())
     }
 
@@ -594,6 +561,10 @@ impl PeerManager {
         }
         record.remote_candidate_epoch = current_remote_candidate_epoch;
         record.fresh_socket.remote_candidate_epoch = current_remote_candidate_epoch;
+        record
+            .measurement
+            .evidence
+            .owner_committed_socket(&record.fresh_socket);
         HardHardResponseAdmission::Ready
     }
 
@@ -803,6 +774,13 @@ impl PeerManager {
         }
         record.state = HardHardSessionState::Sweeping;
         record.attempt_count = record.attempt_count.saturating_add(1);
+        record.measurement.evidence.begin_sweep(
+            record.attempt_count,
+            record
+                .coordinated_plan
+                .as_ref()
+                .and_then(|plan| plan.agreement.map(|a| a.strategy)),
+        );
         Some(record.clone())
     }
 

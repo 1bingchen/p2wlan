@@ -383,6 +383,10 @@ impl PeerManager {
         plan.remote_offer = Some(remote_offer);
         plan.agreement = Some(agreement);
         plan.sync_uncertainty = sync_uncertainty;
+        record
+            .measurement
+            .evidence
+            .begin_sweep(record.attempt_count, Some(agreement.strategy));
         record.remote_prediction = remote_prediction.to_vec();
         record.remote_network_generation = remote_network_generation;
         record.remote_prediction_confidence = remote_confidence;

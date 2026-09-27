@@ -173,96 +173,131 @@ impl PeerManager {
     /// the write so a late old attempt is never attributed to a replacement
     /// peer session or candidate epoch. The report is not consulted by any
     /// production decision.
+    #[cfg(test)]
     pub(crate) async fn record_hard_hard_attempt_report(
         &self,
         peer_id: &str,
         session_token: &str,
-        mut report: HardHardAttemptReport,
+        report: HardHardAttemptReport,
     ) -> bool {
-        if self.current_network_generation_sync() != report.network_generation
-            || !self.peer_session_is_current_sync(
-                peer_id,
-                PeerSessionGeneration(report.peer_session_generation),
-            )
-            || self.current_remote_candidate_epoch(peer_id).await
-                != Some(report.remote_candidate_epoch)
-        {
-            self.emit_timeline_debug(
-                "hard_hard_attempt_report_fenced",
-                Some("direct"),
-                Some("stale_attempt_identity"),
-                Some(format!(
-                    "peer_id={peer_id} generation={} session_tag={} failure_class={}",
-                    report.network_generation, report.session_tag, report.failure_class,
-                )),
-            );
-            return false;
-        }
-        let Some(socket_index) = report.socket_index else {
-            return false;
-        };
-        let Some(strategy) = self
-            .hard_hard_attempt_report_strategy_if_current(
-                peer_id,
-                session_token,
-                report.network_generation,
-                report.remote_candidate_epoch,
-                report.punch_generation,
-                socket_index,
-                report.attempt,
-            )
+        let Some(record) = self
+            .hard_hard_session_by_token(peer_id, session_token)
             .await
         else {
             return false;
         };
-        if let Some(strategy) = strategy {
-            // Fixed-anchor and birthday scans share a transport path. Report
-            // the agreed strategy, never infer it from that implementation.
-            report.mode = match strategy {
-                HardHardProbeStrategy::FixedAnchor => "fixed_anchor",
-                HardHardProbeStrategy::Predictable => "predictable",
-                HardHardProbeStrategy::Birthday => "birthday",
-            }
-            .to_string();
+        self.record_hard_hard_attempt_report_with_evidence(
+            peer_id,
+            session_token,
+            report,
+            &record.measurement.evidence,
+        )
+        .await
+    }
+
+    pub(crate) async fn record_hard_hard_attempt_report_with_evidence(
+        &self,
+        peer_id: &str,
+        session_token: &str,
+        mut report: HardHardAttemptReport,
+        evidence: &HardHardAttemptEvidence,
+    ) -> bool {
+        if !evidence.seal_report(peer_id, session_token, &mut report) {
+            return false;
         }
         let detail = format!(
             "peer_id={peer_id} generation={} session_tag={} role={} mode={} attempt={} failure_class={} terminal_reason={} physical_datagrams_sent={} send_errors={} budget_skipped={}",
-            report.network_generation,
-            report.session_tag,
-            report.role,
-            report.mode,
-            report.attempt,
-            report.failure_class,
-            report.terminal_reason,
-            report.counts.send_success_datagrams,
-            report.counts.send_errors,
-            report.counts.budget_skipped,
+            report.network_generation, report.session_tag, report.role, report.mode,
+            report.attempt, report.failure_class, report.terminal_reason,
+            report.counts.send_success_datagrams, report.counts.send_errors, report.counts.budget_skipped,
         );
-        let mut connections = self.connections.write().await;
-        let Some(connection) = connections.get_mut(peer_id) else {
+        let mut terminal = HardHardTerminalObservation {
+            report: Some(report),
+        };
+        // Canonical epoch -> connection order, without waiting for another
+        // async resource under either guard. Contention preserves the exact
+        // observation in the terminal log instead of delaying path cleanup.
+        let Ok((epoch, mut connections)) = tokio::time::timeout(
+            Duration::from_millis(100),
+            self.lock_epoch_and_connections_write(),
+        )
+        .await
+        else {
+            terminal.archive("commit_contended");
             return false;
         };
-        if !self.peer_session_is_current_sync(
-            peer_id,
-            PeerSessionGeneration(report.peer_session_generation),
-        ) || connection.remote_candidate_epoch() != report.remote_candidate_epoch
-        {
+        let Ok(profile) = self.local_nat_profile.try_read() else {
+            drop(connections);
+            drop(epoch);
+            terminal.archive("profile_publication_contended");
+            return false;
+        };
+        let Ok(sessions) = self.hard_hard_sessions.try_lock() else {
+            drop(profile);
+            drop(connections);
+            drop(epoch);
+            terminal.archive("session_publication_contended");
+            return false;
+        };
+        let Some(report) = terminal.report.as_ref() else {
+            return false;
+        };
+        let record_current = sessions.values().any(|record| {
+            record.peer_id == peer_id
+                && record.session_token == session_token
+                && record.state != HardHardSessionState::Retiring
+                && record.local_network_generation == report.network_generation
+                && record.remote_candidate_epoch == report.remote_candidate_epoch
+                && record.local_profile_generation == report.local_profile_generation
+                && record.remote_profile_generation == report.remote_profile_generation
+                && record.fresh_socket.punch_generation == report.punch_generation
+                && record
+                    .requested_socket_indices
+                    .contains(&report.socket_index.unwrap_or(usize::MAX))
+                && record.attempt_count == report.attempt
+                && record.measurement.evidence == *evidence
+        });
+        let connection_current = connections.get(peer_id).is_some_and(|connection| {
+            connection.online
+                && connection.remote_candidate_epoch() == report.remote_candidate_epoch
+                && connection
+                    .remote_nat_profile
+                    .as_ref()
+                    .and_then(|p| p.generation)
+                    == Some(report.remote_profile_generation)
+        });
+        let current = record_current
+            && connection_current
+            && self.current_network_generation_sync() == report.network_generation
+            && self.current_local_profile_generation_sync() == report.local_profile_generation
+            && self.peer_session_is_current_sync(
+                peer_id,
+                PeerSessionGeneration(report.peer_session_generation),
+            );
+        if !current {
+            drop(sessions);
+            drop(profile);
+            drop(connections);
+            drop(epoch);
+            terminal.archive("terminal_identity_superseded");
             return false;
         }
-        tracing::info!(
-            event = "hard_hard_attempt_report",
-            peer_id,
-            network_generation = report.network_generation,
-            session_tag = %report.session_tag,
-            role = %report.role,
-            mode = %report.mode,
-            attempt = report.attempt,
-            failure_class = %report.failure_class,
-            terminal_reason = %report.terminal_reason,
-            direct_confirmed = report.direct_confirmed,
-            "hard_hard_attempt_report"
-        );
-        connection.record_hard_hard_attempt_report(report, detail);
+        let Some(report) = terminal.report.take() else {
+            return false;
+        };
+        let logged = report.clone();
+        if let Some(connection) = connections.get_mut(peer_id) {
+            connection.record_hard_hard_attempt_report(report, detail);
+        }
+        drop(sessions);
+        drop(profile);
+        drop(connections);
+        drop(epoch);
+        tracing::info!(event = "hard_hard_attempt_report", peer_id,
+            network_generation = logged.network_generation, session_tag = %logged.session_tag,
+            role = %logged.role, mode = %logged.mode, attempt = logged.attempt,
+            failure_class = %logged.failure_class, terminal_reason = %logged.terminal_reason,
+            direct_confirmed = logged.direct_confirmed, "hard_hard_attempt_report");
         true
     }
 

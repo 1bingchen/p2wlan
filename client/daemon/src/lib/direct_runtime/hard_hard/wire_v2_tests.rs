@@ -716,4 +716,5 @@ mod hard_hard_wire_v2_tests {
         ));
     }
     include!("negotiation_tests.rs");
+    include!("barrier_tests.rs");
 }

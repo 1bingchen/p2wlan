@@ -110,6 +110,10 @@ impl VolatilePublishCoalescer {
     /// expiry; the coalescer never publishes itself.
     pub(super) fn on_churn(&mut self, hash: u64, now: Instant) -> VolatileChurnAction {
         if self.last_published_hash == Some(hash) {
+            // A -> B -> A needs no new publication. B is no longer the
+            // committed newest set, so its pending timer must be cancelled.
+            self.pending_hash = None;
+            self.debounce_until = None;
             return VolatileChurnAction::SuppressIdentical;
         }
         if self.pending_hash.is_some() {
@@ -305,6 +309,10 @@ pub(super) async fn run_udp_candidate_refresh(context: UdpCandidateRefreshContex
             continue;
         }
 
+        let gather_fence = {
+            let refresh_guard = candidate_refresh_lock.lock().await;
+            CandidateGatherFence::capture(&refresh_guard, &udp, &peers, &candidate_snapshot).await
+        };
         let gather_started = Instant::now();
         debug!(
             target: "p2wlan_daemon::candidate_refresh",
@@ -320,8 +328,8 @@ pub(super) async fn run_udp_candidate_refresh(context: UdpCandidateRefreshContex
         // operations. Run them concurrently without holding the shared
         // candidate lock. A peer signal must be able to reuse the last
         // committed snapshot while either discovery path is in flight.
-        let mapping_start_udp_addr = udp.local_addr().ok();
-        let mapping_start_generation = peers.current_network_generation_sync();
+        let mapping_start_udp_addr = gather_fence.local_addr;
+        let mapping_start_generation = gather_fence.network_generation;
         let mapping_future = async {
             if !upnp_enabled {
                 return (Vec::new(), HashMap::new());
@@ -336,7 +344,7 @@ pub(super) async fn run_udp_candidate_refresh(context: UdpCandidateRefreshContex
             let existing_candidates = local_candidates.read().await.clone();
             let existing_sources = local_candidate_sources.read().await.clone();
             maybe_add_port_mapping_udp_candidate(
-                mapping_start_udp_addr,
+                (&udp, &peers),
                 &existing_candidates,
                 &existing_sources,
                 &mut discovered,
@@ -365,6 +373,20 @@ pub(super) async fn run_udp_candidate_refresh(context: UdpCandidateRefreshContex
         let refresh_guard = candidate_refresh_lock.lock().await;
         let refresh_lock_wait_ms = refresh_lock_wait_started.elapsed().as_millis() as u64;
 
+        if let Some(reason) = gather_fence
+            .stale_reason(&refresh_guard, &udp, &peers, &candidate_snapshot)
+            .await
+        {
+            debug!(
+                target: "p2wlan_daemon::candidate_refresh",
+                event = "candidate_gather_discarded",
+                reason,
+                gather_elapsed_ms,
+                "Discarding discovery completed after its candidate snapshot or network identity was replaced"
+            );
+            continue;
+        }
+
         let report = match report_result {
             Ok(report) => report,
             Err(err) => {
@@ -382,6 +404,9 @@ pub(super) async fn run_udp_candidate_refresh(context: UdpCandidateRefreshContex
                 continue;
             }
         };
+        // Full discovery deliberately leaves this scheduling policy untouched
+        // until its originating snapshot has passed the commit fence.
+        udp.apply_candidate_report_socket_pool_policy(&report);
         let (mut candidates, mut candidate_sources) = candidate_endpoints_from_report(&report);
         debug!(
             target: "p2wlan_daemon::candidate_refresh",
@@ -710,6 +735,7 @@ pub(super) async fn run_udp_candidate_refresh(context: UdpCandidateRefreshContex
             let now = Instant::now();
             match volatile_coalescer.on_churn(hash, now) {
                 VolatileChurnAction::SuppressIdentical => {
+                    pending_volatile = None;
                     debug!(
                         "Volatile candidate refresh suppressed: candidate set is identical to the last published set (hash={hash}); no offer fan-out"
                     );

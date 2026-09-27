@@ -546,6 +546,9 @@ pub enum PredictionReason {
     LowConfidenceWindow { distance: u8 },
     /// A bounded secondary hypothesis from cross-batch learning.
     LearnedSuccessor { distance: u8 },
+    /// A shorter stride compatible with competing allocations in this batch.
+    /// This is a candidate hypothesis, never fixed-step or allocator-scope evidence.
+    ContentionHypothesis { step: i16, distance: u8 },
     /// Same port again (endpoint-independent mapping).
     StablePort,
     /// Next port of the periodic pattern.

@@ -82,6 +82,8 @@ pub(crate) struct DirectCommitPairSnapshot {
 /// assembled without maintaining a second independently evolving state map.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct HardHardMeasurementObservation {
+    /// Shared only by this token's record, worker and cleanup snapshots.
+    pub(crate) evidence: HardHardAttemptEvidence,
     pub(crate) measurement_started_at_ms: Option<u64>,
     pub(crate) last_measurement_send_at_ms: Option<u64>,
     pub(crate) measurement_completed_at_ms: Option<u64>,

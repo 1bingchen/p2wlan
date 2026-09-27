@@ -1934,6 +1934,7 @@ mod hard_hard_tests {
             stun_send_error_bytes: 20,
             stun_responses: 3,
             candidate_signal_payload_logic_bytes: 48,
+            evidence: Default::default(),
         };
         let send = PunchSendReport {
             logical_probes_attempted: 4,
@@ -2089,6 +2090,184 @@ mod hard_hard_tests {
             ),
             "no_response"
         );
+    }
+
+    fn report_for_observation_fixture(
+        record: &HardHardSessionRecord,
+    ) -> crate::peer::HardHardAttemptReport {
+        crate::peer::HardHardAttemptReport {
+            network_generation: record.local_network_generation,
+            peer_session_generation: record
+                .measurement
+                .evidence
+                .peer_session_generation()
+                .unwrap()
+                .value(),
+            remote_candidate_epoch: record.remote_candidate_epoch,
+            local_profile_generation: record.local_profile_generation,
+            remote_profile_generation: record.remote_profile_generation,
+            punch_generation: record.fresh_socket.punch_generation,
+            socket_index: Some(record.fresh_socket.socket_index),
+            attempt: record.attempt_count,
+            ..crate::peer::HardHardAttemptReport::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn hh_attempt_receive_evidence_excludes_peer_traffic_and_other_tokens() {
+        let (peers, udp, identity, remote) = exact_socket_proof_fixture().await;
+        let record = peers
+            .hard_hard_session_by_token(&identity.peer_id, &identity.session_token)
+            .await
+            .unwrap();
+        udp.update_peer_probe_rx_diagnostics(
+            &identity.peer_id,
+            identity.network_generation,
+            Some("probe-session-exact"),
+            |snapshot| {
+                snapshot.authenticated_probe_packets_received = 50;
+                snapshot.probe_acks_received = 25;
+            },
+        )
+        .await;
+        assert_eq!(
+            record.measurement.evidence.receive_snapshot(),
+            UdpProbeRxSnapshot::default()
+        );
+        let pair = crate::peer::HardHardPairKey {
+            socket_index: identity.socket_index,
+            local_endpoint: identity.socket_local_endpoint,
+            remote_endpoint: remote,
+        };
+        let peer_session = record
+            .measurement
+            .evidence
+            .peer_session_generation()
+            .unwrap();
+        peers
+            .record_hard_hard_receive(
+                &identity.peer_id,
+                "other-token",
+                peer_session,
+                pair.clone(),
+                crate::peer::HardHardReceiveObservation::AuthenticatedAck,
+                1,
+            )
+            .await;
+        assert_eq!(
+            record.measurement.evidence.receive_snapshot(),
+            UdpProbeRxSnapshot::default()
+        );
+        peers
+            .record_hard_hard_receive(
+                &identity.peer_id,
+                &identity.session_token,
+                peer_session,
+                pair,
+                crate::peer::HardHardReceiveObservation::AuthenticatedAck,
+                2,
+            )
+            .await;
+        let observed = record.measurement.evidence.receive_snapshot();
+        assert_eq!(observed.authenticated_probe_packets_received, 1);
+        assert_eq!(observed.authenticated_probe_acks_unmatched, 1);
+        assert_eq!(observed.probe_acks_received, 0);
+        udp.detach_all_dynamic_punch_sockets("attempt_receive_isolation")
+            .await;
+    }
+
+    #[tokio::test]
+    async fn terminal_report_rechecks_retirement_after_connection_writer_wait() {
+        let (peers, udp, identity, _) = exact_socket_proof_fixture().await;
+        let record = peers
+            .hard_hard_session_by_token(&identity.peer_id, &identity.session_token)
+            .await
+            .unwrap();
+        let report = report_for_observation_fixture(&record);
+        let writer = peers.hold_connections_writer_for_test().await;
+        let mut commit = Box::pin(peers.record_hard_hard_attempt_report_with_evidence(
+            &identity.peer_id,
+            &identity.session_token,
+            report.clone(),
+            &record.measurement.evidence,
+        ));
+        assert!(futures_util::poll!(commit.as_mut()).is_pending());
+        assert!(
+            peers
+                .hard_hard_retire_session(
+                    &identity.peer_id,
+                    &record.session_id,
+                    &identity.session_token
+                )
+                .await
+        );
+        assert!(
+            peers
+                .hard_hard_complete_session_cleanup(
+                    &identity.peer_id,
+                    &record.session_id,
+                    &identity.session_token
+                )
+                .await
+        );
+        drop(writer);
+        assert!(
+            !commit.await,
+            "the old observation may archive but cannot commit into the current ring"
+        );
+        assert!(
+            !peers
+                .record_hard_hard_attempt_report_with_evidence(
+                    &identity.peer_id,
+                    &identity.session_token,
+                    report,
+                    &record.measurement.evidence
+                )
+                .await,
+            "archived observations must remain sealed"
+        );
+        assert!(!peers.diagnostics().await[0]
+            .direct_events
+            .iter()
+            .any(|event| event.stage == "hard_hard_attempt_report"));
+        udp.detach_all_dynamic_punch_sockets("attempt_retired_during_commit")
+            .await;
+    }
+
+    #[tokio::test]
+    async fn cancelled_terminal_commit_keeps_one_shot_observation_sealed() {
+        let (peers, udp, identity, _) = exact_socket_proof_fixture().await;
+        let record = peers
+            .hard_hard_session_by_token(&identity.peer_id, &identity.session_token)
+            .await
+            .unwrap();
+        let report = report_for_observation_fixture(&record);
+        let writer = peers.hold_connections_writer_for_test().await;
+        let mut commit = Box::pin(peers.record_hard_hard_attempt_report_with_evidence(
+            &identity.peer_id,
+            &identity.session_token,
+            report.clone(),
+            &record.measurement.evidence,
+        ));
+        assert!(futures_util::poll!(commit.as_mut()).is_pending());
+        drop(commit); // The RAII terminal owner archives while the writer is unavailable.
+        drop(writer);
+        assert!(
+            !peers
+                .record_hard_hard_attempt_report_with_evidence(
+                    &identity.peer_id,
+                    &identity.session_token,
+                    report,
+                    &record.measurement.evidence
+                )
+                .await
+        );
+        assert!(!peers.diagnostics().await[0]
+            .direct_events
+            .iter()
+            .any(|event| event.stage == "hard_hard_attempt_report"));
+        udp.detach_all_dynamic_punch_sockets("attempt_commit_future_cancelled")
+            .await;
     }
 
     #[tokio::test]

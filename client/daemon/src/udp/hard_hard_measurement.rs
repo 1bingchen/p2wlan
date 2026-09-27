@@ -27,6 +27,37 @@ pub(crate) struct HardHardPreparedMeasurement {
     pub(super) scheduled_send: Option<(u64, u64)>,
 }
 
+/// Only an independently rebuilt primary tail may use its later sample time
+/// for freshness. The original batch-to-send forecast bound is still checked:
+/// rebasing evidence cannot extend the scheduled send or its allowed horizon.
+fn validate_prepared_publication_timing(
+    batch_started_at_ms: u64,
+    independent_prediction_sampled_at_ms: Option<u64>,
+    now_ms: u64,
+    scheduled_send: (u64, u64),
+) -> std::result::Result<(), AllocationEvidenceRejection> {
+    use AllocationEvidenceRejection as Reject;
+    if batch_started_at_ms > now_ms {
+        return Err(Reject::Stale);
+    }
+    let sampled_at_ms = independent_prediction_sampled_at_ms.unwrap_or(batch_started_at_ms);
+    if sampled_at_ms < batch_started_at_ms {
+        return Err(Reject::InconsistentOrder);
+    }
+    let (send_at_ms, horizon_ms) = scheduled_send;
+    p2pnet_nat::mapping::allocation::validate_allocation_publication_timing(
+        sampled_at_ms,
+        now_ms,
+        send_at_ms,
+        FRESH_MAPPING_MODEL_MAX_AGE,
+        Duration::from_millis(horizon_ms),
+    )?;
+    if send_at_ms.saturating_sub(batch_started_at_ms) > horizon_ms {
+        return Err(Reject::ForecastHorizonExceeded);
+    }
+    Ok(())
+}
+
 impl HardHardPreparedMeasurement {
     pub(crate) fn measurement_cost(&self) -> HardHardMeasurementStats {
         self.birthday.measurement
@@ -52,25 +83,33 @@ impl HardHardPreparedMeasurement {
         {
             return Err(Reject::IdentityChanged);
         }
-        let sampled_at_ms = self
+        let batch_started_at_ms = self
             .birthday
             .measurement
             .measurement_started_at_ms
             .ok_or(Reject::SampleCount)?;
-        let (send_at_ms, horizon_ms) = self.scheduled_send.ok_or(Reject::ForecastExpired)?;
-        p2pnet_nat::mapping::allocation::validate_allocation_publication_timing(
-            sampled_at_ms,
-            monotonic_millis(),
-            send_at_ms,
-            FRESH_MAPPING_MODEL_MAX_AGE,
-            Duration::from_millis(horizon_ms),
-        )?;
+        let scheduled_send = self.scheduled_send.ok_or(Reject::ForecastExpired)?;
         if prediction_count > 0 {
             let candidates = self.prediction_candidates(network_generation, prediction_count)?;
             if prediction_count > 32 || candidates.len() != prediction_count {
                 return Err(Reject::NoConsistentStep);
             }
         }
+        // prediction_candidates reconciles this exact immutable tail with all
+        // sends before its sample time can be used. A model built with Some
+        // allocation may borrow the full grid's step/domain, even when this
+        // particular offer omits its anchor; it retains the earlier age limit.
+        let independent_prediction_sampled_at_ms = self
+            .predictable
+            .as_ref()
+            .filter(|_| prediction_count > 0 && anchor_port == 0 && self.allocation.is_none())
+            .map(|prediction| prediction.model.sampled_at_ms);
+        validate_prepared_publication_timing(
+            batch_started_at_ms,
+            independent_prediction_sampled_at_ms,
+            monotonic_millis(),
+            scheduled_send,
+        )?;
         if anchor_port != 0 {
             let count = self.birthday.sockets.len();
             let anchor =
@@ -439,6 +478,54 @@ mod tests {
     }
 
     #[test]
+    fn competing_allocations_keep_a_bounded_prediction_hypothesis_without_anchor_evidence() {
+        for (ports, step, expected_prefix) in [
+            (
+                [40000, 40001, 40002, 40003, 40004, 40006],
+                2,
+                [40008, 40007, 40010],
+            ),
+            (
+                [40010, 40009, 40008, 40005, 40003, 40000],
+                -2,
+                [39998, 39999, 39996],
+            ),
+        ] {
+            let (mut samples, attempts, identity) = grid(1);
+            for (sample, port) in samples.iter_mut().zip(ports) {
+                sample.observation.observed.set_port(port);
+            }
+            let (allocation, rejection, prediction) = prepared_prediction(
+                &samples,
+                &attempts,
+                identity,
+                0,
+                samples[0].observation.local_endpoint,
+                HardHardMeasurementStats::default(),
+                (3500, 3500),
+                1000,
+            );
+            assert!(
+                allocation.is_none(),
+                "the irregular grid must never authorize Anchor"
+            );
+            assert_eq!(
+                rejection,
+                Some(AllocationEvidenceRejection::NoConsistentStep)
+            );
+            let prediction =
+                prediction.expect("the complete primary tail still supplies hypotheses");
+            assert_eq!(prediction.model.kind, PortModelKind::Linear { step });
+            assert_eq!(prediction.model.confidence, 86);
+            assert_eq!(&prediction.predicted_ports[..3], &expected_prefix);
+            assert!(prediction.predicted_ports.len() <= p2pnet_nat::MAX_PREDICTED_PORTS);
+            assert_eq!(prediction.model.sampled_at_ms, 130);
+            assert_eq!(prediction.network_generation, identity.network_generation);
+            assert_eq!(prediction.punch_generation, identity.measurement_generation);
+        }
+    }
+
+    #[test]
     fn early_timeout_keeps_a_fresh_final_prediction_but_never_a_shared_anchor() {
         for step in [-1, 1] {
             let (mut samples, mut attempts, identity) = grid(step);
@@ -567,7 +654,7 @@ mod tests {
             0,
             primary,
             measurement,
-            (3500, 3500),
+            (3600, 3500),
             1050,
         );
         assert!(allocation.is_none());
@@ -585,5 +672,47 @@ mod tests {
             Some(800)
         );
         assert_eq!(attempts[0].outcome, Outcome::SentUnobserved);
+        // The batch started at 100, but the independent observed tail really
+        // started at 300. At 2700 it is 2400 ms old, not a stale 2600 ms model.
+        assert!(validate_prepared_publication_timing(
+            prediction.measurement.measurement_started_at_ms.unwrap(),
+            Some(prediction.model.sampled_at_ms),
+            2700,
+            (3600, 3500),
+        )
+        .is_ok());
+        assert_eq!(
+            validate_prepared_publication_timing(100, None, 2700, (3600, 3500)),
+            Err(AllocationEvidenceRejection::Stale),
+            "full-grid or birthday-only evidence keeps the original age limit"
+        );
+    }
+
+    #[test]
+    fn independent_tail_publication_preserves_both_original_forecast_bounds() {
+        use AllocationEvidenceRejection as Reject;
+        assert_eq!(
+            validate_prepared_publication_timing(100, Some(300), 2700, (3601, 3500)),
+            Err(Reject::ForecastHorizonExceeded),
+            "a later tail cannot hide a batch-to-send forecast over 3500 ms"
+        );
+        assert_eq!(
+            validate_prepared_publication_timing(100, Some(300), 2700, (2700, 3500)),
+            Err(Reject::ForecastExpired),
+            "a fresh tail cannot move the original planned send forward"
+        );
+        assert_eq!(
+            validate_prepared_publication_timing(100, Some(300), 2801, (3600, 3500)),
+            Err(Reject::Stale),
+            "freshness is still limited by the tail's actual sample time"
+        );
+        assert_eq!(
+            validate_prepared_publication_timing(100, Some(99), 200, (3600, 3500)),
+            Err(Reject::InconsistentOrder)
+        );
+        assert_eq!(
+            validate_prepared_publication_timing(100, Some(300), 299, (3600, 3500)),
+            Err(Reject::Stale)
+        );
     }
 }

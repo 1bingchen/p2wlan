@@ -1314,6 +1314,44 @@ def extract_duplicate_fault_evidence(
     }
 
 
+def confirmation_cost_summary(attempts: list[dict[str, Any]]) -> dict[str, Any]:
+    """Keep confirmation handoffs separate; missing older fields stay unknown."""
+    purposes = (
+        "triggered_check", "nomination", "probe_ack", "validation_request", "validation_ack"
+    )
+    fields = {
+        f"{purpose}_{unit}": (purpose, unit)
+        for purpose in purposes
+        for unit in ("datagrams", "bytes")
+    }
+    fields.update({
+        outcome: (outcome,)
+        for outcome in ("retryable_not_sent", "budget_deferred", "delivery_unknown", "stopped")
+    })
+    known = dict.fromkeys(fields, 0)
+    unknown = dict.fromkeys(fields, 0)
+    complete = 0
+    for attempt in attempts:
+        available = True
+        for name, path in fields.items():
+            value = attempt.get("confirmation")
+            for key in path:
+                value = value.get(key) if isinstance(value, dict) else None
+            if type(value) is int and value >= 0:
+                known[name] += value
+            else:
+                unknown[name] += 1
+                available = False
+        complete += int(available)
+    return {
+        "basis": "successful confirmation handoffs before terminal report; separate from sweep",
+        "observed_attempt_reports": len(attempts),
+        "complete_attempt_reports": complete,
+        "known_observed_costs": known,
+        "unknown_field_counts": unknown,
+    }
+
+
 def cost_summary(
     rounds: list[dict[str, Any]], attempts: list[dict[str, Any]]
 ) -> dict[str, Any]:
@@ -1376,8 +1414,10 @@ def cost_summary(
         "paired_shared_plan_samples": paired,
         "incomplete_shared_plan_samples": incomplete,
         "requested_rounds_without_attempt_costs": len(rounds) - rounds_with_reports,
+        "probe_cost_scope": "sweep_only",
         "known_observed_costs": known,
         "unknown_field_counts": unknown,
+        "confirmation_costs": confirmation_cost_summary(attempts),
         "full_control_transport_bytes": None,
         "planned_minus_attempted_by_reason": reason_totals,
     }

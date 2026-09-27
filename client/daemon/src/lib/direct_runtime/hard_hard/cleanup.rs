@@ -35,6 +35,10 @@ struct HardHardCleanupDescriptor {
     fresh_socket: crate::peer::HardHardFreshSocketIdentity,
     expires_at_ms: u64,
     cancellation: Arc<crate::PunchSessionCancellation>,
+    // Existing cleanup owner retains its initial observation if a replacement
+    // removes the live ledger before this watcher wakes. The shared attempt
+    // counter prevents an AwaitingPeer fallback from reporting a later sweep.
+    initial_record: HardHardSessionRecord,
 }
 
 impl HardHardCleanupDescriptor {
@@ -46,6 +50,7 @@ impl HardHardCleanupDescriptor {
             fresh_socket: record.fresh_socket.clone(),
             expires_at_ms: record.expires_at_ms,
             cancellation: record.cancellation.clone(),
+            initial_record: record.clone(),
         }
     }
 }
@@ -220,12 +225,19 @@ fn spawn_hard_hard_session_cleanup_with_owner(
         // zero-send terminal report while the exact session identity is still
         // current; ordinary sweep paths have already advanced state/attempt
         // and therefore cannot be double reported here.
-        if let Some(record) = snapshot.as_ref().filter(|record| {
-            record.state == crate::peer::HardHardSessionState::AwaitingPeer
-                && record.attempt_count == 0
-        }) {
+        if let Some(record) = snapshot
+            .as_ref()
+            .or(Some(&descriptor.initial_record))
+            .filter(|record| {
+                matches!(
+                    record.state,
+                    crate::peer::HardHardSessionState::AwaitingPeer
+                        | crate::peer::HardHardSessionState::Retiring
+                ) && record.attempt_count == 0
+            })
+        {
             if let Some(peer_session_generation) =
-                peers.peer_session_generation_sync(&descriptor.peer_id)
+                record.measurement.evidence.peer_session_generation()
             {
                 let targets = record.remote_prediction.as_slice();
                 let planned_sockets = record.requested_socket_indices.len();
@@ -243,18 +255,20 @@ fn spawn_hard_hard_session_cleanup_with_owner(
                         .len()
                         .saturating_mul(HARD_HARD_SWEEP_ATTEMPTS as usize)
                 };
-                let probe_rx = udp
-                    .probe_rx_snapshot_for_peer_session(
-                        &descriptor.peer_id,
-                        record.local_network_generation,
-                        record.probe_session_id.as_deref(),
-                    )
-                    .await;
+                // A same-owner response may have advanced the epoch before
+                // ledger removal. Preserve that committed diagnostic identity
+                // while retaining the original measurement/unsent-plan facts.
+                let observation_socket = record
+                    .measurement
+                    .evidence
+                    .socket_snapshot()
+                    .unwrap_or_else(|| record.fresh_socket.clone());
+                let probe_rx = record.measurement.evidence.receive_snapshot();
                 let _ = record_hard_hard_terminal_attempt(
                     &peers,
                     &descriptor.peer_id,
                     peer_session_generation,
-                    &record.fresh_socket,
+                    &observation_socket,
                     &record.session_token,
                     if record.initiator {
                         "initiator"

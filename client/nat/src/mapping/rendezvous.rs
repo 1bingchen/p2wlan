@@ -11,6 +11,8 @@ use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::time::Duration;
 
+const PRESERVED_PREDICTION_PREFIX: usize = 8;
+
 #[derive(Debug, Clone, Copy)]
 pub struct RendezvousPredictionTiming {
     pub measurement_span_ms: u64,
@@ -79,7 +81,99 @@ pub fn predict_for_rendezvous(
             }
         }
     }
+    if step_estimate.is_none() {
+        add_contention_hypothesis_prefix(model, last, &mut candidates);
+    }
     Ok(candidates)
+}
+
+/// A non-fixed median is not proof that every mapping consumes that stride.
+/// For observed +1,+2, retain +2 first but insert +1 before +4,+6,..., inside
+/// the same candidate count. With a clean subsequent +1 allocator, the first
+/// two pairs cross-match; with +2, rank zero still matches. The signed gcd is
+/// only another hypothesis, and neither the model nor its confidence changes.
+///
+/// More generally, for median s=m*g, the first m offsets are s,s-g,...,g.
+/// When both windows have the same m, actual strides g (with each endpoint's
+/// own magnitude/sign) have reciprocal indices i+j=m-1; actual strides s
+/// retain the first pair. One legacy endpoint also works: its first target s
+/// meets the updated endpoint's (m-1)-th target g. This covers these clean
+/// hypotheses only, not unequal ratios, arbitrary drift or interleaving.
+///
+/// Preserve two original median successors after this prefix: differences
+/// -g,(2*m-1)*g,m*g are distinct for m>1, so even the circular rank validator
+/// rejects this mixed shape and leaves its proven prefix order unchanged.
+fn add_contention_hypothesis_prefix(
+    model: &PortModel,
+    last: u16,
+    candidates: &mut Vec<PredictionCandidate>,
+) {
+    let PortModelKind::Linear { step } = model.kind else {
+        return;
+    };
+    let step = i32::from(step);
+    if step == 0 || model.sequence.len() < 3 || model.sequence.last() != Some(&last) {
+        return;
+    }
+    // Do not infer a port ring from legacy modular deltas, or reinterpret a
+    // learned/sparse/wrapped window. HH2 applies its own evidenced-domain path
+    // to fixed models; this helper only handles ordinary signed arithmetic.
+    let deltas = model
+        .sequence
+        .windows(2)
+        .map(|pair| i32::from(pair[1]) - i32::from(pair[0]))
+        .collect::<Vec<_>>();
+    if model.sequence.contains(&0)
+        || deltas.len() != model.deltas.len()
+        || deltas
+            .iter()
+            .zip(&model.deltas)
+            .any(|(raw, modeled)| *raw != i32::from(*modeled) || raw.signum() != step.signum())
+        || candidates.iter().enumerate().any(|(index, candidate)| {
+            i32::from(candidate.port) != i32::from(last) + step * (index as i32 + 1)
+        })
+    {
+        return;
+    }
+    let gcd = deltas.iter().fold(0, |mut a, delta| {
+        let mut b = delta.abs();
+        while b != 0 {
+            (a, b) = (b, a % b);
+        }
+        a
+    });
+    if gcd == 0 || step.checked_rem(gcd) != Some(0) {
+        return;
+    }
+    let prefix_len = (step.abs() / gcd) as usize;
+    let budget = candidates.len();
+    if !(2..=PRESERVED_PREDICTION_PREFIX).contains(&prefix_len)
+        || prefix_len.saturating_add(2) > budget
+    {
+        return;
+    }
+    let hypothesis_step = gcd * step.signum();
+    let mut result = Vec::with_capacity(budget);
+    result.push(candidates[0]);
+    for distance in (1..prefix_len).rev() {
+        // These offsets lie strictly between last and the already validated
+        // first candidate, so they cannot wrap, become zero or overflow u16.
+        result.push(PredictionCandidate {
+            port: (i32::from(last) + hypothesis_step * distance as i32) as u16,
+            rank: result.len() as u8,
+            reason: PredictionReason::ContentionHypothesis {
+                step: hypothesis_step as i16,
+                distance: distance as u8,
+            },
+        });
+    }
+    for candidate in candidates.iter().skip(1).take(budget - prefix_len) {
+        result.push(PredictionCandidate {
+            rank: result.len() as u8,
+            ..*candidate
+        });
+    }
+    *candidates = result;
 }
 
 /// Keep the freshest eight ranked hypotheses, then cover the rest of the
@@ -98,7 +192,10 @@ pub fn bounded_prediction_window(ports: &[u16], cap: usize) -> Vec<u16> {
     if cap == 0 {
         return Vec::new();
     }
-    let prefix = 8.min(cap.saturating_sub(1)).max(1).min(cap);
+    let prefix = PRESERVED_PREDICTION_PREFIX
+        .min(cap.saturating_sub(1))
+        .max(1)
+        .min(cap);
     let mut result = ports[..prefix].to_vec();
     let remaining = cap - prefix;
     for slot in 1..=remaining {

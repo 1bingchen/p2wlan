@@ -95,6 +95,21 @@ impl UdpTransport {
                         if let Some(guard) = exploration.as_mut() {
                             guard.handoff_succeeded();
                         }
+                        let confirmation_purpose = match purpose {
+                            PendingProbePurpose::HardHardTriggeredCheck => {
+                                Some(crate::peer::HardHardConfirmationPurpose::TriggeredCheck)
+                            }
+                            PendingProbePurpose::HardHardNomination => {
+                                Some(crate::peer::HardHardConfirmationPurpose::Nomination)
+                            }
+                            _ => None,
+                        };
+                        if let Some(purpose) = confirmation_purpose {
+                            scope
+                                .measurement
+                                .evidence
+                                .record_confirmation_handoff(purpose, sent);
+                        }
                         if let Some(plan) = scope.coordinated_plan.as_ref() {
                             if let Some(lease) = plan.measurement_lease.as_ref() {
                                 lease.on_probe_handoff(plan.agreement.map_or(

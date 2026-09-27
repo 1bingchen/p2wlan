@@ -42,6 +42,8 @@ control_reconnect_counter_survives_timeline_eviction 是必须保持的回归契
 
 `/status` 的 `peers[].direct_events[]` 在 `stage=hard_hard_attempt_report` 时携带 schema 2 的 `hard_hard_attempt`。它是现有会话状态所有者导出的只读终态记录，不参与候选排序、发送准入、路径选择或取消判定。写入前会再次核对 network generation、peer session generation、remote candidate epoch、profile generation、punch generation、socket index、session token 和 attempt；旧会话的迟到结果不会记到新会话。`plan_tag` 仅用于把同一会话的单个 rendezvous 计划在两端配对，与 `session_tag` 分离。
 
+终态记录由原会话的诊断 owner 单次封存。写入当前连接时，在有界等待后持有代际与连接保护并再次核对完整身份；身份替换、锁竞争或提交等待被取消时，原记录进入独立的 `hard_hard_attempt_report_archived` 结构化日志，不写入新连接的事件环。该历史日志不参与当前路径判断。认证接收证据仅来自原 token 和所属动态 socket 的精确候选对，不使用同 peer 的普通 Probe 汇总差值。
+
 `mode` 表示当前会话实际协商的 `fixed_anchor`、`predictable` 或 `birthday`；兼容流程保留其原有模式值。模式来自同一会话的权威计划，不能仅凭 socket 数推断。
 
 身份字段包含构建源码、比较基线、build ID、实验 variant/scenario/seed、角色与 attempt。原始 session、IP 和端口不进入结构化记录；`session_tag` 与 `target_order_tags` 是会话加盐的短 SHA-256 标签，只用于同一 attempt 内关联和保留候选顺序，不能当作跨会话身份。
@@ -54,6 +56,10 @@ control_reconnect_counter_survives_timeline_eviction 是必须保持的回归契
 - `send_success_datagrams` / `send_success_bytes` 与 send-error 字段描述实际 UDP 系统调用结果。一个逻辑探测可能带一个有界兼容副本，因此物理 datagram 数不能从候选数推导；
 - `budget_skipped` 与 `planned_logical_probes_not_attempted` 保留没有执行的计划量；矩阵汇总把后者归为成功后取消、过期、预算拒绝、生命周期失效或未知原因；
 - STUN datagram/byte/error/response 单独计费。`candidate_signal_payload_logic_bytes` 只累计候选和来源字符串长度，不是序列化请求、HTTP/WebSocket 帧、TLS 或完整控制传输字节。
+
+`counts.send_success_datagrams` / `send_success_bytes` 保持扫描口径。支持完整确认计数的 HH2 attempt 另带可选 `confirmation`：`triggered_check`、`nomination`、`probe_ack`、`validation_request`、`validation_ack` 分别记录成功 UDP handoff 的 `datagrams` 和 `bytes`；`retryable_not_sent`、`budget_deferred`、`delivery_unknown`、`stopped` 记录候选对发送结果分类次数。确认成本不占用或改写扫描计划字段。旧版、兼容流程或尚未绑定 owner 的报告缺少该对象时表示未知，不能当作零。
+
+矩阵成本汇总使用 `probe_cost_scope=sweep_only` 明确原扫描口径，并在 `confirmation_costs` 单独给出确认成本已知部分、各字段缺失报告数与完整报告数。有效轮次与全部 requested 轮次分别统计；部分缺失不能据此推导完整打洞总成本。
 
 `target_order_tags` 保留实际目标顺序，重复目标仍重复出现；`confirmed_target_rank` 在加密验证选中的远端地址属于该计划时记录其从 0 开始的位置，不暴露地址，空值表示未确认 Direct 或确认的是计划外学习地址。`candidate_cap` 与 `truncation_reason` 说明裁剪边界。分类包括 `measurement_insufficient`、`model_unpredictable`、`budget_rejected`、`send_error`、`missed_schedule`、`candidate_not_executed`、`no_response`、`probe_hit_validation_failed`、`cancelled_generation_changed`、`encrypted_validation_completed` 和证据不足时的 `unknown`。最后一个验证阶段不是业务成功；采集器只有在真实业务 ingress 存在时才派生 `direct_business_succeeded`。探测命中不等于加密验证，验证也不等于业务已可用。
 

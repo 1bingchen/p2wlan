@@ -146,9 +146,18 @@ pub(crate) struct HardHardDatagramSendPermit {
     peer_session_generation: PeerSessionGeneration,
     network_generation: u64,
     local_profile_generation: u64,
+    evidence: HardHardAttemptEvidence,
 }
 
 impl HardHardDatagramSendPermit {
+    pub(crate) fn evidence(&self) -> HardHardAttemptEvidence {
+        self.evidence.clone()
+    }
+
+    pub(crate) fn record_handoff(&self, purpose: HardHardConfirmationPurpose, bytes: usize) {
+        self.evidence.record_confirmation_handoff(purpose, bytes);
+    }
+
     pub(crate) fn is_current(&self, peers: &PeerManager) -> bool {
         !self.cancellation.is_cancelled()
             && tokio::time::Instant::now() < self.deadline
@@ -183,7 +192,7 @@ impl HardHardValidationRequestGuard<'_> {
         self.permit.is_current(peers)
     }
 
-    pub(crate) fn handoff_succeeded(&mut self) {
+    pub(crate) fn handoff_succeeded(&mut self, bytes: usize) {
         let selected = self
             .sessions
             .get_mut(&self.record_key)
@@ -191,6 +200,8 @@ impl HardHardValidationRequestGuard<'_> {
             .and_then(|nomination| nomination.selected.as_mut())
             .expect("selected pair remains locked through Request handoff");
         selected.validation_requests += 1;
+        self.permit
+            .record_handoff(HardHardConfirmationPurpose::ValidationRequest, bytes);
     }
 }
 
@@ -276,6 +287,10 @@ impl HardHardPairCommitGuard<'_> {
         record.fresh_socket.socket_index = self.pair.socket_index;
         record.fresh_socket.socket_local_endpoint = self.pair.local_endpoint;
         record.fresh_socket.punch_generation = self.punch_generation.max(1);
+        record
+            .measurement
+            .evidence
+            .owner_committed_socket(&record.fresh_socket);
         // Publish validation only at the synchronous Direct commit. A
         // cancelled/contended ACK transaction must leave the nominated pair
         // eligible for another bounded encrypted validation request.
@@ -432,6 +447,7 @@ impl PeerManager {
             peer_session_generation: self.peer_session_generation_sync(peer)?,
             network_generation: record.local_network_generation,
             local_profile_generation: record.local_profile_generation,
+            evidence: record.measurement.evidence.clone(),
         };
         if !permit.is_current(self) {
             return None;
@@ -469,6 +485,7 @@ impl PeerManager {
             peer_session_generation: self.peer_session_generation_sync(peer)?,
             network_generation: record.local_network_generation,
             local_profile_generation: record.local_profile_generation,
+            evidence: record.measurement.evidence.clone(),
         };
         permit.is_current(self).then_some(permit)
     }
@@ -516,6 +533,7 @@ impl PeerManager {
             peer_session_generation: self.peer_session_generation_sync(peer)?,
             network_generation: record.local_network_generation,
             local_profile_generation: record.local_profile_generation,
+            evidence: record.measurement.evidence.clone(),
         };
         permit.is_current(self).then_some(permit)
     }
@@ -889,6 +907,7 @@ impl PeerManager {
             }
         };
         complete_hard_hard_pair_send_attempt(attempts, deferrals, ceiling, outcome);
+        record.measurement.evidence.record_send_outcome(outcome);
     }
 
     /// Derive budget purpose from the authoritative phase, not from a caller's

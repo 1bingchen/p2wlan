@@ -492,6 +492,39 @@ impl UdpTransport {
                 let matched_probe_session_id = key_candidate.session_id.clone();
                 let peer_session_generation = key_candidate.session_generation;
                 let key = key_candidate.key;
+                // Attempt evidence belongs to the authenticated token and
+                // receiving pair, never to the peer's shared Probe counters.
+                let observation_token = if scoped_hh2 {
+                    hh2_token.as_deref()
+                } else if hh2_token.is_none() {
+                    socket_token.as_deref()
+                } else {
+                    None
+                };
+                if let (Some(token), Ok(local_endpoint)) = (observation_token, socket.local_addr())
+                {
+                    self.peers
+                        .record_hard_hard_receive(
+                            &identity.source_node_id,
+                            token,
+                            peer_session_generation,
+                            crate::peer::HardHardPairKey {
+                                socket_index,
+                                local_endpoint,
+                                remote_endpoint: source,
+                            },
+                            match packet.kind {
+                                PunchPacketKind::Punch => {
+                                    crate::peer::HardHardReceiveObservation::AuthenticatedPunch
+                                }
+                                PunchPacketKind::Ack => {
+                                    crate::peer::HardHardReceiveObservation::AuthenticatedAck
+                                }
+                            },
+                            monotonic_millis(),
+                        )
+                        .await;
+                }
                 if let Some(token) = hh2_token.as_deref().filter(|_| scoped_hh2) {
                     self.handle_hard_hard_pair_packet(
                         &identity.source_node_id,
@@ -1045,6 +1078,24 @@ impl UdpTransport {
                                 metrics.probe_acks_received += 1
                             })
                             .await;
+                            if let (Some(token), Some(local_endpoint)) =
+                                (hard_hard_token.as_deref(), local_endpoint)
+                            {
+                                self.peers
+                                    .record_hard_hard_receive(
+                                        &identity.source_node_id,
+                                        token,
+                                        peer_session_generation,
+                                        crate::peer::HardHardPairKey {
+                                            socket_index,
+                                            local_endpoint,
+                                            remote_endpoint: source,
+                                        },
+                                        crate::peer::HardHardReceiveObservation::MatchedAck,
+                                        monotonic_millis(),
+                                    )
+                                    .await;
+                            }
                             self.update_peer_probe_rx_diagnostics(
                                 &identity.source_node_id,
                                 generation,

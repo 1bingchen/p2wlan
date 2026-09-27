@@ -332,12 +332,22 @@ impl UdpTransport {
                 drop(state);
                 if !self
                     .peers
-                    .hard_hard_pair_observe(peer, token, pair, evidence)
+                    .hard_hard_pair_observe(peer, token, pair.clone(), evidence)
                     .await
                 {
                     return;
                 }
                 self.update_socket_diagnostics(socket_index, |m| m.probe_acks_received += 1)
+                    .await;
+                self.peers
+                    .record_hard_hard_receive(
+                        peer,
+                        token,
+                        peer_session,
+                        pair,
+                        crate::peer::HardHardReceiveObservation::MatchedAck,
+                        monotonic_millis(),
+                    )
                     .await;
                 evidence
             }
@@ -414,6 +424,13 @@ impl UdpTransport {
                 // rechecked after every await, immediately before kernel IO.
                 match socket.try_send_to(bytes, pair.remote_endpoint) {
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => continue,
+                    Ok(sent) => {
+                        permit.record_handoff(
+                            crate::peer::HardHardConfirmationPurpose::ProbeAck,
+                            sent,
+                        );
+                        return Ok(sent);
+                    }
                     result => return result,
                 }
             }

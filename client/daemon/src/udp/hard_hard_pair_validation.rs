@@ -355,6 +355,7 @@ impl UdpTransport {
                     .dynamic
                     .get(&index)
                     .is_some_and(|entry| entry.hard_hard_committed_remote == Some(endpoint));
+                let handoff_evidence = permit.as_ref().map(|permit| permit.evidence());
                 let mut request_guard = if request && !committed {
                     let permit = permit.ok_or_else(|| {
                         DaemonError::Network("hh2 validation permission revoked".into())
@@ -382,7 +383,16 @@ impl UdpTransport {
                 match socket.try_send_to(&packet.wire_bytes, endpoint) {
                     Ok(sent) => {
                         if let Some(guard) = request_guard.as_mut() {
-                            guard.handoff_succeeded();
+                            guard.handoff_succeeded(sent);
+                        } else if let Some(evidence) = handoff_evidence.as_ref() {
+                            evidence.record_confirmation_handoff(
+                                if request {
+                                    crate::peer::HardHardConfirmationPurpose::ValidationRequest
+                                } else {
+                                    crate::peer::HardHardConfirmationPurpose::ValidationAck
+                                },
+                                sent,
+                            );
                         }
                         return Ok(sent);
                     }

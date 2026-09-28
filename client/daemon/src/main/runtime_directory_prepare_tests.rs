@@ -1,26 +1,30 @@
 #[test]
 fn runtime_directory_prepare_entry_is_strict_and_has_no_combined_daemon_options() {
     use std::ffi::OsString;
+    #[cfg(windows)]
+    let absolute = PathBuf::from(r"C:\p2wlan-runtime-parse");
+    #[cfg(not(windows))]
+    let absolute = PathBuf::from("/tmp/p2wlan-runtime-parse");
+    let flag = OsString::from("--prepare-runtime-directory");
+    let path_arg = absolute.as_os_str().to_owned();
+    let mut combined = flag.clone();
+    combined.push("=");
+    combined.push(&path_arg);
     for args in [
-        vec!["--prepare-runtime-directory"],
-        vec!["--prepare-runtime-directory", "relative"],
-        vec!["--prepare-runtime-directory=/tmp/runtime"],
-        vec!["--prepare-runtime-directory", "/tmp/runtime", "--managed"],
-        vec!["--version", "--prepare-runtime-directory", "/tmp/runtime"],
+        vec![flag.clone()],
+        vec![flag.clone(), "relative".into()],
+        vec![combined],
+        vec![flag.clone(), path_arg.clone(), "--managed".into()],
+        vec!["--version".into(), flag.clone(), path_arg.clone()],
     ] {
-        let args: Vec<OsString> = args.into_iter().map(OsString::from).collect();
         assert!(parse_runtime_directory_prepare_args(&args).is_err());
     }
     assert!(parse_runtime_directory_prepare_args(&["--version".into()])
         .unwrap()
         .is_none());
     assert_eq!(
-        parse_runtime_directory_prepare_args(&[
-            "--prepare-runtime-directory".into(),
-            "/tmp/runtime".into(),
-        ])
-        .unwrap(),
-        Some(PathBuf::from("/tmp/runtime"))
+        parse_runtime_directory_prepare_args(&[flag, path_arg]).unwrap(),
+        Some(absolute)
     );
 }
 

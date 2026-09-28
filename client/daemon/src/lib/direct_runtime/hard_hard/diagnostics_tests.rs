@@ -192,33 +192,140 @@ mod hard_hard_production_diagnostics_tests {
     #[test]
     fn hard_hard_active_priority_never_delays_replacement_lifecycle() {
         for field in 0..4 {
+            for token in [None, Some("a1")] {
+                let mut ledger = PendingHandshakeState::default();
+                let CandidateOfferWorkAdmission::Started(owner, active) =
+                    ledger.enqueue_candidate_offer_work(offer(1, Some("a1")))
+                else {
+                    panic!("owner");
+                };
+                let mut replacement = offer(2, token);
+                replace_lifecycle(&mut replacement, field);
+                let expected_generation = replacement.candidate_generation;
+                let _ = ledger.enqueue_candidate_offer_work(replacement);
+                assert!(ledger.candidate_offer_work_has_priority_successor(
+                    "private-peer-identity",
+                    owner.owner,
+                    &active
+                ));
+                assert_eq!(
+                    ledger
+                        .take_queued_candidate_offer_work_before_commit(
+                            "private-peer-identity",
+                            owner.owner,
+                            &active,
+                        )
+                        .unwrap()
+                        .candidate_generation,
+                    expected_generation
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn hard_hard_active_replay_preserves_original_and_cannot_run_after_finish() {
+        let mut ledger = PendingHandshakeState::default();
+        let CandidateOfferWorkAdmission::Started(owner, active) =
+            ledger.enqueue_candidate_offer_work(offer(1, Some("a1")))
+        else {
+            panic!("owner");
+        };
+        let original_deadline = active.punch_at_ms;
+        let mut replay = offer(2, Some("a1"));
+        replay.candidates = vec!["198.51.100.88:50000".into()];
+        replay.punch_at_ms = Some(hard_hard_now_ms() + 7_000);
+        let CandidateOfferWorkAdmission::Coalesced {
+            discarded: Some(discarded),
+            reason: HardHardCandidateDiscardReason::SameSessionPreserved,
+        } = ledger.enqueue_candidate_offer_work(replay)
+        else {
+            panic!("active duplicate must be discarded instead of becoming a successor");
+        };
+        assert_eq!(discarded.candidate_generation, 2);
+        assert_eq!(active.candidate_generation, 1);
+        assert_eq!(active.punch_at_ms, original_deadline);
+        assert_eq!(active.candidates, ["198.51.100.77:45678"]);
+        assert!(!ledger.candidate_offer_work_has_priority_successor(
+            "private-peer-identity",
+            owner.owner,
+            &active,
+        ));
+        assert!(ledger
+            .finish_candidate_offer_work("private-peer-identity", owner.owner)
+            .is_none());
+        assert!(ledger.candidate_offer_workers.is_empty());
+    }
+
+    #[test]
+    fn hard_hard_active_identity_follows_both_queue_handover_paths() {
+        for before_commit in [false, true] {
             let mut ledger = PendingHandshakeState::default();
-            let CandidateOfferWorkAdmission::Started(owner, active) =
-                ledger.enqueue_candidate_offer_work(offer(1, Some("a1")))
+            let CandidateOfferWorkAdmission::Started(owner, _) =
+                ledger.enqueue_candidate_offer_work(offer(1, None))
             else {
                 panic!("owner");
             };
-            let mut replacement = offer(2, None);
-            replace_lifecycle(&mut replacement, field);
-            let expected_generation = replacement.candidate_generation;
-            let _ = ledger.enqueue_candidate_offer_work(replacement);
-            assert!(ledger.candidate_offer_work_has_priority_successor(
+            let _ = ledger.enqueue_candidate_offer_work(offer(2, Some("a1")));
+            let active = if before_commit {
+                ledger.take_queued_candidate_offer_work("private-peer-identity", owner.owner)
+            } else {
+                ledger.finish_candidate_offer_work("private-peer-identity", owner.owner)
+            }
+            .unwrap();
+            let _ = ledger.enqueue_candidate_offer_work(offer(3, None));
+            assert!(matches!(
+                ledger.enqueue_candidate_offer_work(offer(4, Some("a1"))),
+                CandidateOfferWorkAdmission::Coalesced {
+                    reason: HardHardCandidateDiscardReason::SameSessionPreserved,
+                    discarded: Some(_),
+                }
+            ));
+            assert!(!ledger.candidate_offer_work_has_priority_successor(
                 "private-peer-identity",
                 owner.owner,
-                &active
+                &active,
             ));
+            let next = ledger
+                .finish_candidate_offer_work("private-peer-identity", owner.owner)
+                .unwrap();
             assert_eq!(
-                ledger
-                    .take_queued_candidate_offer_work_before_commit(
-                        "private-peer-identity",
-                        owner.owner,
-                        &active,
-                    )
-                    .unwrap()
-                    .candidate_generation,
-                expected_generation
+                next.candidate_generation, 3,
+                "duplicate must preserve the queued ordinary refresh"
             );
+            assert!(ledger.candidate_offer_workers["private-peer-identity"]
+                .active_hard_hard_identity
+                .is_none());
         }
+    }
+
+    #[test]
+    fn hard_hard_same_token_opposite_role_is_not_a_replay() {
+        let mut ledger = PendingHandshakeState::default();
+        let CandidateOfferWorkAdmission::Started(owner, _) =
+            ledger.enqueue_candidate_offer_work(offer(1, Some("a1")))
+        else {
+            panic!("owner");
+        };
+        let mut answer = offer(2, Some("a1"));
+        let mut coordination =
+            HardHardCoordination::parse(answer.session_id.as_deref().unwrap()).unwrap();
+        coordination.role = HardHardRole::Responder;
+        answer.session_id = Some(coordination.encode());
+        assert!(matches!(
+            ledger.enqueue_candidate_offer_work(answer),
+            CandidateOfferWorkAdmission::Coalesced {
+                discarded: None,
+                ..
+            }
+        ));
+        assert_eq!(
+            ledger
+                .finish_candidate_offer_work("private-peer-identity", owner.owner)
+                .unwrap()
+                .candidate_generation,
+            2
+        );
     }
 
     #[test]

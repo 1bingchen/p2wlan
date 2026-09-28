@@ -144,6 +144,10 @@ async fn hard_hard_profile_wait_preserves_successor_and_cancellation() {
     assert!(futures_util::poll!(&mut wait).is_pending());
     let mut successor = (*offer).clone();
     successor.candidate_generation = 2;
+    let mut coordination =
+        HardHardCoordination::parse(successor.session_id.as_deref().unwrap()).unwrap();
+    coordination.token = "b2".to_string();
+    successor.session_id = Some(coordination.encode());
     assert!(matches!(
         daemon
             .pending_handshakes
@@ -168,6 +172,48 @@ async fn hard_hard_profile_wait_preserves_successor_and_cancellation() {
     assert!(futures_util::poll!(&mut wait).is_pending());
     daemon.pending_handshakes.lock().clear_peer(&peer.node_id);
     assert!(!wait.await);
+}
+
+#[tokio::test(start_paused = true)]
+async fn hard_hard_profile_wait_keeps_active_transcript_on_same_token_replay() {
+    let (daemon, mut peer, offer, mut reservation) = profile_wait_fixture().await;
+    let original_deadline = offer.punch_at_ms;
+    let mut wait =
+        Box::pin(daemon.wait_for_hard_hard_profile_publication(&offer, &mut reservation));
+    assert!(futures_util::poll!(&mut wait).is_pending());
+    let mut replay = (*offer).clone();
+    replay.candidate_generation = 2;
+    replay.candidates = vec!["198.51.100.88:50000".into()];
+    replay.punch_at_ms = Some(hard_hard_now_ms() + 7_000);
+    assert!(matches!(
+        daemon
+            .pending_handshakes
+            .lock()
+            .enqueue_candidate_offer_work(replay),
+        CandidateOfferWorkAdmission::Coalesced {
+            reason: HardHardCandidateDiscardReason::SameSessionPreserved,
+            discarded: Some(_),
+        }
+    ));
+    tokio::time::advance(UNKNOWN_PEER_OFFER_POLL).await;
+    assert!(
+        futures_util::poll!(&mut wait).is_pending(),
+        "a replay is not a new work owner or a published NAT profile"
+    );
+    peer.nat_type = published_profile(1);
+    daemon.peers.add_peer(&peer).await;
+    tokio::time::advance(UNKNOWN_PEER_OFFER_POLL).await;
+    assert!(wait.await);
+    assert_eq!(offer.punch_at_ms, original_deadline);
+    assert_eq!(offer.candidates, ["198.51.100.77:40000"]);
+    assert!(
+        daemon
+            .pending_handshakes
+            .lock()
+            .finish_candidate_offer_work(&peer.node_id, reservation.owner)
+            .is_none(),
+        "the altered duplicate must not become another worker after the original completes"
+    );
 }
 
 #[tokio::test(start_paused = true)]

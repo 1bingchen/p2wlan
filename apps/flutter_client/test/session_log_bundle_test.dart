@@ -117,13 +117,11 @@ void main() {
       clientLogPath: client.path,
       extraFiles: [
         (
-          name:
-              'rooms/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef/p2wlan-daemon.log',
+          name: 'rooms/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef/p2wlan-daemon.log',
           path: roomLog.path,
         ),
         (
-          name:
-              'rooms/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef/status-summary.json',
+          name: 'rooms/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef/status-summary.json',
           path: roomSummary.path,
         ),
       ],

@@ -173,18 +173,22 @@ func TestFrameSizeBoundary(t *testing.T) {
 	}
 	defer conn.Close()
 
-	largePayload := make([]byte, 100)
-	_, _ = conn.Write(makeFrame(msgRegister, largePayload))
-
-	buf := make([]byte, 100)
-	n, err := conn.Read(buf)
-	if err != nil && err != io.EOF {
-		t.Fatalf("read: %v", err)
+	// The declared size must be rejected before reading the body. Sending
+	// unread payload as well can make Windows reset the closing TCP stream,
+	// discarding the error frame and testing OS close timing instead of the
+	// protocol boundary. Withhold the body to prove the header alone suffices.
+	if err := conn.SetDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatalf("set frame deadline: %v", err)
 	}
-	if n < frameHeader {
-		t.Fatalf("expected error frame, got %d bytes", n)
+	header := makeFrame(msgRegister, make([]byte, config.MaxFramePayload+1))[:frameHeader]
+	if err := writeFull(conn, header); err != nil {
+		t.Fatalf("write oversized header: %v", err)
 	}
-	code := binary.BigEndian.Uint16(buf[8:10])
+	typ, payload := readTestFrame(t, conn)
+	if typ != msgError || len(payload) < 2 {
+		t.Fatalf("expected complete error frame, got type=%d payload=%d bytes", typ, len(payload))
+	}
+	code := binary.BigEndian.Uint16(payload[:2])
 	if code != 4006 {
 		t.Errorf("expected code 4006 (frame too large), got %d", code)
 	}

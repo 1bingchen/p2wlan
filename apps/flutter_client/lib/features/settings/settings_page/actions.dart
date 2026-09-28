@@ -346,16 +346,18 @@ extension _SettingsPageActions on _SettingsPageState {
       );
       if (!mounted ||
           uploadSessionRevision != widget.statusStore.sessionRevision ||
-          widget.settingsStore.settings.authToken != settings.authToken)
+          widget.settingsStore.settings.authToken != settings.authToken) {
         return;
+      }
       final bundle = await CurrentSessionLogBundle.collectCurrentStartup(
         activeRoomProfileIds: activeRoomProfileIds,
         dynamicSummaries: dynamicSummaries,
       );
       if (!mounted ||
           uploadSessionRevision != widget.statusStore.sessionRevision ||
-          widget.settingsStore.settings.authToken != settings.authToken)
+          widget.settingsStore.settings.authToken != settings.authToken) {
         return;
+      }
       final result = await _controlApi.uploadSupportLogs(
         controlServer: settings.controlServer,
         authToken: authToken,

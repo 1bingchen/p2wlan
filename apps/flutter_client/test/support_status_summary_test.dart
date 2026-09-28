@@ -222,22 +222,19 @@ void main() {
     },
   );
 
-  test(
-    'daemon-stale live captures are marked stale and build observations labeled',
-    () {
-      final safe = jsonDecode(
-        buildSupportStatusSummary(
-          source: 'live',
-          snapshot: {'version': '0.1.166', 'peer_snapshot_stale': true},
-          observedDaemonBuild: {
-            'daemon_version': '0.1.165',
-            'git_commit': 'abcdef01',
-          },
-        ),
-      );
-      expect(safe['stale'], isTrue);
-      expect(safe['status']['version'], '0.1.166');
-      expect(safe['last_observed_daemon_build']['daemon_version'], '0.1.165');
-    },
-  );
+  test('daemon-stale live captures are marked stale and build observations labeled', () {
+    final safe = jsonDecode(
+      buildSupportStatusSummary(
+        source: 'live',
+        snapshot: {'version': '0.1.166', 'peer_snapshot_stale': true},
+        observedDaemonBuild: {
+          'daemon_version': '0.1.165',
+          'git_commit': 'abcdef01',
+        },
+      ),
+    );
+    expect(safe['stale'], isTrue);
+    expect(safe['status']['version'], '0.1.166');
+    expect(safe['last_observed_daemon_build']['daemon_version'], '0.1.165');
+  });
 }

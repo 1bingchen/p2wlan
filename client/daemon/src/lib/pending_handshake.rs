@@ -234,6 +234,7 @@ struct CandidateOfferWorkOwner {
     owner: u64,
     cancellation: tokio::sync::watch::Sender<bool>,
     active_sender_public_key: Option<String>,
+    active_hard_hard_identity: Option<HardHardCandidateActiveIdentity>,
     queued: Option<PendingPeerOffer>,
 }
 
@@ -1283,6 +1284,21 @@ impl PendingHandshakeState {
             if incoming_matches_active && queued_has_different_identity {
                 return CandidateOfferWorkAdmission::RejectedIdentity;
             }
+            let incoming_hh_identity = HardHardCandidateActiveIdentity::from_offer(&offer);
+            if incoming_matches_active
+                && worker
+                    .active_hard_hard_identity
+                    .as_ref()
+                    .is_some_and(|active| incoming_hh_identity.as_ref() == Some(active))
+            {
+                // A replay cannot replace or queue behind the active original:
+                // doing either would let altered candidates/deadlines restart
+                // this same transcript after the current worker completes.
+                return CandidateOfferWorkAdmission::Coalesced {
+                    discarded: Some(Box::new(offer)),
+                    reason: HardHardCandidateDiscardReason::SameSessionPreserved,
+                };
+            }
             let now = hard_hard_now_ms();
             let queued_hh = worker
                 .queued
@@ -1299,10 +1315,12 @@ impl PendingHandshakeState {
                         reason: HardHardCandidateDiscardReason::OrdinaryCoalesced,
                     };
                 }
-                if incoming_hh
-                    .as_ref()
-                    .is_some_and(|incoming| incoming.token == queued_hh.token)
-                {
+                if incoming_hh.as_ref().is_some_and(|incoming| {
+                    incoming.token == queued_hh.token
+                        && incoming.role == queued_hh.role
+                        && incoming.v2.as_ref().map(|meta| meta.stage)
+                            == queued_hh.v2.as_ref().map(|meta| meta.stage)
+                }) {
                     // Never replace an immutable transcript with a same-token
                     // replay, even if its fields or deadline were changed.
                     return CandidateOfferWorkAdmission::Coalesced {
@@ -1333,6 +1351,7 @@ impl PendingHandshakeState {
         let owner = self.next_candidate_offer_worker_id;
         let peer_id = offer.from_node_id.clone();
         let active_sender_public_key = offer.sender_public_key.clone();
+        let active_hard_hard_identity = HardHardCandidateActiveIdentity::from_offer(&offer);
         let (cancellation_tx, cancellation) = tokio::sync::watch::channel(false);
         self.candidate_offer_workers.insert(
             peer_id,
@@ -1340,6 +1359,7 @@ impl PendingHandshakeState {
                 owner,
                 cancellation: cancellation_tx,
                 active_sender_public_key,
+                active_hard_hard_identity,
                 queued: None,
             },
         );
@@ -1363,6 +1383,7 @@ impl PendingHandshakeState {
         }
         if let Some(next) = worker.queued.take() {
             worker.active_sender_public_key = next.sender_public_key.clone();
+            worker.active_hard_hard_identity = HardHardCandidateActiveIdentity::from_offer(&next);
             return Some(next);
         }
         self.candidate_offer_workers.remove(peer_id);
@@ -1380,6 +1401,7 @@ impl PendingHandshakeState {
         }
         let next = worker.queued.take()?;
         worker.active_sender_public_key = next.sender_public_key.clone();
+        worker.active_hard_hard_identity = HardHardCandidateActiveIdentity::from_offer(&next);
         Some(next)
     }
 

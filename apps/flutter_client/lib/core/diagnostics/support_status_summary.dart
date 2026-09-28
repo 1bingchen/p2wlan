@@ -341,9 +341,8 @@ Map<String, Object?>? _endpoint(dynamic value, Map<String, String> aliases) {
     return null;
   }
   if (value is! String || value.length > 128) return null;
-  final match = RegExp(
-    r'^(?:\[([^\]]+)\]|([^:]+)):(\d{1,5})$',
-  ).firstMatch(value);
+  final match = RegExp(r'^(?:\[([^\]]+)\]|([^:]+)):(\d{1,5})$')
+      .firstMatch(value);
   if (match == null) return null;
   final ip = InternetAddress.tryParse(match[1] ?? match[2]!);
   final port = int.tryParse(match[3]!);

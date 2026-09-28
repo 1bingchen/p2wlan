@@ -101,60 +101,57 @@ void main() {
     },
   );
 
-  test(
-    'main snapshot and eight room summaries retain exact wire instance count',
-    () async {
-      final summary = buildSupportStatusSummary(
-        source: 'cached',
-        snapshot: {'version': '0.1.166'},
-      );
-      final payload = await _upload(
-        summary: summary,
-        roomFiles: [
-          for (var room = 1; room <= maxSupportLogRoomInstances; room++) ...[
-            SessionLogFile(
-              name:
-                  'rooms/${room.toRadixString(16).padLeft(64, '0')}/p2wlan-daemon.log',
-              content: 'room ok',
-            ),
-            SessionLogFile(
-              name:
-                  'rooms/${room.toRadixString(16).padLeft(64, '0')}/status-summary.json',
-              content: summary,
-            ),
-          ],
+  test('main snapshot and eight room summaries retain exact wire instance count', () async {
+    final summary = buildSupportStatusSummary(
+      source: 'cached',
+      snapshot: {'version': '0.1.166'},
+    );
+    final payload = await _upload(
+      summary: summary,
+      roomFiles: [
+        for (var room = 1; room <= maxSupportLogRoomInstances; room++) ...[
+          SessionLogFile(
+            name:
+                'rooms/${room.toRadixString(16).padLeft(64, '0')}/p2wlan-daemon.log',
+            content: 'room ok',
+          ),
+          SessionLogFile(
+            name:
+                'rooms/${room.toRadixString(16).padLeft(64, '0')}/status-summary.json',
+            content: summary,
+          ),
         ],
-      );
-      expect(payload['manifest'], {
-        'total_instances': 9,
-        'has_room_logs': true,
-        'retained_room_instances': 8,
-      });
-      expect(payload['files'], hasLength(maxSupportLogFilesV2));
-      final instances = payload['instances'] as List;
-      expect(instances, hasLength(maxSupportLogInstancesV2));
-      expect(
-        instances.where((instance) => instance['instance_type'] == 'main'),
-        hasLength(1),
-      );
-      expect(
-        instances
-            .where((instance) => instance['instance_type'] == 'room')
-            .map((instance) => instance['profile_id'])
-            .toSet(),
-        hasLength(8),
-      );
-      for (final file in payload['files']) {
-        if ((file['name'] as String).endsWith('status-summary.json')) {
-          expect(jsonDecode(file['content'])['stale'], isTrue);
-          expect(
-            utf8.encode(file['content']).length,
-            lessThanOrEqualTo(maxSupportStatusBytes),
-          );
-        }
+      ],
+    );
+    expect(payload['manifest'], {
+      'total_instances': 9,
+      'has_room_logs': true,
+      'retained_room_instances': 8,
+    });
+    expect(payload['files'], hasLength(maxSupportLogFilesV2));
+    final instances = payload['instances'] as List;
+    expect(instances, hasLength(maxSupportLogInstancesV2));
+    expect(
+      instances.where((instance) => instance['instance_type'] == 'main'),
+      hasLength(1),
+    );
+    expect(
+      instances
+          .where((instance) => instance['instance_type'] == 'room')
+          .map((instance) => instance['profile_id'])
+          .toSet(),
+      hasLength(8),
+    );
+    for (final file in payload['files']) {
+      if ((file['name'] as String).endsWith('status-summary.json')) {
+        expect(jsonDecode(file['content'])['stale'], isTrue);
+        expect(
+          utf8.encode(file['content']).length,
+          lessThanOrEqualTo(maxSupportStatusBytes),
+        );
       }
-    },
-  );
+    }
+  });
 
   test(
     'diagnostic 401 is recorded but does not block authenticated log upload',

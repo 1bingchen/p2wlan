@@ -115,9 +115,42 @@ impl HardHardCandidateDiscardReason {
         match self {
             Self::OrdinaryCoalesced => "ordinary_candidate_coalesced",
             Self::Superseded => "queued_hard_hard_superseded",
-            Self::SameSessionPreserved => "queued_same_session_preserved",
+            Self::SameSessionPreserved => "same_session_preserved",
             Self::Expired => "queued_hard_hard_expired",
         }
+    }
+}
+
+/// A bounded projection of the active worker's immutable envelope. It cannot
+/// authorize a session or a send; the original offer remains in that worker.
+/// The sender key is already retained by `CandidateOfferWorkOwner`.
+#[derive(PartialEq, Eq)]
+struct HardHardCandidateActiveIdentity {
+    network_generation: u64,
+    peer_session_generation: Option<PeerSessionGeneration>,
+    remote_incarnation: Option<u64>,
+    token: String,
+    role: HardHardRole,
+    stage: Option<HardHardV2Stage>,
+}
+
+impl HardHardCandidateActiveIdentity {
+    fn from_offer(offer: &PendingPeerOffer) -> Option<Self> {
+        let coordination = HardHardCoordination::parse(offer.session_id.as_deref()?)?;
+        let stage = coordination.v2.as_ref().map(|meta| meta.stage);
+        if stage.is_some_and(HardHardV2Stage::is_barrier) {
+            return None;
+        }
+        Some(Self {
+            network_generation: offer.network_generation,
+            peer_session_generation: offer.peer_session_generation,
+            remote_incarnation: crate::control::candidate_generation_incarnation(
+                offer.candidate_generation,
+            ),
+            token: coordination.token,
+            role: coordination.role,
+            stage,
+        })
     }
 }
 

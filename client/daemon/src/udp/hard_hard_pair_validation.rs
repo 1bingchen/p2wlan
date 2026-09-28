@@ -2,6 +2,10 @@ use super::*;
 use crate::peer::HardHardPairKey;
 
 #[cfg(test)]
+#[path = "tests/direct_validation_send.rs"]
+mod deadline_tests;
+
+#[cfg(test)]
 #[derive(Default)]
 pub(super) struct HardHardValidationSendGate {
     pub(super) reached: tokio::sync::Notify,
@@ -262,10 +266,11 @@ impl UdpTransport {
         packet: &EncryptedPeerPacket,
         endpoint: SocketAddr,
     ) -> Result<usize> {
-        self.send_direct_validation_on_socket(socket, index, packet, endpoint, false, None)
+        self.send_direct_validation_on_socket(socket, index, packet, endpoint, false, None, None)
             .await
     }
 
+    #[cfg(test)]
     pub(crate) async fn send_direct_validation_request_on_socket(
         &self,
         socket: &Arc<UdpSocket>,
@@ -274,10 +279,35 @@ impl UdpTransport {
         endpoint: SocketAddr,
         scope: Option<&HardHardValidationScope>,
     ) -> Result<usize> {
-        self.send_direct_validation_on_socket(socket, index, packet, endpoint, true, scope)
-            .await
+        self.send_direct_validation_request_on_socket_until(
+            socket, index, packet, endpoint, scope, None,
+        )
+        .await
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn send_direct_validation_request_on_socket_until(
+        &self,
+        socket: &Arc<UdpSocket>,
+        index: usize,
+        packet: &EncryptedPeerPacket,
+        endpoint: SocketAddr,
+        scope: Option<&HardHardValidationScope>,
+        ordinary_deadline: Option<tokio::time::Instant>,
+    ) -> Result<usize> {
+        self.send_direct_validation_on_socket(
+            socket,
+            index,
+            packet,
+            endpoint,
+            true,
+            scope,
+            ordinary_deadline,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
     async fn send_direct_validation_on_socket(
         &self,
         socket: &Arc<UdpSocket>,
@@ -286,6 +316,7 @@ impl UdpTransport {
         endpoint: SocketAddr,
         request: bool,
         expected_scope: Option<&HardHardValidationScope>,
+        ordinary_deadline: Option<tokio::time::Instant>,
     ) -> Result<usize> {
         if self.hard_hard_socket_mode(index).await.is_none() {
             if expected_scope.is_some() {
@@ -300,7 +331,13 @@ impl UdpTransport {
                 ));
             }
             return self
-                .send_encrypted_packet_on_socket(socket, index, packet, endpoint)
+                .send_encrypted_packet_on_socket_until(
+                    socket,
+                    index,
+                    packet,
+                    endpoint,
+                    ordinary_deadline,
+                )
                 .await;
         }
         let send = async {

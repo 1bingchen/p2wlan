@@ -1070,6 +1070,7 @@ async fn pending_probe_ack_requires_authenticated_ack_admission() {
     udp.pending_probes.lock().await.insert(
         nonce,
         PendingProbe {
+            validation_preflight: None,
             sent_at: Instant::now(),
             expires_at: Instant::now() + DIRECT_KEEPALIVE_ACK_TIMEOUT,
             endpoint: sender_addr,
@@ -1142,6 +1143,7 @@ async fn unavailable_pending_probe_ack_keeps_nonce_without_learning_direct() {
     udp.pending_probes.lock().await.insert(
         nonce,
         PendingProbe {
+            validation_preflight: None,
             sent_at: Instant::now(),
             expires_at: Instant::now() + DIRECT_KEEPALIVE_ACK_TIMEOUT,
             endpoint: sender_addr,
@@ -1206,6 +1208,7 @@ async fn expired_authenticated_probe_ack_is_terminal_and_cannot_learn_direct() {
     udp.pending_probes.lock().await.insert(
         nonce,
         PendingProbe {
+            validation_preflight: None,
             sent_at: Instant::now() - Duration::from_secs(3),
             expires_at: Instant::now() - Duration::from_millis(1),
             endpoint: sender_addr,

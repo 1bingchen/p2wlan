@@ -53,6 +53,7 @@ include!("udp/state.rs");
 
 mod stun_waiter;
 use stun_waiter::StunWaiters;
+mod direct_validation_preflight;
 
 include!("udp/admission.rs");
 include!("udp/gather.rs");

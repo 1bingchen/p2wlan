@@ -417,6 +417,7 @@ impl UdpTransport {
         self.direct_validation.expectations.lock().await.insert(
             peer_id.to_string(),
             DirectValidationExpectation {
+                preflight_attempted: false,
                 hard_hard_pair: None,
                 request_id,
                 generation,
@@ -480,6 +481,7 @@ impl UdpTransport {
         self.register_direct_validation_expectation(
             peer_id,
             DirectValidationExpectation {
+                preflight_attempted: false,
                 hard_hard_pair: None,
                 request_id,
                 generation,
@@ -610,6 +612,7 @@ impl UdpTransport {
             .register_direct_validation_expectation(
                 peer_id,
                 DirectValidationExpectation {
+                    preflight_attempted: false,
                     hard_hard_pair,
                     request_id,
                     generation,

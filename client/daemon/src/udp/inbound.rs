@@ -1128,13 +1128,21 @@ impl UdpTransport {
                                     )
                                     .await;
                             }
-                            self.peers
+                            let endpoint_learned = self
+                                .peers
                                 .learn_authenticated_endpoint_in_epoch(
                                     &epoch_guard,
                                     &identity.source_node_id,
                                     source,
                                 )
                                 .await;
+                            if endpoint_learned {
+                                self.complete_validation_preflight_in_epoch(
+                                    &identity.source_node_id,
+                                    &pending,
+                                )
+                                .await;
+                            }
                             let accepted = self
                                 .peers
                                 .record_direct_probe_success_with_latency_for_generation_and_local_endpoint_for_remote_epoch(

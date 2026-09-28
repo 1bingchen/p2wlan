@@ -1102,103 +1102,165 @@ async fn run_direct_encrypted_validation_session_inner(
                 break;
             }
         };
-        let socket_index = Some(prepared.socket_index);
-        let request_session_status = transport.session_status(&peer_id).await;
-        tracing::debug!(target: "p2pnet_daemon::direct_validation",
-            event = "direct_validation_request_prepared",
-            peer_id = %peer_id,
-            remote_endpoint = %target.endpoint,
-            generation,
-            request_id,
-            sequence,
-            socket_index = prepared.socket_index,
-            session_active = request_session_status.has_active,
-            session_expired = request_session_status.expired,
-            session_needs_rekey = request_session_status.needs_rekey,
-            active_session_instance = ?request_session_status.active_session_instance,
-            previous_session_instance = ?request_session_status.previous_session_instance,
-            pending_responder_count = request_session_status.pending_responder_count,
-            "prepared exact UDP socket and captured WireGuard session before encryption"
-        );
-        peers
-            .record_direct_validation_event_with_metadata(
-                &peer_id,
-                generation,
-                crate::peer::DirectValidationEventMetadata {
-                    local_validation_session_id: Some(owner_token),
-                    request_id: Some(request_id),
-                    expected_endpoint: Some(target.endpoint),
-                    ..crate::peer::DirectValidationEventMetadata::default()
-                },
-                "direct_validation_request_prepared",
-                Some(target.endpoint),
-                socket_index,
-                None,
-                Some(sent),
-                format!(
-                    "prepared exact UDP socket before encryption {}",
-                    format_validation_session_status(request_session_status)
-                ),
-            )
-            .await;
-        let payload = build_direct_validation_payload(
-            DirectValidationKind::Request,
-            generation,
-            request_id,
-            sequence as u8,
-            owner_token,
-        );
-        let packet = Ipv4Packet::build_icmp_echo_request(
-            local_ip,
-            peer_ip,
-            request_id,
-            sequence as u16,
-            &payload,
-        );
-        let send_udp = udp.clone();
-        let validation_peer_id = peer_id.clone();
-        let send_socket = prepared.socket.clone();
-        let send_socket_index = prepared.socket_index;
-        let endpoint = target.endpoint;
-        let request_hard_hard_scope = hard_hard_scope.clone();
-        match transport
-            .encrypt_and_emit_outbound_with_lock_timeout(
-                OutboundPacket {
-                    room_authorization: None,
-                    peer_id: peer_id.clone(),
-                    dst_ip: connection.virtual_ip.clone(),
-                    packet,
-                    trace: None,
-                },
-                crate::transport::DIRECT_VALIDATION_EMIT_LOCK_TIMEOUT,
-                move |encrypted| async move {
-                    if !send_udp
-                        .mark_direct_validation_send_started(
-                            &validation_peer_id,
-                            request_id,
+        // Authenticate the return mapping without chasing its source port.
+        // The probe and encrypted request share the prepared socket and the
+        // original destination. Preflight uses this attempt's ACK budget.
+        let attempt_deadline = hard_hard_scope
+            .is_none()
+            .then(|| Instant::now() + DIRECT_VALIDATION_ACK_WAIT);
+        if let Some(deadline) = attempt_deadline {
+            let outcome = udp
+                .send_direct_validation_preflight(
+                    &peer_id,
+                    crate::peer::DirectValidationIdentity::owned(
+                        crate::peer::PathEpoch::new(
                             generation,
-                            owner_token,
-                        )
-                        .await
-                    {
-                        return Err(crate::error::DaemonError::Network(
-                            "direct-validation owner was revoked before UDP send".to_string(),
-                        ));
-                    }
-                    send_udp
-                        .send_direct_validation_request_on_socket(
-                            &send_socket,
-                            send_socket_index,
-                            &encrypted,
-                            endpoint,
-                            request_hard_hard_scope.as_ref(),
-                        )
-                        .await
-                        .map(|_| ())
-                },
-            )
-            .await
-        {
+                            target.peer_session_generation,
+                            target.remote_candidate_epoch,
+                        ),
+                        owner_token,
+                        Some(request_id),
+                        Some(target.endpoint),
+                    ),
+                    &prepared,
+                    tokio::time::Instant::from_std(deadline),
+                )
+                .await;
+            tracing::debug!(target: "p2pnet_daemon::direct_validation",
+                event = "direct_validation_preflight_completed",
+                peer_id = %peer_id,
+                remote_endpoint = %target.endpoint,
+                socket_index = prepared.socket_index,
+                generation,
+                request_id,
+                ?outcome,
+                "finished bounded independent return-mapping authentication"
+            );
+        }
+        let socket_index = Some(prepared.socket_index);
+        let endpoint = target.endpoint;
+        // One ordinary attempt owns the full preflight -> encrypted handoff
+        // budget. Expiry drops its emit guard/callback; the socket also checks
+        // the same deadline immediately before every kernel send poll.
+        let emit = async {
+            let request_session_status = transport.session_status(&peer_id).await;
+            tracing::debug!(target: "p2pnet_daemon::direct_validation",
+                event = "direct_validation_request_prepared",
+                peer_id = %peer_id,
+                remote_endpoint = %target.endpoint,
+                generation,
+                request_id,
+                sequence,
+                socket_index = prepared.socket_index,
+                session_active = request_session_status.has_active,
+                session_expired = request_session_status.expired,
+                session_needs_rekey = request_session_status.needs_rekey,
+                active_session_instance = ?request_session_status.active_session_instance,
+                previous_session_instance = ?request_session_status.previous_session_instance,
+                pending_responder_count = request_session_status.pending_responder_count,
+                "prepared exact UDP socket and captured WireGuard session before encryption"
+            );
+            peers
+                .record_direct_validation_event_with_metadata(
+                    &peer_id,
+                    generation,
+                    crate::peer::DirectValidationEventMetadata {
+                        local_validation_session_id: Some(owner_token),
+                        request_id: Some(request_id),
+                        expected_endpoint: Some(target.endpoint),
+                        ..crate::peer::DirectValidationEventMetadata::default()
+                    },
+                    "direct_validation_request_prepared",
+                    Some(target.endpoint),
+                    socket_index,
+                    None,
+                    Some(sent),
+                    format!(
+                        "prepared exact UDP socket before encryption {}",
+                        format_validation_session_status(request_session_status)
+                    ),
+                )
+                .await;
+            let payload = build_direct_validation_payload(
+                DirectValidationKind::Request,
+                generation,
+                request_id,
+                sequence as u8,
+                owner_token,
+            );
+            let packet = Ipv4Packet::build_icmp_echo_request(
+                local_ip,
+                peer_ip,
+                request_id,
+                sequence as u16,
+                &payload,
+            );
+            let send_udp = udp.clone();
+            let validation_peer_id = peer_id.clone();
+            let send_socket = prepared.socket.clone();
+            let send_socket_index = prepared.socket_index;
+            let request_hard_hard_scope = hard_hard_scope.clone();
+            transport
+                .encrypt_and_emit_outbound_with_lock_timeout(
+                    OutboundPacket {
+                        room_authorization: None,
+                        peer_id: peer_id.clone(),
+                        dst_ip: connection.virtual_ip.clone(),
+                        packet,
+                        trace: None,
+                    },
+                    attempt_deadline.map_or(
+                        crate::transport::DIRECT_VALIDATION_EMIT_LOCK_TIMEOUT,
+                        |deadline| {
+                            crate::transport::DIRECT_VALIDATION_EMIT_LOCK_TIMEOUT
+                                .min(deadline.saturating_duration_since(Instant::now()))
+                        },
+                    ),
+                    move |encrypted| async move {
+                        if attempt_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                            return Err(crate::error::DaemonError::Network(
+                                "direct_validation_attempt_deadline_expired".into(),
+                            ));
+                        }
+                        if !send_udp
+                            .mark_direct_validation_send_started(
+                                &validation_peer_id,
+                                request_id,
+                                generation,
+                                owner_token,
+                            )
+                            .await
+                        {
+                            return Err(crate::error::DaemonError::Network(
+                                "direct-validation owner was revoked before UDP send".to_string(),
+                            ));
+                        }
+                        send_udp
+                            .send_direct_validation_request_on_socket_until(
+                                &send_socket,
+                                send_socket_index,
+                                &encrypted,
+                                endpoint,
+                                request_hard_hard_scope.as_ref(),
+                                attempt_deadline.map(tokio::time::Instant::from_std),
+                            )
+                            .await
+                            .map(|_| ())
+                    },
+                )
+                .await
+        };
+        let emitted = if let Some(deadline) = attempt_deadline {
+            match tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), emit).await {
+                Ok(result) => result,
+                Err(_) => Err(crate::error::DaemonError::Network(
+                    "direct_validation_attempt_deadline_expired".into(),
+                )),
+            }
+        } else {
+            emit.await
+        };
+        match emitted {
             Ok(crate::transport::BoundedEmitOutcome::Sent) => {
                 sent = sent.saturating_add(1);
                 tracing::info!(
@@ -1233,7 +1295,9 @@ async fn run_direct_encrypted_validation_session_inner(
                     .await;
 
                 let ack_wait_started = Instant::now();
-                while ack_wait_started.elapsed() < DIRECT_VALIDATION_ACK_WAIT {
+                let ack_deadline =
+                    attempt_deadline.unwrap_or(ack_wait_started + DIRECT_VALIDATION_ACK_WAIT);
+                while Instant::now() < ack_deadline {
                     let Some(current) =
                         current_validation_target(&peers, &peer_id, &target_rx, owner_token).await
                     else {
@@ -1306,8 +1370,7 @@ async fn run_direct_encrypted_validation_session_inner(
                     // for the next bounded attempt. This request was already
                     // sent to `endpoint`, so its ACK remains valid evidence
                     // within the same owner/generation/request lease.
-                    let remaining =
-                        DIRECT_VALIDATION_ACK_WAIT.saturating_sub(ack_wait_started.elapsed());
+                    let remaining = ack_deadline.saturating_duration_since(Instant::now());
                     let _ = wait_for_validation_update(
                         &mut target_rx,
                         DIRECT_ENCRYPTED_VALIDATION_SESSION_POLL.min(remaining),
@@ -1321,7 +1384,7 @@ async fn run_direct_encrypted_validation_session_inner(
                 // worker-level timeout alone cannot distinguish a dead
                 // endpoint from a request that was sent successfully but
                 // never received an authenticated ACK.
-                if ack_wait_started.elapsed() >= DIRECT_VALIDATION_ACK_WAIT {
+                if Instant::now() >= ack_deadline {
                     peers
                         .record_direct_validation_event_with_metadata(
                             &peer_id,

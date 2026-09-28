@@ -1159,6 +1159,7 @@ impl UdpTransport {
             pending.insert(
                 nonce,
                 PendingProbe {
+                    validation_preflight: None,
                     sent_at,
                     // A punch/heartbeat ACK that arrives after this bound is
                     // terminally stale.  The old 60-second map-retention

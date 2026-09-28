@@ -3067,6 +3067,7 @@ async fn public_key_change_detaches_every_dynamic_socket_and_clears_probes() {
     transport.pending_probes.lock().await.insert(
         nonce,
         PendingProbe {
+            validation_preflight: None,
             sent_at: Instant::now(),
             expires_at: Instant::now() + DIRECT_KEEPALIVE_ACK_TIMEOUT,
             endpoint: nat.peer_public,

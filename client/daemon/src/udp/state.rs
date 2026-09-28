@@ -690,6 +690,8 @@ impl DirectValidationAckRejectReason {
 /// with the single acquire inside the prepare path.
 #[derive(Debug)]
 pub(crate) struct DirectValidationExpectation {
+    /// At most one ordinary Probe-v2 preflight may consume this request.
+    pub(crate) preflight_attempted: bool,
     /// Immutable rendezvous identity: absence of its live owner is terminal,
     /// never permission to reinterpret this request as a legacy validation.
     pub(crate) hard_hard_pair: Option<HardHardValidationScope>,
@@ -1513,6 +1515,9 @@ impl Default for PeerReflexiveIngress {
 
 #[derive(Debug, Clone)]
 struct PendingProbe {
+    /// Optional completion for the existing owned validation request. It is
+    /// fulfilled only after independent authenticated endpoint learning.
+    validation_preflight: Option<Arc<direct_validation_preflight::PreflightReceipt>>,
     sent_at: Instant,
     /// Monotonic terminal deadline for this probe's ACK.  Keeping the nonce
     /// in the bounded map for cleanup is not permission to accept an ACK

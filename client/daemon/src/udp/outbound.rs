@@ -1736,6 +1736,19 @@ impl UdpTransport {
         packet: &EncryptedPeerPacket,
         endpoint: SocketAddr,
     ) -> Result<usize> {
+        self.send_encrypted_packet_on_socket_until(socket, socket_index, packet, endpoint, None)
+            .await
+    }
+
+    /// Exact-socket control sends may carry an immutable attempt deadline.
+    pub(super) async fn send_encrypted_packet_on_socket_until(
+        &self,
+        socket: &Arc<UdpSocket>,
+        socket_index: usize,
+        packet: &EncryptedPeerPacket,
+        endpoint: SocketAddr,
+        deadline: Option<tokio::time::Instant>,
+    ) -> Result<usize> {
         if !self
             .permits_ordinary_send_on_socket(&packet.peer_id, socket_index, socket)
             .await
@@ -1745,6 +1758,12 @@ impl UdpTransport {
             ));
         }
         let sent = std::future::poll_fn(|cx| {
+            if deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
+                return std::task::Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "direct_validation_attempt_deadline_expired",
+                )));
+            }
             // Re-evaluate on EVERY readiness poll, including after socket backpressure.
             if packet
                 .room_authorization
@@ -1784,8 +1803,14 @@ impl UdpTransport {
             )));
         }
 
-        self.update_socket_diagnostics(socket_index, |metrics| metrics.encrypted_packets_sent += 1)
-            .await;
+        if deadline.is_some() {
+            // The physical handoff is final: auxiliary contention cannot make
+            // an accepted Request appear unsent when its deadline expires.
+            self.update_socket_diagnostics_try(socket_index, |m| m.encrypted_packets_sent += 1);
+        } else {
+            self.update_socket_diagnostics(socket_index, |m| m.encrypted_packets_sent += 1)
+                .await;
+        }
 
         debug!(
             "Sent {} encrypted bytes to peer {} at {} (dst={})",

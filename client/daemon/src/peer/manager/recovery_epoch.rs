@@ -1530,11 +1530,9 @@ impl PeerManager {
         self.direct_commit_notify.clone()
     }
 
-    /// Bounded feedback wait: block until the peer's direct-commit sequence
-    /// advances past `from_seq` (or becomes Some when it was None), or until
-    /// `timeout` elapses.  Used instead of a bare sleep so a promotion
-    /// reliably preempts the next sweep stage without relying on scheduler
-    /// preemption of `yield_now()`.
+    /// Bounded feedback wait. Only a current Direct path returns true;
+    /// candidate handovers also advance the sequence but only invalidate the
+    /// caller's snapshot. They wake the caller without claiming a promotion.
     pub(crate) async fn wait_for_direct_commit_or_timeout(
         &self,
         peer_id: &str,
@@ -1544,17 +1542,19 @@ impl PeerManager {
         let notify = self.direct_commit_notify();
         let deadline = Instant::now() + timeout;
         loop {
-            if self.direct_commit_seq_sync(peer_id) != from_seq {
-                return true;
-            }
+            let notified = notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
             if self.is_direct_sync(peer_id) {
                 return true;
+            }
+            if self.direct_commit_seq_sync(peer_id) != from_seq {
+                return false;
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 return false;
             }
-            let notified = notify.notified();
             tokio::select! {
                 _ = notified => {}
                 _ = tokio::time::sleep(remaining) => return false,

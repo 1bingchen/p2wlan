@@ -79,6 +79,7 @@ async fn drain_udp_quiet(socket: &UdpSocket, quiet: Duration) {
 #[test]
 fn legacy_ack_matching_accepts_port_drift_but_rejects_ip_drift() {
     let pending = PendingProbe {
+        validation_preflight: None,
         sent_at: Instant::now(),
         expires_at: Instant::now() + DIRECT_KEEPALIVE_ACK_TIMEOUT,
         endpoint: "203.0.113.10:40000".parse().unwrap(),

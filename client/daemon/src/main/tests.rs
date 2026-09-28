@@ -722,3 +722,4 @@ fn diagnostics_scope_returns_error(
 }
 
 include!("diagnostics_auth_tests.rs");
+include!("runtime_directory_prepare_tests.rs");

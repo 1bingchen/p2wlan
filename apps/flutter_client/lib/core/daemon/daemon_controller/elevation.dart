@@ -1,6 +1,18 @@
 part of '../daemon_controller.dart';
 
 const _windowsChildPidMarker = '__P2WLAN_CHILD_PID__=';
+const _posixChildPidMarker = '__P2WLAN_POSIX_CHILD_PID__=';
+
+/// The elevated shell returns only the launched PID. Log rotation and PID
+/// file writes belong to the interactive user; the daemon owns its fd-safe
+/// log writer and config persistence.
+String buildPosixDaemonLaunchShell(String binaryPath, List<String> args) {
+  String quote(String value) => "'${value.replaceAll("'", "'\\''")}'";
+  return '(P2WLAN_DAEMON_BIN=${quote(binaryPath)} '
+      '${quote(binaryPath)} ${args.map(quote).join(' ')} '
+      '> /dev/null 2>&1 < /dev/null & '
+      'printf \'$_posixChildPidMarker%s\\n\' "\$!")';
+}
 
 /// Parse the marker emitted by the single elevated `Start-Process -PassThru`
 /// launch. Keeping this pure makes PID supervision testable without running
@@ -68,67 +80,14 @@ extension DaemonControllerElevation on DaemonController {
   String _buildElevatedShell({
     required File binary,
     required List<String> args,
-    required Directory configDir,
-    required Directory logDir,
-    required String logPath,
-    required String pidPath,
   }) {
-    final repairOwnership = _macosRepairOwnershipShell(configDir, logDir);
-    final repairBefore = repairOwnership.isEmpty ? '' : '$repairOwnership; ';
-    final repairAfter = repairOwnership.isEmpty
-        ? ''
-        : '; /bin/sleep 1; $repairOwnership';
-    final rotateLog = _macosRotateLogShell(logPath);
-    return 'mkdir -p ${_shellQuote(configDir.path)} ${_shellQuote(logDir.path)}; '
-        '$repairBefore'
-        '$rotateLog'
-        ': > ${_shellQuote(logPath)}; chmod 600 ${_shellQuote(logPath)}; '
-        '$repairBefore'
-        '(P2WLAN_DAEMON_BIN=${_shellQuote(binary.path)} '
-        '${_shellQuote(binary.path)} ${args.map(_shellQuote).join(' ')} '
-        '>> ${_shellQuote(logPath)} 2>&1 < /dev/null & echo \$! > ${_shellQuote(pidPath)})'
-        '$repairAfter';
+    return buildPosixDaemonLaunchShell(binary.path, args);
   }
 
-  String _macosRotateLogShell(String logPath) {
-    if (!Platform.isMacOS) return '';
-    final current = _shellQuote(logPath);
-    final previous = _shellQuote('$logPath.1');
-    return 'if [ -f $current ]; then '
-        '/bin/rm -f $previous || exit 72; '
-        '/bin/mv $current $previous || exit 73; '
-        'fi; ';
-  }
-
-  String _macosRepairOwnershipShell(Directory configDir, Directory logDir) {
-    if (!Platform.isMacOS) return '';
-    final owner = _macosUserOwnerForUserPaths();
-    if (owner == null || owner.isEmpty || owner == 'root') return '';
-    final quotedOwner = _shellQuote(owner);
-    final quotedConfigDir = _shellQuote(configDir.path);
-    final quotedLogDir = _shellQuote(logDir.path);
-    return 'owner=$quotedOwner; '
-        'group="\$(/usr/bin/id -gn "\$owner" 2>/dev/null || /bin/echo staff)"; '
-        '/usr/sbin/chown -R "\$owner:\$group" $quotedConfigDir $quotedLogDir >/dev/null 2>&1 || true';
-  }
-
-  String? _macosUserOwnerForUserPaths() {
-    for (final key in const ['SUDO_USER', 'USER', 'LOGNAME']) {
-      final value = Platform.environment[key]?.trim();
-      if (value != null && value.isNotEmpty && value != 'root') {
-        return value;
-      }
-    }
-    final home = Platform.environment['HOME']?.trim();
-    if (home == null || home.isEmpty || home == '/var/root') return null;
-    final parts = home.split('/').where((part) => part.isNotEmpty).toList();
-    if (parts.isEmpty) return null;
-    final user = parts.last.trim();
-    if (user.isEmpty || user == 'root') return null;
-    return user;
-  }
-
-  Future<void> _startMacosElevated(String command, {String? password}) async {
+  Future<_MacosElevatedCommandResult> _startMacosElevated(
+    String command, {
+    String? password,
+  }) async {
     final credentials = _MacosElevationCredentials();
     try {
       var activePassword = password;
@@ -157,11 +116,25 @@ extension DaemonControllerElevation on DaemonController {
         run = await credentials.runWithPassword(command, freshPassword);
       }
       if (!run.ok) {
-        throw run.error ?? '管理员权限启动失败。';
+        throw _MacosElevationException(
+          run.error ?? '管理员权限启动失败。',
+          childPid: run.childPid,
+        );
       }
       if (shouldPersistPassword) {
-        await saveMacosAdminPassword?.call(activePassword);
+        try {
+          await saveMacosAdminPassword?.call(activePassword);
+        } catch (_) {
+          throw _MacosElevationException(
+            '无法保存本地管理员凭据。',
+            childPid: run.childPid,
+          );
+        }
       }
+      return _MacosElevatedCommandResult(
+        password: activePassword,
+        childPid: run.childPid,
+      );
     } on MissingPluginException {
       throw '当前 macOS 构建不支持本地管理员凭据存储，请重新安装 P2WLAN。';
     } on PlatformException catch (error) {
@@ -317,6 +290,10 @@ class _MacosElevationCredentials {
       ok: result['ok'] == true,
       missingCredential: result['missingCredential'] == true,
       authenticationFailed: result['authenticationFailed'] == true,
+      childPid: switch (result['childPid']) {
+        int pid when pid > 0 => pid,
+        _ => null,
+      },
       error: (result['error'] as String?)?.trim(),
     );
   }
@@ -327,11 +304,32 @@ class _MacosElevationRunResult {
     required this.ok,
     this.missingCredential = false,
     this.authenticationFailed = false,
+    this.childPid,
     this.error,
   });
 
   final bool ok;
   final bool missingCredential;
   final bool authenticationFailed;
+  final int? childPid;
   final String? error;
+}
+
+/// The credential remains local to one launch and is never rendered in
+/// debug output. Preparation and launch can share a newly entered password.
+class _MacosElevatedCommandResult {
+  const _MacosElevatedCommandResult({required this.password, this.childPid});
+
+  final String password;
+  final int? childPid;
+}
+
+class _MacosElevationException implements Exception {
+  const _MacosElevationException(this.message, {this.childPid});
+
+  final String message;
+  final int? childPid;
+
+  @override
+  String toString() => message;
 }

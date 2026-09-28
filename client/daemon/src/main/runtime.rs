@@ -1,4 +1,9 @@
 fn main() -> p2pnet_daemon::Result<()> {
+    // This strict repair entry never reads tokens/configuration or starts the
+    // daemon. It must remain ahead of every ordinary startup side effect.
+    if run_runtime_directory_prepare_from_process_args()? {
+        return Ok(());
+    }
     // The lifecycle probes are intentionally parsed before Clap and before any
     // token/config/logging/instance-lock side effect. They are strict, hidden
     // packaging contracts rather than production daemon options.

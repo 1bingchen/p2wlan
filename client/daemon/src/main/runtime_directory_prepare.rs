@@ -37,9 +37,9 @@ fn run_runtime_directory_prepare_from_process_args() -> p2pnet_daemon::Result<bo
     #[cfg(not(unix))]
     {
         let _ = path;
-        return Err(DaemonError::Config(
+        Err(DaemonError::Config(
             "runtime_directory_prepare: unsupported platform".into(),
-        ));
+        ))
     }
     #[cfg(unix)]
     {

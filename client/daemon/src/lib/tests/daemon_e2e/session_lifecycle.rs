@@ -328,11 +328,11 @@ fn candidate_offer_work_is_newest_wins_owner_scoped_and_capacity_bounded() {
     };
     assert!(matches!(
         state.enqueue_candidate_offer_work(offer("peer-candidate-owner", 2)),
-        CandidateOfferWorkAdmission::Coalesced,
+        CandidateOfferWorkAdmission::Coalesced { .. },
     ));
     assert!(matches!(
         state.enqueue_candidate_offer_work(offer("peer-candidate-owner", 3)),
-        CandidateOfferWorkAdmission::Coalesced,
+        CandidateOfferWorkAdmission::Coalesced { .. },
     ));
     assert_eq!(first.candidate_generation, 1);
     let newest = state

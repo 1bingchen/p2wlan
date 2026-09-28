@@ -157,6 +157,18 @@ where
             return Ok(());
         }
 
+        // Hints queued during discovery/cleanup describe one latest network,
+        // not a backlog of sockets that each need to be constructed.
+        if let Some(receiver) = &ctx.android_network_change_rx {
+            if let Some(hint) = crate::android_network_change::take_latest(receiver).await {
+                record_android_network_change(
+                    &ctx.peers,
+                    &ctx.android_network_change_observed,
+                    &hint,
+                );
+            }
+        }
+
         let mut instance_ctx = ctx.clone();
         let network_hint_before_instance = ctx
             .android_network_change_observed
@@ -194,6 +206,18 @@ where
 
         let (result, instance_runtime) = match bind(ctx.udp_bind, ctx.peers.clone()).await {
             Ok(binding) => {
+                if let Some(receiver) = &ctx.android_network_change_rx {
+                    if let Some(hint) = crate::android_network_change::take_latest(receiver).await {
+                        record_android_network_change(
+                            &ctx.peers,
+                            &ctx.android_network_change_observed,
+                            &hint,
+                        );
+                        // A callback crossed DNS/interface selection or bind.
+                        // This unpublished socket has no readers to retire.
+                        continue;
+                    }
+                }
                 if had_live_udp_instance {
                     let generation = ctx
                         .peers
@@ -407,96 +431,82 @@ async fn run_udp_direct_instance(
         async move { udp.run_inbound(inbound_tx).await }
     });
 
-    let local_interface_networks = p2pnet_nat::gather_local_networks();
-    info!(
-        count = local_interface_networks.len(),
-        "Updated local directly-connected networks for on-link Host probing"
-    );
-    peers
-        .set_local_interface_networks(local_interface_networks)
-        .await;
+    let mut initial_publication_worker = None;
+    // One lifecycle future covers startup discovery as well as steady-state
+    // work. Cancellation drops the gather, then runs the same owner-scoped
+    // cleanup; a queued edge cannot wait behind an entire STUN refresh.
+    let outcome = {
+        let work = async {
+            let local_interface_networks = p2pnet_nat::gather_local_networks();
+            info!(
+                count = local_interface_networks.len(),
+                "Updated local directly-connected networks for on-link Host probing"
+            );
+            peers
+                .set_local_interface_networks(local_interface_networks)
+                .await;
 
-    // Publish host candidates as soon as the socket has a port.  The full
-    // report below may spend seconds probing an unreachable STUN observer;
-    // that delay is useful for NAT classification but must not delay the
-    // first encrypted relay session or the first LAN/public host punch.
-    if peers.gather_host_candidates().await {
-        if let Ok(local_addr) = udp.local_addr() {
-            let mut host_candidates = p2pnet_nat::gather_local_addresses()
-                .into_iter()
-                .filter(|ip| ip.is_ipv4() == local_addr.ip().is_ipv4())
-                .map(|ip| SocketAddr::new(ip, local_addr.port()).to_string())
-                .collect::<Vec<_>>();
-            if !local_addr.ip().is_unspecified() && !local_addr.ip().is_loopback() {
-                host_candidates.push(local_addr.to_string());
-            }
-            host_candidates.sort();
-            host_candidates.dedup();
-            if !host_candidates.is_empty() {
-                let mut host_sources = host_candidates
-                    .iter()
-                    .cloned()
-                    .map(|endpoint| (endpoint, "host".to_string()))
-                    .collect::<HashMap<_, _>>();
-                let host_network_identity = prepare_signal_candidates_and_network_identity(
-                    &[],
-                    &HashMap::new(),
-                    &mut host_candidates,
-                    &mut host_sources,
-                );
-                // This fast path must never wait behind an older refresh: a
-                // rebound UDP instance must still observe shutdown promptly.
-                if let Ok(_host_commit_guard) = candidate_refresh_lock.try_lock() {
-                    publish_candidate_snapshot_to_store_with_readiness(
-                        &candidate_snapshot,
-                        host_candidates.clone(),
-                        host_sources.clone(),
-                        host_network_identity.clone(),
-                        false,
-                    )
-                    .await;
-                    *local_candidates.write().await = host_candidates.clone();
-                    *udp_local_candidate_sources.write().await = host_sources;
-                    *local_network_identity.write().await = host_network_identity;
-                    info!(
+            // Publish host candidates as soon as the socket has a port.  The full
+            // report below may spend seconds probing an unreachable STUN observer;
+            // that delay is useful for NAT classification but must not delay the
+            // first encrypted relay session or the first LAN/public host punch.
+            if peers.gather_host_candidates().await {
+                if let Ok(local_addr) = udp.local_addr() {
+                    let mut host_candidates = p2pnet_nat::gather_local_addresses()
+                        .into_iter()
+                        .filter(|ip| ip.is_ipv4() == local_addr.ip().is_ipv4())
+                        .map(|ip| SocketAddr::new(ip, local_addr.port()).to_string())
+                        .collect::<Vec<_>>();
+                    if !local_addr.ip().is_unspecified() && !local_addr.ip().is_loopback() {
+                        host_candidates.push(local_addr.to_string());
+                    }
+                    host_candidates.sort();
+                    host_candidates.dedup();
+                    if !host_candidates.is_empty() {
+                        let mut host_sources = host_candidates
+                            .iter()
+                            .cloned()
+                            .map(|endpoint| (endpoint, "host".to_string()))
+                            .collect::<HashMap<_, _>>();
+                        let host_network_identity = prepare_signal_candidates_and_network_identity(
+                            &[],
+                            &HashMap::new(),
+                            &mut host_candidates,
+                            &mut host_sources,
+                        );
+                        // This fast path must never wait behind an older refresh: a
+                        // rebound UDP instance must still observe shutdown promptly.
+                        if let Ok(_host_commit_guard) = candidate_refresh_lock.try_lock() {
+                            publish_candidate_snapshot_to_store_with_readiness(
+                                &candidate_snapshot,
+                                host_candidates.clone(),
+                                host_sources.clone(),
+                                host_network_identity.clone(),
+                                false,
+                            )
+                            .await;
+                            *local_candidates.write().await = host_candidates.clone();
+                            *udp_local_candidate_sources.write().await = host_sources;
+                            *local_network_identity.write().await = host_network_identity;
+                            info!(
                         "Published {} provisional host UDP candidates before STUN refresh (initial_gather_complete=false)",
                         host_candidates.len()
                     );
+                        }
+                    }
                 }
             }
-        }
-    }
 
-    // Do not let a slow initial STUN refresh hide a successfully rebound UDP
-    // transport. If this lease is superseded while waiting, skip candidate
-    // work entirely and let the common cleanup below withdraw only our owner.
-    let initial_refresh_guard = tokio::select! {
-        guard = candidate_refresh_lock.lock() => Some(guard),
-        lifecycle = wait_for_udp_direct_lifecycle(
-            shutdown_rx.clone(),
-            lease.shutdown_receiver(),
-            android_network_change_rx.clone(),
-        ) => {
-            if let UdpDirectLifecycleSignal::NetworkChanged(hint) = lifecycle {
-                record_android_network_change(
-                    &peers,
-                    &android_network_change_observed,
-                    &hint,
-                );
-            }
-            None
-        },
-    };
-    let outcome = if let Some(initial_refresh_guard) = initial_refresh_guard {
-        let mut advertised_nat_type = "unknown".to_string();
+            let initial_refresh_guard = candidate_refresh_lock.lock().await;
+            let mut advertised_nat_type = "unknown".to_string();
 
-        let (mut candidate_endpoints, mut candidate_sources) = match udp
-            .gather_candidate_report_live_parallel(stun_servers.clone(), stun_timeout)
-            .await
-        {
-            Ok(report) => {
-                let (endpoints, sources) = candidate_endpoints_from_report(&report);
-                info!(
+            let (mut candidate_endpoints, mut candidate_sources) = match udp
+                .gather_candidate_report_live_parallel(stun_servers.clone(), stun_timeout)
+                .await
+            {
+                Ok(report) => {
+                    let (endpoints, sources) = candidate_endpoints_from_report(&report);
+                    info!(
                             "Local NAT profile: mapping={:?} public={:?} stun_success={}/{} confidence={} egress={}",
                             report.nat_profile.mapping_behavior,
                             report.nat_profile.public_endpoint,
@@ -510,354 +520,329 @@ async fn run_udp_direct_instance(
                             report.nat_profile.confidence,
                             proxy_env.label(),
                 );
-                let nat_publication = peers.update_nat_profile(report.nat_profile.clone()).await;
-                advertised_nat_type = report
-                    .nat_profile
-                    .control_label_with_generation_and_observation(
-                        nat_publication.generation,
-                        nat_publication.observation,
-                    );
-                let pool_eligible = socket_pool_enabled
-                    && report.nat_profile.mapping_behavior
-                        == MappingBehavior::AddressOrPortDependent
-                    && !report.nat_profile.udp_blocked;
-                udp.set_socket_pool_active(pool_eligible);
-                if udp.socket_count() > 1 {
-                    info!(
-                        "Experimental UDP socket pool: sockets={} active={} reason={}",
-                        udp.socket_count(),
-                        udp.socket_pool_active(),
-                        if pool_eligible {
-                            "address/port-dependent mapping"
-                        } else {
-                            "NAT profile did not qualify"
-                        }
-                    );
-                }
-                *nat_profile.write().await = Some(report.nat_profile);
-                (endpoints, sources)
-            }
-            Err(err) => {
-                warn!("Failed to gather UDP candidates: {err}");
-                (Vec::new(), HashMap::new())
-            }
-        };
-
-        match udp.local_addr() {
-            Ok(addr) => {
-                if let Some(endpoint) = advertised_udp_endpoint(
-                    addr,
-                    udp_advertise.as_deref(),
-                    &candidate_endpoints,
-                    &candidate_sources,
-                    peers.gather_host_candidates().await,
-                ) {
-                    // The advertised endpoint is the peer's PRIMARY punch
-                    // target and must be FIRST in the signaled order (the
-                    // receiver preserves signal order as its probe
-                    // priority).  The public mapping is already present
-                    // from gathering, so move it to the front instead of
-                    // only inserting when absent (field evidence:
-                    // v0.1.116 acceptance rounds where the private host
-                    // endpoint stayed first timed out at ~102 s because
-                    // the peer punched the unreachable private address).
-                    if let Some(index) = candidate_endpoints.iter().position(|c| c == &endpoint) {
-                        candidate_endpoints.remove(index);
-                    }
-                    candidate_endpoints.insert(0, endpoint.clone());
-                    candidate_sources
-                        .entry(endpoint.clone())
-                        .or_insert_with(|| {
-                            if udp_advertise.as_deref().is_some_and(|configured| {
-                                !configured.trim().is_empty() && configured.trim() == endpoint
-                            }) {
-                                "manual".to_string()
+                    let nat_publication =
+                        peers.update_nat_profile(report.nat_profile.clone()).await;
+                    advertised_nat_type = report
+                        .nat_profile
+                        .control_label_with_generation_and_observation(
+                            nat_publication.generation,
+                            nat_publication.observation,
+                        );
+                    let pool_eligible = socket_pool_enabled
+                        && report.nat_profile.mapping_behavior
+                            == MappingBehavior::AddressOrPortDependent
+                        && !report.nat_profile.udp_blocked;
+                    udp.set_socket_pool_active(pool_eligible);
+                    if udp.socket_count() > 1 {
+                        info!(
+                            "Experimental UDP socket pool: sockets={} active={} reason={}",
+                            udp.socket_count(),
+                            udp.socket_pool_active(),
+                            if pool_eligible {
+                                "address/port-dependent mapping"
                             } else {
-                                "host".to_string()
+                                "NAT profile did not qualify"
                             }
-                        });
-                    info!("UDP transport listening on {addr}; advertising {endpoint}");
-                } else {
-                    warn!(
+                        );
+                    }
+                    *nat_profile.write().await = Some(report.nat_profile);
+                    (endpoints, sources)
+                }
+                Err(err) => {
+                    warn!("Failed to gather UDP candidates: {err}");
+                    (Vec::new(), HashMap::new())
+                }
+            };
+
+            match udp.local_addr() {
+                Ok(addr) => {
+                    if let Some(endpoint) = advertised_udp_endpoint(
+                        addr,
+                        udp_advertise.as_deref(),
+                        &candidate_endpoints,
+                        &candidate_sources,
+                        peers.gather_host_candidates().await,
+                    ) {
+                        // The advertised endpoint is the peer's PRIMARY punch
+                        // target and must be FIRST in the signaled order (the
+                        // receiver preserves signal order as its probe
+                        // priority).  The public mapping is already present
+                        // from gathering, so move it to the front instead of
+                        // only inserting when absent (field evidence:
+                        // v0.1.116 acceptance rounds where the private host
+                        // endpoint stayed first timed out at ~102 s because
+                        // the peer punched the unreachable private address).
+                        if let Some(index) = candidate_endpoints.iter().position(|c| c == &endpoint)
+                        {
+                            candidate_endpoints.remove(index);
+                        }
+                        candidate_endpoints.insert(0, endpoint.clone());
+                        candidate_sources
+                            .entry(endpoint.clone())
+                            .or_insert_with(|| {
+                                if udp_advertise.as_deref().is_some_and(|configured| {
+                                    !configured.trim().is_empty() && configured.trim() == endpoint
+                                }) {
+                                    "manual".to_string()
+                                } else {
+                                    "host".to_string()
+                                }
+                            });
+                        info!("UDP transport listening on {addr}; advertising {endpoint}");
+                    } else {
+                        warn!(
                             "UDP transport listening on {addr}; no reachable endpoint was discovered or configured."
                         );
+                    }
+                }
+                Err(err) => {
+                    warn!("UDP transport bound but local addr unavailable: {err}")
                 }
             }
-            Err(err) => {
-                warn!("UDP transport bound but local addr unavailable: {err}")
-            }
-        }
 
-        let initial_network_identity = prepare_signal_candidates_and_network_identity(
-            &[],
-            &HashMap::new(),
-            &mut candidate_endpoints,
-            &mut candidate_sources,
-        );
-        // Commit the candidate snapshot BEFORE the endpoint publish and
-        // any gateway-mapping discovery.  A congested control lane or a
-        // silent SSDP gateway must never delay the local candidate commit
-        // (which every responder answer reads).
-        info!(
-            "Prepared {} UDP candidate endpoints for signaling (initial_gather_complete=true)",
-            candidate_endpoints.len()
-        );
-        publish_candidate_snapshot_to_store(
-            &candidate_snapshot,
-            candidate_endpoints.clone(),
-            candidate_sources.clone(),
-            initial_network_identity.clone(),
-        )
-        .await;
-        *local_candidates.write().await = candidate_endpoints.clone();
-        *udp_local_candidate_sources.write().await = candidate_sources.clone();
-        *local_network_identity.write().await = initial_network_identity.clone();
-        if upnp_enabled {
-            // Gateway mapping discovery (SSDP/IGD/PCP/NAT-PMP) can take
-            // seconds on gateways without a mapping service.  It must
-            // never block the commit or hold the refresh lock; run it as
-            // bounded best-effort background work and fold any discovered
-            // candidate back into the committed set.
-            let mapping_udp = udp.clone();
-            let mapping_peers = peers.clone();
-            let mapping_generation = peers.current_network_generation_sync();
-            let local_candidates = local_candidates.clone();
-            let local_sources = udp_local_candidate_sources.clone();
-            let candidate_snapshot = candidate_snapshot.clone();
-            let candidate_refresh_lock = candidate_refresh_lock.clone();
-            let runtime = gateway_mapping_runtime.clone();
-            let diagnostics = gateway_mapping_diagnostics.clone();
-            let mapping_owner = lease.owner();
-            let mapping_publication = udp_transport_publication.clone();
-            let mapping_candidate_endpoints = candidate_endpoints.clone();
-            let mapping_candidate_sources = candidate_sources.clone();
-            tokio::spawn(async move {
-                let mut discovered = Vec::new();
-                let mut discovered_sources = HashMap::new();
-                maybe_add_port_mapping_udp_candidate(
-                    (&mapping_udp, &mapping_peers),
-                    &mapping_candidate_endpoints,
-                    &mapping_candidate_sources,
-                    &mut discovered,
-                    &mut discovered_sources,
-                    runtime,
-                    diagnostics,
-                )
-                .await;
-                if discovered.is_empty() {
-                    return;
-                }
-                if let Err(reason) = commit_gateway_mapping_candidates(
-                    &mapping_publication,
-                    mapping_owner,
-                    &mapping_peers,
-                    mapping_generation,
-                    &candidate_refresh_lock,
-                    &candidate_snapshot,
-                    &local_candidates,
-                    &local_sources,
-                    discovered,
-                    discovered_sources,
+            let initial_network_identity = prepare_signal_candidates_and_network_identity(
+                &[],
+                &HashMap::new(),
+                &mut candidate_endpoints,
+                &mut candidate_sources,
+            );
+            // Commit the candidate snapshot BEFORE the endpoint publish and
+            // any gateway-mapping discovery.  A congested control lane or a
+            // silent SSDP gateway must never delay the local candidate commit
+            // (which every responder answer reads).
+            info!(
+                "Prepared {} UDP candidate endpoints for signaling (initial_gather_complete=true)",
+                candidate_endpoints.len()
+            );
+            publish_candidate_snapshot_to_store(
+                &candidate_snapshot,
+                candidate_endpoints.clone(),
+                candidate_sources.clone(),
+                initial_network_identity.clone(),
+            )
+            .await;
+            *local_candidates.write().await = candidate_endpoints.clone();
+            *udp_local_candidate_sources.write().await = candidate_sources.clone();
+            *local_network_identity.write().await = initial_network_identity.clone();
+            if upnp_enabled {
+                // Gateway mapping discovery (SSDP/IGD/PCP/NAT-PMP) can take
+                // seconds on gateways without a mapping service.  It must
+                // never block the commit or hold the refresh lock; run it as
+                // bounded best-effort background work and fold any discovered
+                // candidate back into the committed set.
+                let mapping_udp = udp.clone();
+                let mapping_peers = peers.clone();
+                let mapping_generation = peers.current_network_generation_sync();
+                let local_candidates = local_candidates.clone();
+                let local_sources = udp_local_candidate_sources.clone();
+                let candidate_snapshot = candidate_snapshot.clone();
+                let candidate_refresh_lock = candidate_refresh_lock.clone();
+                let runtime = gateway_mapping_runtime.clone();
+                let diagnostics = gateway_mapping_diagnostics.clone();
+                let mapping_owner = lease.owner();
+                let mapping_publication = udp_transport_publication.clone();
+                let mapping_candidate_endpoints = candidate_endpoints.clone();
+                let mapping_candidate_sources = candidate_sources.clone();
+                tokio::spawn(async move {
+                    let mut discovered = Vec::new();
+                    let mut discovered_sources = HashMap::new();
+                    maybe_add_port_mapping_udp_candidate(
+                        (&mapping_udp, &mapping_peers),
+                        &mapping_candidate_endpoints,
+                        &mapping_candidate_sources,
+                        &mut discovered,
+                        &mut discovered_sources,
+                        runtime,
+                        diagnostics,
+                    )
+                    .await;
+                    if discovered.is_empty() {
+                        return;
+                    }
+                    if let Err(reason) = commit_gateway_mapping_candidates(
+                        &mapping_publication,
+                        mapping_owner,
+                        &mapping_peers,
+                        mapping_generation,
+                        &candidate_refresh_lock,
+                        &candidate_snapshot,
+                        &local_candidates,
+                        &local_sources,
+                        discovered,
+                        discovered_sources,
+                    )
+                    .await
+                    {
+                        debug!(
+                            event = "gateway_mapping_candidate_discarded",
+                            reason_code = reason,
+                            "Gateway mapping no longer owns the candidate publication"
+                        );
+                    }
+                });
+            }
+            let initial_control_endpoint = control_udp_endpoint_from_candidates_with_loopback(
+                &candidate_endpoints,
+                &candidate_sources,
+                fresh_mapping_harness_loopback,
+            );
+            let mut published_endpoint = None;
+            if let Some(endpoint) = initial_control_endpoint.as_ref() {
+                // The handshake control lane has its own bounded deadline; a
+                // short caller budget keeps a pathological lane from stalling
+                // transport startup.
+                match tokio::time::timeout(
+                    Duration::from_millis(STARTUP_ENDPOINT_PUBLISH_BUDGET_MS),
+                    control.update_endpoint_for_handshake(endpoint, &advertised_nat_type),
                 )
                 .await
                 {
-                    debug!(
-                        event = "gateway_mapping_candidate_discarded",
-                        reason_code = reason,
-                        "Gateway mapping no longer owns the candidate publication"
-                    );
-                }
-            });
-        }
-        let initial_control_endpoint = control_udp_endpoint_from_candidates_with_loopback(
-            &candidate_endpoints,
-            &candidate_sources,
-            fresh_mapping_harness_loopback,
-        );
-        let mut published_endpoint = None;
-        if let Some(endpoint) = initial_control_endpoint.as_ref() {
-            // The handshake control lane has its own bounded deadline; a
-            // short caller budget keeps a pathological lane from stalling
-            // transport startup.
-            match tokio::time::timeout(
-                Duration::from_millis(STARTUP_ENDPOINT_PUBLISH_BUDGET_MS),
-                control.update_endpoint_for_handshake(endpoint, &advertised_nat_type),
-            )
-            .await
-            {
-                Ok(Ok(())) => published_endpoint = Some(endpoint.clone()),
-                Ok(Err(err)) => {
-                    warn!("Failed to publish initial UDP endpoint '{endpoint}': {err}")
-                }
-                Err(_) => {
-                    warn!("Initial UDP endpoint publish '{endpoint}' exceeded its budget")
+                    Ok(Ok(())) => published_endpoint = Some(endpoint.clone()),
+                    Ok(Err(err)) => {
+                        warn!("Failed to publish initial UDP endpoint '{endpoint}': {err}")
+                    }
+                    Err(_) => {
+                        warn!("Initial UDP endpoint publish '{endpoint}' exceeded its budget")
+                    }
                 }
             }
-        }
-        drop(initial_refresh_guard);
+            drop(initial_refresh_guard);
 
-        // Candidate-only fan-out is background work.  Starting the UDP
-        // reader and validation workers must not wait behind a serial
-        // control lane servicing a large peer roster; a foreground
-        // handshake can then use the critical offer lane immediately.
-        let initial_publication_task = {
-            let control = control.clone();
-            let peers = peers.clone();
-            let udp = udp.clone();
-            let punch_deduplicator = punch_deduplicator.clone();
-            let candidates = candidate_endpoints.clone();
-            let candidate_sources = candidate_sources.clone();
-            let candidate_snapshot = candidate_snapshot.clone();
-            let stun_servers = stun_servers.clone();
-            let signal_control = control.clone();
-            async move {
-                publish_local_candidates_to_known_peers(
-                    &control,
-                    peers,
-                    udp,
-                    punch_deduplicator,
-                    &candidates,
-                    &candidate_sources,
-                    udp_punch_interval,
-                    udp_punch_attempts,
-                    "initial UDP candidates ready",
-                    Some(HolePunchSignalContext {
-                        control: signal_control,
-                        candidate_snapshot: candidate_snapshot.clone(),
+            // Candidate-only fan-out is background work.  Starting the UDP
+            // reader and validation workers must not wait behind a serial
+            // control lane servicing a large peer roster; a foreground
+            // handshake can then use the critical offer lane immediately.
+            let initial_publication_task = {
+                let control = control.clone();
+                let peers = peers.clone();
+                let udp = udp.clone();
+                let punch_deduplicator = punch_deduplicator.clone();
+                let candidates = candidate_endpoints.clone();
+                let candidate_sources = candidate_sources.clone();
+                let candidate_snapshot = candidate_snapshot.clone();
+                let stun_servers = stun_servers.clone();
+                let signal_control = control.clone();
+                async move {
+                    publish_local_candidates_to_known_peers(
+                        &control,
+                        peers,
+                        udp,
+                        punch_deduplicator,
+                        &candidates,
+                        &candidate_sources,
+                        udp_punch_interval,
+                        udp_punch_attempts,
+                        "initial UDP candidates ready",
+                        Some(HolePunchSignalContext {
+                            control: signal_control,
+                            candidate_snapshot: candidate_snapshot.clone(),
+                            stun_servers,
+                            stun_timeout,
+                            boot_epoch_ms,
+                        }),
+                    )
+                    .await;
+                }
+            };
+            initial_publication_worker = Some(tokio::spawn(initial_publication_task));
+
+            // Keep the route captured with the bind, even if it changed during
+            // STUN or candidate preparation. The first two changed samples must
+            // rebuild this socket rather than adopt that newer route as baseline.
+            if keepalive_interval.is_zero() {
+                let refresh_udp = udp.clone();
+                tokio::select! {
+                    result = &mut inbound_worker => match result {
+                        Ok(result) => result,
+                        Err(error) => Err(DaemonError::Network(format!(
+                            "UDP inbound worker failed: {error}"
+                        ))),
+                    },
+                    _ = run_udp_candidate_refresh(UdpCandidateRefreshContext {
+                        udp: refresh_udp,
                         stun_servers,
                         stun_timeout,
+                        udp_advertise,
+                        upnp_enabled,
+                        allow_loopback_stun_endpoint: fresh_mapping_harness_loopback,
+                        published_endpoint,
+                         local_candidates: local_candidates.clone(),
+                         local_candidate_sources: udp_local_candidate_sources.clone(),
+                         local_network_identity: local_network_identity.clone(),
+                         candidate_snapshot: candidate_snapshot.clone(),
+                        candidate_refresh_lock: candidate_refresh_lock.clone(),
+                        nat_profile,
+                        gateway_mapping_runtime,
+                        gateway_mapping_diagnostics,
+                        punch_deduplicator,
+                        control: control.clone(),
+                        peers: peers.clone(),
+                        probe_interval: udp_punch_interval,
+                        punch_attempts: udp_punch_attempts,
                         boot_epoch_ms,
-                    }),
-                )
-                .await;
+                    }) => Ok(()),
+                    changed = wait_for_network_route_change(initial_route_signature, excluded_interfaces.clone()) => {
+                        Err(DaemonError::Network(format!("network route changed; rebuilding direct UDP transport: {changed:?}")))
+                    },
+                }
+            } else {
+                let keepalive_udp = udp.clone();
+                let refresh_udp = udp.clone();
+                tokio::select! {
+                    result = &mut inbound_worker => match result {
+                        Ok(result) => result,
+                        Err(error) => Err(DaemonError::Network(format!(
+                            "UDP inbound worker failed: {error}"
+                        ))),
+                    },
+                    _ = keepalive_udp.run_keepalives(keepalive_interval) => Ok(()),
+                    _ = run_udp_candidate_refresh(UdpCandidateRefreshContext {
+                        udp: refresh_udp,
+                        stun_servers,
+                        stun_timeout,
+                        udp_advertise,
+                        upnp_enabled,
+                        allow_loopback_stun_endpoint: fresh_mapping_harness_loopback,
+                        published_endpoint,
+                         local_candidates: local_candidates.clone(),
+                         local_candidate_sources: udp_local_candidate_sources.clone(),
+                         local_network_identity: local_network_identity.clone(),
+                         candidate_snapshot: candidate_snapshot.clone(),
+                        candidate_refresh_lock: candidate_refresh_lock.clone(),
+                        nat_profile,
+                        gateway_mapping_runtime,
+                        gateway_mapping_diagnostics,
+                        punch_deduplicator,
+                        control: control.clone(),
+                        peers: peers.clone(),
+                        probe_interval: udp_punch_interval,
+                        punch_attempts: udp_punch_attempts,
+                        boot_epoch_ms,
+                    }) => Ok(()),
+                    changed = wait_for_network_route_change(initial_route_signature, excluded_interfaces.clone()) => {
+                        Err(DaemonError::Network(format!("network route changed; rebuilding direct UDP transport: {changed:?}")))
+                    },
+                }
             }
         };
-        let initial_publication_worker = Some(tokio::spawn(initial_publication_task));
-
-        // Keep the route captured with the bind, even if it changed during
-        // STUN or candidate preparation. The first two changed samples must
-        // rebuild this socket rather than adopt that newer route as baseline.
-        let outcome = if keepalive_interval.is_zero() {
-            let refresh_udp = udp.clone();
-            tokio::select! {
-                result = &mut inbound_worker => match result {
-                    Ok(result) => result,
-                    Err(error) => Err(DaemonError::Network(format!(
-                        "UDP inbound worker failed: {error}"
-                    ))),
-                },
-                _ = run_udp_candidate_refresh(UdpCandidateRefreshContext {
-                    udp: refresh_udp,
-                    stun_servers,
-                    stun_timeout,
-                    udp_advertise,
-                    upnp_enabled,
-                    allow_loopback_stun_endpoint: fresh_mapping_harness_loopback,
-                    published_endpoint,
-                     local_candidates: local_candidates.clone(),
-                     local_candidate_sources: udp_local_candidate_sources.clone(),
-                     local_network_identity: local_network_identity.clone(),
-                     candidate_snapshot: candidate_snapshot.clone(),
-                    candidate_refresh_lock: candidate_refresh_lock.clone(),
-                    nat_profile,
-                    gateway_mapping_runtime,
-                    gateway_mapping_diagnostics,
-                    punch_deduplicator,
-                    control: control.clone(),
-                    peers: peers.clone(),
-                    probe_interval: udp_punch_interval,
-                    punch_attempts: udp_punch_attempts,
-                    boot_epoch_ms,
-                }) => Ok(()),
-                changed = wait_for_network_route_change(initial_route_signature, excluded_interfaces.clone()) => {
-                    Err(DaemonError::Network(format!("network route changed; rebuilding direct UDP transport: {changed:?}")))
-                },
-                lifecycle = wait_for_udp_direct_lifecycle(
-                    shutdown_rx.clone(),
-                    lease.shutdown_receiver(),
-                    android_network_change_rx.clone(),
-                ) => match lifecycle {
-                    UdpDirectLifecycleSignal::Stop => Ok(()),
-                    UdpDirectLifecycleSignal::NetworkChanged(hint) => {
-                        record_android_network_change(
-                            &peers,
-                            &android_network_change_observed,
-                            &hint,
-                        );
-                        Err(DaemonError::Network(format!(
-                            "Android physical network changed; rebuilding direct UDP transport: kotlin_network_generation={} network_identity_hash={}",
-                            hint.kotlin_network_generation,
-                            hint.network_identity_hash,
-                        )))
-                    }
-                },
-            }
-        } else {
-            let keepalive_udp = udp.clone();
-            let refresh_udp = udp.clone();
-            tokio::select! {
-                result = &mut inbound_worker => match result {
-                    Ok(result) => result,
-                    Err(error) => Err(DaemonError::Network(format!(
-                        "UDP inbound worker failed: {error}"
-                    ))),
-                },
-                _ = keepalive_udp.run_keepalives(keepalive_interval) => Ok(()),
-                _ = run_udp_candidate_refresh(UdpCandidateRefreshContext {
-                    udp: refresh_udp,
-                    stun_servers,
-                    stun_timeout,
-                    udp_advertise,
-                    upnp_enabled,
-                    allow_loopback_stun_endpoint: fresh_mapping_harness_loopback,
-                    published_endpoint,
-                     local_candidates: local_candidates.clone(),
-                     local_candidate_sources: udp_local_candidate_sources.clone(),
-                     local_network_identity: local_network_identity.clone(),
-                     candidate_snapshot: candidate_snapshot.clone(),
-                    candidate_refresh_lock: candidate_refresh_lock.clone(),
-                    nat_profile,
-                    gateway_mapping_runtime,
-                    gateway_mapping_diagnostics,
-                    punch_deduplicator,
-                    control: control.clone(),
-                    peers: peers.clone(),
-                    probe_interval: udp_punch_interval,
-                    punch_attempts: udp_punch_attempts,
-                    boot_epoch_ms,
-                }) => Ok(()),
-                changed = wait_for_network_route_change(initial_route_signature, excluded_interfaces.clone()) => {
-                    Err(DaemonError::Network(format!("network route changed; rebuilding direct UDP transport: {changed:?}")))
-                },
-                lifecycle = wait_for_udp_direct_lifecycle(
-                    shutdown_rx.clone(),
-                    lease.shutdown_receiver(),
-                    android_network_change_rx.clone(),
-                ) => match lifecycle {
-                    UdpDirectLifecycleSignal::Stop => Ok(()),
-                    UdpDirectLifecycleSignal::NetworkChanged(hint) => {
-                        record_android_network_change(
-                            &peers,
-                            &android_network_change_observed,
-                            &hint,
-                        );
-                        Err(DaemonError::Network(format!(
-                            "Android physical network changed; rebuilding direct UDP transport: kotlin_network_generation={} network_identity_hash={}",
-                            hint.kotlin_network_generation,
-                            hint.network_identity_hash,
-                        )))
-                    }
-                },
-            }
-        };
-        if let Some(initial_publication_worker) = initial_publication_worker {
-            initial_publication_worker.abort();
-            let _ = initial_publication_worker.await;
+        tokio::select! {
+            biased;
+            lifecycle = wait_for_udp_direct_lifecycle(
+                shutdown_rx.clone(), lease.shutdown_receiver(), android_network_change_rx.clone(),
+            ) => match lifecycle {
+                UdpDirectLifecycleSignal::Stop => Ok(()),
+                UdpDirectLifecycleSignal::NetworkChanged(hint) => {
+                    record_android_network_change(&peers, &android_network_change_observed, &hint);
+                    Err(DaemonError::Network("Android physical network changed; rebuilding direct UDP transport".into()))
+                }
+            },
+            result = work => result,
         }
-        outcome
-    } else {
-        Ok(())
     };
+    if let Some(worker) = initial_publication_worker {
+        worker.abort();
+        let _ = worker.await;
+    }
 
     inbound_worker.abort();
     let _ = inbound_worker.await;
@@ -1083,16 +1068,7 @@ async fn wait_for_udp_direct_lifecycle(
         _ = wait_for_udp_direct_stop(daemon_shutdown_rx, instance_shutdown_rx) => {
             UdpDirectLifecycleSignal::Stop
         }
-        hint = async move {
-            let mut receiver = network_change_rx.lock().await;
-            loop {
-                match receiver.recv().await {
-                    Ok(hint) => break Some(hint),
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break None,
-                }
-            }
-        } => {
+        hint = crate::android_network_change::recv_latest(&network_change_rx) => {
             match hint {
                 Some(hint) => UdpDirectLifecycleSignal::NetworkChanged(hint),
                 None => UdpDirectLifecycleSignal::Stop,

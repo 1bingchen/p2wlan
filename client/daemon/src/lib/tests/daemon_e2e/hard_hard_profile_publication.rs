@@ -149,7 +149,7 @@ async fn hard_hard_profile_wait_preserves_successor_and_cancellation() {
             .pending_handshakes
             .lock()
             .enqueue_candidate_offer_work(successor),
-        CandidateOfferWorkAdmission::Coalesced
+        CandidateOfferWorkAdmission::Coalesced { .. }
     ));
     tokio::time::advance(UNKNOWN_PEER_OFFER_POLL).await;
     assert!(wait.await);

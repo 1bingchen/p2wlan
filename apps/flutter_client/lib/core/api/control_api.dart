@@ -7,6 +7,7 @@ import 'dart:typed_data';
 import '../build_info.dart';
 import '../diagnostics/session_log_bundle.dart';
 import '../diagnostics/support_log_protocol.dart';
+import '../diagnostics/support_status_summary.dart';
 import '../security/redactor.dart';
 import '../state/settings_store.dart';
 
@@ -292,6 +293,7 @@ class ControlApi {
     required ClientBuildInfo clientBuild,
     required DaemonBuildInfo? daemonBuild,
     required Iterable<SessionLogFile> files,
+    String? mainStatusSummary,
     Iterable<String> omittedRoomProfileIds = const [],
   }) async {
     final token = authToken.trim();
@@ -318,6 +320,7 @@ class ControlApi {
     try {
       compressed = await _prepareSupportLogPayload(
         uploadedAt: DateTime.now().toUtc().toIso8601String(),
+        mainStatusSummary: mainStatusSummary,
         deviceName: deviceName.trim(),
         platform: Platform.operatingSystem,
         clientBuild: {
@@ -490,6 +493,7 @@ class ControlApi {
 
 Future<Uint8List> _prepareSupportLogPayload({
   required String uploadedAt,
+  String? mainStatusSummary,
   required String deviceName,
   required String platform,
   required Map<String, String> clientBuild,
@@ -504,7 +508,9 @@ Future<Uint8List> _prepareSupportLogPayload({
             'name': file['name'] ?? '',
             // This is the only redaction pass. It runs in the worker isolate,
             // so even a busy log cannot monopolize Flutter's UI isolate.
-            'content': redactSensitive(file['content'] ?? ''),
+            'content': (file['name'] ?? '').endsWith('status-summary.json')
+                ? sanitizeSupportStatusSummary(file['content'] ?? '')
+                : redactSensitive(file['content'] ?? ''),
           },
         )
         .toList(growable: false);
@@ -524,7 +530,11 @@ Future<Uint8List> _prepareSupportLogPayload({
         .where((profileId) => !roomProfiles.contains(profileId))
         .toSet();
     final hasRoomLogs = roomProfiles.isNotEmpty;
-    final schemaVersion = hasRoomLogs || omittedProfiles.isNotEmpty ? 2 : 1;
+    final summary = mainStatusSummary == null
+        ? null
+        : sanitizeSupportStatusSummary(mainStatusSummary);
+    final schemaVersion =
+        hasRoomLogs || omittedProfiles.isNotEmpty || summary != null ? 2 : 1;
     final payload = <String, dynamic>{
       'schema_version': schemaVersion,
       'uploaded_at': uploadedAt,
@@ -545,6 +555,15 @@ Future<Uint8List> _prepareSupportLogPayload({
           },
         },
       'files': logFiles,
+      if (summary != null)
+        'instances': [
+          {'instance_type': 'main', 'status_summary': summary},
+          for (final profile in roomProfiles)
+            {
+              'instance_type': 'room',
+              if (profile != 'legacy') 'profile_id': profile,
+            },
+        ],
     };
     final jsonBytes = utf8.encode(jsonEncode(payload));
     if (jsonBytes.length > maxSupportLogExpandedBytes) {

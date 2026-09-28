@@ -42,13 +42,15 @@ async fn wait_control_recovery(
                     let _ = event_tx.send(ControlEvent::Disconnected);
                     return false;
                 }
-                Some(ControlCommand::NetworkChanged) => {
+                Some(ControlCommand::NetworkChanged(changes)) => {
                     // This also invalidates in-flight timing samples. On
                     // Android the route signature may be empty, so the
                     // explicit pool-rebuild hint cannot be discarded.
-                    http.notify_network_changed();
-                    if matches!(delay, ControlRecoveryDelay::Transient(_)) {
-                        return true;
+                    if changes.take_pending(true).is_some() {
+                        http.notify_network_changed();
+                        if matches!(delay, ControlRecoveryDelay::Transient(_)) {
+                            return true;
+                        }
                     }
                 }
                 Some(_) => {}

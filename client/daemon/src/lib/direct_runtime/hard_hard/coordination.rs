@@ -460,17 +460,61 @@ async fn hard_hard_plan_claim_fence_is_current(
     epoch: u64,
     punch_at_ms: u64,
 ) -> bool {
-    hard_hard_punch_window_is_usable(hard_hard_now_ms(), punch_at_ms)
-        && !peers.is_direct(peer_id).await
-        && peers.peer_session_is_current_sync(peer_id, peer_session_generation)
-        && peers
-            .hard_hard_plan_for_peer(peer_id)
-            .await
-            .is_some_and(|current| hard_hard_plan_matches(current, plan))
-        && matches!(
-            peers.recovery_epoch_admit(peer_id).await,
-            RecoveryAdmission::Accepted { epoch: current } if current == epoch
-        )
+    match hard_hard_plan_claim_fence(
+        peers,
+        peer_id,
+        peer_session_generation,
+        plan,
+        epoch,
+        punch_at_ms,
+    )
+    .await
+    {
+        Ok(()) => true,
+        Err(reason) => {
+            reason.log(None, "initiator", plan, peer_session_generation, epoch);
+            false
+        }
+    }
+}
+
+async fn hard_hard_plan_claim_fence(
+    peers: &PeerManager,
+    peer_id: &str,
+    peer_session_generation: crate::peer::PeerSessionGeneration,
+    plan: crate::peer::HardHardPlanSnapshot,
+    epoch: u64,
+    punch_at_ms: u64,
+) -> std::result::Result<(), HardHardClaimFailure> {
+    let window = hard_hard_punch_window(hard_hard_now_ms(), punch_at_ms);
+    if window != HardHardPunchWindow::Usable {
+        return Err(HardHardClaimFailure::new(match window {
+            HardHardPunchWindow::TooSoon => HardHardClaimFailureReason::PunchWindowTooSoon,
+            _ => HardHardClaimFailureReason::PunchWindowBeyondLifetime,
+        }));
+    }
+    if peers.is_direct(peer_id).await {
+        return Err(HardHardClaimFailure::new(
+            HardHardClaimFailureReason::AlreadyDirect,
+        ));
+    }
+    let observed_session = peers.peer_session_generation_sync(peer_id);
+    if observed_session != Some(peer_session_generation) {
+        let mut reason = HardHardClaimFailure::new(HardHardClaimFailureReason::PeerSessionChanged);
+        reason.observed_peer_session_generation = observed_session.map(|value| value.value());
+        return Err(reason);
+    }
+    let current_plan = peers.hard_hard_plan_for_peer(peer_id).await;
+    if !current_plan.is_some_and(|current| hard_hard_plan_matches(current, plan)) {
+        let mut reason = HardHardClaimFailure::new(if current_plan.is_some() {
+            HardHardClaimFailureReason::PlanChanged
+        } else {
+            HardHardClaimFailureReason::PlanUnavailable
+        });
+        reason.observed_plan = current_plan;
+        return Err(reason);
+    }
+    hard_hard_recovery_claim_fence(peers.recovery_epoch_admit(peer_id).await, epoch)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -535,7 +579,10 @@ async fn claim_hard_hard_responder_session(
     plan: crate::peer::HardHardPlanSnapshot,
     epoch: u64,
     punch_at_ms: u64,
-) -> Option<(PunchSessionPermit, crate::peer::RecoveryEpochIdentity)> {
+) -> std::result::Result<
+    (PunchSessionPermit, crate::peer::RecoveryEpochIdentity),
+    HardHardClaimFailure,
+> {
     let Some(reservation) = peers
         .try_begin_hard_hard_generation_for_epoch(peer_id, epoch)
         .await
@@ -550,9 +597,11 @@ async fn claim_hard_hard_responder_session(
                 "Hard↔Hard responder fresh-generation quota exhausted before punch claim; Relay remains usable",
             )
             .await;
-        return None;
+        return Err(HardHardClaimFailure::new(
+            HardHardClaimFailureReason::GenerationQuotaUnavailable,
+        ));
     };
-    if !hard_hard_plan_claim_fence_is_current(
+    if let Err(failure) = hard_hard_plan_claim_fence(
         peers,
         peer_id,
         peer_session_generation,
@@ -563,7 +612,7 @@ async fn claim_hard_hard_responder_session(
     .await
     {
         reservation.refund().await;
-        return None;
+        return Err(failure);
     }
     let Some(claim) = punch_deduplicator
         .claim_for_epoch_with_rendezvous_for_peer_session(
@@ -579,11 +628,13 @@ async fn claim_hard_hard_responder_session(
         .await
     else {
         reservation.refund().await;
-        return None;
+        return Err(HardHardClaimFailure::new(
+            HardHardClaimFailureReason::ClaimUnavailable,
+        ));
     };
     let deferred = match claim {
         RendezvousPunchClaim::Claimed(session) => {
-            if !hard_hard_plan_claim_fence_is_current(
+            if let Err(failure) = hard_hard_plan_claim_fence(
                 peers,
                 peer_id,
                 peer_session_generation,
@@ -595,16 +646,18 @@ async fn claim_hard_hard_responder_session(
             {
                 drop(session);
                 reservation.refund().await;
-                return None;
+                return Err(failure);
             }
             let recovery_identity = reservation.identity();
             reservation.commit();
-            return Some((session, recovery_identity));
+            return Ok((session, recovery_identity));
         }
         RendezvousPunchClaim::Deferred(deferred) => deferred,
         RendezvousPunchClaim::RejectedStalePeerSession => {
             reservation.refund().await;
-            return None;
+            return Err(HardHardClaimFailure::new(
+                HardHardClaimFailureReason::PeerSessionChanged,
+            ));
         }
     };
     let epoch_identity = reservation.identity();
@@ -625,7 +678,9 @@ async fn claim_hard_hard_responder_session(
                 ),
             )
             .await;
-        return None;
+        return Err(HardHardClaimFailure::new(
+            HardHardClaimFailureReason::Deferred(deferred.reason),
+        ));
     };
 
     peers
@@ -645,7 +700,7 @@ async fn claim_hard_hard_responder_session(
         .await;
     sleep(retry_delay).await;
 
-    let retry_fence_is_current = hard_hard_plan_claim_fence_is_current(
+    let retry_fence_is_current = hard_hard_plan_claim_fence(
         peers,
         peer_id,
         peer_session_generation,
@@ -654,7 +709,7 @@ async fn claim_hard_hard_responder_session(
         punch_at_ms,
     )
     .await;
-    if !retry_fence_is_current {
+    if let Err(failure) = retry_fence_is_current {
         peers
             .record_direct_event(
                 peer_id,
@@ -665,7 +720,7 @@ async fn claim_hard_hard_responder_session(
                 "Hard↔Hard responder protected-claim retry crossed its punch/session/recovery fence",
             )
             .await;
-        return None;
+        return Err(failure);
     }
 
     let Some(retry_reservation) = peers
@@ -682,11 +737,15 @@ async fn claim_hard_hard_responder_session(
                 "Hard↔Hard responder protected-claim retry lost its exact recovery reservation",
             )
             .await;
-        return None;
+        return Err(HardHardClaimFailure::new(
+            HardHardClaimFailureReason::RetryReservationUnavailable,
+        ));
     };
     if !peers.peer_session_is_current_sync(peer_id, peer_session_generation) {
         retry_reservation.refund().await;
-        return None;
+        return Err(HardHardClaimFailure::new(
+            HardHardClaimFailureReason::PeerSessionChanged,
+        ));
     }
     let Some(retry_claim) = punch_deduplicator
         .claim_for_epoch_with_rendezvous_for_peer_session(
@@ -702,11 +761,13 @@ async fn claim_hard_hard_responder_session(
         .await
     else {
         retry_reservation.refund().await;
-        return None;
+        return Err(HardHardClaimFailure::new(
+            HardHardClaimFailureReason::ClaimUnavailable,
+        ));
     };
     match retry_claim {
         RendezvousPunchClaim::Claimed(session) => {
-            if !hard_hard_plan_claim_fence_is_current(
+            if let Err(failure) = hard_hard_plan_claim_fence(
                 peers,
                 peer_id,
                 peer_session_generation,
@@ -718,11 +779,11 @@ async fn claim_hard_hard_responder_session(
             {
                 drop(session);
                 retry_reservation.refund().await;
-                return None;
+                return Err(failure);
             }
             let recovery_identity = retry_reservation.identity();
             retry_reservation.commit();
-            Some((session, recovery_identity))
+            Ok((session, recovery_identity))
         }
         RendezvousPunchClaim::Deferred(retry) => {
             retry_reservation.refund().await;
@@ -740,11 +801,15 @@ async fn claim_hard_hard_responder_session(
                     ),
                 )
                 .await;
-            None
+            Err(HardHardClaimFailure::new(
+                HardHardClaimFailureReason::Deferred(retry.reason),
+            ))
         }
         RendezvousPunchClaim::RejectedStalePeerSession => {
             retry_reservation.refund().await;
-            None
+            Err(HardHardClaimFailure::new(
+                HardHardClaimFailureReason::PeerSessionChanged,
+            ))
         }
     }
 }
@@ -792,38 +857,59 @@ fn hard_hard_initiator_response_record_matches(
         && !current.cancellation.is_cancelled()
 }
 
-async fn hard_hard_initiator_response_claim_fence_is_current(
+async fn hard_hard_initiator_response_claim_fence(
     peers: &PeerManager,
     peer_id: &str,
     peer_session_generation: crate::peer::PeerSessionGeneration,
     plan: crate::peer::HardHardPlanSnapshot,
     record: &HardHardSessionRecord,
     epoch: u64,
-) -> bool {
+) -> std::result::Result<(), HardHardClaimFailure> {
+    // Preserve the original read/await order and exact record comparison.
     let current_record = peers
         .hard_hard_session_by_token(peer_id, &record.session_token)
         .await;
     let current_plan = peers.hard_hard_plan_for_peer(peer_id).await;
-    // The initiator already owns a measured socket. A reciprocal response is
-    // deliberately allowed at the canonical punch instant (the test/control
-    // forwarder may advance the shared clock to exactly `punch_at_ms`) and
-    // through the bounded sweep deadline. Reusing the responder's
-    // pre-measurement minimum-lead check here incorrectly rejects the on-time
-    // response and leaves only the responder sweeping.
-    record
+    if record
         .punch_at_ms
         .saturating_add(HARD_HARD_SWEEP_DEADLINE.as_millis() as u64)
-        >= hard_hard_now_ms()
-        && !peers.is_direct(peer_id).await
-        && peers.peer_session_is_current_sync(peer_id, peer_session_generation)
-        && current_record
-            .as_ref()
-            .is_some_and(|current| hard_hard_initiator_response_record_matches(current, record))
-        && current_plan.is_some_and(|current| hard_hard_plan_matches(current, plan))
-        && matches!(
-            peers.recovery_epoch_admit(peer_id).await,
-            RecoveryAdmission::Accepted { epoch: current } if current == epoch
-        )
+        < hard_hard_now_ms()
+    {
+        return Err(HardHardClaimFailure::new(
+            HardHardClaimFailureReason::SweepDeadlineExpired,
+        ));
+    }
+    if peers.is_direct(peer_id).await {
+        return Err(HardHardClaimFailure::new(
+            HardHardClaimFailureReason::AlreadyDirect,
+        ));
+    }
+    let observed_session = peers.peer_session_generation_sync(peer_id);
+    if observed_session != Some(peer_session_generation) {
+        let mut reason = HardHardClaimFailure::new(HardHardClaimFailureReason::PeerSessionChanged);
+        reason.observed_peer_session_generation = observed_session.map(|value| value.value());
+        return Err(reason);
+    }
+    if !current_record
+        .as_ref()
+        .is_some_and(|current| hard_hard_initiator_response_record_matches(current, record))
+    {
+        return Err(HardHardClaimFailure::new(if current_record.is_some() {
+            HardHardClaimFailureReason::SessionChanged
+        } else {
+            HardHardClaimFailureReason::SessionMissing
+        }));
+    }
+    if !current_plan.is_some_and(|current| hard_hard_plan_matches(current, plan)) {
+        let mut reason = HardHardClaimFailure::new(if current_plan.is_some() {
+            HardHardClaimFailureReason::PlanChanged
+        } else {
+            HardHardClaimFailureReason::PlanUnavailable
+        });
+        reason.observed_plan = current_plan;
+        return Err(reason);
+    }
+    hard_hard_recovery_claim_fence(peers.recovery_epoch_admit(peer_id).await, epoch)
 }
 
 /// A reciprocal response may collide with the short first-send protection of
@@ -840,8 +926,8 @@ async fn claim_hard_hard_initiator_response_session(
     plan: crate::peer::HardHardPlanSnapshot,
     record: &HardHardSessionRecord,
     epoch: u64,
-) -> Option<PunchSessionPermit> {
-    if !hard_hard_initiator_response_claim_fence_is_current(
+) -> std::result::Result<PunchSessionPermit, HardHardClaimFailure> {
+    hard_hard_initiator_response_claim_fence(
         peers,
         peer_id,
         peer_session_generation,
@@ -849,10 +935,7 @@ async fn claim_hard_hard_initiator_response_session(
         record,
         epoch,
     )
-    .await
-    {
-        return None;
-    }
+    .await?;
     let claim = punch_deduplicator
         .claim_for_epoch_with_rendezvous_for_peer_session(
             peers,
@@ -864,10 +947,11 @@ async fn claim_hard_hard_initiator_response_session(
             None,
             Some(record.punch_at_ms),
         )
-        .await?;
+        .await
+        .ok_or_else(|| HardHardClaimFailure::new(HardHardClaimFailureReason::ClaimUnavailable))?;
     let deferred = match claim {
         RendezvousPunchClaim::Claimed(session) => {
-            if hard_hard_initiator_response_claim_fence_is_current(
+            if let Err(failure) = hard_hard_initiator_response_claim_fence(
                 peers,
                 peer_id,
                 peer_session_generation,
@@ -877,13 +961,17 @@ async fn claim_hard_hard_initiator_response_session(
             )
             .await
             {
-                return Some(session);
+                drop(session);
+                return Err(failure);
             }
-            drop(session);
-            return None;
+            return Ok(session);
         }
         RendezvousPunchClaim::Deferred(deferred) => deferred,
-        RendezvousPunchClaim::RejectedStalePeerSession => return None,
+        RendezvousPunchClaim::RejectedStalePeerSession => {
+            return Err(HardHardClaimFailure::new(
+                HardHardClaimFailureReason::PeerSessionChanged,
+            ))
+        }
     };
     let Some(retry_delay) = hard_hard_protected_claim_retry_delay(deferred, unix_time_millis())
     else {
@@ -901,7 +989,9 @@ async fn claim_hard_hard_initiator_response_session(
                 ),
             )
             .await;
-        return None;
+        return Err(HardHardClaimFailure::new(
+            HardHardClaimFailureReason::Deferred(deferred.reason),
+        ));
     };
 
     peers
@@ -921,7 +1011,7 @@ async fn claim_hard_hard_initiator_response_session(
         .await;
     sleep(retry_delay).await;
 
-    let retry_fence_is_current = hard_hard_initiator_response_claim_fence_is_current(
+    let retry_fence_is_current = hard_hard_initiator_response_claim_fence(
         peers,
         peer_id,
         peer_session_generation,
@@ -930,7 +1020,7 @@ async fn claim_hard_hard_initiator_response_session(
         epoch,
     )
     .await;
-    if !retry_fence_is_current {
+    if let Err(failure) = retry_fence_is_current {
         peers
             .record_direct_event(
                 peer_id,
@@ -941,7 +1031,7 @@ async fn claim_hard_hard_initiator_response_session(
                 "Hard↔Hard initiator response protected-claim retry crossed its token/session/plan/recovery/lifecycle/punch-window fence",
             )
             .await;
-        return None;
+        return Err(failure);
     }
 
     let retry_claim = punch_deduplicator
@@ -955,10 +1045,11 @@ async fn claim_hard_hard_initiator_response_session(
             None,
             Some(record.punch_at_ms),
         )
-        .await?;
+        .await
+        .ok_or_else(|| HardHardClaimFailure::new(HardHardClaimFailureReason::ClaimUnavailable))?;
     match retry_claim {
         RendezvousPunchClaim::Claimed(session) => {
-            if hard_hard_initiator_response_claim_fence_is_current(
+            if let Err(failure) = hard_hard_initiator_response_claim_fence(
                 peers,
                 peer_id,
                 peer_session_generation,
@@ -968,10 +1059,10 @@ async fn claim_hard_hard_initiator_response_session(
             )
             .await
             {
-                Some(session)
-            } else {
                 drop(session);
-                None
+                Err(failure)
+            } else {
+                Ok(session)
             }
         }
         RendezvousPunchClaim::Deferred(retry) => {
@@ -989,8 +1080,12 @@ async fn claim_hard_hard_initiator_response_session(
                     ),
                 )
                 .await;
-            None
+            Err(HardHardClaimFailure::new(
+                HardHardClaimFailureReason::Deferred(retry.reason),
+            ))
         }
-        RendezvousPunchClaim::RejectedStalePeerSession => None,
+        RendezvousPunchClaim::RejectedStalePeerSession => Err(HardHardClaimFailure::new(
+            HardHardClaimFailureReason::PeerSessionChanged,
+        )),
     }
 }

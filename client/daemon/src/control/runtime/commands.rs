@@ -93,12 +93,21 @@ async fn handle_control_command(
                 }
             }
         }
-        ControlCommand::NetworkChanged => {
+        ControlCommand::NetworkChanged(changes) => {
+            let Some(hint) = changes.take_pending(true) else {
+                debug!(
+                    event = "android_network_hint_absorbed",
+                    "Registration already covers this network notification"
+                );
+                return ControlCommandDisposition::Continue;
+            };
             http.notify_network_changed();
             if let Some(task) = signal_ws_task {
                 task.abort();
             }
             info!(
+                kotlin_network_generation = hint.kotlin_network_generation,
+                network_identity_hash = %hint.network_identity_hash,
                 "Android physical network changed; restarting control registration and signaling transports"
             );
             ControlCommandDisposition::Reregister

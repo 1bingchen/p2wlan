@@ -2,6 +2,10 @@ use super::*;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
+fn release_transport(base: &str) -> RouteAwareControlHttpClient {
+    route_aware_control_http_clients(ControlProxyMode::Direct, base, None).0
+}
+
 fn registration(
     base_url: &str,
 ) -> tokio::sync::watch::Sender<Option<super::super::CriticalControlAuth>> {
@@ -115,6 +119,7 @@ async fn lost_ack_response_does_not_block_application_or_reorder_lease_acks() {
     let (events_tx, mut events_rx) = mpsc::unbounded_channel();
     spawn_signal_application_lane(
         reqwest::Client::builder().no_proxy().build().unwrap(),
+        release_transport(&base),
         base,
         "ack-test-token".into(),
         "ack-test-node".into(),
@@ -354,11 +359,13 @@ async fn ack_failure_during_tracker_contention_does_not_dispatch_the_next_signal
         Duration::from_secs(3),
         acknowledge_signal_batch(
             &http,
+            &release_transport(&base),
             &base,
             "ack-test-token",
             "ack-test-node",
             fence,
             ack_rx,
+            &[],
         ),
     )
     .await
@@ -380,6 +387,8 @@ async fn ack_failure_during_tracker_contention_does_not_dispatch_the_next_signal
         "the undispatched owner is retired"
     );
 }
+
+include!("signal_release_tests.rs");
 
 #[tokio::test(start_paused = true)]
 async fn ack_registration_change_interrupts_a_pending_response() {

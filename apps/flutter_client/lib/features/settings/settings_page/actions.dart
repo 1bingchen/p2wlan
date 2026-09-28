@@ -325,11 +325,37 @@ extension _SettingsPageActions on _SettingsPageState {
     try {
       final parallel = widget.statusStore.parallelRooms;
       final activeRoomProfileIds = parallel.supportLogProfileCandidates;
-      final dynamicSummaries = parallel.exportStatusSummaries();
+      final uploadSessionRevision = widget.statusStore.sessionRevision;
+      final observedBuild =
+          widget.statusStore.daemonController.lastDaemonBuildInfo;
+      final dynamicSummaries = parallel.exportStatusSummaries(
+        supportSafe: true,
+      );
+      final mainStatusSummary = await captureMainSupportStatus(
+        diagnosticsUrl: settings.diagnosticsUrl,
+        cachedSnapshot: widget.statusStore.snapshot?.raw,
+        cachedAt: widget.statusStore.lastSuccessfulStatusAt,
+        observedDaemonBuild: observedBuild == null
+            ? null
+            : {
+                'app_version': observedBuild.appVersion,
+                'daemon_version': observedBuild.daemonVersion,
+                'git_commit': observedBuild.gitCommit,
+                'build_id': observedBuild.buildId,
+              },
+      );
+      if (!mounted ||
+          uploadSessionRevision != widget.statusStore.sessionRevision ||
+          widget.settingsStore.settings.authToken != settings.authToken)
+        return;
       final bundle = await CurrentSessionLogBundle.collectCurrentStartup(
         activeRoomProfileIds: activeRoomProfileIds,
         dynamicSummaries: dynamicSummaries,
       );
+      if (!mounted ||
+          uploadSessionRevision != widget.statusStore.sessionRevision ||
+          widget.settingsStore.settings.authToken != settings.authToken)
+        return;
       final result = await _controlApi.uploadSupportLogs(
         controlServer: settings.controlServer,
         authToken: authToken,
@@ -337,6 +363,7 @@ extension _SettingsPageActions on _SettingsPageState {
         clientBuild: ClientBuildInfo.current,
         daemonBuild: widget.statusStore.daemonController.lastDaemonBuildInfo,
         files: bundle.files,
+        mainStatusSummary: mainStatusSummary,
         omittedRoomProfileIds: bundle.omittedRoomProfileIds,
       );
       if (mounted) {

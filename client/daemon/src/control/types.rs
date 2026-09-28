@@ -623,8 +623,6 @@ struct ListSignalsResponse {
 #[derive(Debug, Deserialize)]
 struct SignalDelivery {
     #[serde(default)]
-    batch_token: String,
-    #[serde(default)]
     lease_expires_at_ms: Option<u64>,
 }
 
@@ -695,6 +693,7 @@ pub struct ControlClient {
     event_tx: mpsc::UnboundedSender<ControlEvent>,
     /// Channel to send commands to the background task.
     cmd_tx: mpsc::UnboundedSender<ControlCommand>,
+    network_changes: Arc<ControlNetworkChanges>,
     /// Bounded lane for initiator offers that carry real WireGuard handshake
     /// bytes.  It is serviced by a separate worker so a slow
     /// candidate-only/peer-reflexive POST can never hold an offer behind the
@@ -955,7 +954,7 @@ enum ControlCommand {
     /// Rebind the existing control HTTP/WebSocket lifecycle after an Android
     /// physical-network handoff.
     #[cfg_attr(not(target_os = "android"), allow(dead_code))]
-    NetworkChanged,
+    NetworkChanged(Arc<ControlNetworkChanges>),
     /// Create a tunnel.
     CreateTunnel {
         protocol: String,

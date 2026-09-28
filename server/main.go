@@ -187,6 +187,7 @@ func registerDeviceControlRoutes(mux *http.ServeMux, authService *auth.Service, 
 	mux.HandleFunc("POST /api/v1/signals", anySessionAuth(apiServer.CreateSignal))
 	mux.HandleFunc("GET /api/v1/signals", anySessionAuth(apiServer.ListSignals))
 	mux.HandleFunc("POST /api/v1/signals/ack", anySessionAuth(apiServer.AckSignals))
+	mux.HandleFunc("POST /api/v1/signals/release", anySessionAuth(apiServer.ReleaseSignals))
 	mux.HandleFunc("POST /api/v1/tunnels", anySessionAuth(apiServer.CreateTunnel))
 	mux.HandleFunc("GET /api/v1/tunnels", anySessionAuth(apiServer.ListTunnels))
 	mux.HandleFunc("DELETE /api/v1/tunnels/{id}", anySessionAuth(apiServer.DeleteTunnel))

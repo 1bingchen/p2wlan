@@ -1403,7 +1403,7 @@ pub(crate) async fn spawn_hard_hard_initiator_response_with_signal(
         .await;
         return HardHardRemoteStart::Rejected;
     };
-    let Some(session) = claim_hard_hard_initiator_response_session(
+    let session = match claim_hard_hard_initiator_response_session(
         &peers,
         &punch_deduplicator,
         &peer_id,
@@ -1413,25 +1413,35 @@ pub(crate) async fn spawn_hard_hard_initiator_response_with_signal(
         epoch,
     )
     .await
-    else {
-        hard_hard_a0_stage_log(
-            &peers,
-            "initiator",
-            Some(&coordination.token),
-            HardHardA0Stage::OwnerAdmission,
-            HardHardA0Reason::ClaimRejected,
-        );
-        let _ = record_hard_hard_unexecuted_session_attempt(
-            &peers,
-            &peer_id,
-            peer_session_generation,
-            &record,
-            "initiator",
-            &remote_prediction,
-            "response_claim_rejected",
-        )
-        .await;
-        return HardHardRemoteStart::Rejected;
+    {
+        Ok(value) => value,
+        Err(failure) => {
+            failure.log(
+                Some(&coordination.token),
+                "initiator",
+                expected_plan,
+                peer_session_generation,
+                epoch,
+            );
+            hard_hard_a0_stage_log(
+                &peers,
+                "initiator",
+                Some(&coordination.token),
+                HardHardA0Stage::OwnerAdmission,
+                HardHardA0Reason::ClaimRejected,
+            );
+            let _ = record_hard_hard_unexecuted_session_attempt(
+                &peers,
+                &peer_id,
+                peer_session_generation,
+                &record,
+                "initiator",
+                &remote_prediction,
+                "response_claim_rejected",
+            )
+            .await;
+            return HardHardRemoteStart::Rejected;
+        }
     };
     hard_hard_a0_stage_log(
         &peers,

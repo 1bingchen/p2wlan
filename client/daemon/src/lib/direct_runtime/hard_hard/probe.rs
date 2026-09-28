@@ -345,8 +345,8 @@ fn hard_hard_a0_stage_tags(session_token: Option<&str>) -> (String, String, &'st
     }
 }
 
-/// Emit bounded A0 control-stage evidence only in the explicitly isolated
-/// experiment lane. Pre-session decisions have no shared identity yet and are
+/// Emit bounded control-stage evidence in ordinary release builds too.
+/// Pre-session decisions have no shared identity yet and are
 /// marked local-only; later stages use the session and rendezvous-plan tags
 /// already shared by the existing hh1 envelope.
 fn hard_hard_a0_stage_log(
@@ -356,9 +356,7 @@ fn hard_hard_a0_stage_log(
     stage: HardHardA0Stage,
     reason: HardHardA0Reason,
 ) {
-    if !peers.hard_hard_experiment_only() {
-        return;
-    }
+    let _ = peers; // Caller owns admission; diagnostics never change it.
     let (session_tag, plan_tag, identity_scope) = hard_hard_a0_stage_tags(session_token);
     tracing::info!(
         event = "hard_hard_attempt_stage",
@@ -368,7 +366,7 @@ fn hard_hard_a0_stage_log(
         plan_tag = %plan_tag,
         stage = stage.label(),
         reason_code = reason.label(),
-        "Hard-Hard A0 control stage"
+        "Hard-Hard control stage"
     );
 }
 
@@ -379,9 +377,7 @@ fn hard_hard_a0_profile_binding_rejection_log(
     reason: HardHardA0Reason,
     snapshot: crate::peer::RemoteNatProfileBindSnapshot,
 ) {
-    if !peers.hard_hard_experiment_only() {
-        return;
-    }
+    let _ = peers; // Caller owns admission; diagnostics never change it.
     let (session_tag, plan_tag, identity_scope) = hard_hard_a0_stage_tags(Some(session_token));
     tracing::info!(
         event = "hard_hard_attempt_stage",
@@ -398,7 +394,7 @@ fn hard_hard_a0_profile_binding_rejection_log(
         profile_fresh = snapshot.profile_fresh,
         profile_candidate_epoch = ?snapshot.profile_candidate_epoch,
         declared_profile_generation = snapshot.declared_generation,
-        "Hard-Hard A0 profile-binding snapshot"
+        "Hard-Hard profile-binding snapshot"
     );
 }
 

@@ -14,6 +14,7 @@ async fn run_control_loop(
     event_loop_ready: Arc<AtomicBool>,
     telemetry_hub: Option<Arc<crate::peer::PathTelemetryHub>>,
     server_clock: Arc<ServerClockEstimate>,
+    network_changes: Arc<ControlNetworkChanges>,
 ) {
     let base_url = normalize_http_base_url(&config.control.server_url);
 
@@ -37,20 +38,55 @@ async fn run_control_loop(
     info!("Connecting to control plane at {base_url}");
 
     // Outer recovery loop: re-registers after transient disconnects.
-    loop {
+    'recovery: loop {
         server_clock.invalidate_registration();
         // The critical lane must never reuse a node id/token from a previous
         // registration generation while this loop is reconnecting.
         let _ = critical_auth_tx.send(None);
         // ---- Registration with exponential backoff ----
-        let (self_node_id, registration_seq) = {
+        let (self_node_id, registration_seq, network_edge) = {
             let mut attempt: u32 = 0;
             loop {
-                let registration = async {
-                    let current_http = http.current()?;
-                    register_device(&current_http, &base_url, &token, &config).await
+                let (network_edge, changed) = network_changes.begin_registration();
+                if changed {
+                    http.notify_network_changed();
+                    debug!(
+                        event = "android_network_hint_absorbed",
+                        "Registration starts on the latest authorized network edge"
+                    );
                 }
-                .await;
+                let Some(mut registration_state) = network_changes
+                    .during_registration(
+                        &network_edge,
+                        &critical_auth_tx,
+                        &server_clock,
+                        state.write(),
+                    )
+                    .await
+                else {
+                    continue;
+                };
+                registration_state.registered = false;
+                drop(registration_state);
+                let registration = tokio::select! {
+                    biased;
+                    _ = network_changes.changed_since(&network_edge) => {
+                        debug!(event = "control_registration_superseded", "Physical network changed during registration; discarding the old attempt");
+                        continue;
+                    }
+                    result = async {
+                        let current_http = http.current()?;
+                        register_device(&current_http, &base_url, &token, &config).await
+                    } => result,
+                };
+                if !network_changes.commit_registration_if_current(
+                    &network_edge,
+                    &critical_auth_tx,
+                    &server_clock,
+                    || {},
+                ) {
+                    continue;
+                }
                 match registration {
                     Ok((
                         node_id,
@@ -63,17 +99,37 @@ async fn run_control_loop(
                     )) => {
                         let registration_seq_changed =
                             config.control.registration_seq != registration_seq;
-                        config.control.registration_seq = registration_seq;
-                        let _ = critical_auth_tx.send(Some(CriticalControlAuth {
-                            accepted_peer_capabilities,
-                            base_url: base_url.clone(),
-                            token: token.clone(),
-                            self_node_id: node_id.clone(),
-                            registration_seq,
-                            signal_signing_identity: signal_signing_identity.clone(),
-                        }));
+                        if !network_changes.commit_registration_if_current(
+                            &network_edge,
+                            &critical_auth_tx,
+                            &server_clock,
+                            || {
+                                config.control.registration_seq = registration_seq;
+                                let _ = critical_auth_tx.send(Some(CriticalControlAuth {
+                                    accepted_peer_capabilities,
+                                    base_url: base_url.clone(),
+                                    token: token.clone(),
+                                    self_node_id: node_id.clone(),
+                                    registration_seq,
+                                    signal_signing_identity: signal_signing_identity.clone(),
+                                }));
+                            },
+                        ) {
+                            continue;
+                        }
                         if let Some(health) = health.as_ref() {
-                            health.mark_device_lease_success().await;
+                            if network_changes
+                                .during_registration(
+                                    &network_edge,
+                                    &critical_auth_tx,
+                                    &server_clock,
+                                    health.mark_device_lease_success(),
+                                )
+                                .await
+                                .is_none()
+                            {
+                                continue;
+                            }
                         }
                         if let Some(hub) = &telemetry_hub {
                             hub.set_ids(node_id.clone(), config.network.network_id.clone());
@@ -88,9 +144,28 @@ async fn run_control_loop(
                             Some(format!("node_id={node_id} virtual_ip={virtual_ip}")),
                         );
                         {
-                            let mut s = state.write().await;
-                            s.registered = true;
-                            s.virtual_ip = Some(virtual_ip.clone());
+                            let Some(mut s) = network_changes
+                                .during_registration(
+                                    &network_edge,
+                                    &critical_auth_tx,
+                                    &server_clock,
+                                    state.write(),
+                                )
+                                .await
+                            else {
+                                continue;
+                            };
+                            if !network_changes.commit_registration_if_current(
+                                &network_edge,
+                                &critical_auth_tx,
+                                &server_clock,
+                                || {
+                                    s.registered = true;
+                                    s.virtual_ip = Some(virtual_ip.clone());
+                                },
+                            ) {
+                                continue;
+                            }
                         }
                         {
                             let mut snap = advertised_snapshot.lock().unwrap();
@@ -129,28 +204,22 @@ async fn run_control_loop(
                             server_relay_servers
                         };
 
-                        let _ = event_tx.send(ControlEvent::Registered {
-                            node_id: Some(node_id.clone()),
-                            virtual_ip: virtual_ip.clone(),
-                            cidr: Some(cidr.clone()),
-                            relay_servers,
-                            relay_catalog,
-                        });
-
-                        // Candidate refresh and relay-first setup may begin
-                        // as soon as registration succeeds.  Publish the
-                        // currently authoritative registration token before
-                        // the optional Ed25519 credential challenge; the
-                        // later update below replaces it atomically if the
-                        // challenge issues a device credential.
-                        let _ = critical_auth_tx.send(Some(CriticalControlAuth {
-                            accepted_peer_capabilities,
-                            base_url: base_url.clone(),
-                            token: token.clone(),
-                            self_node_id: node_id.clone(),
-                            registration_seq,
-                            signal_signing_identity: signal_signing_identity.clone(),
-                        }));
+                        if !network_changes.commit_registration_if_current(
+                            &network_edge,
+                            &critical_auth_tx,
+                            &server_clock,
+                            || {
+                                let _ = event_tx.send(ControlEvent::Registered {
+                                    node_id: Some(node_id.clone()),
+                                    virtual_ip: virtual_ip.clone(),
+                                    cidr: Some(cidr.clone()),
+                                    relay_servers,
+                                    relay_catalog,
+                                });
+                            },
+                        ) {
+                            continue;
+                        }
 
                         // Attempt Ed25519 challenge for device credential
                         if !config.control.credential_issued
@@ -158,7 +227,7 @@ async fn run_control_loop(
                             && !config.node.ed25519_public_key.is_empty()
                         {
                             info!("Attempting Ed25519 challenge for device credential...");
-                            let credential_result = async {
+                            let credential_work = async {
                                 let current_http = http.current()?;
                                 obtain_device_credential(
                                     &current_http,
@@ -169,8 +238,15 @@ async fn run_control_loop(
                                     &config.node.ed25519_public_key,
                                 )
                                 .await
-                            }
-                            .await;
+                            };
+                            let credential_result = network_changes
+                                .finish_registration_side_effect(
+                                    &network_edge,
+                                    &critical_auth_tx,
+                                    &server_clock,
+                                    credential_work,
+                                )
+                                .await;
                             match credential_result {
                                 Ok(device_credential) => {
                                     info!("Device credential obtained successfully");
@@ -197,16 +273,25 @@ async fn run_control_loop(
                         // chance to replace the user token.  The independent
                         // handshake worker must sign as this exact
                         // server-assigned node identity, never config.node_id.
-                        let _ = critical_auth_tx.send(Some(CriticalControlAuth {
-                            accepted_peer_capabilities,
-                            base_url: base_url.clone(),
-                            token: token.clone(),
-                            self_node_id: node_id.clone(),
-                            registration_seq,
-                            signal_signing_identity: signal_signing_identity.clone(),
-                        }));
+                        if !network_changes.commit_registration_if_current(
+                            &network_edge,
+                            &critical_auth_tx,
+                            &server_clock,
+                            || {
+                                let _ = critical_auth_tx.send(Some(CriticalControlAuth {
+                                    accepted_peer_capabilities,
+                                    base_url: base_url.clone(),
+                                    token: token.clone(),
+                                    self_node_id: node_id.clone(),
+                                    registration_seq,
+                                    signal_signing_identity: signal_signing_identity.clone(),
+                                }));
+                            },
+                        ) {
+                            continue;
+                        }
 
-                        break (node_id, registration_seq);
+                        break (node_id, registration_seq, network_edge);
                     }
                     Err(err) => {
                         let err_str = err.to_string();
@@ -285,7 +370,7 @@ async fn run_control_loop(
 
         // ---- Polling cycle ----
         // Initial poll
-        let initial_peer_poll = async {
+        let initial_peer_work = async {
             let (current_http, http_pool_id) = http.current_with_pool_id()?;
             poll_peers(
                 &current_http,
@@ -299,8 +384,18 @@ async fn run_control_loop(
                 event_tx,
             )
             .await
-        }
-        .await;
+        };
+        let Some(initial_peer_poll) = network_changes
+            .during_registration(
+                &network_edge,
+                &critical_auth_tx,
+                &server_clock,
+                initial_peer_work,
+            )
+            .await
+        else {
+            continue 'recovery;
+        };
         if let Err(err) = initial_peer_poll {
             let err_str = err.to_string();
             if is_registration_conflict_error(&err_str) {
@@ -322,7 +417,18 @@ async fn run_control_loop(
         // ready.  A leased signal delivered during startup cannot be applied;
         // the server's ordered lease would then fence every later signal for
         // its full TTL, making a healthy relay handshake appear to stall.
-        wait_for_event_loop_ready(&event_loop_ready).await;
+        if network_changes
+            .during_registration(
+                &network_edge,
+                &critical_auth_tx,
+                &server_clock,
+                wait_for_event_loop_ready(&event_loop_ready),
+            )
+            .await
+            .is_none()
+        {
+            continue 'recovery;
+        }
         let initial_signal_poll = async {
             let current_http = http.current()?;
             poll_signals(
@@ -336,10 +442,21 @@ async fn run_control_loop(
                 &recent_signal_ids,
                 &server_clock,
                 critical_auth_tx.subscribe(),
+                &http,
             )
             .await
         }
         .await;
+        // A GET may already have leased rows. Let decoding/application-lane
+        // setup finish, then revoke so the release owner can recover them.
+        if !network_changes.commit_registration_if_current(
+            &network_edge,
+            &critical_auth_tx,
+            &server_clock,
+            || {},
+        ) {
+            continue 'recovery;
+        }
         if let Err(err) = initial_signal_poll {
             let err_str = err.to_string();
             if is_registration_conflict_error(&err_str) {
@@ -358,6 +475,14 @@ async fn run_control_loop(
             let _ = event_tx.send(ControlEvent::ControlHealthy);
         }
 
+        if !network_changes.commit_registration_if_current(
+            &network_edge,
+            &critical_auth_tx,
+            &server_clock,
+            || {},
+        ) {
+            continue 'recovery;
+        }
         let signal_ws_connected = Arc::new(AtomicBool::new(false));
         let (signal_wake_tx, mut signal_wake_rx) = mpsc::channel(SIGNAL_WS_WAKE_QUEUE);
         let signal_ws_task = token.starts_with("dc-").then(|| {
@@ -566,6 +691,7 @@ async fn run_control_loop(
                             &recent_signal_ids,
                             &server_clock,
                             critical_auth_tx.subscribe(),
+                            &http,
                         )
                         .await
                     }
@@ -624,6 +750,7 @@ async fn run_control_loop(
                             &recent_signal_ids,
                             &server_clock,
                             critical_auth_tx.subscribe(),
+                            &http,
                         )
                         .await
                     }

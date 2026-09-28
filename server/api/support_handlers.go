@@ -397,14 +397,14 @@ func supportLogStorageFailureDetails(err error) (stage, reason string) {
 		}
 	}
 	switch {
+	case errors.Is(err, syscall.ENOTDIR):
+		reason = "not_directory"
 	case errors.Is(err, os.ErrPermission):
 		reason = "permission_denied"
 	case errors.Is(err, os.ErrNotExist):
 		reason = "path_missing"
 	case errors.Is(err, os.ErrExist):
 		reason = "already_exists"
-	case errors.Is(err, syscall.ENOTDIR):
-		reason = "not_directory"
 	case errors.Is(err, syscall.ENOSPC):
 		reason = "no_space"
 	case errors.Is(err, syscall.EROFS):

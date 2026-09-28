@@ -584,6 +584,7 @@ func TestUploadSupportLogsUnavailableDirectoryReportsOnlySafeFailure(t *testing.
 	t.Setenv("LOG_UPLOAD_DIR", directory)
 	server := NewServer(nil, nil, nil)
 	bundle := supportLogBundleForRooms(0)
+	bundle.Manifest.HasRoomLogs = false
 	bundle.DeviceName = "private-device-marker"
 	bundle.ClientBuild = map[string]string{"token": "private-token-marker"}
 	bundle.Files[0].Content = "private-bundle-content-marker"

@@ -8,11 +8,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/yhan-sun/p2wlan/server/auth"
@@ -143,6 +145,8 @@ func (s *Server) UploadSupportLogs(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := persistSupportLogBundle(s.supportLogDir, uploadID, stored); err != nil {
+		stage, reason := supportLogStorageFailureDetails(err)
+		log.Printf("event=support_log_storage_failed stage=%s reason=%s", stage, reason)
 		http.Error(w, `{"error":"support log storage failed"}`, http.StatusInternalServerError)
 		return
 	}
@@ -159,6 +163,9 @@ func (s *Server) UploadSupportLogs(w http.ResponseWriter, r *http.Request) {
 func supportLogDirFromEnv() string {
 	if value := strings.TrimSpace(os.Getenv("LOG_UPLOAD_DIR")); value != "" {
 		return value
+	}
+	if databasePath := strings.TrimSpace(os.Getenv("DB_PATH")); filepath.IsAbs(databasePath) {
+		return filepath.Join(filepath.Dir(databasePath), "log-uploads")
 	}
 	return filepath.Join("data", "log-uploads")
 }
@@ -347,24 +354,95 @@ func newSupportLogUploadID() (string, error) {
 	return hex.EncodeToString(random[:]), nil
 }
 
+type supportLogStorageStage string
+
+const (
+	supportLogValidateDirectory supportLogStorageStage = "validate_directory"
+	supportLogCreateDirectory   supportLogStorageStage = "create_directory"
+	supportLogRestrictDirectory supportLogStorageStage = "restrict_directory"
+	supportLogEncodeBundle      supportLogStorageStage = "encode_bundle"
+	supportLogCreateTempFile    supportLogStorageStage = "create_temp_file"
+	supportLogRestrictTempFile  supportLogStorageStage = "restrict_temp_file"
+	supportLogWriteBundle       supportLogStorageStage = "write_bundle"
+	supportLogFinishGzip        supportLogStorageStage = "finish_gzip"
+	supportLogSyncFile          supportLogStorageStage = "sync_file"
+	supportLogCloseFile         supportLogStorageStage = "close_file"
+	supportLogPublishBundle     supportLogStorageStage = "publish_bundle"
+)
+
+// Keep the cause for errors.Is/As without including filesystem paths or bundle
+// metadata in formatted errors. HTTP and journal diagnostics use only safe fields.
+type supportLogStorageError struct {
+	stage supportLogStorageStage
+	cause error
+}
+
+func (e *supportLogStorageError) Error() string {
+	stage, reason := supportLogStorageFailureDetails(e)
+	return fmt.Sprintf("support log storage failed: stage=%s reason=%s", stage, reason)
+}
+
+func (e *supportLogStorageError) Unwrap() error { return e.cause }
+
+func supportLogStorageFailureDetails(err error) (stage, reason string) {
+	stage = "unknown"
+	var storageErr *supportLogStorageError
+	if errors.As(err, &storageErr) {
+		switch storageErr.stage {
+		case supportLogValidateDirectory, supportLogCreateDirectory, supportLogRestrictDirectory,
+			supportLogEncodeBundle, supportLogCreateTempFile, supportLogRestrictTempFile,
+			supportLogWriteBundle, supportLogFinishGzip, supportLogSyncFile,
+			supportLogCloseFile, supportLogPublishBundle:
+			stage = string(storageErr.stage)
+		}
+	}
+	switch {
+	case errors.Is(err, os.ErrPermission):
+		reason = "permission_denied"
+	case errors.Is(err, os.ErrNotExist):
+		reason = "path_missing"
+	case errors.Is(err, os.ErrExist):
+		reason = "already_exists"
+	case errors.Is(err, syscall.ENOTDIR):
+		reason = "not_directory"
+	case errors.Is(err, syscall.ENOSPC):
+		reason = "no_space"
+	case errors.Is(err, syscall.EROFS):
+		reason = "read_only_filesystem"
+	case errors.Is(err, os.ErrInvalid):
+		reason = "invalid_argument"
+	default:
+		reason = "io_error"
+	}
+	return stage, reason
+}
+
 func persistSupportLogBundle(directory, uploadID string, bundle storedSupportLogBundle) error {
+	return persistSupportLogBundleWithDirectoryMode(directory, uploadID, bundle, os.Chmod)
+}
+
+// The per-call directory operation lets regressions exercise chmod failure on
+// every platform without modifying process privileges or global filesystem hooks.
+func persistSupportLogBundleWithDirectoryMode(directory, uploadID string, bundle storedSupportLogBundle, chmodDirectory func(string, os.FileMode) error) error {
 	if strings.TrimSpace(directory) == "" {
-		return errors.New("support log directory is empty")
+		return &supportLogStorageError{stage: supportLogValidateDirectory, cause: os.ErrInvalid}
 	}
 	if err := os.MkdirAll(directory, 0o700); err != nil {
-		return err
+		return &supportLogStorageError{stage: supportLogCreateDirectory, cause: err}
 	}
 	// Tighten an existing directory as well; this directory is intended for
 	// private support artifacts, not public downloads.
-	_ = os.Chmod(directory, 0o700)
+	if err := chmodDirectory(directory, 0o700); err != nil {
+		return &supportLogStorageError{stage: supportLogRestrictDirectory, cause: err}
+	}
 
 	encoded, err := json.MarshalIndent(bundle, "", "  ")
 	if err != nil {
-		return err
+		return &supportLogStorageError{stage: supportLogEncodeBundle, cause: err}
 	}
 	tmp, err := privatefile.CreateTemp(directory)
 	if err != nil {
-		return err
+		return &supportLogStorageError{stage: supportLogCreateTempFile, cause: err}
 	}
 	tmpName := tmp.Name()
 	defer func() {
@@ -372,27 +450,30 @@ func persistSupportLogBundle(directory, uploadID string, bundle storedSupportLog
 	}()
 	if err := tmp.Chmod(0o600); err != nil {
 		_ = tmp.Close()
-		return err
+		return &supportLogStorageError{stage: supportLogRestrictTempFile, cause: err}
 	}
 	writer := gzip.NewWriter(tmp)
 	if _, err := writer.Write(encoded); err != nil {
 		_ = writer.Close()
 		_ = tmp.Close()
-		return err
+		return &supportLogStorageError{stage: supportLogWriteBundle, cause: err}
 	}
 	if err := writer.Close(); err != nil {
 		_ = tmp.Close()
-		return err
+		return &supportLogStorageError{stage: supportLogFinishGzip, cause: err}
 	}
 	if err := tmp.Sync(); err != nil {
 		_ = tmp.Close()
-		return err
+		return &supportLogStorageError{stage: supportLogSyncFile, cause: err}
 	}
 	if err := tmp.Close(); err != nil {
-		return err
+		return &supportLogStorageError{stage: supportLogCloseFile, cause: err}
 	}
 	finalName := filepath.Join(directory, fmt.Sprintf("%s-%s.json.gz", bundle.ReceivedAt[:10], uploadID))
-	return os.Rename(tmpName, finalName)
+	if err := os.Rename(tmpName, finalName); err != nil {
+		return &supportLogStorageError{stage: supportLogPublishBundle, cause: err}
+	}
+	return nil
 }
 
 func pruneSupportLogBundles(directory string, now time.Time) {

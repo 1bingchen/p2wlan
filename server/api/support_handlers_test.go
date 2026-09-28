@@ -5,12 +5,16 @@ import (
 	"compress/gzip"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
+	"syscall"
 	"testing"
 
 	"github.com/yhan-sun/p2wlan/server/auth"
@@ -541,4 +545,164 @@ func postSupportLogBundle(t *testing.T, server *Server, bundle supportLogBundle)
 	recorder := httptest.NewRecorder()
 	server.UploadSupportLogs(recorder, req)
 	return recorder
+}
+
+func TestSupportLogDirectoryResolutionPreservesOverridesAndDevelopmentDefault(t *testing.T) {
+	absoluteDirectory := t.TempDir()
+	absoluteDatabase := filepath.Join(absoluteDirectory, "state", "control.db")
+	siblingUploads := filepath.Join(absoluteDirectory, "state", "log-uploads")
+	explicitUploads := filepath.Join(absoluteDirectory, "custom-uploads")
+	relativeUploads := filepath.Join("custom", "logs")
+	legacyUploads := filepath.Join("data", "log-uploads")
+	for _, tc := range []struct {
+		name, uploadDirectory, databasePath, want string
+	}{
+		{"absolute override", explicitUploads, absoluteDatabase, explicitUploads},
+		{"relative override", "  " + relativeUploads + "  ", absoluteDatabase, relativeUploads},
+		{"absolute database", "", absoluteDatabase, siblingUploads},
+		{"trimmed absolute database", " \t ", "  " + absoluteDatabase + "  ", siblingUploads},
+		{"missing database", "", "", legacyUploads},
+		{"blank database", "", " \t ", legacyUploads},
+		{"relative database", "", filepath.Join("state", "control.db"), legacyUploads},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("LOG_UPLOAD_DIR", tc.uploadDirectory)
+			t.Setenv("DB_PATH", tc.databasePath)
+			if got := supportLogDirFromEnv(); got != tc.want {
+				t.Fatalf("support log directory = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestUploadSupportLogsUnavailableDirectoryReportsOnlySafeFailure(t *testing.T) {
+	parent := filepath.Join(t.TempDir(), "private-storage-path-marker")
+	if err := os.WriteFile(parent, []byte("existing-file"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	directory := filepath.Join(parent, "uploads")
+	t.Setenv("LOG_UPLOAD_DIR", directory)
+	server := NewServer(nil, nil, nil)
+	bundle := supportLogBundleForRooms(0)
+	bundle.DeviceName = "private-device-marker"
+	bundle.ClientBuild = map[string]string{"token": "private-token-marker"}
+	bundle.Files[0].Content = "private-bundle-content-marker"
+	var journal bytes.Buffer
+	previousOutput := log.Writer()
+	log.SetOutput(&journal)
+	t.Cleanup(func() { log.SetOutput(previousOutput) })
+
+	recorder := postSupportLogBundle(t, server, bundle)
+	if recorder.Code != http.StatusInternalServerError || recorder.Body.String() != "{\"error\":\"support log storage failed\"}\n" {
+		t.Fatalf("expected unchanged generic storage error, got HTTP %d: %s", recorder.Code, recorder.Body.String())
+	}
+	if !strings.Contains(journal.String(), "event=support_log_storage_failed stage=create_directory reason=") {
+		t.Fatalf("missing safe storage diagnostic: %s", journal.String())
+	}
+	for _, secret := range []string{directory, parent, "private-storage-path-marker", "private-device-marker", "private-token-marker", "private-bundle-content-marker", "support-test"} {
+		if strings.Contains(recorder.Body.String(), secret) || strings.Contains(journal.String(), secret) {
+			t.Fatalf("storage failure leaked fixture metadata %q", secret)
+		}
+	}
+	content, err := os.ReadFile(parent)
+	if err != nil || string(content) != "existing-file" {
+		t.Fatalf("unavailable directory modified existing data: %q, %v", content, err)
+	}
+}
+
+func TestSupportLogStorageFailurePreservesCauseWithoutFormattingIt(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		cause  error
+		reason string
+	}{
+		{"permission", os.ErrPermission, "permission_denied"},
+		{"missing", os.ErrNotExist, "path_missing"},
+		{"exists", os.ErrExist, "already_exists"},
+		{"not directory", syscall.ENOTDIR, "not_directory"},
+		{"no space", syscall.ENOSPC, "no_space"},
+		{"read only", syscall.EROFS, "read_only_filesystem"},
+		{"invalid", os.ErrInvalid, "invalid_argument"},
+		{"unknown", errors.New("private-inner-error-marker"), "io_error"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			underlying := &os.PathError{Op: "private-operation-marker", Path: "private-path-marker", Err: tc.cause}
+			err := &supportLogStorageError{stage: supportLogPublishBundle, cause: underlying}
+			if !errors.Is(err, tc.cause) {
+				t.Fatal("wrapped storage error lost its cause")
+			}
+			var pathError *os.PathError
+			if !errors.As(err, &pathError) || pathError != underlying {
+				t.Fatal("wrapped storage error lost the original typed error")
+			}
+			stage, reason := supportLogStorageFailureDetails(fmt.Errorf("private-wrapper-marker: %w", err))
+			if stage != "publish_bundle" || reason != tc.reason {
+				t.Fatalf("unexpected safe classification: %s/%s", stage, reason)
+			}
+			if got, want := err.Error(), "support log storage failed: stage=publish_bundle reason="+tc.reason; got != want {
+				t.Fatalf("unsafe or unstable error formatting: %q", got)
+			}
+		})
+	}
+	stage, reason := supportLogStorageFailureDetails(&supportLogStorageError{
+		stage: supportLogStorageStage("private-stage-marker"), cause: errors.New("private-error-marker"),
+	})
+	if stage != "unknown" || reason != "io_error" {
+		t.Fatalf("unknown fields must not be echoed: %s/%s", stage, reason)
+	}
+}
+
+func TestPersistSupportLogBundleRejectsEmptyOrUnavailableDirectory(t *testing.T) {
+	if err := persistSupportLogBundle(" ", "upload", storedSupportLogBundle{}); !errors.Is(err, os.ErrInvalid) {
+		t.Fatalf("empty directory must preserve invalid-argument cause, got %v", err)
+	}
+	parent := filepath.Join(t.TempDir(), "file")
+	if err := os.WriteFile(parent, []byte("unchanged"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	err := persistSupportLogBundle(filepath.Join(parent, "uploads"), "upload", storedSupportLogBundle{})
+	var storageErr *supportLogStorageError
+	var pathErr *os.PathError
+	if !errors.As(err, &storageErr) || storageErr.stage != supportLogCreateDirectory || !errors.As(err, &pathErr) || !errors.Is(err, pathErr.Err) {
+		t.Fatalf("directory failure must retain stage and filesystem cause, got %v", err)
+	}
+}
+
+func TestPersistSupportLogBundleStopsWhenDirectoryChmodFails(t *testing.T) {
+	directory := filepath.Join(t.TempDir(), "uploads")
+	cause := &os.PathError{Op: "chmod", Path: directory, Err: os.ErrPermission}
+	chmodCalls := 0
+	err := persistSupportLogBundleWithDirectoryMode(directory, "upload", storedSupportLogBundle{}, func(path string, mode os.FileMode) error {
+		chmodCalls++
+		if path != directory || mode != 0o700 {
+			t.Fatalf("unexpected directory permission operation: %q, %v", path, mode)
+		}
+		return cause
+	})
+	stage, reason := supportLogStorageFailureDetails(err)
+	if chmodCalls != 1 || stage != "restrict_directory" || reason != "permission_denied" || !errors.Is(err, cause) {
+		t.Fatalf("chmod failure was swallowed or misclassified: calls=%d, error=%v", chmodCalls, err)
+	}
+	entries, readErr := os.ReadDir(directory)
+	if readErr != nil || len(entries) != 0 {
+		t.Fatalf("chmod failure must stop before creating artifacts: %v, %v", entries, readErr)
+	}
+}
+
+func TestPersistSupportLogBundlePublishFailureCleansPrivateTemporaryFile(t *testing.T) {
+	directory := t.TempDir()
+	bundle := storedSupportLogBundle{ReceivedAt: "2026-09-28T12:00:00Z", UserID: "private-user-marker"}
+	finalName := "2026-09-28-upload.json.gz"
+	if err := os.Mkdir(filepath.Join(directory, finalName), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	err := persistSupportLogBundle(directory, "upload", bundle)
+	var storageErr *supportLogStorageError
+	if !errors.As(err, &storageErr) || storageErr.stage != supportLogPublishBundle {
+		t.Fatalf("expected publish-stage error, got %v", err)
+	}
+	entries, readErr := os.ReadDir(directory)
+	if readErr != nil || len(entries) != 1 || entries[0].Name() != finalName || !entries[0].IsDir() {
+		t.Fatalf("failed publication must preserve target and remove temporary file: %v, %v", entries, readErr)
+	}
 }

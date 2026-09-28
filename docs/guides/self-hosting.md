@@ -11,7 +11,7 @@
 - p2wlan-server、install-server.sh、deploy-server.sh
 - BUILD-METADATA.txt 和 SHA256SUMS
 
-普通部署不需要在服务器上安装 Go、Node.js 或从源码构建。管理台使用 React/TypeScript/Vite 开发，但 Vite 只在开发和 CI 构建阶段运行；生成的静态产物由 `go:embed` 编译进 `p2wlan-control`，发布后仍然是单一 Control 进程。
+普通部署不需要在服务器上安装 Go、Node.js 或从源码构建。Linux systemd manager 的安装、升级和 doctor 需要 Python 3 标准库，以固定文件句柄检查和准备私有日志存储；该检查代码随同一归档的 manager 发布，不在线下载。管理台使用 React/TypeScript/Vite 开发，但 Vite 只在开发和 CI 构建阶段运行；生成的静态产物由 `go:embed` 编译进 `p2wlan-control`，发布后仍然是单一 Control 进程。
 
 ## 支持与验证范围
 
@@ -64,6 +64,8 @@ Control 与 Relay 分机时，撤权 feed 使用 HTTPS 和独立 Bearer token。
 
 使用发布归档的 `install-server.sh` 安装时，`p2wlan-server init` 会为新部署分别生成 `JWT_SECRET` 和独立的 256-bit `CONTROL_ADMIN_TOKEN`，因此固定归档的标准安装路径默认具备管理台凭据，同时仍只在 Control 的受保护配置文件中保存秘密。对于早期已经存在、但缺少管理台凭据的部署，可以显式运行 `sudo p2wlan-server setup --role all` 补齐这一项；该命令不会轮换已有 JWT、Relay、TLS 或其他凭据。
 
+支持日志使用独立的私有持久目录。标准安装显式设置 `LOG_UPLOAD_DIR` 为数据目录下的 `log-uploads`，不依赖进程工作目录；受管理目录由 `p2wlan` 拥有并限制为 `0700`。自定义值由部署者创建并检查服务账户和 systemd 的访问权限；Compose 自定义路径还须位于可写的持久挂载内。不要把支持日志放进发布目录或公共下载目录。
+
 管理台入口为与 Control 同一可信 HTTPS origin 下的 `/admin/`；删除 `CONTROL_ADMIN_TOKEN` 并重启 Control 即可完全关闭管理面，此时 `/admin` 与 `/admin/*` 对任意 HTTP 方法都返回 404。当前管理台只读，不提供删除设备、修改房间或重启服务等写操作。
 
 管理台源码位于 `server/admin-ui/`；CI 按锁文件执行 `npm ci` 并重新构建，再与仓库中已提交的 `server/admin/web/` 逐字节比对，因此源码改动后忘记重新构建会被 CI 拦下。服务端 tag / staging 构建也会在 `go build` 前重新执行 typecheck 和 production build，再由 Go 将生成目录嵌入 Control。这保证发布归档和本地 `go build` 都不会携带过期 UI，同时服务端安装和升级路径仍然只围绕原有服务端归档，不引入第二套前端发布流程。
@@ -80,4 +82,4 @@ Compose 镜像也包含 `p2wlan-db`，可在挂载的数据卷上生成一致性
     sudo p2wlan-server check --service all
     sudo p2wlan-server doctor --service all
 
-`verify` 检查发布归档和版本，`check` 检查本机 Control/Relay 健康端点，`doctor` 在此基础上继续检查 systemd、Admin 凭据、SQLite 完整性、Relay TLS 文件、备份和数据盘空间。它们都不代替真实客户端、TUN、NAT、公网 TLS 入口或业务连通性验证。
+`verify` 检查发布归档和版本，`check` 检查本机 Control/Relay 健康端点，`doctor` 在此基础上继续检查 systemd、Admin 凭据、支持日志配置及服务账户的主机目录访问权限、SQLite 完整性、Relay TLS 文件、备份和数据盘空间。主机权限检查不进入运行服务的 mount namespace，也不写入支持包；完整上传仍需用户授权后实际验证。它们都不代替真实客户端、TUN、NAT、公网 TLS 入口或业务连通性验证。

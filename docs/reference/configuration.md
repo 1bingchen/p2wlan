@@ -8,11 +8,13 @@
 | DB_PATH | SQLite 文件路径，不是目录；相对路径相对于服务工作目录。 |
 | JWT_SECRET | 每个部署独立随机值，持续保存；改变会使现有账号会话失效。 |
 | CONTROL_ADMIN_TOKEN | 管理控制台凭据；`p2wlan-config` 默认生成独立 256-bit 随机值。为空时 `/admin` 与 `/admin/*` 返回 404；手工配置时至少 32 个字符，只用于 `/admin/api/v1/*` 的 Bearer 认证，不能复用 JWT_SECRET 或 Relay 凭据。 |
-| LOG_UPLOAD_DIR | 支持日志保存目录，必须是受保护的持久目录。 |
+| LOG_UPLOAD_DIR | 支持日志保存目录。托管部署显式配置为服务账户可写的绝对持久路径；默认受管理目录为数据目录下的 `log-uploads`，权限 `0700`。升级保留非空自定义值。 |
 | RELAY_CATALOG_JSON | 每项包含唯一 region、audience 和客户端可访问的 tls:// endpoint。 |
 | RELAY_TICKET_SIGNER_KEY_FILE / RELAY_TICKET_SIGNER_KID | 签票私钥和 key id，必须成对配置。 |
 | RELAY_TICKET_TTL | Relay ticket 的短期有效期，不是账号 token 的有效期。 |
 | RELAY_REVOCATION_FEED_TOKEN | Control 与 Relay 之间独立的撤权凭据。 |
+
+未配置或留空 `LOG_UPLOAD_DIR` 时，Control 在 `DB_PATH` 为绝对路径的情况下使用数据库父目录下的 `log-uploads`；`DB_PATH` 缺失或为相对路径时，兼容默认仍为进程工作目录下的 `data/log-uploads`。固定归档的 manager 使用显式绝对路径，避免旧服务缺少工作目录配置时把支持包存到其他位置。该回退不接管不可写目录，也不改变已配置的日志路径。
 
 `CONTROL_ADMIN_TOKEN` 只开启同一 Control origin 下的只读管理台及 Admin API（包括 `/admin/api/v1/connections`、`/admin/api/v1/connection-transitions`、`/admin/api/v1/connection-health` 与 `/admin/api/v1/connection-trends`）。管理页不会把令牌写回响应，也不会把用户 JWT 提升为全局管理员权限；公网访问时仍必须由可信 HTTPS 反向代理保护 Control。`p2wlan-config` 与固定服务端归档的 `p2wlan-server init` 都会为新部署生成独立随机值并只写入私有 `control.env`；早期缺少该项的部署可显式运行 `p2wlan-server setup` 补齐，而不会轮换已有 JWT / Relay / TLS 凭据。删除该变量并重启 Control 即可关闭管理台。
 

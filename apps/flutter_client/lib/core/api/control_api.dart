@@ -366,21 +366,27 @@ class ControlApi {
       final text = await utf8
           .decodeStream(response)
           .timeout(_supportLogUploadTimeout);
+      if (response.statusCode < 200 || response.statusCode >= 300) {
+        String? serverError;
+        try {
+          final decoded = jsonDecode(text);
+          if (decoded is Map && decoded['error'] is String) {
+            serverError = decoded['error'] as String;
+          }
+        } on FormatException {
+          // Proxies may return HTML or an empty body. The HTTP status still
+          // identifies authentication failures without exposing that body.
+        }
+        throw ControlApiException(
+          _zhSupportLogUploadError(serverError, response.statusCode),
+        );
+      }
       final decoded = text.trim().isEmpty
           ? <String, dynamic>{}
           : jsonDecode(text);
       final body = decoded is Map
           ? Map<String, dynamic>.from(decoded)
           : <String, dynamic>{};
-      if (response.statusCode < 200 || response.statusCode >= 300) {
-        throw ControlApiException(
-          _zhAuthError(
-            body['error']?.toString(),
-            response.statusCode,
-            '登录状态已过期，请重新登录后再上传日志',
-          ),
-        );
-      }
       final uploadId = body['upload_id']?.toString().trim() ?? '';
       if (uploadId.isEmpty || body['success'] == false) {
         throw const ControlApiException('控制服务器没有返回日志上传编号');
@@ -665,6 +671,31 @@ class ControlApiException implements Exception {
 
   @override
   String toString() => message;
+}
+
+String _zhSupportLogUploadError(String? message, int statusCode) {
+  if (statusCode == 401) return '登录状态已过期，请重新登录后再上传日志';
+  if (statusCode == 403) return '当前账号没有上传日志的权限，请联系服务器管理员';
+  if (statusCode == 404) return '控制服务器暂不支持日志上传，请先更新服务端';
+  if (statusCode == 413) return '日志文件过大，请缩短本次启动时间后再试';
+  if (statusCode == 429) return '日志上传过于频繁，请稍后再试';
+  final normalized = (message?.trim().toLowerCase() ?? '').replaceAll('_', ' ');
+  if (normalized == 'support log storage failed') {
+    return '控制服务器无法保存日志，请联系管理员检查日志存储权限或剩余空间，修复后再试';
+  }
+  if (normalized.contains('schema version')) {
+    return '控制服务器不支持多房间日志格式(schema v2)，请升级服务端后再试';
+  }
+  if (normalized.contains('manifest') &&
+      normalized.contains('total instances')) {
+    return '日志包实例清单与实际文件不一致，请重试上传';
+  }
+  // Error bodies can contain internal paths, credentials or echoed logs.
+  // Only recognized errors above are translated; unknown text stays private.
+  if (statusCode >= 500) {
+    return '控制服务器暂时无法处理日志上传（HTTP $statusCode），请稍后重试或联系服务器管理员';
+  }
+  return '日志上传失败（HTTP $statusCode），请稍后重试；若持续失败，请联系服务器管理员';
 }
 
 String _zhAuthError(

@@ -204,6 +204,21 @@ fn same_responder_sender_identity(left: Option<&str>, right: Option<&str>) -> bo
     }
 }
 
+/// Scheduling priority never overrides a peer/network lifecycle replacement.
+/// Candidate counters may advance within one remote incarnation; those ordinary
+/// refreshes must still wait for the bounded, already queued rendezvous.
+fn same_candidate_offer_lifecycle(left: &PendingPeerOffer, right: &PendingPeerOffer) -> bool {
+    left.from_node_id == right.from_node_id
+        && same_responder_sender_identity(
+            left.sender_public_key.as_deref(),
+            right.sender_public_key.as_deref(),
+        )
+        && left.network_generation == right.network_generation
+        && left.peer_session_generation == right.peer_session_generation
+        && crate::control::candidate_generation_incarnation(left.candidate_generation)
+            == crate::control::candidate_generation_incarnation(right.candidate_generation)
+}
+
 /// Owner token for one independently polled candidate-offer worker.
 ///
 /// Candidate application may wait on the network epoch, the connection map,
@@ -219,12 +234,16 @@ struct CandidateOfferWorkOwner {
     owner: u64,
     cancellation: tokio::sync::watch::Sender<bool>,
     active_sender_public_key: Option<String>,
+    active_hard_hard_identity: Option<HardHardCandidateActiveIdentity>,
     queued: Option<PendingPeerOffer>,
 }
 
 enum CandidateOfferWorkAdmission {
     Started(CandidateOfferWorkReservation, Box<PendingPeerOffer>),
-    Coalesced,
+    Coalesced {
+        discarded: Option<Box<PendingPeerOffer>>,
+        reason: HardHardCandidateDiscardReason,
+    },
     RejectedIdentity,
     Capacity,
 }
@@ -1265,8 +1284,64 @@ impl PendingHandshakeState {
             if incoming_matches_active && queued_has_different_identity {
                 return CandidateOfferWorkAdmission::RejectedIdentity;
             }
-            worker.queued = Some(offer);
-            return CandidateOfferWorkAdmission::Coalesced;
+            let incoming_hh_identity = HardHardCandidateActiveIdentity::from_offer(&offer);
+            if incoming_matches_active
+                && worker
+                    .active_hard_hard_identity
+                    .as_ref()
+                    .is_some_and(|active| incoming_hh_identity.as_ref() == Some(active))
+            {
+                // A replay cannot replace or queue behind the active original:
+                // doing either would let altered candidates/deadlines restart
+                // this same transcript after the current worker completes.
+                return CandidateOfferWorkAdmission::Coalesced {
+                    discarded: Some(Box::new(offer)),
+                    reason: HardHardCandidateDiscardReason::SameSessionPreserved,
+                };
+            }
+            let now = hard_hard_now_ms();
+            let queued_hh = worker
+                .queued
+                .as_ref()
+                .filter(|queued| same_candidate_offer_lifecycle(queued, &offer))
+                .and_then(|queued| hard_hard_candidate_priority(queued, now));
+            let incoming_hh = hard_hard_candidate_priority(&offer, now);
+            if let Some(queued_hh) = queued_hh.as_ref() {
+                if incoming_hh.is_none() {
+                    // Keep the one queued, unexpired rendezvous. Ordinary
+                    // latest-wins refreshes cannot silently consume its slot.
+                    return CandidateOfferWorkAdmission::Coalesced {
+                        discarded: Some(Box::new(offer)),
+                        reason: HardHardCandidateDiscardReason::OrdinaryCoalesced,
+                    };
+                }
+                if incoming_hh.as_ref().is_some_and(|incoming| {
+                    incoming.token == queued_hh.token
+                        && incoming.role == queued_hh.role
+                        && incoming.v2.as_ref().map(|meta| meta.stage)
+                            == queued_hh.v2.as_ref().map(|meta| meta.stage)
+                }) {
+                    // Never replace an immutable transcript with a same-token
+                    // replay, even if its fields or deadline were changed.
+                    return CandidateOfferWorkAdmission::Coalesced {
+                        discarded: Some(Box::new(offer)),
+                        reason: HardHardCandidateDiscardReason::SameSessionPreserved,
+                    };
+                }
+            }
+            let discarded = worker.queued.replace(offer).map(Box::new);
+            let reason = if discarded.as_deref().is_some_and(|old| {
+                old.session_id
+                    .as_deref()
+                    .and_then(HardHardCoordination::parse)
+                    .is_some()
+                    && hard_hard_candidate_priority(old, now).is_none()
+            }) {
+                HardHardCandidateDiscardReason::Expired
+            } else {
+                HardHardCandidateDiscardReason::Superseded
+            };
+            return CandidateOfferWorkAdmission::Coalesced { discarded, reason };
         }
         if self.candidate_offer_workers.len() >= MAX_CANDIDATE_OFFER_WORKERS {
             return CandidateOfferWorkAdmission::Capacity;
@@ -1276,6 +1351,7 @@ impl PendingHandshakeState {
         let owner = self.next_candidate_offer_worker_id;
         let peer_id = offer.from_node_id.clone();
         let active_sender_public_key = offer.sender_public_key.clone();
+        let active_hard_hard_identity = HardHardCandidateActiveIdentity::from_offer(&offer);
         let (cancellation_tx, cancellation) = tokio::sync::watch::channel(false);
         self.candidate_offer_workers.insert(
             peer_id,
@@ -1283,6 +1359,7 @@ impl PendingHandshakeState {
                 owner,
                 cancellation: cancellation_tx,
                 active_sender_public_key,
+                active_hard_hard_identity,
                 queued: None,
             },
         );
@@ -1306,6 +1383,7 @@ impl PendingHandshakeState {
         }
         if let Some(next) = worker.queued.take() {
             worker.active_sender_public_key = next.sender_public_key.clone();
+            worker.active_hard_hard_identity = HardHardCandidateActiveIdentity::from_offer(&next);
             return Some(next);
         }
         self.candidate_offer_workers.remove(peer_id);
@@ -1323,19 +1401,48 @@ impl PendingHandshakeState {
         }
         let next = worker.queued.take()?;
         worker.active_sender_public_key = next.sender_public_key.clone();
+        worker.active_hard_hard_identity = HardHardCandidateActiveIdentity::from_offer(&next);
         Some(next)
+    }
+
+    /// Before processing an active HH envelope, an ordinary successor must
+    /// wait. `finish_candidate_offer_work` still consumes it after completion.
+    fn take_queued_candidate_offer_work_before_commit(
+        &mut self,
+        peer_id: &str,
+        owner: u64,
+        active: &PendingPeerOffer,
+    ) -> Option<PendingPeerOffer> {
+        if !self.candidate_offer_work_has_priority_successor(peer_id, owner, active) {
+            return None;
+        }
+        self.take_queued_candidate_offer_work(peer_id, owner)
+    }
+
+    fn candidate_offer_work_has_priority_successor(
+        &self,
+        peer_id: &str,
+        owner: u64,
+        active: &PendingPeerOffer,
+    ) -> bool {
+        let now = hard_hard_now_ms();
+        self.candidate_offer_workers
+            .get(peer_id)
+            .is_some_and(|worker| {
+                worker.owner == owner
+                    && !*worker.cancellation.borrow()
+                    && worker.queued.as_ref().is_some_and(|queued| {
+                        !same_candidate_offer_lifecycle(active, queued)
+                            || hard_hard_candidate_priority(active, now).is_none()
+                            || hard_hard_candidate_priority(queued, now).is_some()
+                    })
+            })
     }
 
     fn candidate_offer_work_is_current(&self, peer_id: &str, owner: u64) -> bool {
         self.candidate_offer_workers
             .get(peer_id)
             .is_some_and(|worker| worker.owner == owner && !*worker.cancellation.borrow())
-    }
-
-    fn candidate_offer_work_has_successor(&self, peer_id: &str, owner: u64) -> bool {
-        self.candidate_offer_workers
-            .get(peer_id)
-            .is_some_and(|worker| worker.owner == owner && worker.queued.is_some())
     }
 
     #[cfg(test)]

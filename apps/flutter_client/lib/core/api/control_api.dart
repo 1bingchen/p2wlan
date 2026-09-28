@@ -7,6 +7,7 @@ import 'dart:typed_data';
 import '../build_info.dart';
 import '../diagnostics/session_log_bundle.dart';
 import '../diagnostics/support_log_protocol.dart';
+import '../diagnostics/support_status_summary.dart';
 import '../security/redactor.dart';
 import '../state/settings_store.dart';
 
@@ -292,6 +293,7 @@ class ControlApi {
     required ClientBuildInfo clientBuild,
     required DaemonBuildInfo? daemonBuild,
     required Iterable<SessionLogFile> files,
+    String? mainStatusSummary,
     Iterable<String> omittedRoomProfileIds = const [],
   }) async {
     final token = authToken.trim();
@@ -318,6 +320,7 @@ class ControlApi {
     try {
       compressed = await _prepareSupportLogPayload(
         uploadedAt: DateTime.now().toUtc().toIso8601String(),
+        mainStatusSummary: mainStatusSummary,
         deviceName: deviceName.trim(),
         platform: Platform.operatingSystem,
         clientBuild: {
@@ -366,21 +369,27 @@ class ControlApi {
       final text = await utf8
           .decodeStream(response)
           .timeout(_supportLogUploadTimeout);
+      if (response.statusCode < 200 || response.statusCode >= 300) {
+        String? serverError;
+        try {
+          final decoded = jsonDecode(text);
+          if (decoded is Map && decoded['error'] is String) {
+            serverError = decoded['error'] as String;
+          }
+        } on FormatException {
+          // Proxies may return HTML or an empty body. The HTTP status still
+          // identifies authentication failures without exposing that body.
+        }
+        throw ControlApiException(
+          _zhSupportLogUploadError(serverError, response.statusCode),
+        );
+      }
       final decoded = text.trim().isEmpty
           ? <String, dynamic>{}
           : jsonDecode(text);
       final body = decoded is Map
           ? Map<String, dynamic>.from(decoded)
           : <String, dynamic>{};
-      if (response.statusCode < 200 || response.statusCode >= 300) {
-        throw ControlApiException(
-          _zhAuthError(
-            body['error']?.toString(),
-            response.statusCode,
-            '登录状态已过期，请重新登录后再上传日志',
-          ),
-        );
-      }
       final uploadId = body['upload_id']?.toString().trim() ?? '';
       if (uploadId.isEmpty || body['success'] == false) {
         throw const ControlApiException('控制服务器没有返回日志上传编号');
@@ -484,6 +493,7 @@ class ControlApi {
 
 Future<Uint8List> _prepareSupportLogPayload({
   required String uploadedAt,
+  String? mainStatusSummary,
   required String deviceName,
   required String platform,
   required Map<String, String> clientBuild,
@@ -498,7 +508,9 @@ Future<Uint8List> _prepareSupportLogPayload({
             'name': file['name'] ?? '',
             // This is the only redaction pass. It runs in the worker isolate,
             // so even a busy log cannot monopolize Flutter's UI isolate.
-            'content': redactSensitive(file['content'] ?? ''),
+            'content': (file['name'] ?? '').endsWith('status-summary.json')
+                ? sanitizeSupportStatusSummary(file['content'] ?? '')
+                : redactSensitive(file['content'] ?? ''),
           },
         )
         .toList(growable: false);
@@ -518,7 +530,11 @@ Future<Uint8List> _prepareSupportLogPayload({
         .where((profileId) => !roomProfiles.contains(profileId))
         .toSet();
     final hasRoomLogs = roomProfiles.isNotEmpty;
-    final schemaVersion = hasRoomLogs || omittedProfiles.isNotEmpty ? 2 : 1;
+    final summary = mainStatusSummary == null
+        ? null
+        : sanitizeSupportStatusSummary(mainStatusSummary);
+    final schemaVersion =
+        hasRoomLogs || omittedProfiles.isNotEmpty || summary != null ? 2 : 1;
     final payload = <String, dynamic>{
       'schema_version': schemaVersion,
       'uploaded_at': uploadedAt,
@@ -539,6 +555,15 @@ Future<Uint8List> _prepareSupportLogPayload({
           },
         },
       'files': logFiles,
+      if (summary != null)
+        'instances': [
+          {'instance_type': 'main', 'status_summary': summary},
+          for (final profile in roomProfiles)
+            {
+              'instance_type': 'room',
+              if (profile != 'legacy') 'profile_id': profile,
+            },
+        ],
     };
     final jsonBytes = utf8.encode(jsonEncode(payload));
     if (jsonBytes.length > maxSupportLogExpandedBytes) {
@@ -665,6 +690,31 @@ class ControlApiException implements Exception {
 
   @override
   String toString() => message;
+}
+
+String _zhSupportLogUploadError(String? message, int statusCode) {
+  if (statusCode == 401) return '登录状态已过期，请重新登录后再上传日志';
+  if (statusCode == 403) return '当前账号没有上传日志的权限，请联系服务器管理员';
+  if (statusCode == 404) return '控制服务器暂不支持日志上传，请先更新服务端';
+  if (statusCode == 413) return '日志文件过大，请缩短本次启动时间后再试';
+  if (statusCode == 429) return '日志上传过于频繁，请稍后再试';
+  final normalized = (message?.trim().toLowerCase() ?? '').replaceAll('_', ' ');
+  if (normalized == 'support log storage failed') {
+    return '控制服务器无法保存日志，请联系管理员检查日志存储权限或剩余空间，修复后再试';
+  }
+  if (normalized.contains('schema version')) {
+    return '控制服务器不支持多房间日志格式(schema v2)，请升级服务端后再试';
+  }
+  if (normalized.contains('manifest') &&
+      normalized.contains('total instances')) {
+    return '日志包实例清单与实际文件不一致，请重试上传';
+  }
+  // Error bodies can contain internal paths, credentials or echoed logs.
+  // Only recognized errors above are translated; unknown text stays private.
+  if (statusCode >= 500) {
+    return '控制服务器暂时无法处理日志上传（HTTP $statusCode），请稍后重试或联系服务器管理员';
+  }
+  return '日志上传失败（HTTP $statusCode），请稍后重试；若持续失败，请联系服务器管理员';
 }
 
 String _zhAuthError(

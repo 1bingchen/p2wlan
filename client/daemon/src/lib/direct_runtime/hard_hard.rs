@@ -13,6 +13,7 @@ use crate::udp::{
 
 include!("hard_hard/test_gates.rs");
 include!("hard_hard/coordination.rs");
+include!("hard_hard/diagnostics.rs");
 include!("hard_hard/wire_v2.rs");
 include!("hard_hard/cleanup.rs");
 include!("hard_hard/probe.rs");
@@ -23,3 +24,4 @@ include!("hard_hard/initiator.rs");
 include!("hard_hard/responder.rs");
 include!("hard_hard/tests.rs");
 include!("hard_hard/wire_v2_tests.rs");
+include!("hard_hard/diagnostics_tests.rs");

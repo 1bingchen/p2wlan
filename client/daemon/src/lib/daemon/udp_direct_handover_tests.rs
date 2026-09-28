@@ -8,6 +8,160 @@ async fn bind_test_udp_direct(
     })
 }
 
+#[tokio::test]
+async fn queued_android_edges_are_absorbed_before_the_first_udp_bind() {
+    let daemon = Daemon::new(Config::generate_default("https://ctrl.test", "net1").unwrap());
+    let candidate_guard = daemon.candidate_refresh_lock.lock().await;
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let (network_tx, network_rx) = broadcast::channel(32);
+    let mut context = test_context(&daemon, shutdown_rx);
+    let network_rx = Arc::new(Mutex::new(network_rx));
+    context.android_network_change_rx = Some(network_rx.clone());
+    for generation in [40, 1] {
+        network_tx
+            .send(AndroidNetworkChangeHint {
+                kotlin_network_generation: generation,
+                network_identity_hash: format!("authorized-{generation}"),
+            })
+            .unwrap();
+    }
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let binder_attempts = attempts.clone();
+    let mut publication = daemon.udp_transport_publication.subscribe();
+    let worker = tokio::spawn(run_udp_direct_task_with_binder(
+        context,
+        move |bind, peers| {
+            binder_attempts.fetch_add(1, Ordering::SeqCst);
+            bind_test_udp_direct(bind, peers)
+        },
+    ));
+    timeout(Duration::from_secs(2), publication.changed())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(publication.borrow().is_some());
+    // The original lifecycle receives shutdown while waiting on the real
+    // refresh lock. Any leftover queued edge would win the biased select and
+    // force another bind before shutdown is observed.
+    shutdown_tx.send(true).unwrap();
+    timeout(Duration::from_secs(2), worker)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    assert_eq!(daemon.peers.current_network_generation_sync(), 0);
+    assert!(matches!(
+        network_rx.lock().await.try_recv(),
+        Err(broadcast::error::TryRecvError::Empty)
+    ));
+    drop(candidate_guard);
+}
+
+#[tokio::test]
+async fn network_edge_during_bind_discards_the_unpublished_socket() {
+    let daemon = Daemon::new(Config::generate_default("https://ctrl.test", "net1").unwrap());
+    let candidate_guard = daemon.candidate_refresh_lock.lock().await;
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let (network_tx, network_rx) = broadcast::channel(32);
+    let mut context = test_context(&daemon, shutdown_rx);
+    context.android_network_change_rx = Some(Arc::new(Mutex::new(network_rx)));
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let binder_attempts = attempts.clone();
+    let mut publication = daemon.udp_transport_publication.subscribe();
+    let worker = tokio::spawn(run_udp_direct_task_with_binder(
+        context,
+        move |bind, peers| {
+            let first = binder_attempts.fetch_add(1, Ordering::SeqCst) == 0;
+            let network_tx = network_tx.clone();
+            async move {
+                let binding = bind_test_udp_direct(bind, peers).await?;
+                if first {
+                    network_tx
+                        .send(AndroidNetworkChangeHint {
+                            kotlin_network_generation: 1,
+                            network_identity_hash: "new-network-during-bind".into(),
+                        })
+                        .unwrap();
+                }
+                Ok(binding)
+            }
+        },
+    ));
+    timeout(Duration::from_secs(2), publication.changed())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(publication.borrow().is_some());
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        daemon.peers.current_network_generation_sync(),
+        0,
+        "an unpublished discarded bind must not manufacture a live generation"
+    );
+    shutdown_tx.send(true).unwrap();
+    timeout(Duration::from_secs(2), worker)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    drop(candidate_guard);
+}
+
+#[tokio::test]
+async fn network_hint_cancels_startup_while_profile_commit_is_queued() {
+    let daemon = Daemon::new(Config::generate_default("https://ctrl.test", "net1").unwrap());
+    let binding = bind_test_udp_direct("127.0.0.1:0".parse().unwrap(), daemon.peers.clone())
+        .await
+        .unwrap();
+    let profile_reader = daemon.nat_profile.read().await;
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let (network_tx, network_rx) = broadcast::channel(8);
+    let mut context = test_context(&daemon, shutdown_rx);
+    context.android_network_change_rx = Some(Arc::new(Mutex::new(network_rx)));
+    let observed = context.android_network_change_observed.clone();
+    let mut binding = Some(binding);
+    let mut worker = Box::pin(run_udp_direct_task_with_binder(context, move |_, _| {
+        std::future::ready(
+            binding
+                .take()
+                .ok_or_else(|| DaemonError::Network("no replacement needed".into())),
+        )
+    }));
+    assert!(futures_util::poll!(worker.as_mut()).is_pending());
+    assert!(
+        daemon.nat_profile.try_read().is_err(),
+        "startup must have queued its real profile writer behind the held read lock"
+    );
+    network_tx
+        .send(AndroidNetworkChangeHint {
+            kotlin_network_generation: 2,
+            network_identity_hash: "new-network".into(),
+        })
+        .unwrap();
+    assert!(futures_util::poll!(worker.as_mut()).is_pending());
+    assert_eq!(
+        observed.load(Ordering::Acquire),
+        1,
+        "network cancellation must run without waiting for the startup profile writer"
+    );
+    assert!(
+        daemon.nat_profile.try_read().is_ok(),
+        "cancelled startup must release the queued writer"
+    );
+    shutdown_tx.send(true).unwrap();
+    timeout(Duration::from_secs(2), worker)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(daemon
+        .udp_transport_publication
+        .current_owner()
+        .await
+        .is_none());
+    drop(profile_reader);
+}
+
 #[tokio::test(start_paused = true)]
 async fn route_handover_during_startup_keeps_the_socket_bind_baseline() {
     let daemon = Daemon::new(Config::generate_default("https://ctrl.test", "net1").unwrap());

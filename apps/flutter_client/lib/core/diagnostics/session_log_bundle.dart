@@ -5,6 +5,7 @@ import 'dart:isolate';
 import '../daemon/diagnostics_auth.dart';
 import '../security/redactor.dart';
 import 'support_log_protocol.dart';
+import 'support_status_summary.dart';
 
 // Mobile log uploads must not make the Flutter UI hold several copies of a
 // multi-megabyte, high-volume daemon log while it is being redacted and
@@ -55,7 +56,10 @@ class CurrentSessionLogBundle {
         logDirPath: directory.path,
         activeRoomProfileIds: roomProfileIds,
         dynamicSummaries: summaries,
-        maxBytesPerFile: maxBytesPerFile,
+        maxBytesPerFile: maxBytesPerFile.clamp(
+          1,
+          maxCurrentSessionLogBytesPerFile,
+        ),
       ),
     );
     return CurrentSessionLogBundle(
@@ -93,14 +97,20 @@ class CurrentSessionLogBundle {
       final file = File(normalizedPath);
       if (!await file.exists()) continue;
       final rawContent = await _readCurrentFile(file, maxBytesPerFile);
-      final content = redactFiles ? redactSensitive(rawContent) : rawContent;
+      final content = candidate.name.endsWith('status-summary.json')
+          ? sanitizeSupportStatusSummary(rawContent)
+          : redactFiles
+          ? redactSensitive(rawContent)
+          : rawContent;
       if (content.trim().isEmpty || !seenNames.add(candidate.name)) continue;
       files.add(SessionLogFile(name: candidate.name, content: content));
     }
     for (final file in inlineFiles) {
       final name = file.name.trim();
       if (name.isEmpty || !seenNames.add(name)) continue;
-      final rawContent = _truncateInlineContent(file.content, maxBytesPerFile);
+      final rawContent = name.endsWith('status-summary.json')
+          ? sanitizeSupportStatusSummary(file.content)
+          : _truncateInlineContent(file.content, maxBytesPerFile);
       final content = redactFiles ? redactSensitive(rawContent) : rawContent;
       if (content.trim().isEmpty) continue;
       files.add(SessionLogFile(name: name, content: content));
@@ -202,7 +212,7 @@ Future<String> _readCurrentFile(File file, int maxBytes) async {
   final truncated = length > maxBytes;
   final start = truncated ? length - maxBytes : 0;
   final bytes = <int>[];
-  await for (final chunk in file.openRead(start)) {
+  await for (final chunk in file.openRead(start, length)) {
     bytes.addAll(chunk);
   }
   final decoded = utf8.decode(bytes, allowMalformed: true);

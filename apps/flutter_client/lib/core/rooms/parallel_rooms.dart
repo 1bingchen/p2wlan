@@ -6,6 +6,7 @@ import 'package:flutter/foundation.dart';
 
 import '../daemon/daemon_controller.dart';
 import '../diagnostics/support_log_protocol.dart';
+import '../diagnostics/support_status_summary.dart';
 import '../models/diagnostics_models.dart';
 import 'room_api.dart';
 import 'room_profiles.dart';
@@ -140,7 +141,7 @@ class ParallelRooms extends ChangeNotifier {
   List<String> get allRecentRoomProfileIds =>
       supportLogSelection.retainedProfileIds;
 
-  Map<String, String> exportStatusSummaries() {
+  Map<String, String> exportStatusSummaries({bool supportSafe = false}) {
     final summaries = <String, String>{};
     for (final id in allRecentRoomProfileIds) {
       ParallelRoomSession? active;
@@ -158,6 +159,16 @@ class ParallelRooms extends ChangeNotifier {
             _recentRoomPhases[id] ??
             RoomConnectionPhase.unavailable;
         final message = active?.message ?? _recentRoomMessages[id];
+        if (supportSafe) {
+          summaries[id] = buildSupportStatusSummary(
+            snapshot: snapshot?.raw,
+            source: snapshot == null ? 'unavailable' : 'cached',
+            stale: true,
+            roomPhase: phase.name,
+            errorCode: snapshot == null ? 'room_status_unavailable' : null,
+          );
+          continue;
+        }
         summaries[id] = jsonEncode({
           'network_id': plan.room.id,
           'room_name': plan.room.name,

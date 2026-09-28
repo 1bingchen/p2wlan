@@ -335,7 +335,7 @@ pub(crate) async fn spawn_hard_hard_responder(
         .await;
         return HardHardRemoteStart::NotStarted;
     };
-    let Some((session, recovery_identity)) = claim_hard_hard_responder_session(
+    let (session, recovery_identity) = match claim_hard_hard_responder_session(
         &peers,
         &punch_deduplicator,
         &peer_id,
@@ -345,28 +345,38 @@ pub(crate) async fn spawn_hard_hard_responder(
         punch_at_ms,
     )
     .await
-    else {
-        hard_hard_a0_stage_log(
-            &peers,
-            "responder",
-            Some(&coordination.token),
-            HardHardA0Stage::OwnerAdmission,
-            HardHardA0Reason::ClaimRejected,
-        );
-        let _ = record_hard_hard_pre_session_failure(
-            &peers,
-            &peer_id,
-            peer_session_generation,
-            plan,
-            &coordination.token,
-            "responder",
-            0,
-            None,
-            "candidate_not_executed",
-            "session_claim_rejected",
-        )
-        .await;
-        return HardHardRemoteStart::NotStarted;
+    {
+        Ok(value) => value,
+        Err(failure) => {
+            failure.log(
+                Some(&coordination.token),
+                "responder",
+                plan,
+                peer_session_generation,
+                epoch,
+            );
+            hard_hard_a0_stage_log(
+                &peers,
+                "responder",
+                Some(&coordination.token),
+                HardHardA0Stage::OwnerAdmission,
+                HardHardA0Reason::ClaimRejected,
+            );
+            let _ = record_hard_hard_pre_session_failure(
+                &peers,
+                &peer_id,
+                peer_session_generation,
+                plan,
+                &coordination.token,
+                "responder",
+                0,
+                None,
+                "candidate_not_executed",
+                "session_claim_rejected",
+            )
+            .await;
+            return HardHardRemoteStart::NotStarted;
+        }
     };
     hard_hard_a0_stage_log(
         &peers,

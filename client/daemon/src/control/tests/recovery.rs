@@ -53,7 +53,7 @@ async fn registration_backoff_keeps_network_hint_and_revokes_previous_auth() {
             response_tx,
         })
         .unwrap();
-    commands.send(ControlCommand::NetworkChanged).unwrap();
+    commands.send(network_change_test_command()).unwrap();
     let started = time::Instant::now();
 
     assert!(
@@ -110,7 +110,7 @@ async fn permanent_auth_hints_preserve_original_cooldown_and_fence_late_timing()
         .is_some());
 
     time::advance(Duration::from_secs(59)).await;
-    commands.send(ControlCommand::NetworkChanged).unwrap();
+    commands.send(network_change_test_command()).unwrap();
     assert!(futures_util::poll!(&mut wait).is_pending());
     assert!(harness
         .clock
@@ -127,7 +127,7 @@ async fn permanent_auth_hints_preserve_original_cooldown_and_fence_late_timing()
     assert!(harness.clock.timing_hint(Instant::now(), 7).is_none());
 
     time::advance(Duration::from_millis(500)).await;
-    commands.send(ControlCommand::NetworkChanged).unwrap();
+    commands.send(network_change_test_command()).unwrap();
     commands.send(ControlCommand::PollPeersNow).unwrap();
     assert!(futures_util::poll!(&mut wait).is_pending());
     time::advance(Duration::from_millis(500)).await;

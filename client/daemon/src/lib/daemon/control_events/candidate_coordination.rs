@@ -79,6 +79,18 @@ enum HardHardOfferHandling {
     Started,
 }
 
+impl HardHardOfferHandling {
+    fn diagnostic_label(self) -> &'static str {
+        match self {
+            Self::NotHardHard => "not_hard_hard",
+            Self::Fallback => "fallback_to_generic_punch",
+            Self::Rejected => "hard_hard_rejected",
+            Self::RejectedPreservingSession => "repeat_rejected_owner_preserved",
+            Self::Started => "hard_hard_started_or_already_owned",
+        }
+    }
+}
+
 impl Daemon {
     /// Runs under the existing per-peer candidate owner, before candidate
     /// mutation. Same-token delivery can acknowledge the existing work, but
@@ -149,6 +161,11 @@ impl Daemon {
                 &offer.candidates,
                 offer.punch_at_server_ms,
             );
+        tracing::info!(event = "hard_hard_signal_repeat",
+            session_tag = %hard_hard_anonymized_tag(&coordination.token, "session"),
+            identity_current, fresh_matches, accepted = matches,
+            outcome = if matches { "already_owned" } else { "rejected_owner_preserved" },
+            "Hard-Hard repeated signal checked before candidate mutation");
         self.peers.record_direct_event(
             &offer.from_node_id,
             if matches { "hard_hard_signal_duplicate" } else { "hard_hard_signal_repeat_rejected" },
@@ -215,7 +232,7 @@ impl Daemon {
             if self
                 .pending_handshakes
                 .lock()
-                .candidate_offer_work_has_successor(peer_id, reservation.owner)
+                .candidate_offer_work_has_priority_successor(peer_id, reservation.owner, offer)
             {
                 return true;
             }
@@ -255,7 +272,8 @@ impl Daemon {
                     None,
                     Some("profile_metadata_pending"),
                     Some(format!(
-                        "peer={peer_id} declared_generation={} observed_generation={observed:?}",
+                        "session_tag={} declared_generation={} observed_generation={observed:?}",
+                        hard_hard_anonymized_tag(&coordination.token, "session"),
                         coordination.local_profile_generation,
                     )),
                 );
@@ -581,7 +599,7 @@ impl Daemon {
         candidate_apply_result: CandidateSetApplyResult,
         fresh_punch: FreshPunchDecision,
         reservation: &mut CandidateOfferWorkReservation,
-    ) {
+    ) -> HardHardOfferHandling {
         let hard_hard_handling =
             if let Some(repeated) = self.handle_hard_hard_repeated_signal(offer).await {
                 repeated
@@ -608,7 +626,7 @@ impl Daemon {
         if self.peers.hard_hard_experiment_only()
             && hard_hard_handling != HardHardOfferHandling::NotHardHard
         {
-            return;
+            return hard_hard_handling;
         }
         if matches!(
             hard_hard_handling,
@@ -616,7 +634,7 @@ impl Daemon {
                 | HardHardOfferHandling::RejectedPreservingSession
                 | HardHardOfferHandling::Started
         ) {
-            return;
+            return hard_hard_handling;
         }
         match fresh_punch {
             FreshPunchDecision::Fresh(id, frozen_targets) => {
@@ -630,7 +648,7 @@ impl Daemon {
                     )
                     .await
                 {
-                    return;
+                    return hard_hard_handling;
                 }
                 // C=0 (mutual-APD): when we also hold a fresh local mapping,
                 // knock back from OUR fresh source at the SAME canonical
@@ -671,6 +689,7 @@ impl Daemon {
                 }
             }
         }
+        hard_hard_handling
     }
 
     #[cfg(test)]

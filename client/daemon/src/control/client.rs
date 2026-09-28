@@ -264,6 +264,7 @@ impl ControlClient {
         let (critical_auth_tx, critical_auth_rx) = watch::channel(None);
         let event_loop_ready = Arc::new(AtomicBool::new(false));
         let server_clock = Arc::new(ServerClockEstimate::default());
+        let network_changes = Arc::new(ControlNetworkChanges::default());
 
         let state = Arc::new(RwLock::new(ClientState {
             server_clock: server_clock.clone(),
@@ -294,6 +295,7 @@ impl ControlClient {
             event_loop_ready: event_loop_ready.clone(),
             event_tx: event_tx.clone(),
             cmd_tx: cmd_tx.clone(),
+            network_changes: network_changes.clone(),
             critical_offer_tx,
             critical_answer_tx,
             critical_ctrl_tx,
@@ -374,6 +376,7 @@ impl ControlClient {
                     event_loop_ready,
                     telemetry_hub,
                     server_clock,
+                    network_changes,
                 )
                 .await;
             };
@@ -453,6 +456,7 @@ impl ControlClient {
             event_loop_ready: Arc::new(AtomicBool::new(false)),
             event_tx,
             cmd_tx,
+            network_changes: Arc::new(ControlNetworkChanges::default()),
             critical_offer_tx,
             critical_answer_tx,
             critical_ctrl_tx,
@@ -1084,9 +1088,13 @@ impl ControlClient {
     /// changed. The loop rebuilds its pooled HTTP clients and reconnects the
     /// optional signaling WebSocket through its normal registration path.
     #[cfg_attr(not(target_os = "android"), allow(dead_code))]
-    pub(crate) fn network_changed(&self) {
+    pub(crate) fn network_changed(&self, hint: crate::AndroidNetworkChangeHint) {
         self.invalidate_network_timing();
-        let _ = self.cmd_tx.send(ControlCommand::NetworkChanged);
+        if self.network_changes.observe(hint) {
+            let _ = self
+                .cmd_tx
+                .send(ControlCommand::NetworkChanged(self.network_changes.clone()));
+        }
     }
 
     /// Shutdown the control client without waiting behind ordinary HTTP work.

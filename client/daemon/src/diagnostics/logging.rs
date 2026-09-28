@@ -373,7 +373,7 @@ fn open_private_log(path: &Path) -> io::Result<File> {
         use std::os::unix::fs::OpenOptionsExt;
         options
             .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
     }
     #[cfg(windows)]
     {
@@ -400,7 +400,13 @@ fn open_private_log(path: &Path) -> io::Result<File> {
     }
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        if metadata.nlink() != 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "log path has unexpected hard links",
+            ));
+        }
         file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
     }
     file.seek(SeekFrom::End(0))?;
@@ -706,6 +712,28 @@ mod tests {
         symlink(&target, &path).unwrap();
         assert!(bounded_file_writer(&path).is_err());
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "keep me");
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hard_link_log_paths_are_rejected_before_chmod_or_trimming() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let path = temp_log();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let target = path.with_file_name("unrelated");
+        std::fs::write(&target, "keep this entire content").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o640)).unwrap();
+        std::fs::hard_link(&target, &path).unwrap();
+        assert!(RollingFile::open(&path, 4, 1).is_err());
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "keep this entire content"
+        );
+        let metadata = std::fs::metadata(&target).unwrap();
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o640);
+        assert_eq!(metadata.nlink(), 2);
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 }

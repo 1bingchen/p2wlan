@@ -95,6 +95,7 @@ func TestProductionDeviceControlRoutesFenceRegistrationSession(t *testing.T) {
 	assertConflict(request(http.MethodPost, "/api/v1/signals", `{"to_node_id":"`+peer.ID+`","type":"peer_reflexive","candidates":["203.0.113.44:51820"]}`, ""))
 	assertConflict(request(http.MethodGet, "/api/v1/signals", "", ""))
 	assertConflict(request(http.MethodPost, "/api/v1/signals/ack", `{"signals":[]}`, ""))
+	assertConflict(request(http.MethodPost, "/api/v1/signals/release", `{"signals":[]}`, ""))
 	assertConflict(request(http.MethodPost, "/api/v1/relay/tickets", `{"audience":"not-reached"}`, ""))
 
 	currentSeq := strconv.FormatInt(device.RegistrationSeq, 10)

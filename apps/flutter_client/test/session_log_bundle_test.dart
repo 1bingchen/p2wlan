@@ -144,8 +144,9 @@ void main() {
     final collectedSummary = bundle.files.firstWhere(
       (f) => f.name.endsWith('.json'),
     );
-    expect(collectedSummary.content, contains('<redacted>'));
+    expect(jsonDecode(collectedSummary.content)['support_summary_version'], 1);
     expect(collectedSummary.content, isNot(contains('auth-secret')));
+    expect(collectedSummary.content, isNot(contains('room-1')));
   });
 
   test(

@@ -67,6 +67,20 @@ fn control_event_kind(event: &control::ControlEvent) -> &'static str {
     }
 }
 
+fn log_control_event_phase(kind: &'static str, phase: &'static str) {
+    if kind == "control_healthy" {
+        debug!(
+            event = "control_event_phase",
+            phase, kind, "control_event_phase phase={} kind={}", phase, kind
+        );
+    } else {
+        info!(
+            event = "control_event_phase",
+            phase, kind, "control_event_phase phase={} kind={}", phase, kind
+        );
+    }
+}
+
 impl Daemon {
     async fn run_control_event_loop(
         &mut self,
@@ -203,13 +217,7 @@ impl Daemon {
                             event => (event, None, None),
                         };
                         let event_kind = control_event_kind(&event);
-                        info!(
-                            event = "control_event_phase",
-                            phase = "dequeued",
-                            kind = event_kind,
-                            "control_event_phase phase=dequeued kind={}",
-                            event_kind
-                        );
+                        log_control_event_phase(event_kind, "dequeued");
                         if let Some((signal_id, signal_seq, signal_type)) = signal_context.as_ref() {
                             info!(
                                 "Control signal phase=dequeued id={} type={} seq={:?} network_generation={}",
@@ -222,13 +230,7 @@ impl Daemon {
                         if let Some(receipt) = signal_delivery_receipt.as_ref() {
                             receipt.record_phase("dequeued", "control_event_loop");
                         }
-                        info!(
-                            event = "control_event_phase",
-                            phase = "dispatch_started",
-                            kind = event_kind,
-                            "control_event_phase phase=dispatch_started kind={}",
-                            event_kind
-                        );
+                        log_control_event_phase(event_kind, "dispatch_started");
                         match event {
                     ControlEvent::Registered {
                         node_id,
@@ -1103,7 +1105,9 @@ impl Daemon {
                                 }));
                                 control::SignalApplyOutcome::Applied
                             }
-                            CandidateOfferWorkAdmission::Coalesced => {
+                            CandidateOfferWorkAdmission::Coalesced { discarded, reason } => {
+                                // Admission returned after dropping the pending ledger guard.
+                                hard_hard_candidate_discarded(discarded.as_deref(), reason);
                                 self.timeline.emit(
                                     "peer_offer_candidate_work_coalesced",
                                     None,

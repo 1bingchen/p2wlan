@@ -19,6 +19,7 @@ struct AppliedSignalAck {
 #[allow(clippy::too_many_arguments)]
 fn spawn_signal_application_lane(
     http: reqwest::Client,
+    release_http: RouteAwareControlHttpClient,
     base_url: String,
     token: String,
     self_node_id: String,
@@ -28,6 +29,10 @@ fn spawn_signal_application_lane(
     deliveries: Vec<LeasedSignalDelivery>,
 ) {
     tokio::spawn(async move {
+        let leased: Vec<_> = deliveries
+            .iter()
+            .map(|delivery| delivery.ack.clone())
+            .collect();
         let (ack_tx, ack_rx) = mpsc::channel(SIGNAL_ACK_PIPELINE_CAPACITY);
         tokio::join!(
             apply_signal_batch(
@@ -39,11 +44,13 @@ fn spawn_signal_application_lane(
             ),
             acknowledge_signal_batch(
                 &http,
+                &release_http,
                 &base_url,
                 &token,
                 &self_node_id,
                 ack_registration,
                 ack_rx,
+                &leased,
             ),
         );
     });
@@ -253,15 +260,31 @@ async fn apply_signal_batch(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn acknowledge_signal_batch(
     http: &reqwest::Client,
+    release_http: &RouteAwareControlHttpClient,
     base_url: &str,
     token: &str,
     self_node_id: &str,
     mut registration: SignalAckRegistration,
     mut acknowledgements: mpsc::Receiver<AppliedSignalAck>,
+    leased: &[SignalAckRequest],
 ) {
-    while let Some(applied) = acknowledgements.recv().await {
+    loop {
+        if registration.ensure_current().is_err() {
+            acknowledgements.close();
+            release_revoked_signal_leases(release_http, registration, leased).await;
+            return;
+        }
+        let applied = tokio::select! {
+            biased;
+            _ = registration.current.changed() => { continue; }
+            applied = acknowledgements.recv() => {
+                let Some(applied) = applied else { return; };
+                applied
+            }
+        };
         if let Err(error) = ack_signals_with_retry(
             http,
             base_url,
@@ -280,7 +303,11 @@ async fn acknowledge_signal_batch(
             // Closing the only receiver also stops the application producer
             // at its next boundary. The original per-row application timeout
             // still bounds an event already handed to the daemon owner.
-            break;
+            acknowledgements.close();
+            if registration.ensure_current().is_err() {
+                release_revoked_signal_leases(release_http, registration, leased).await;
+            }
+            return;
         }
         info!(
             "Control signal phase=acked id={} from={} type={} seq={:?}",

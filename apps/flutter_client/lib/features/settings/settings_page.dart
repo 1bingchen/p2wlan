@@ -15,6 +15,7 @@ import '../../core/api/diagnostics_api.dart';
 import '../../core/build_info.dart';
 import '../../core/capabilities/platform_capabilities.dart';
 import '../../core/diagnostics/session_log_bundle.dart';
+import '../../core/diagnostics/support_status_capture.dart';
 import '../../core/models/diagnostics_models.dart';
 import '../../core/platform/windows_startup_registration.dart';
 import '../../core/state/settings_store.dart';

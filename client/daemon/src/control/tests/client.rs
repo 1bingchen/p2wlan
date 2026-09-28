@@ -395,6 +395,12 @@ async fn poll_signals_skips_bad_handshake_without_dropping_healthy_signals() {
         &Arc::new(tokio::sync::Mutex::new(SignalDeliveryTracker::default())),
         &server_clock,
         registration.subscribe(),
+        &route_aware_control_http_clients(
+            ControlProxyMode::Direct,
+            &format!("http://{address}"),
+            None,
+        )
+        .0,
     )
     .await;
     assert!(
@@ -521,6 +527,12 @@ async fn poll_signals_ack_mode_applies_then_acks_and_dedupes_redelivery() {
         &dedup,
         &server_clock,
         registration.subscribe(),
+        &route_aware_control_http_clients(
+            ControlProxyMode::Direct,
+            &format!("http://{address}"),
+            None,
+        )
+        .0,
     )
     .await;
     assert!(result.is_ok(), "first poll must succeed: {result:?}");
@@ -554,6 +566,12 @@ async fn poll_signals_ack_mode_applies_then_acks_and_dedupes_redelivery() {
         &dedup,
         &server_clock,
         registration.subscribe(),
+        &route_aware_control_http_clients(
+            ControlProxyMode::Direct,
+            &format!("http://{address}"),
+            None,
+        )
+        .0,
     )
     .await;
     assert!(
@@ -596,6 +614,12 @@ async fn poll_signals_ack_mode_applies_then_acks_and_dedupes_redelivery() {
         &dedup,
         &server_clock,
         registration.subscribe(),
+        &route_aware_control_http_clients(
+            ControlProxyMode::Direct,
+            &format!("http://{address}"),
+            None,
+        )
+        .0,
     )
     .await;
     assert!(result.is_ok(), "third poll must succeed: {result:?}");

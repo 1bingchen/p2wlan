@@ -103,6 +103,8 @@ pub struct AndroidNetworkChangeHint {
 /// duplicating the Kotlin callback state.
 pub type AndroidNetworkChangeReceiver = Arc<Mutex<broadcast::Receiver<AndroidNetworkChangeHint>>>;
 
+mod android_network_change;
+
 use acl::AclEngine;
 use candidate_refresh::{
     add_peer_reflexive_candidate_to_set, advertised_udp_endpoint, candidate_endpoints_from_report,

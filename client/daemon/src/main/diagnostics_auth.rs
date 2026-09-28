@@ -59,6 +59,8 @@ fn capture_diagnostics_auth_owner(dir: &AuthPath) -> std::io::Result<Option<Diag
 struct DiagnosticsDiscoveryLock {
     path: AuthPathBuf,
     file: auth_fs::File,
+    #[cfg(unix)]
+    directory: auth_fs::File,
 }
 
 impl DiagnosticsDiscoveryLock {
@@ -68,15 +70,20 @@ impl DiagnosticsDiscoveryLock {
         diagnostics_client_sid: Option<&str>,
     ) -> std::io::Result<Self> {
         let path = dir.join("p2wlan-daemon.diag-auth.lock");
+        #[cfg(unix)]
+        let directory = open_auth_directory(dir, false)?;
+        #[cfg(unix)]
+        validate_auth_directory_owner(&directory, owner)?;
+        #[cfg(not(unix))]
         let mut options = auth_fs::OpenOptions::new();
+        #[cfg(not(unix))]
         options.read(true).write(true).create(true).truncate(false);
         #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options
-                .mode(0o600)
-                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
-        }
+        let file = open_auth_file_at(
+            &directory,
+            c"p2wlan-daemon.diag-auth.lock",
+            libc::O_RDWR | libc::O_CREAT,
+        )?;
         #[cfg(windows)]
         {
             use std::os::windows::fs::OpenOptionsExt;
@@ -84,6 +91,7 @@ impl DiagnosticsDiscoveryLock {
             // process to open it and receive the explicit lock conflict.
             options.share_mode(0x00000001 | 0x00000002);
         }
+        #[cfg(not(unix))]
         let file = options.open(&path)?;
         if !file.metadata()?.is_file() {
             return Err(std::io::Error::new(
@@ -107,7 +115,12 @@ impl DiagnosticsDiscoveryLock {
                 format!("diagnostics discovery directory already owned or unavailable: {error}"),
             )
         })?;
-        let lock = Self { path, file };
+        let lock = Self {
+            path,
+            file,
+            #[cfg(unix)]
+            directory,
+        };
         if !lock.is_current() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::WouldBlock,
@@ -116,7 +129,10 @@ impl DiagnosticsDiscoveryLock {
         }
         // A failed contender must not change the active publisher's ACL/owner.
         #[cfg(unix)]
-        restrict_auth_file(&lock.file, owner)?;
+        {
+            restrict_auth_directory(&lock.directory, owner)?;
+            restrict_auth_file(&lock.file, owner)?;
+        }
         #[cfg(windows)]
         restrict_auth_file(&lock.path, diagnostics_client_sid)?;
         #[cfg(unix)]
@@ -130,20 +146,73 @@ impl DiagnosticsDiscoveryLock {
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt;
-            let Ok(current) = auth_fs::symlink_metadata(&self.path) else {
+            let Some(dir) = self.path.parent() else {
                 return false;
             };
-            self.file.metadata().is_ok_and(|held| {
-                current.is_file()
-                    && current.nlink() == 1
-                    && current.dev() == held.dev()
-                    && current.ino() == held.ino()
-            })
+            let Ok(current_directory) = open_auth_directory(dir, false) else {
+                return false;
+            };
+            let (Ok(current_dir), Ok(held_dir)) =
+                (current_directory.metadata(), self.directory.metadata())
+            else {
+                return false;
+            };
+            if current_dir.dev() != held_dir.dev() || current_dir.ino() != held_dir.ino() {
+                return false;
+            }
+            let Ok(current) = open_auth_file_at(
+                &self.directory,
+                c"p2wlan-daemon.diag-auth.lock",
+                libc::O_RDONLY,
+            ) else {
+                return false;
+            };
+            let (Ok(current), Ok(held)) = (current.metadata(), self.file.metadata()) else {
+                return false;
+            };
+            current.is_file()
+                && current.nlink() == 1
+                && current.dev() == held.dev()
+                && current.ino() == held.ino()
         }
         #[cfg(not(unix))]
         {
             // Windows denies delete sharing for this held file handle.
             self.file.metadata().is_ok() && self.path.is_file()
+        }
+    }
+
+    fn auth_matches(&self, token: &str) -> bool {
+        #[cfg(unix)]
+        {
+            open_auth_file_at(&self.directory, c"p2wlan-daemon.diag-auth", libc::O_RDONLY)
+                .is_ok_and(|file| auth_file_contents_match(file, token))
+        }
+        #[cfg(not(unix))]
+        {
+            auth_file_matches(&self.path.with_file_name("p2wlan-daemon.diag-auth"), token)
+        }
+    }
+
+    fn remove_auth_file(&self) -> std::io::Result<()> {
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            if unsafe {
+                libc::unlinkat(
+                    self.directory.as_raw_fd(),
+                    c"p2wlan-daemon.diag-auth".as_ptr(),
+                    0,
+                )
+            } != 0
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        }
+        #[cfg(not(unix))]
+        {
+            auth_fs::remove_file(self.path.with_file_name("p2wlan-daemon.diag-auth"))
         }
     }
 
@@ -153,9 +222,18 @@ impl DiagnosticsDiscoveryLock {
         diagnostics_client_sid: Option<&str>,
     ) -> std::io::Result<()> {
         if self.is_current() {
+            #[cfg(unix)]
+            validate_auth_directory_owner(&self.directory, owner)?;
             return Ok(());
         }
         let dir = self.path.parent().unwrap_or_else(|| AuthPath::new("."));
+        #[cfg(unix)]
+        {
+            // Recreate only the exact leaf. Missing or redirected ancestors
+            // require a fresh launcher preparation, never a recursive repair.
+            open_auth_directory(dir, true)?;
+        }
+        #[cfg(not(unix))]
         auth_fs::create_dir_all(dir)?;
         // External cleanup may unlink the whole directory. The old inode's
         // lock grants no authority over a recreated directory: reacquire the
@@ -163,6 +241,121 @@ impl DiagnosticsDiscoveryLock {
         *self = Self::acquire(dir, owner, diagnostics_client_sid)?;
         Ok(())
     }
+}
+
+#[cfg(unix)]
+fn auth_component_name(value: &std::ffi::OsStr) -> std::io::Result<std::ffi::CString> {
+    use std::os::unix::ffi::OsStrExt;
+    std::ffi::CString::new(value.as_bytes()).map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid diagnostics path")
+    })
+}
+
+#[cfg(unix)]
+fn open_auth_file_at(
+    directory: &auth_fs::File,
+    name: &std::ffi::CStr,
+    flags: libc::c_int,
+) -> std::io::Result<auth_fs::File> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    let fd = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            flags | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+            0o600 as libc::c_uint,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // openat returned an owned descriptor; File closes it on every exit path.
+    Ok(unsafe { auth_fs::File::from_raw_fd(fd) })
+}
+
+#[cfg(unix)]
+fn open_auth_directory(dir: &AuthPath, create_leaf: bool) -> std::io::Result<auth_fs::File> {
+    use std::os::fd::AsRawFd;
+    use std::path::Component;
+    if !dir.is_absolute() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "diagnostics repair requires its canonical absolute directory",
+        ));
+    }
+    let mut directory = auth_fs::File::open("/")?;
+    let mut parts = dir.components().peekable();
+    while let Some(part) = parts.next() {
+        let name = match part {
+            Component::RootDir => continue,
+            Component::Normal(name) => auth_component_name(name)?,
+            _ => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "diagnostics directory is not canonical",
+                ));
+            }
+        };
+        let opened = open_auth_file_at(&directory, &name, libc::O_RDONLY | libc::O_DIRECTORY);
+        directory = match opened {
+            Ok(opened) => opened,
+            Err(error)
+                if create_leaf
+                    && parts.peek().is_none()
+                    && error.kind() == std::io::ErrorKind::NotFound =>
+            {
+                let result = unsafe {
+                    libc::mkdirat(directory.as_raw_fd(), name.as_ptr(), 0o700 as libc::mode_t)
+                };
+                if result != 0 {
+                    let error = std::io::Error::last_os_error();
+                    if error.kind() != std::io::ErrorKind::AlreadyExists {
+                        return Err(error);
+                    }
+                }
+                open_auth_file_at(&directory, &name, libc::O_RDONLY | libc::O_DIRECTORY)?
+            }
+            Err(error) => return Err(error),
+        };
+    }
+    Ok(directory)
+}
+
+#[cfg(unix)]
+fn validate_auth_directory_owner(
+    directory: &auth_fs::File,
+    owner: Option<DiagnosticsAuthOwner>,
+) -> std::io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let current = directory.metadata()?;
+    let euid = unsafe { libc::geteuid() };
+    let expected_uid = owner.map_or(euid, |owner| owner.uid);
+    if !current.is_dir() || (current.uid() != expected_uid && current.uid() != euid) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "diagnostics directory belongs to a different user",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn restrict_auth_directory(
+    directory: &auth_fs::File,
+    owner: Option<DiagnosticsAuthOwner>,
+) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    validate_auth_directory_owner(directory, owner)?;
+    if let Some(owner) = owner {
+        let current = directory.metadata()?;
+        if (current.uid(), current.gid()) != (owner.uid, owner.gid)
+            && unsafe { libc::fchown(directory.as_raw_fd(), owner.uid, owner.gid) } != 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    directory.set_permissions(auth_fs::Permissions::from_mode(0o700))
 }
 
 impl DiagnosticsAuthGuard {
@@ -207,7 +400,13 @@ impl DiagnosticsAuthGuard {
         rand::thread_rng().fill_bytes(&mut bytes);
         let token = Zeroizing::new(hex::encode(bytes));
         let path = dir.join("p2wlan-daemon.diag-auth");
-        let result = publish_auth_file(&path, token.as_str(), owner, diagnostics_client_sid);
+        let result = publish_auth_file(
+            &discovery_lock,
+            &path,
+            token.as_str(),
+            owner,
+            diagnostics_client_sid,
+        );
 
         if let Err(error) = result {
             return Err(DaemonError::Config(format!(
@@ -248,15 +447,19 @@ impl Drop for DiagnosticsAuthGuard {
             Ok(lock) => lock,
             Err(poisoned) => poisoned.into_inner(),
         };
-        let owns_current_file = repair_lock.as_ref().is_some_and(|lock| lock.is_current())
-            && auth_file_matches(&self.path, self.token.as_str());
+        let owns_current_file = repair_lock
+            .as_ref()
+            .is_some_and(|lock| lock.is_current() && lock.auth_matches(self.token.as_str()));
         if !owns_current_file {
             // Never reacquire a missing lock merely to remove a successor's
             // discovery file. The aborted task also observes this empty slot.
             repair_lock.take();
             return;
         }
-        match auth_fs::remove_file(&self.path) {
+        let Some(lock) = repair_lock.as_ref() else {
+            return;
+        };
+        match lock.remove_auth_file() {
             Ok(()) => info!(
                 "Removed diagnostics auth token file {}",
                 self.path.display()
@@ -275,14 +478,26 @@ impl Drop for DiagnosticsAuthGuard {
 /// permissions/ACLs used at daemon startup. This is deliberately a helper so
 /// the startup path and the live repair path cannot drift apart.
 fn publish_auth_file(
+    discovery_lock: &DiagnosticsDiscoveryLock,
     path: &AuthPath,
     token: &str,
     owner: Option<DiagnosticsAuthOwner>,
     diagnostics_client_sid: Option<&str>,
 ) -> std::io::Result<()> {
+    if path
+        != discovery_lock
+            .path
+            .with_file_name("p2wlan-daemon.diag-auth")
+        || !discovery_lock.is_current()
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            "diagnostics discovery ownership changed before publication",
+        ));
+    }
+    #[cfg(unix)]
+    validate_auth_directory_owner(&discovery_lock.directory, owner)?;
     let dir = path.parent().unwrap_or_else(|| AuthPath::new("."));
-    auth_fs::create_dir_all(dir)?;
-
     let mut temp_bytes = [0u8; 12];
     rand::thread_rng().fill_bytes(&mut temp_bytes);
     let temp_path = dir.join(format!(
@@ -290,15 +505,22 @@ fn publish_auth_file(
         hex::encode(temp_bytes)
     ));
 
+    #[cfg(unix)]
+    let temp_name = auth_component_name(temp_path.file_name().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "missing auth file name")
+    })?)?;
     let result = (|| -> std::io::Result<()> {
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).create_new(true);
         #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let mut file = options.open(&temp_path)?;
+        let mut file = open_auth_file_at(
+            &discovery_lock.directory,
+            &temp_name,
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
+        )?;
+        #[cfg(not(unix))]
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)?;
         file.write_all(token.as_bytes())?;
         file.flush()?;
         #[cfg(unix)]
@@ -317,6 +539,31 @@ fn publish_auth_file(
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error),
         }
+        if !discovery_lock.is_current() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "diagnostics discovery ownership changed during publication",
+            ));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            let fd = discovery_lock.directory.as_raw_fd();
+            // Both names are relative to the held directory, so replacement
+            // of an ancestor cannot redirect this write into a successor.
+            if unsafe {
+                libc::renameat(
+                    fd,
+                    temp_name.as_ptr(),
+                    fd,
+                    c"p2wlan-daemon.diag-auth".as_ptr(),
+                )
+            } != 0
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+        }
+        #[cfg(not(unix))]
         auth_fs::rename(&temp_path, path)?;
         #[cfg(windows)]
         if let Err(error) = restrict_auth_file(path, diagnostics_client_sid) {
@@ -324,11 +571,20 @@ fn publish_auth_file(
             return Err(error);
         }
         #[cfg(unix)]
-        std::fs::File::open(dir)?.sync_all()?;
+        discovery_lock.directory.sync_all()?;
         Ok(())
     })();
 
     if result.is_err() {
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            // The random temporary name belongs to this publication only.
+            unsafe {
+                libc::unlinkat(discovery_lock.directory.as_raw_fd(), temp_name.as_ptr(), 0);
+            }
+        }
+        #[cfg(not(unix))]
         let _ = auth_fs::remove_file(&temp_path);
     }
     #[cfg(unix)]
@@ -338,9 +594,8 @@ fn publish_auth_file(
     result
 }
 
+#[cfg(any(test, not(unix)))]
 fn auth_file_matches(path: &AuthPath, token: &str) -> bool {
-    use std::io::Read;
-    const MAX_AUTH_FILE_BYTES: u64 = 4096;
     let mut options = auth_fs::OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
@@ -356,6 +611,12 @@ fn auth_file_matches(path: &AuthPath, token: &str) -> bool {
     let Ok(file) = options.open(path) else {
         return false;
     };
+    auth_file_contents_match(file, token)
+}
+
+fn auth_file_contents_match(file: auth_fs::File, token: &str) -> bool {
+    use std::io::Read;
+    const MAX_AUTH_FILE_BYTES: u64 = 4096;
     let Ok(metadata) = file.metadata() else {
         return false;
     };
@@ -397,10 +658,10 @@ fn repair_auth_file_if_needed(
         return Ok(DiagnosticsAuthRepair::Closed);
     };
     discovery_lock.ensure_current(owner, diagnostics_client_sid)?;
-    if auth_file_matches(path, token) {
+    if discovery_lock.auth_matches(token) {
         return Ok(DiagnosticsAuthRepair::Unchanged);
     }
-    publish_auth_file(path, token, owner, diagnostics_client_sid)?;
+    publish_auth_file(discovery_lock, path, token, owner, diagnostics_client_sid)?;
     Ok(DiagnosticsAuthRepair::Repaired)
 }
 

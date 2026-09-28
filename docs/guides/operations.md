@@ -9,7 +9,7 @@
     sudo p2wlan-server check --service all
     sudo p2wlan-server doctor --service all
 
-Control 的 /health 只表示进程可响应；Relay 的 /readyz 还要求撤权 feed 已同步并在有效时间内。`check` 用于服务级健康判定；`doctor` 额外检查发布包、systemd、Admin 凭据、SQLite、Relay TLS、备份和数据盘空间，并把非致命项标成 warning。两者都不能证明真实公网入口、TUN 或应用业务已经端到端可达。
+Control 的 /health 只表示进程可响应；Relay 的 /readyz 还要求撤权 feed 已同步并在有效时间内。`check` 用于服务级健康判定；`doctor` 额外检查发布包、systemd、Admin 凭据、支持日志配置与主机目录权限、SQLite、Relay TLS、备份和数据盘空间，并把非致命项标成 warning。两者都不能证明真实公网入口、TUN 或应用业务已经端到端可达。
 
 ## 管理控制台
 
@@ -85,6 +85,8 @@ Needs attention 列表逐条显示服务端返回的固定 signal 和阈值相�
     sudo p2wlan-server logs --service relay
 
 日志轮转、访问权限和保留期限由部署者配置。证书续期必须更新实际挂载文件并重载或重启 Relay，再用 TLS 客户端验证证书链和 endpoint；ACME 客户端报告成功不等于 Relay 已加载新证书。
+
+支持包上传失败时，先运行 `doctor --service control`。缺少 `LOG_UPLOAD_DIR`、相对路径、目录不可访问、只读文件系统或目录未保持服务账户私有权限会报告失败，即使 `/health` 返回 200。doctor 不修改自定义目录、不打印配置内容，也不代替运行中服务的 systemd/Docker 挂载检查、磁盘配额检查或实际授权上传；不要用放宽整个数据目录权限的方式绕过失败。
 
 密钥轮换分别处理 JWT、管理控制台令牌、Relay 票据签名 key、撤权 feed token 和 TLS 私钥。只有实现明确支持重叠验证时，才可承诺无中断轮换。
 

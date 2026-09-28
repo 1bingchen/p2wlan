@@ -54,9 +54,11 @@ jobs:
         run: python3 scripts/quality/run_rust_tests.py hard_hard_ --each
       - name: Linux route gate tests
         run: "python3 scripts/quality/run_rust_tests.py route::tests::"
-      - name: Diagnostics credential owner regression (privileged Linux)
-        # Build as the runner; elevate only the exact ignored test selected
-        # from this Cargo invocation, with a mandatory non-empty result gate.
+      - name: Daemon ownership regressions (privileged Linux)
+        # Build bin/lib tests as the runner and enumerate all three fixed ignored
+        # cases. Elevate each exact selector from this Cargo invocation separately;
+        # credential repair, runtime preparation, and config ownership must each
+        # execute exactly once, with no empty selection or ignored result accepted.
         timeout-minutes: 20
         run: python3 scripts/quality/run_diagnostics_owner_test.py
       - name: Rust Linux Target Cross-Compile Check

@@ -8,7 +8,8 @@ part of '../daemon_controller.dart';
 bool isP2wlanDaemonRuntimeCommandLine(String command) {
   final normalized = command.trim();
   if (!normalized.contains(DaemonController.daemonBinaryName)) return false;
-  return !RegExp(r'(^|\s)--build-info(?:\s|$)').hasMatch(normalized);
+  return !RegExp(r'(^|\s)--(?:build-info|prepare-runtime-directory)(?:\s|=|$)')
+      .hasMatch(normalized);
 }
 
 /// The OS-returned launch PID and the authenticated diagnostics PID are the

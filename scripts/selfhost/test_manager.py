@@ -4,6 +4,8 @@ import subprocess
 import tempfile
 import unittest
 
+from test_support_log_storage import SupportLogStorageTests
+
 ROOT = Path(__file__).resolve().parents[2]
 
 
@@ -26,6 +28,9 @@ class ManagerHealthTests(unittest.TestCase):
         self.executable(release / 'p2wlan-db', '#!/bin/sh\n[ "$1" = --verify ]\n')
         self.executable(self.bin / 'systemctl', '#!/bin/sh\nexit 0\n')
         self.executable(self.bin / 'id', '#!/bin/sh\nif [ "$1" = "-u" ]; then echo 0; else exec /usr/bin/id "$@"; fi\n')
+        # Storage transactions have their own real-filesystem tests above;
+        # this fixture isolates doctor aggregation from privileged identity setup.
+        self.executable(self.bin / 'python3', '#!/bin/sh\ncat >/dev/null\n[ "${FAIL_STORAGE:-0}" = 0 ]\n')
         self.executable(self.bin / 'curl', '''#!/bin/sh
 printf '%s\\n' "$*" >> "$HEALTH_CALLS"
 case "$*" in *'/readyz'*) [ "${FAIL_RELAY:-0}" = 0 ] || exit 22;; esac
@@ -111,6 +116,17 @@ exit 0
         )
         self.assertNotEqual(result.returncode, 0)
         self.assertIn('CONTROL_ADMIN_TOKEN is shorter than the server minimum', result.stdout)
+        self.assertIn('Result: 1 failure(s)', result.stdout)
+
+    def test_doctor_storage_failure_is_not_hidden_by_healthy_http(self):
+        self.env['FAIL_STORAGE'] = '1'
+        result = subprocess.run(
+            ['bash', str(ROOT/'scripts/p2wlan-server'), 'doctor', '--service', 'control'],
+            env=self.env, capture_output=True, text=True, timeout=10,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('PASS  selected local health/readiness endpoints respond', result.stdout)
+        self.assertIn('FAIL  support log storage configuration or host permissions failed', result.stdout)
         self.assertIn('Result: 1 failure(s)', result.stdout)
 
     def test_doctor_relay_fails_closed_when_tls_files_are_not_configured(self):

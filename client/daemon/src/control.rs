@@ -32,6 +32,8 @@ use tokio::time::{self, timeout};
 use tracing::{debug, error, info, warn};
 
 mod hard_hard_signal;
+mod network_change;
+use network_change::ControlNetworkChanges;
 mod http;
 mod timing;
 pub(crate) use hard_hard_signal::HardHardStartAckDelivery;

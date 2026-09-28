@@ -191,6 +191,7 @@ pub(super) async fn poll_signals(
     delivery_tracker: &Arc<tokio::sync::Mutex<SignalDeliveryTracker>>,
     server_clock: &ServerClockEstimate,
     registration_rx: tokio::sync::watch::Receiver<Option<super::CriticalControlAuth>>,
+    release_http: &RouteAwareControlHttpClient,
 ) -> Result<()> {
     let ack_registration = SignalAckRegistration::capture(
         base_url,
@@ -250,12 +251,29 @@ pub(super) async fn poll_signals(
             );
         }
     }
-    ack_registration.ensure_current()?;
+    if let Err(error) = ack_registration.ensure_current() {
+        if body.delivery.is_some() {
+            let leased: Vec<_> = body
+                .signals
+                .iter()
+                .take(SIGNAL_ACK_PIPELINE_CAPACITY)
+                .filter(|signal| signal.to_node_id.as_deref() == Some(self_node_id))
+                .filter_map(|signal| {
+                    Some(SignalAckRequest {
+                        id: signal.id.clone()?,
+                        delivery_token: signal.delivery_token.clone()?,
+                    })
+                })
+                .collect();
+            release_revoked_signal_leases(release_http, ack_registration, &leased).await;
+        }
+        return Err(error);
+    }
     let ack_mode = body.delivery.is_some();
     if let Some(delivery) = body.delivery.as_ref() {
         debug!(
-            "Control server granted an ACK-mode delivery lease (batch_token={} lease_expires_at_ms={:?}); acknowledging each row only after state-machine application",
-            delivery.batch_token, delivery.lease_expires_at_ms
+            "Control signal phase=lease_batch rows={} lease_expires_at_ms={:?}; acknowledging each row only after state-machine application",
+            body.signals.len(), delivery.lease_expires_at_ms
         );
     }
 
@@ -497,6 +515,7 @@ pub(super) async fn poll_signals(
     for deliveries in leased_deliveries.into_values() {
         spawn_signal_application_lane(
             http.clone(),
+            release_http.clone(),
             base_url.to_string(),
             token.to_string(),
             self_node_id.to_string(),
@@ -794,6 +813,7 @@ struct SignalAckRequest {
 }
 
 include!("signal_ack.rs");
+include!("signal_release.rs");
 
 pub(super) fn normalize_signal_punch_at(
     punch_at_ms: Option<u64>,

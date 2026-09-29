@@ -51,6 +51,47 @@ fn observation_fixture(
 }
 
 #[test]
+fn archived_terminal_survives_peer_replacement_without_double_recording() {
+    let (_, _, _, mut report) = observation_fixture(true);
+    report.session_tag = "0123456789abcdef".into();
+    report.plan_tag = "abcdef0123456789".into();
+    report.counts.send_success_datagrams = 24;
+    let timeline = ConnectionTimeline::new("node-a", 0);
+    let mut terminal = HardHardTerminalObservation {
+        report: Some(report),
+        peer_id: "peer".into(),
+        timeline: Some(timeline.clone()),
+    };
+
+    terminal.archive("terminal_identity_superseded");
+    drop(terminal);
+    let summaries = timeline.snapshot().hard_hard_terminal_summaries;
+    assert_eq!(summaries.len(), 1);
+    assert!(!summaries[0].current_connection_committed);
+    assert_eq!(
+        summaries[0].archive_reason.as_deref(),
+        Some("terminal_identity_superseded")
+    );
+    assert_eq!(summaries[0].send_success_datagrams, 24);
+}
+
+#[test]
+fn historical_terminal_retention_is_fixed_size() {
+    let (_, _, _, report) = observation_fixture(true);
+    let timeline = ConnectionTimeline::new("node-a", 0);
+    for index in 0..(crate::connection_timeline::HARD_HARD_TERMINAL_SUMMARY_MAX_ENTRIES + 4) {
+        timeline.record_hard_hard_terminal(&format!("peer-{index}"), &report, true, None);
+    }
+    let summaries = timeline.snapshot().hard_hard_terminal_summaries;
+    assert_eq!(
+        summaries.len(),
+        crate::connection_timeline::HARD_HARD_TERMINAL_SUMMARY_MAX_ENTRIES
+    );
+    assert_eq!(summaries[0].peer_id, "peer-4");
+    assert_eq!(summaries.last().unwrap().peer_id, "peer-19");
+}
+
+#[test]
 fn observation_isolates_rebound_token_and_caps_pair_detail() {
     let (evidence, mut identity, pair, _) = observation_fixture(true);
     for port in 41000..41100 {

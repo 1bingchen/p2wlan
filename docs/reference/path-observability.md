@@ -4,7 +4,7 @@
 
 本地认证的 GET /status 响应附带进程内递增的 X-P2WLAN-Status-Request-ID 响应头，用于把同主机客户端的连接/首字节耗时与 daemon 快照、序列化和写回阶段对应起来。诊断日志只记录请求编号、进程编号、耗时和快照重试/回退状态，不记录授权头、token 或 peer 身份；JSON schema 不依赖该可选响应头。
 
-状态对象带 schema_version、network_generation、peer_session_generation、remote_candidate_epoch、lifecycle、current_path、previous_path、transition_reason、path_age_ms、direct_state、relay_state、recovery_state、selected_path_mtu 和 selected_udp_datagram_size。
+状态对象带 schema_version、network_generation、peer_session_generation、remote_candidate_epoch、lifecycle、current_path、previous_path、transition_reason、last_path_change_reason、path_age_ms、first_direct_commit_age_ms、direct_state、relay_state、recovery_state、selected_path_mtu 和 selected_udp_datagram_size。`transition_reason` 是最后一次被接纳事件的原因，可能没有改变活动路径；`last_path_change_reason` 仅在活动路径实际切换时更新。首个 Direct 提交的 age 保留到本网络代际结束，不依赖 32 条转换事件环。
 
 固定指标字段包括：
 
@@ -36,7 +36,11 @@ direct_time_to_connect_ms 使用固定边界 50、100、250、500、1000、3000�
 
 control_reconnect_counter_survives_timeline_eviction 是必须保持的回归契约：进程时间线淘汰旧记录后，Control 重连计数仍来自有界状态，而不是依赖已被淘汰的事件。
 
+`connection_timeline.hot_path_observations` 保留进程生命周期内的精确分类计数，包括会话证据锁竞争、身份过期、业务 ingress 暂缓、出站队列冲刷批次，以及匹配 ACK 被验证调度器接纳、合并、限流或因健康 Direct 而忽略的次数。高频会话事件只在每类计数达到 1、2、4、8 等 2 的幂时写入时间线和状态事件流；计数本身不会按包推动状态 revision。`session_evidence_contended` 表示当前身份围栏暂时竞争，`stale_session_evidence` 表示身份已过期，不应仅凭采样事件数反推总包数。
+
 ## Hard↔Hard attempt report
+
+控制客户端的阶段追踪同时识别 `hh1` 与 `hh2`，服务端在 `P2WLAN_A0_SIGNAL_TRACE=1` 时记录对应信令接纳阶段。关联字段使用短摘要标签，不输出原始 session token；信令持久化仅表示服务端接纳，不能证明对端已执行探测或建立 Direct。
 
 实验环境变量 P2WLAN_EXPERIMENT_* 标签和信令延迟只在显式 --hard-hard-experiment-only 模式下生效；信令延迟默认为 0，最大 2000 ms。普通模式即使继承这些环境变量，也不会增加延迟或把实验标签写入 attempt 报告。
 
@@ -47,6 +51,8 @@ control_reconnect_counter_survives_timeline_eviction 是必须保持的回归契
 `/status` 的 `peers[].direct_events[]` 在 `stage=hard_hard_attempt_report` 时携带 schema 2 的 `hard_hard_attempt`。它是现有会话状态所有者导出的只读终态记录，不参与候选排序、发送准入、路径选择或取消判定。写入前会再次核对 network generation、peer session generation、remote candidate epoch、profile generation、punch generation、socket index、session token 和 attempt；旧会话的迟到结果不会记到新会话。`plan_tag` 仅用于把同一会话的单个 rendezvous 计划在两端配对，与 `session_tag` 分离。
 
 终态记录由原会话的诊断 owner 单次封存。写入当前连接时，在有界等待后持有代际与连接保护并再次核对完整身份；身份替换、锁竞争或提交等待被取消时，原记录进入独立的 `hard_hard_attempt_report_archived` 结构化日志，不写入新连接的事件环。该历史日志不参与当前路径判断。选中 socket、扫描汇总和完成等辅助事件始终输出结构化日志，连接事件环只作非阻塞写入；辅助记录不会阻塞确认发包或正式终态的封存。认证接收证据仅来自原 token 和所属动态 socket 的精确候选对，不使用同 peer 的普通 Probe 汇总差值。
+
+同一封存入口另将最后 16 条正式 HH 终态压缩到进程时间线的 `hard_hard_terminal_summaries`，连接对象更换后仍可读取。摘要只保留阶段、代际、匿名会话/计划标签、发送与匹配 ACK 计数及结果；`current_connection_committed=false` 和 `archive_reason` 明确表示旧身份终态未写入当前连接。它不保留完整扫描账本，也不能代替当前 peer 的路径状态或真实业务证据。
 
 `mode` 表示当前会话实际协商的 `fixed_anchor`、`predictable` 或 `birthday`；兼容流程保留其原有模式值。模式来自同一会话的权威计划，不能仅凭 socket 数推断。
 

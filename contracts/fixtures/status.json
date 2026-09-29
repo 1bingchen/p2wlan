@@ -1,6 +1,6 @@
 {
   "contractVersion": 1,
-  "version": "0.1.166",
+  "version": "0.1.167",
   "process_id": 44413,
   "node_id": "node-a",
   "virtual_ip": "10.20.0.7",
@@ -98,7 +98,21 @@
   "connection_timeline": {
     "correlation_id": "node-a-boot0",
     "events": [],
-    "first_usable_summaries": []
+    "first_usable_summaries": [],
+    "hard_hard_terminal_summaries": [],
+    "hot_path_observations": {
+      "responder_binding_contended": 0,
+      "responder_binding_stale": 0,
+      "direct_ingress_contended": 0,
+      "direct_ingress_stale": 0,
+      "business_ingress_deferred": 0,
+      "business_ingress_stale": 0,
+      "outbound_flush_batches": 0,
+      "matched_ack_validation_queued": 0,
+      "matched_ack_validation_coalesced": 0,
+      "matched_ack_validation_backpressured": 0,
+      "matched_ack_validation_inactive": 0
+    }
   },
   "traversal_history": {
     "sources": []

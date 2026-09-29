@@ -60,6 +60,111 @@ impl CandidateLaneTestHarness {
     }
 }
 
+#[tokio::test]
+async fn queued_candidate_refresh_rejects_replaced_network_before_http() {
+    let server = MockControlServer::spawn(|_, _| MockAction::Ok).await;
+    let base_url = format!("http://{}", server.address);
+    let http =
+        route_aware_control_http_clients(crate::config::ControlProxyMode::Direct, &base_url, None)
+            .0;
+    let (auth_tx, auth_rx) = dispatch_auth_for_test();
+    let mut auth = auth_tx.borrow().clone().unwrap();
+    auth.base_url = base_url;
+    auth_tx.send_replace(None);
+    let (candidate_tx, candidate_rx) = mpsc::channel(CANDIDATE_OFFER_QUEUE_CAPACITY);
+    let (event_tx, _events) = mpsc::unbounded_channel();
+    let worker = tokio::spawn(run_candidate_offer_worker(
+        candidate_rx,
+        http,
+        auth_rx,
+        event_tx,
+    ));
+
+    let peers = Arc::new(crate::peer::PeerManager::new(test_config()));
+    peers
+        .add_peer(&PeerInfo {
+            node_id: "peer".into(),
+            public_key: "peer-key".into(),
+            endpoint: "192.0.2.1:41000".into(),
+            virtual_ip: "10.20.0.9".into(),
+            online: true,
+            ..PeerInfo::default()
+        })
+        .await;
+    let old_generation = peers.current_network_generation_sync();
+    let peer_session = peers.peer_session_generation_sync("peer").unwrap();
+    let old_fence = CandidatePublicationFence::new(
+        peers.clone(),
+        None,
+        "peer".into(),
+        old_generation,
+        peer_session,
+        0,
+    );
+    assert!(old_fence.is_current().await);
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let (_delivery, mut stale_command) = prepaid_ack_command_for_test(
+        deadline,
+        Arc::new(crate::PunchSessionCancellation::default()),
+    )
+    .await;
+    stale_command.not_after = None;
+    stale_command.expected_registration_seq = None;
+    stale_command.prepaid_attempts = 1;
+    stale_command.publication_fence = Some(old_fence);
+    let (stale_tx, stale_rx) = oneshot::channel();
+    stale_command.response_tx = stale_tx;
+    candidate_tx.send(stale_command).await.unwrap();
+
+    peers
+        .advance_network_generation("test network handover")
+        .await;
+    assert_ne!(peers.current_network_generation_sync(), old_generation);
+    auth_tx.send_replace(Some(auth));
+    assert_eq!(
+        timeout(Duration::from_secs(2), stale_rx)
+            .await
+            .unwrap()
+            .unwrap(),
+        PeerOfferSendOutcome::Cancelled
+    );
+    assert!(server.signal_posts.lock().unwrap().is_empty());
+
+    let current_fence = CandidatePublicationFence::new(
+        peers.clone(),
+        None,
+        "peer".into(),
+        peers.current_network_generation_sync(),
+        peers.peer_session_generation_sync("peer").unwrap(),
+        0,
+    );
+    assert!(current_fence.is_current().await);
+    let (_delivery, mut current_command) = prepaid_ack_command_for_test(
+        deadline,
+        Arc::new(crate::PunchSessionCancellation::default()),
+    )
+    .await;
+    current_command.not_after = None;
+    current_command.expected_registration_seq = None;
+    current_command.prepaid_attempts = 1;
+    current_command.publication_fence = Some(current_fence);
+    let (current_tx, current_rx) = oneshot::channel();
+    current_command.response_tx = current_tx;
+    candidate_tx.send(current_command).await.unwrap();
+    assert_eq!(
+        timeout(Duration::from_secs(2), current_rx)
+            .await
+            .unwrap()
+            .unwrap(),
+        PeerOfferSendOutcome::Sent
+    );
+    assert_eq!(server.signal_posts.lock().unwrap().len(), 1);
+    drop(candidate_tx);
+    worker.abort();
+    server.task.abort();
+}
+
 #[tokio::test(start_paused = true)]
 async fn candidate_idle_worker_completion_reclaims_its_lane() {
     let mut harness = CandidateLaneTestHarness::new();

@@ -1,3 +1,17 @@
+fn matched_ack_validation_observation(
+    admission: DirectValidationAdmission,
+) -> crate::connection_timeline::HotPathObservation {
+    use crate::connection_timeline::HotPathObservation;
+    match admission {
+        DirectValidationAdmission::Queued => HotPathObservation::MatchedAckValidationQueued,
+        DirectValidationAdmission::Coalesced => HotPathObservation::MatchedAckValidationCoalesced,
+        DirectValidationAdmission::Backpressured => {
+            HotPathObservation::MatchedAckValidationBackpressured
+        }
+        DirectValidationAdmission::Inactive => HotPathObservation::MatchedAckValidationInactive,
+    }
+}
+
 impl UdpTransport {
     /// Commit a modern responder handshake transaction from an authenticated
     /// pending Probe-v2 packet. WireGuard is promoted first; Probe is only
@@ -1166,15 +1180,22 @@ impl UdpTransport {
                                 // the ACK's source so both sides converge to
                                 // Direct without user traffic.
                                 //
-                                // This is evidence ingress only. It is
-                                // deliberately recorded before handing off to
-                                // the bounded validation scheduler and never
-                                // promotes Direct on its own. The explicit
-                                // pending-probe generation/session prevents a
-                                // later rekey or another peer's ACK from being
-                                // presented as this validation request.
+                                // Only admitted work is a validation request.
+                                // Healthy Direct consent ACKs are expected to
+                                // be inactive and must not look like a fresh
+                                // encrypted validation attempt in diagnostics.
+                                let admission = self
+                                    .trigger_encrypted_validation(&identity.source_node_id, source)
+                                    .await;
                                 self.peers
-                                    .record_direct_event_for_generation_with_socket(
+                                    .count_hot_path(matched_ack_validation_observation(admission));
+                                if matches!(
+                                    admission,
+                                    DirectValidationAdmission::Queued
+                                        | DirectValidationAdmission::Coalesced
+                                ) {
+                                    self.peers
+                                        .record_direct_event_for_generation_with_socket(
                                         &identity.source_node_id,
                                         generation,
                                         "direct_validation_ingress_requested",
@@ -1189,10 +1210,9 @@ impl UdpTransport {
                                             format_optional_endpoint(local_endpoint),
                                             latency.as_millis(),
                                         ),
-                                    )
-                                    .await;
-                                self.trigger_encrypted_validation(&identity.source_node_id, source)
-                                    .await;
+                                        )
+                                        .await;
+                                }
                                 if purpose == PendingProbePurpose::ConsentCheck {
                                     self.peers
                                         .record_direct_event(
@@ -1572,8 +1592,19 @@ impl UdpTransport {
                                     // per-pending-probe attribution. The ACK
                                     // remains only an ingress signal for the
                                     // encrypted validation worker.
+                                    let admission =
+                                        self.trigger_encrypted_validation(&peer_id, source).await;
                                     self.peers
-                                        .record_direct_event_for_generation_with_socket(
+                                        .count_hot_path(matched_ack_validation_observation(
+                                            admission,
+                                        ));
+                                    if matches!(
+                                        admission,
+                                        DirectValidationAdmission::Queued
+                                            | DirectValidationAdmission::Coalesced
+                                    ) {
+                                        self.peers
+                                            .record_direct_event_for_generation_with_socket(
                                             &peer_id,
                                             generation,
                                             "direct_validation_ingress_requested",
@@ -1588,9 +1619,9 @@ impl UdpTransport {
                                                 format_optional_endpoint(local_endpoint),
                                                 latency.as_millis(),
                                             ),
-                                        )
-                                        .await;
-                                    self.trigger_encrypted_validation(&peer_id, source).await;
+                                            )
+                                            .await;
+                                    }
                                     if purpose == PendingProbePurpose::ConsentCheck {
                                         self.peers
                                             .record_direct_event(

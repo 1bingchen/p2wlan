@@ -173,6 +173,7 @@ impl ControlClient {
             punch_at_ms: Some(local_time_ms),
             punch_at_server_ms: Some(server_time_ms),
             fresh_ownership: Some(ownership.clone()),
+            publication_fence: None,
             response_tx,
         });
         tokio::select! {
@@ -266,6 +267,7 @@ impl ControlClient {
             punch_at_ms: Some(local_time_ms),
             punch_at_server_ms: Some(server_time_ms),
             fresh_ownership: Some(ownership),
+            publication_fence: None,
             response_tx,
         });
         Ok(Arc::new(HardHardStartAckDelivery(std::sync::Mutex::new(

@@ -4,13 +4,14 @@ import 'dart:isolate';
 
 import '../daemon/diagnostics_auth.dart';
 import '../security/redactor.dart';
+import 'session_log_capture.dart';
 import 'support_log_protocol.dart';
 import 'support_status_summary.dart';
 
 // Mobile log uploads must not make the Flutter UI hold several copies of a
 // multi-megabyte, high-volume daemon log while it is being redacted and
-// compressed. The tail is still large enough to include the recent failure
-// timeline, while keeping Android memory pressure predictable.
+// compressed. One shared head/tail budget retains startup context and recent
+// failure events while keeping Android memory pressure predictable.
 const maxCurrentSessionLogBytesPerFile = 1 * 1024 * 1024;
 
 class SessionLogFile {
@@ -74,7 +75,8 @@ class CurrentSessionLogBundle {
   }
 
   /// Read only the files that represent the current daemon startup.
-  /// Rotated `.1` files are deliberately never consulted.
+  /// Rotated `.1` through `.4` are consulted only when segment markers prove
+  /// a continuous chain in the same runtime; legacy logs remain current-file only.
   static Future<CurrentSessionLogBundle> collect({
     required String daemonLogPath,
     required String clientLogPath,
@@ -96,7 +98,9 @@ class CurrentSessionLogBundle {
       if (normalizedPath.isEmpty || !seenPaths.add(normalizedPath)) continue;
       final file = File(normalizedPath);
       if (!await file.exists()) continue;
-      final rawContent = await _readCurrentFile(file, maxBytesPerFile);
+      final rawContent = candidate.name.endsWith('.log')
+          ? await readCurrentRuntimeLog(file, maxBytesPerFile)
+          : await _readCurrentFile(file, maxBytesPerFile);
       final content = candidate.name.endsWith('status-summary.json')
           ? sanitizeSupportStatusSummary(rawContent)
           : redactFiles

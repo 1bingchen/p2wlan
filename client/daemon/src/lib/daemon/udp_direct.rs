@@ -706,6 +706,7 @@ async fn run_udp_direct_instance(
                     }
                 }
             }
+            let initial_publication_generation = peers.current_network_generation_sync();
             drop(initial_refresh_guard);
 
             // Candidate-only fan-out is background work.  Starting the UDP
@@ -719,6 +720,7 @@ async fn run_udp_direct_instance(
                 let punch_deduplicator = punch_deduplicator.clone();
                 let candidates = candidate_endpoints.clone();
                 let candidate_sources = candidate_sources.clone();
+                let publication_generation = initial_publication_generation;
                 let candidate_snapshot = candidate_snapshot.clone();
                 let stun_servers = stun_servers.clone();
                 let signal_control = control.clone();
@@ -730,6 +732,7 @@ async fn run_udp_direct_instance(
                         punch_deduplicator,
                         &candidates,
                         &candidate_sources,
+                        publication_generation,
                         udp_punch_interval,
                         udp_punch_attempts,
                         "initial UDP candidates ready",

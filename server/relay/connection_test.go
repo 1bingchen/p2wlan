@@ -2,12 +2,32 @@ package main
 
 import (
 	"encoding/binary"
+	"errors"
+	"fmt"
 	"io"
 	"net"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 )
+
+func TestRelayReadCloseCauseSeparatesExpectedDisconnects(t *testing.T) {
+	for _, tc := range []struct {
+		err  error
+		want string
+	}{
+		{fmt.Errorf("peer: %w", io.EOF), "peer_closed"},
+		{io.ErrUnexpectedEOF, "partial_frame"},
+		{net.ErrClosed, "local_closed"},
+		{syscall.ECONNRESET, "connection_reset"},
+		{errors.New("other failure"), "read_error"},
+	} {
+		if got := relayReadCloseCause(tc.err); got != tc.want {
+			t.Errorf("relayReadCloseCause(%v) = %q, want %q", tc.err, got, tc.want)
+		}
+	}
+}
 
 type shortWriter struct {
 	max int

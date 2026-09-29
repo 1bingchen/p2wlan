@@ -34,6 +34,7 @@ const _scalars = {
   'peer_snapshot_age_ms',
   'peer_snapshot_shape',
   'network_generation',
+  'connection_generation',
   'uptime_ms',
   'ready_phase',
   'udp_socket_count',
@@ -232,6 +233,8 @@ const _scalars = {
   'previous_path',
   'lifecycle',
   'transition_reason',
+  'last_path_change_reason',
+  'first_direct_commit_age_ms',
   'reason_code',
   'direct_state',
   'relay_state',
@@ -246,6 +249,78 @@ const _scalars = {
   'observations_total',
   'target_order_tags_total',
   'query_failed',
+  'first_usable_at_ms',
+  'transition_revision',
+  'relay_ready_at_ms',
+  'first_usable_delta_ms',
+  'direct_first_remaining_ms_at_relay_ready',
+  'business_sent',
+  'business_received',
+  'business_exchange',
+  'source',
+  'last_success_age_ms',
+  'last_failure_age_ms',
+  'consecutive_failures',
+  'last_error_code',
+  'last_liveness',
+  'latest_stage',
+  'latest_age_ms',
+  'latest_candidate_count',
+  'latest_sent_probes',
+  'latest_unique_target_ports',
+  'latest_repeated_target_ports',
+  'candidate_pair_count',
+  'selected_path_mtu',
+  'selected_udp_datagram_size',
+  'latency_ms',
+  'rtt_ewma_ms',
+  'jitter_ms',
+  'success_count',
+  'failure_count',
+  'success_rate_per_mille',
+  'cooldown_remaining_ms',
+  'accepted_transitions',
+  'accepted_observations',
+  'duplicate_events',
+  'rejected_transitions',
+  'path_changes',
+  'direct_attempts',
+  'direct_retries',
+  'direct_validations',
+  'direct_successes',
+  'direct_failures',
+  'validation_failures',
+  'relay_confirmations',
+  'relay_fallbacks',
+  'relay_failures',
+  'candidate_refreshes',
+  'control_reconnects',
+  'network_generation_changes',
+  'lifecycle_resets',
+  'dplpmtud_changes',
+  'active_tasks',
+  'active_sockets',
+  'dropped_transition_events',
+  'count',
+  'sum_ms',
+  'max_ms',
+  'path_state_revision',
+  'event_kind',
+  'decision',
+  'responder_binding_contended',
+  'responder_binding_stale',
+  'direct_ingress_contended',
+  'direct_ingress_stale',
+  'business_ingress_deferred',
+  'business_ingress_stale',
+  'outbound_flush_batches',
+  'matched_ack_validation_queued',
+  'matched_ack_validation_coalesced',
+  'matched_ack_validation_backpressured',
+  'matched_ack_validation_inactive',
+  'transitions_truncated',
+  'current_connection_committed',
+  'archive_reason',
 };
 const _objects = {
   'nat_profile',
@@ -278,6 +353,18 @@ const _objects = {
   'current_path_selection',
   'selected_pair',
   'current_direct_pair',
+  'connection_timeline',
+  'hot_path_observations',
+  'traversal_history',
+  'direct_health',
+  'relay_health',
+  'metrics',
+  'direct_time_to_connect_ms',
+  'network_epoch',
+  'epoch',
+  'latest_handshake',
+  'latest_validation',
+  'candidate_punch',
 };
 const _endpoints = {
   'udp_local_addr',
@@ -484,6 +571,35 @@ class _Projection {
             [value[0], value[1]],
       ];
     }
+    for (final (key, limit) in [
+      ('events', 16),
+      ('first_usable_summaries', 8),
+      ('hard_hard_terminal_summaries', 8),
+      ('sources', 8),
+      ('transitions', 8),
+    ]) {
+      if (input[key] is! List) continue;
+      final values = _list(input[key]);
+      result['${key}_total'] = input['${key}_total'] is int
+          ? input['${key}_total']
+          : values.length;
+      result[key] = [
+        for (final value in values.skip(
+          values.length > limit ? values.length - limit : 0,
+        ))
+          project(value, depth + 1),
+      ];
+      if (values.length > limit) truncated = true;
+    }
+    for (final key in ['bounds_ms', 'buckets']) {
+      if (input[key] is! List) continue;
+      final values = _list(input[key]);
+      result[key] = [
+        for (final value in values.take(16))
+          if (value is int) value,
+      ];
+      if (values.length > 16) truncated = true;
+    }
     return result;
   }
 }
@@ -546,10 +662,13 @@ String buildSupportStatusSummary({
       'attempts_truncated':
           allEvents.length > 256 || reports.length > attempts.length,
     });
+    final transitions = _list(_map(peer['path_observability'])['transitions']);
     while (utf8.encode(jsonEncode(peer)).length > maxSupportStatusPeerBytes &&
-        (events.isNotEmpty || attempts.isNotEmpty)) {
+        (events.isNotEmpty || transitions.isNotEmpty || attempts.isNotEmpty)) {
       if (events.isNotEmpty) {
         events.removeLast();
+      } else if (transitions.isNotEmpty) {
+        transitions.removeAt(0);
       } else {
         attempts.removeLast();
       }
@@ -566,6 +685,10 @@ String buildSupportStatusSummary({
     peer['events_truncated'] = allEvents.length > events.length;
     peer['attempts_truncated'] =
         allEvents.length > 256 || reports.length > attempts.length;
+    if (peer['path_observability'] case final Map<String, Object?> path) {
+      path['transitions_truncated'] =
+          (path['transitions_total'] as int? ?? 0) > transitions.length;
+    }
     if (peer['events_truncated'] == true ||
         peer['attempts_truncated'] == true) {
       projection.truncated = true;

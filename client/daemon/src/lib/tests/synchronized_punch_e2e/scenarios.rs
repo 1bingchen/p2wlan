@@ -96,6 +96,7 @@ async fn hard_hard_initiator_is_cancelled_with_its_udp_invocation_only() {
         None,
         None,
         Some(shutdown_rx),
+        None,
     )
     .await;
     assert_eq!(
@@ -135,6 +136,51 @@ async fn hard_hard_initiator_is_cancelled_with_its_udp_invocation_only() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn hard_hard_initiator_preserves_candidate_publication_lifecycle() {
+    let (_daemon, peers, udp, control) = build_hard_hard_ordinary_fallback_fixture().await;
+    let old_lifecycle = (
+        peers.current_network_generation_sync(),
+        peers.peer_session_generation_sync(HARD_HARD_B).unwrap(),
+    );
+    peers
+        .advance_network_generation("test delayed candidate handoff to HH")
+        .await;
+    let signal = hard_hard_fallback_signal(
+        control,
+        1,
+        vec![
+            "127.0.0.1:41001".parse().unwrap(),
+            "127.0.0.1:41002".parse().unwrap(),
+            "127.0.0.1:41003".parse().unwrap(),
+        ],
+    );
+    let deduplicator = PunchAttemptDeduplicator::default();
+    assert_eq!(
+        spawn_hard_hard_initiator(
+            udp,
+            peers.clone(),
+            deduplicator.clone(),
+            HARD_HARD_B.to_string(),
+            signal,
+            None,
+            Some(old_lifecycle),
+        )
+        .await,
+        HardHardInitiatorStart::NotStarted(HardHardInitiatorNotStarted::RecoverySuperseded)
+    );
+    assert_eq!(deduplicator.active_session_count(), 0);
+    assert!(peers
+        .recovery_epoch_work_budget_report(HARD_HARD_B)
+        .await
+        .is_none());
+    let connection = peers.get_connection(HARD_HARD_B).await.unwrap();
+    assert!(!connection
+        .direct_events
+        .iter()
+        .any(|event| event.stage == "hard_hard_plan_selected"));
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn hard_hard_failed_preledger_measurement_releases_udp_lifecycle_watcher() {
     let (_daemon, peers, udp, control) = build_hard_hard_ordinary_fallback_fixture().await;
     let blackholes = [
@@ -165,6 +211,7 @@ async fn hard_hard_failed_preledger_measurement_releases_udp_lifecycle_watcher()
         None,
         None,
         Some(shutdown_rx),
+        None,
     )
     .await;
     wait_for_stage(&peers, HARD_HARD_B, "hard_hard_measurement_failed").await;
@@ -459,6 +506,7 @@ async fn hard_hard_initiator_deferred_claim_refunds_exact_fresh_quota() {
             HARD_HARD_B.to_string(),
             signal,
             None,
+            None,
         )
         .await,
         HardHardInitiatorStart::ExistingPunchOwner,
@@ -548,6 +596,7 @@ async fn hard_hard_measurement_lane_contention_refunds_without_sending_stun() {
             PunchAttemptDeduplicator::default(),
             HARD_HARD_B.to_string(),
             signal,
+            None,
             None,
         )
         .await,

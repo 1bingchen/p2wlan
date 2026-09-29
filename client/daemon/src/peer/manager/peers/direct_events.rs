@@ -150,6 +150,12 @@ impl PeerManager {
         );
         let mut terminal = HardHardTerminalObservation {
             report: Some(report),
+            peer_id: peer_id.to_string(),
+            timeline: self
+                .timeline
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone(),
         };
         // Canonical epoch -> connection order, without waiting for another
         // async resource under either guard. Contention preserves the exact
@@ -226,6 +232,9 @@ impl PeerManager {
         if let Some(connection) = connections.get_mut(peer_id) {
             connection.record_hard_hard_attempt_report(report, detail);
         }
+        if let Some(timeline) = terminal.timeline.as_ref() {
+            timeline.record_hard_hard_terminal(peer_id, &logged, true, None);
+        }
         drop(sessions);
         drop(profile);
         drop(connections);
@@ -268,6 +277,11 @@ impl PeerManager {
             report.failure_class,
             report.terminal_reason,
         );
+        let timeline = self
+            .timeline
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
         let mut connections = self.connections.write().await;
         let Some(connection) = connections.get_mut(peer_id) else {
             return false;
@@ -305,6 +319,9 @@ impl PeerManager {
             pre_session = true,
             "hard_hard_attempt_report"
         );
+        if let Some(timeline) = timeline.as_ref() {
+            timeline.record_hard_hard_terminal(peer_id, &report, true, None);
+        }
         connection.record_hard_hard_attempt_report(report, detail);
         true
     }

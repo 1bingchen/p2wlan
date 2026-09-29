@@ -1280,6 +1280,7 @@ async fn install_test_daemon_udp(
     node_id: &str,
     virtual_ip: &str,
     wireguard: &WireGuardTransport,
+    ingress_gate: Option<Arc<crate::udp::TestUdpIngressGate>>,
 ) -> (
     UdpTransport,
     DirectValidationIngress,
@@ -1294,13 +1295,16 @@ async fn install_test_daemon_udp(
     let validation_ingress = DirectValidationIngress::new();
     let peer_reflexive_ingress = PeerReflexiveIngress::new();
     let validation_enabled = Arc::new(AtomicBool::new(true));
-    let udp_base = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers.clone())
+    let mut udp_base = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers.clone())
         .await
         .unwrap()
         .with_local_node_id(node_id)
         .with_wireguard_transport(wireguard.clone())
         .with_inbound_channel(udp_inbound_tx.clone())
         .with_peer_reflexive_observer(peer_reflexive_ingress.clone());
+    if let Some(gate) = ingress_gate {
+        udp_base = udp_base.with_test_ingress_gate(gate);
+    }
     let validation_trigger = validation_ingress.clone();
     let validation_enabled_for_trigger = validation_enabled.clone();
     let udp = udp_base.with_validation_trigger(Arc::new(move |observation| {
@@ -1454,6 +1458,17 @@ async fn build_two_peer_harness_with_stun_mode(
     let (ports, a_public_socket, b_public_socket, stun_observers, candidate_guards) =
         HarnessPorts::allocate_with_mode(stun, nat_mode).await;
     let birthday_enabled = nat_mode == HarnessNatMode::HighEntropy;
+    // The birthday permutation spans the UDP port ring and can otherwise hit
+    // another real loopback socket behind the fake NAT. Every high-entropy
+    // fixture, positive and negative, must receive only via its own NAT link
+    // and STUN observers. Unconfigured gates reject everything until setup
+    // binds the exact source endpoints below, before any offer starts work.
+    let ingress_gates = birthday_enabled.then(|| {
+        [
+            Arc::new(crate::udp::TestUdpIngressGate::default()),
+            Arc::new(crate::udp::TestUdpIngressGate::default()),
+        ]
+    });
     let a_identity = NodeIdentity::generate();
     let b_identity = NodeIdentity::generate();
     let root = std::env::temp_dir().join(format!(
@@ -1630,7 +1645,14 @@ async fn build_two_peer_harness_with_stun_mode(
         mut tasks_a,
         validation_task_a,
         peer_reflexive_task_a,
-    ) = install_test_daemon_udp(&mut daemon_a, HARD_HARD_A, "10.20.0.1", &wg_a).await;
+    ) = install_test_daemon_udp(
+        &mut daemon_a,
+        HARD_HARD_A,
+        "10.20.0.1",
+        &wg_a,
+        ingress_gates.as_ref().map(|gates| gates[0].clone()),
+    )
+    .await;
     let (
         udp_b,
         _validation_b,
@@ -1639,7 +1661,14 @@ async fn build_two_peer_harness_with_stun_mode(
         mut tasks_b,
         validation_task_b,
         peer_reflexive_task_b,
-    ) = install_test_daemon_udp(&mut daemon_b, HARD_HARD_B, "10.20.0.2", &wg_b).await;
+    ) = install_test_daemon_udp(
+        &mut daemon_b,
+        HARD_HARD_B,
+        "10.20.0.2",
+        &wg_b,
+        ingress_gates.as_ref().map(|gates| gates[1].clone()),
+    )
+    .await;
     let primary_a = race_primary.then(|| udp_a.local_addr().unwrap());
     let actual_public = mapping_miss.then(|| {
         (
@@ -1660,6 +1689,20 @@ async fn build_two_peer_harness_with_stun_mode(
         nat_mode == HarnessNatMode::HighEntropy,
     )
     .await;
+    if let Some(gates) = ingress_gates {
+        gates[0].allow_sources_once(
+            ports
+                .a_observers
+                .into_iter()
+                .chain([link._b_source.local_addr().unwrap()]),
+        );
+        gates[1].allow_sources_once(
+            ports
+                .b_observers
+                .into_iter()
+                .chain([link._a_source.local_addr().unwrap()]),
+        );
+    }
 
     let control_a = daemon_a.control.clone();
     let control_b = daemon_b.control.clone();

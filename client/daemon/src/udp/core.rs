@@ -93,6 +93,8 @@ impl UdpTransport {
             #[cfg(test)]
             hh2_probe_ack_send_gate: Arc::new(Mutex::new(None)),
             stun_waiters: StunWaiters::default(),
+            #[cfg(test)]
+            test_ingress_gate: None,
             socket_state: Arc::new(Mutex::new(SocketState {
                 hard_hard_pair_modes: HashMap::new(),
                 dynamic: HashMap::new(),

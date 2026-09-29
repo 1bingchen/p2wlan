@@ -115,3 +115,6 @@ mod hard_hard_pacing;
 
 #[path = "tests/probe_admission_transaction.rs"]
 mod probe_admission_transaction;
+
+#[path = "tests/nat_ingress.rs"]
+mod nat_ingress;

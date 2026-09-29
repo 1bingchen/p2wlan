@@ -1401,9 +1401,8 @@ async fn hard_hard_random_random_birthday_no_collision_cleans_up_without_direct(
     harness.link.set_drop_b_to_a(true);
     // High-entropy candidates intentionally include the public endpoints that
     // the synthetic NAT owns.  Hold authenticated Punch packets as well as
-    // dropping forwarded traffic so this no-collision fixture cannot race a
-    // direct winner through the link's dynamic-socket fallback before either
-    // birthday sweep reaches its terminal failure state.
+    // dropping forwarded traffic. The harness's receive boundary also blocks
+    // random targets from bypassing this link via real private UDP sockets.
     harness.link.set_hold_authenticated_punch(true);
     trigger_initial_offer(&harness).await;
 
@@ -1608,7 +1607,7 @@ async fn hard_hard_random_random_unauthenticated_packet_cannot_win() {
     // The exact dynamic socket is durable production state; the diagnostic
     // ring is intentionally bounded and may evict `hard_hard_sweep_started`
     // after a 128-probe burst before this test's polling task runs.
-    let (_, speculative_socket) = timeout(HARD_HARD_E2E_TIMEOUT, async {
+    let (socket_index, speculative_socket) = timeout(HARD_HARD_E2E_TIMEOUT, async {
         loop {
             if let Some(socket) = harness.udp_a.socket_for_peer(Some(HARD_HARD_B)).await {
                 return socket;
@@ -1618,17 +1617,33 @@ async fn hard_hard_random_random_unauthenticated_packet_cannot_win() {
     })
     .await
     .expect("birthday sweep must expose a speculative socket");
-    let injector = UdpSocket::bind("127.0.0.1:0".parse::<SocketAddr>().unwrap())
+    // Inject through the modeled NAT source so the protocol parser, rather
+    // than the fixture's private-socket boundary, must reject this packet.
+    // A truncated Probe-v2 header gives an exact receive/rejection counter.
+    harness
+        .link
+        ._b_source
+        .send_to(b"PNCH\x02", speculative_socket.local_addr().unwrap())
         .await
         .unwrap();
-    injector
-        .send_to(
-            b"not-a-probe-v2-packet",
-            speculative_socket.local_addr().unwrap(),
-        )
-        .await
-        .unwrap();
-    sleep(Duration::from_millis(50)).await;
+    timeout(HARD_HARD_E2E_TIMEOUT, async {
+        loop {
+            if harness
+                .udp_a
+                .socket_pool_diagnostics()
+                .await
+                .iter()
+                .any(|socket| {
+                    socket.socket_index == socket_index && socket.authenticated_probe_malformed > 0
+                })
+            {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the malformed packet must reach and be rejected by the Probe parser");
     for (peers, peer_id) in [
         (&harness.peers_a, HARD_HARD_B),
         (&harness.peers_b, HARD_HARD_A),
@@ -1646,7 +1661,6 @@ async fn hard_hard_random_random_unauthenticated_packet_cannot_win() {
             .any(|event| event.stage == "hard_hard_winner_selected"));
         assert_ne!(peer.state, ConnectionState::Direct);
     }
-    drop(injector);
     harness.shutdown().await;
 
     // A fresh production session must still select an authenticated birthday

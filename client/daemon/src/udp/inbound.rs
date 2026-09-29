@@ -322,6 +322,18 @@ impl UdpTransport {
             };
             let udp_received = Instant::now();
 
+            // A loopback birthday target can equal another private fixture
+            // socket. Enforce the simulated NAT boundary before STUN or any
+            // probe/validation side effect, including on dynamic readers.
+            #[cfg(test)]
+            if self
+                .test_ingress_gate
+                .as_ref()
+                .is_some_and(|gate| !gate.admit(source))
+            {
+                continue;
+            }
+
             if n == 0 {
                 continue;
             }

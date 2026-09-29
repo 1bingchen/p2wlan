@@ -53,6 +53,10 @@ include!("udp/state.rs");
 
 mod stun_waiter;
 use stun_waiter::StunWaiters;
+#[cfg(test)]
+mod test_ingress;
+#[cfg(test)]
+pub(crate) use test_ingress::TestUdpIngressGate;
 mod direct_validation_preflight;
 
 include!("udp/admission.rs");
@@ -183,6 +187,10 @@ pub struct UdpTransport {
     hh2_probe_ack_send_gate:
         Arc<Mutex<Option<Arc<hard_hard_pair_validation::HardHardValidationSendGate>>>>,
     stun_waiters: StunWaiters,
+    /// A synthetic NAT owns its complete receive boundary in tests. Omitted
+    /// from production and disabled unless the fixture installs its own gate.
+    #[cfg(test)]
+    test_ingress_gate: Option<Arc<TestUdpIngressGate>>,
     /// Merged socket ownership state: dynamic punch sockets, per-peer
     /// affinity pins and the affinity epoch counter live under one mutex so
     /// every ownership transition is atomic and no lock ordering exists.

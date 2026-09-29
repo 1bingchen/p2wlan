@@ -17,11 +17,16 @@ impl Eq for HardHardAttemptEvidence {}
 /// that future cannot lose a cancelled attempt or publish into a new peer.
 struct HardHardTerminalObservation {
     report: Option<HardHardAttemptReport>,
+    peer_id: String,
+    timeline: Option<Arc<ConnectionTimeline>>,
 }
 
 impl HardHardTerminalObservation {
     fn archive(&mut self, reason: &'static str) {
         if let Some(report) = self.report.take() {
+            if let Some(timeline) = self.timeline.as_ref() {
+                timeline.record_hard_hard_terminal(&self.peer_id, &report, false, Some(reason));
+            }
             if let Ok(json) = serde_json::to_string(&report) {
                 tracing::info!(event = "hard_hard_attempt_report_archived",
                     reason_code = reason, session_tag = %report.session_tag,

@@ -1565,6 +1565,7 @@ async fn superseded_udp_lease_cancels_old_detached_punch_without_touching_replac
         None,
         None,
         Some(old_lease.shutdown_receiver()),
+        None,
     )
     .await;
     assert_eq!(deduplicator.active_session_count(), 1);
@@ -1628,6 +1629,7 @@ async fn superseded_udp_lease_cancels_old_detached_punch_without_touching_replac
         None,
         None,
         Some(replacement_lease.shutdown_receiver()),
+        None,
     )
     .await;
     let (_, source) = timeout(
@@ -1707,6 +1709,153 @@ async fn late_hole_punch_send_error_cannot_degrade_same_node_rejoin() {
         RecoveryStage::Initial,
         "the old worker must not move the replacement recovery epoch to relay backoff"
     );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn candidate_publication_handoff_cannot_adopt_a_replacement_lifecycle() {
+    let peers = Arc::new(PeerManager::new(
+        Config::generate_default("https://ctrl.test", "candidate-publication-handoff").unwrap(),
+    ));
+    let remote = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let peer = deferred_initiator_test_peer("node-b", &remote.local_addr().unwrap().to_string());
+    peers.add_peer(&peer).await;
+    let udp = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers.clone())
+        .await
+        .unwrap();
+    let deduplicator = PunchAttemptDeduplicator::default();
+    for replace_peer in [false, true] {
+        let fence = control::CandidatePublicationFence::new(
+            peers.clone(),
+            None,
+            peer.node_id.clone(),
+            peers.current_network_generation_sync(),
+            peers.peer_session_generation_sync(&peer.node_id).unwrap(),
+            0,
+        );
+        assert!(fence.is_current().await);
+        // Model a control-worker success whose oneshot receiver has not yet
+        // resumed. The replacement is fully online before punch admission.
+        if replace_peer {
+            peers.remove_peer(&peer.node_id).await;
+            peers.add_peer(&peer).await;
+        } else {
+            peers
+                .advance_network_generation("test delayed publication receipt")
+                .await;
+        }
+        spawn_hole_punch_task_with_lifecycle(
+            udp.clone(),
+            peers.clone(),
+            deduplicator.clone(),
+            peer.node_id.clone(),
+            Duration::ZERO,
+            1,
+            Some(unix_time_millis() + 1000),
+            None,
+            None,
+            None,
+            None,
+            Some(fence),
+        )
+        .await;
+        assert_eq!(deduplicator.active_session_count(), 0);
+        assert!(peers
+            .recovery_epoch_work_budget_report(&peer.node_id)
+            .await
+            .is_none());
+    }
+    let mut packet = [0u8; 2048];
+    assert_eq!(
+        remote.try_recv_from(&mut packet).unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn candidate_publication_rechecks_lifecycle_after_target_snapshot_wait() {
+    let peers = Arc::new(PeerManager::new(
+        Config::generate_default("https://ctrl.test", "candidate-publication-claim").unwrap(),
+    ));
+    let peer = deferred_initiator_test_peer("node-b", "192.0.2.20:42000");
+    peers.add_peer(&peer).await;
+    let udp = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers.clone())
+        .await
+        .unwrap();
+    let deduplicator = PunchAttemptDeduplicator::default();
+    let old_generation = peers.current_network_generation_sync();
+    let peer_session = peers.peer_session_generation_sync(&peer.node_id).unwrap();
+    let fence = control::CandidatePublicationFence::new(
+        peers.clone(),
+        None,
+        peer.node_id.clone(),
+        old_generation,
+        peer_session,
+        0,
+    );
+    let interface_writer = peers.hold_local_interface_networks_writer_for_test().await;
+    let admission = spawn_hole_punch_task_with_lifecycle(
+        udp,
+        peers.clone(),
+        deduplicator.clone(),
+        peer.node_id.clone(),
+        Duration::ZERO,
+        1,
+        Some(unix_time_millis() + 1000),
+        None,
+        None,
+        None,
+        None,
+        Some(fence),
+    );
+    tokio::pin!(admission);
+    assert!(futures_util::poll!(admission.as_mut()).is_pending());
+    assert!(peers
+        .recovery_epoch_work_budget_report(&peer.node_id)
+        .await
+        .is_some());
+    peers
+        .advance_network_generation("test target snapshot wait")
+        .await;
+    drop(interface_writer);
+    admission.await;
+    assert_eq!(deduplicator.active_session_count(), 0);
+    // A new owner must remain claimable; presenting the old generation again
+    // cannot cancel or fold stale work into this current owner.
+    let generation = peers.current_network_generation_sync();
+    let epoch = match peers.recovery_epoch_admit(&peer.node_id).await {
+        RecoveryAdmission::Accepted { epoch } => epoch,
+        other => panic!("replacement epoch must admit: {other:?}"),
+    };
+    let claim = deduplicator
+        .claim_for_epoch_with_rendezvous_for_peer_session(
+            &peers,
+            &peer.node_id,
+            peer_session,
+            generation,
+            epoch,
+            PUNCH_PRIORITY_SYNCHRONIZED,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let RendezvousPunchClaim::Claimed(current) = claim else {
+        panic!("replacement must own claim")
+    };
+    assert!(deduplicator
+        .claim_for_epoch_with_rendezvous_for_peer_session(
+            &peers,
+            &peer.node_id,
+            peer_session,
+            old_generation,
+            epoch,
+            PUNCH_PRIORITY_SYNCHRONIZED,
+            None,
+            None,
+        )
+        .await
+        .is_none());
+    assert!(!current.is_cancelled());
 }
 
 #[tokio::test]

@@ -1,24 +1,12 @@
-fn hard_hard_a0_control_identity(session_id: &str) -> Option<(&'static str, &str)> {
-    let mut fields = session_id.splitn(4, ':');
-    if fields.next()? != "hh1" {
-        return None;
-    }
-    let role = match fields.next()? {
-        "i" => "initiator",
-        "r" => "responder",
-        _ => return None,
+fn hard_hard_a0_control_identity(session_id: &str) -> Option<(&'static str, String)> {
+    // Use the authoritative wire parser so HH2 binary envelopes share the
+    // same redacted identity as endpoint diagnostics and legacy HH1 signals.
+    let coordination = crate::HardHardCoordination::parse(session_id)?;
+    let role = match coordination.role {
+        crate::HardHardRole::Initiator => "initiator",
+        crate::HardHardRole::Responder => "responder",
     };
-    let token = fields.next()?;
-    if fields.next().is_none()
-        || token.is_empty()
-        || token.len() > 32
-        || !token
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit() || byte == b'-')
-    {
-        return None;
-    }
-    Some((role, token))
+    Some((role, coordination.token))
 }
 
 fn hard_hard_a0_control_tag(token: &str, label: &str) -> String {
@@ -52,8 +40,8 @@ pub(crate) fn hard_hard_a0_control_stage(
         event = "hard_hard_attempt_stage",
         role,
         identity_scope = "shared_session",
-        session_tag = %hard_hard_a0_control_tag(token, "session"),
-        plan_tag = %hard_hard_a0_control_tag(token, "rendezvous-plan"),
+        session_tag = %hard_hard_a0_control_tag(&token, "session"),
+        plan_tag = %hard_hard_a0_control_tag(&token, "rendezvous-plan"),
         stage,
         reason_code,
         "Hard-Hard A0 control signaling stage"
@@ -693,6 +681,29 @@ impl ControlClient {
         punch_at_ms: Option<u64>,
         fresh_ownership: Option<Arc<crate::PunchSessionCancellation>>,
     ) -> std::result::Result<(), PeerOfferSendFailure> {
+        self.send_peer_offer_with_sources_and_punch_at_fenced(
+            to_node_id,
+            candidates,
+            candidate_sources,
+            handshake_init,
+            punch_at_ms,
+            fresh_ownership,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn send_peer_offer_with_sources_and_punch_at_fenced(
+        &self,
+        to_node_id: &str,
+        candidates: &[String],
+        candidate_sources: &HashMap<String, String>,
+        handshake_init: &[u8],
+        punch_at_ms: Option<u64>,
+        fresh_ownership: Option<Arc<crate::PunchSessionCancellation>>,
+        publication_fence: Option<Arc<CandidatePublicationFence>>,
+    ) -> std::result::Result<(), PeerOfferSendFailure> {
         #[cfg(test)]
         if let Some(result) = self.maybe_forward_test_signal(
             to_node_id,
@@ -737,6 +748,7 @@ impl ControlClient {
                 punch_at_ms,
                 punch_at_server_ms: None,
                 fresh_ownership,
+                publication_fence,
                 response_tx,
             })
             .map_err(|error| match error {
@@ -857,6 +869,7 @@ impl ControlClient {
             punch_at_ms,
             punch_at_server_ms,
             fresh_ownership: Some(fresh_ownership),
+            publication_fence: None,
             response_tx,
         });
         match enqueue_result {

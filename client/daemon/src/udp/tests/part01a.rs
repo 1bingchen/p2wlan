@@ -681,8 +681,45 @@ fn pool_stun_evidence_promotes_a_primary_blocked_profile_before_pool_gate() {
         Some("198.51.100.20:41000")
     );
     assert!(primary.nat_profile.birthday_candidate);
-    assert_eq!(primary.nat_profile.observations.len(), 2);
+    // The profile's observation sequence belongs to its primary local_addr.
+    // The pool-backed public candidate is retained separately and must not
+    // become a fake second port-allocation sample on that primary socket.
+    assert_eq!(primary.nat_profile.observations.len(), 1);
     assert!(socket_pool_is_eligible(&primary));
+}
+
+#[test]
+fn pool_socket_samples_do_not_change_primary_allocation_model() {
+    let mut primary = hard_nat_candidate_report(p2pnet_nat::FilteringBehavior::Unknown);
+    primary.nat_profile.observations = [40001, 40005, 40009]
+        .into_iter()
+        .enumerate()
+        .map(|(index, port)| p2pnet_nat::StunObservation {
+            server: format!("198.51.100.{}:3478", index + 1),
+            mapped_address: Some(format!("203.0.113.10:{port}")),
+            rtt_ms: Some(8),
+            error: None,
+        })
+        .collect();
+    let expected = p2pnet_nat::NatCapabilities::from_profile(&primary.nat_profile);
+    let mut pool = hard_nat_candidate_report(p2pnet_nat::FilteringBehavior::Unknown);
+    pool.candidates = vec![p2pnet_nat::IceCandidate::server_reflexive(
+        "203.0.113.10",
+        52017,
+    )];
+    pool.nat_profile.observations = vec![p2pnet_nat::StunObservation {
+        server: "198.51.100.9:3478".to_string(),
+        mapped_address: Some("203.0.113.10:52017".to_string()),
+        rtt_ms: Some(12),
+        error: None,
+    }];
+
+    assert!(!merge_pool_nat_profile(&mut primary, &pool));
+    assert_eq!(primary.nat_profile.observations.len(), 3);
+    assert_eq!(
+        p2pnet_nat::NatCapabilities::from_profile(&primary.nat_profile).allocation_model,
+        expected.allocation_model
+    );
 }
 
 #[tokio::test]

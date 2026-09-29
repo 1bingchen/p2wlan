@@ -9,6 +9,7 @@ pub(crate) async fn spawn_hard_hard_initiator(
     peer_id: String,
     signal: HolePunchSignalContext,
     invocation_shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>,
+    expected_lifecycle: Option<(u64, PeerSessionGeneration)>,
 ) -> HardHardInitiatorStart {
     if punch_invocation_is_cancelled(invocation_shutdown_rx.as_ref()) {
         hard_hard_a0_stage_log(
@@ -20,7 +21,12 @@ pub(crate) async fn spawn_hard_hard_initiator(
         );
         return HardHardInitiatorStart::InvocationCancelled;
     }
-    let Some(peer_session_generation) = peers.peer_session_generation_sync(&peer_id) else {
+    let lifecycle = expected_lifecycle.or_else(|| {
+        peers
+            .peer_session_generation_sync(&peer_id)
+            .map(|session| (peers.current_network_generation_sync(), session))
+    });
+    let Some((network_generation, peer_session_generation)) = lifecycle else {
         hard_hard_a0_stage_log(
             &peers,
             "initiator",
@@ -30,6 +36,11 @@ pub(crate) async fn spawn_hard_hard_initiator(
         );
         return HardHardInitiatorStart::NotStarted(HardHardInitiatorNotStarted::RecoverySuperseded);
     };
+    if peers.current_network_generation_sync() != network_generation
+        || !peers.peer_session_is_current_sync(&peer_id, peer_session_generation)
+    {
+        return HardHardInitiatorStart::NotStarted(HardHardInitiatorNotStarted::RecoverySuperseded);
+    }
     if peers.hard_hard_session_is_active(&peer_id).await {
         hard_hard_a0_stage_log(
             &peers,
@@ -50,6 +61,13 @@ pub(crate) async fn spawn_hard_hard_initiator(
         );
         return HardHardInitiatorStart::NotStarted(HardHardInitiatorNotStarted::PlanChanged);
     };
+    // A candidate publication may cross the control response channel before
+    // reaching this planner. Its old invocation must not acquire a new plan.
+    if plan.local_network_generation != network_generation
+        || !peers.peer_session_is_current_sync(&peer_id, peer_session_generation)
+    {
+        return HardHardInitiatorStart::NotStarted(HardHardInitiatorNotStarted::PlanChanged);
+    }
     hard_hard_a0_stage_log(
         &peers,
         "initiator",

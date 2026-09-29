@@ -118,11 +118,11 @@ impl UdpTransport {
                 // while another bound socket has a live public mapping.  The
                 // old code discarded that distinction: it classified the
                 // whole daemon as UDP-blocked and left the pool inactive,
-                // even though it had just gathered the 96 real pool targets
-                // later offered to the peer.  Keep the observations and
-                // promote the profile before deciding whether the pool is
-                // usable, so startup Direct and recovery use the same
-                // evidence that candidate signaling uses.
+                // even though it had just gathered real pool targets later
+                // offered to the peer. Promote the pool-backed capability
+                // without mixing its port samples into the primary socket's
+                // allocation sequence; the socket-indexed candidates retain
+                // the pool evidence used by signaling.
                 merge_pool_nat_profile(&mut report, &pool_report);
                 self.append_pool_candidates(&mut report, pool_report.candidates, socket_index)
                     .await;
@@ -244,11 +244,11 @@ fn classify_live_filtering_response(
     p2pnet_nat::ice::classify_filtering_probe_response(server, response_source, &[server])
 }
 
-/// Fold evidence from one socket-pool member into the daemon-level NAT
-/// profile.  The primary socket's profile is still authoritative whenever it
-/// has evidence of its own.  When it says `UdpBlocked` but a pool member has a
-/// real STUN mapping, the correct diagnosis is instead "primary mapping
-/// unavailable; pool-backed mapping-dependent Direct is available".
+/// Promote pool-backed reachability without treating independent UDP sockets
+/// as one sequential port-allocation experiment. `NatProfile.observations`
+/// belongs to `local_addr` and is consumed by the allocation-model inference;
+/// appending pool observations there can falsely label a predictable primary
+/// socket as random, or invent an ordering that was never measured.
 ///
 /// This is deliberately conservative: it does not invent a port delta or a
 /// predicted window from a single pool member.  It only changes the gates
@@ -267,11 +267,6 @@ fn merge_pool_nat_profile(
     if observed_endpoints.is_empty() {
         return false;
     }
-
-    report
-        .nat_profile
-        .observations
-        .extend(pool_report.nat_profile.observations.iter().cloned());
 
     if !report.nat_profile.udp_blocked {
         return false;

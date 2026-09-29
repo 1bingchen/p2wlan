@@ -333,7 +333,9 @@ impl PunchAttemptDeduplicator {
         fresh_generation: Option<crate::FreshPredictionId>,
         punch_at_ms: Option<u64>,
     ) -> Option<RendezvousPunchClaim> {
-        if !peers.peer_session_is_current_sync(peer_id, peer_session_generation) {
+        if peers.current_network_generation_sync() != network_generation
+            || !peers.peer_session_is_current_sync(peer_id, peer_session_generation)
+        {
             return None;
         }
         let claim = self.claim_with_rendezvous(
@@ -345,7 +347,9 @@ impl PunchAttemptDeduplicator {
             fresh_generation,
             punch_at_ms,
         );
-        if !peers.peer_session_is_current_sync(peer_id, peer_session_generation) {
+        if peers.current_network_generation_sync() != network_generation
+            || !peers.peer_session_is_current_sync(peer_id, peer_session_generation)
+        {
             if let RendezvousPunchClaim::Claimed(session) = claim {
                 drop(session);
             }

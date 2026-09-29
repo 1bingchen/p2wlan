@@ -163,6 +163,147 @@ void main() {
     },
   );
 
+  test('support export retains bounded path evidence and exact hot counters', () {
+    final encoded = buildSupportStatusSummary(
+      source: 'live',
+      snapshot: {
+        'connection_timeline': {
+          'correlation_id': 'private-correlation',
+          'events': [
+            for (var index = 0; index < 24; index++)
+              {
+                'event': 'direct_promoted',
+                'at_ms': index,
+                'connection_generation': 3,
+                'peer_id': 'private-peer',
+                'detail': 'token=secret /private/log',
+              },
+          ],
+          'first_usable_summaries': [
+            {
+              'peer_id': 'private-peer',
+              'path': 'direct',
+              'first_usable_at_ms': 500,
+              'transition_revision': 9,
+              'business_exchange': true,
+              'relay_id': 'private-relay',
+            },
+          ],
+          'hot_path_observations': {
+            'direct_ingress_contended': 703,
+            'direct_ingress_stale': 4,
+            'outbound_flush_batches': 289,
+            'matched_ack_validation_inactive': 81,
+          },
+          'hard_hard_terminal_summaries': [
+            {
+              'peer_id': 'private-peer',
+              'session_tag': '0123456789abcdef',
+              'mode': 'birthday',
+              'failure_class': 'cancelled_generation_changed',
+              'current_connection_committed': false,
+              'archive_reason': 'terminal_identity_superseded',
+              'send_success_datagrams': 24,
+              'detail': 'token=secret',
+            },
+          ],
+        },
+        'traversal_history': {
+          'sources': [
+            {
+              'source': 'peer_reflexive',
+              'success_count': 2,
+              'last_error': 'token=secret',
+            },
+          ],
+        },
+        'peers': [
+          {
+            'node_id': 'private-peer',
+            'path_observability': {
+              'current_path': 'direct',
+              'path_age_ms': 200,
+              'last_path_change_reason': 'direct_committed',
+              'first_direct_commit_age_ms': 204,
+              'direct_health': {
+                'success_count': 7,
+                'last_error': 'Bearer secret',
+              },
+              'latest_validation': {
+                'latest_stage': 'ack_authenticated',
+                'validation_rtt_ms': 11,
+              },
+              'metrics': {
+                'direct_successes': 1,
+                'direct_time_to_connect_ms': {
+                  'bounds_ms': [50, 100],
+                  'buckets': [0, 1, 0],
+                },
+              },
+              'transitions': [
+                for (var index = 0; index < 12; index++)
+                  {
+                    'revision': index,
+                    'reason_code': 'direct_validated',
+                    'epoch': {
+                      'network_generation': 3,
+                      'peer_session_generation': 7,
+                      'remote_candidate_epoch': 9,
+                    },
+                  },
+              ],
+            },
+          },
+        ],
+      },
+    );
+    final safe = jsonDecode(sanitizeSupportStatusSummary(encoded));
+    final status = safe['status'];
+    expect(status['connection_timeline']['events_total'], 24);
+    expect(status['connection_timeline']['events'].length, 16);
+    expect(status['connection_timeline']['events'].first['at_ms'], 8);
+    expect(
+      status['connection_timeline']['events'].first['connection_generation'],
+      3,
+    );
+    expect(
+      status['connection_timeline']['first_usable_summaries'][0]['business_exchange'],
+      isTrue,
+    );
+    expect(
+      status['connection_timeline']['hot_path_observations']['direct_ingress_contended'],
+      703,
+    );
+    expect(
+      status['connection_timeline']['hot_path_observations']['matched_ack_validation_inactive'],
+      81,
+    );
+    final terminal =
+        status['connection_timeline']['hard_hard_terminal_summaries'][0];
+    expect(terminal['current_connection_committed'], isFalse);
+    expect(terminal['archive_reason'], 'terminal_identity_superseded');
+    expect(terminal['send_success_datagrams'], 24);
+    expect(status['traversal_history']['sources'][0]['success_count'], 2);
+    final path = safe['peers'][0]['path_observability'];
+    expect(path['direct_health']['success_count'], 7);
+    expect(path['last_path_change_reason'], 'direct_committed');
+    expect(path['first_direct_commit_age_ms'], 204);
+    expect(path['path_age_ms'], 200);
+    expect(path['latest_validation']['validation_rtt_ms'], 11);
+    expect(path['metrics']['direct_time_to_connect_ms']['buckets'], [0, 1, 0]);
+    expect(path['transitions_total'], 12);
+    expect(path['transitions'].length, 8);
+    expect(path['transitions'].first['epoch'], {
+      'network_generation': 3,
+      'peer_session_generation': 7,
+      'remote_candidate_epoch': 9,
+    });
+    expect(path['transitions_truncated'], isTrue);
+    for (final forbidden in ['private-', 'token=secret', 'Bearer secret']) {
+      expect(jsonEncode(safe), isNot(contains(forbidden)));
+    }
+  });
+
   test(
     'a typed attempt outside the recent event tail is retained separately',
     () {

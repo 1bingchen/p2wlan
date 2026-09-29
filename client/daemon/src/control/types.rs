@@ -905,7 +905,77 @@ struct CandidateOfferCommand {
     /// candidate-only response. Initial offers leave this empty.
     punch_at_server_ms: Option<u64>,
     fresh_ownership: Option<Arc<crate::PunchSessionCancellation>>,
+    /// Candidate refreshes re-check their source network, peer lifecycle and
+    /// committed candidate set in the per-peer worker immediately before HTTP.
+    /// HH transcript commands use their separate registration/owner fences.
+    publication_fence: Option<Arc<CandidatePublicationFence>>,
     response_tx: oneshot::Sender<PeerOfferSendOutcome>,
+}
+
+pub(crate) struct CandidatePublicationFence {
+    peers: Arc<crate::peer::PeerManager>,
+    candidate_snapshot: Option<Arc<RwLock<Option<crate::CandidateSnapshotLease>>>>,
+    peer_id: String,
+    network_generation: u64,
+    peer_session_generation: crate::peer::PeerSessionGeneration,
+    candidate_hash: u64,
+}
+
+impl CandidatePublicationFence {
+    pub(crate) fn lifecycle(&self) -> (u64, crate::peer::PeerSessionGeneration) {
+        (self.network_generation, self.peer_session_generation)
+    }
+
+    pub(crate) fn new(
+        peers: Arc<crate::peer::PeerManager>,
+        candidate_snapshot: Option<Arc<RwLock<Option<crate::CandidateSnapshotLease>>>>,
+        peer_id: String,
+        network_generation: u64,
+        peer_session_generation: crate::peer::PeerSessionGeneration,
+        candidate_hash: u64,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            peers,
+            candidate_snapshot,
+            peer_id,
+            network_generation,
+            peer_session_generation,
+            candidate_hash,
+        })
+    }
+
+    pub(crate) async fn is_current(&self) -> bool {
+        if self.peers.current_network_generation_sync() != self.network_generation
+            || self.peers.peer_session_generation_sync(&self.peer_id)
+                != Some(self.peer_session_generation)
+        {
+            return false;
+        }
+        if !self.peers.peer_online(&self.peer_id).await
+            || self
+                .peers
+                .should_defer_relay_assisted_punch(&self.peer_id)
+                .await
+        {
+            return false;
+        }
+        // Read the coherent candidate lease after the peer-state awaits, so
+        // a refresh that commits while those checks are blocked cannot leave
+        // an old hash looking current at the final HTTP admission boundary.
+        if let Some(candidate_snapshot) = self.candidate_snapshot.as_ref() {
+            if !candidate_snapshot
+                .read()
+                .await
+                .as_ref()
+                .is_some_and(|lease| lease.hash == self.candidate_hash)
+            {
+                return false;
+            }
+        }
+        self.peers.current_network_generation_sync() == self.network_generation
+            && self.peers.peer_session_generation_sync(&self.peer_id)
+                == Some(self.peer_session_generation)
+    }
 }
 
 /// Why a peer-offer send did not obtain authoritative server acceptance.

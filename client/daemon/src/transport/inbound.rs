@@ -1,4 +1,5 @@
 use super::*;
+use crate::connection_timeline::HotPathObservation;
 use crate::transport::wire::wire_receiver_index;
 
 impl WireGuardTransport {
@@ -694,11 +695,11 @@ impl WireGuardTransport {
                                     }
                                 }
                             } else {
-                                peers.emit_timeline(
+                                peers.observe_hot_path(
                                     if binding_contended {
-                                        "session_evidence_contended"
+                                        HotPathObservation::ResponderBindingContended
                                     } else {
-                                        "stale_session_evidence"
+                                        HotPathObservation::ResponderBindingStale
                                     },
                                     relay_endpoint.as_ref().map(|_| "relay").or(Some("direct")),
                                     Some(if binding_contended {
@@ -706,16 +707,18 @@ impl WireGuardTransport {
                                     } else {
                                         "session_replaced_or_removed"
                                     }),
-                                    Some(format!(
-                                        "peer={} session_instance={:?} responder_binding={}",
-                                        inbound.peer_id,
-                                        inbound.session_instance,
-                                        if binding_contended {
-                                            "contended"
-                                        } else {
-                                            "stale"
-                                        },
-                                    )),
+                                    || {
+                                        format!(
+                                            "peer={} session_instance={:?} responder_binding={}",
+                                            inbound.peer_id,
+                                            inbound.session_instance,
+                                            if binding_contended {
+                                                "contended"
+                                            } else {
+                                                "stale"
+                                            },
+                                        )
+                                    },
                                 );
                             }
                             drop(binding_guard);
@@ -897,12 +900,23 @@ impl WireGuardTransport {
                                         direct_validation,
                                     )
                                 {
-                                    let session_guard = self
-                                        .acquire_current_session_evidence_guard(
+                                    let session_guard_outcome = self
+                                        .acquire_current_session_evidence_guard_outcome(
                                             &inbound.peer_id,
                                             inbound.session_instance,
                                         )
                                         .await;
+                                    let session_contended = matches!(
+                                        session_guard_outcome,
+                                        CurrentSessionEvidenceGuardOutcome::Contended
+                                    );
+                                    let session_guard = match session_guard_outcome {
+                                        CurrentSessionEvidenceGuardOutcome::Current(guard) => {
+                                            Some(guard)
+                                        }
+                                        CurrentSessionEvidenceGuardOutcome::Contended
+                                        | CurrentSessionEvidenceGuardOutcome::Stale => None,
+                                    };
                                     let session_current = inbound.session_instance.is_none()
                                         || session_guard.is_some();
                                     // Endpoint learning is not a Relay/current-
@@ -911,14 +925,30 @@ impl WireGuardTransport {
                                     // those while retaining the emit guard.
                                     drop(session_guard);
                                     if !session_current {
-                                        peers.emit_timeline(
-                                            "stale_session_evidence",
+                                        peers.observe_hot_path(
+                                            if session_contended {
+                                                HotPathObservation::DirectIngressContended
+                                            } else {
+                                                HotPathObservation::DirectIngressStale
+                                            },
                                             Some("direct"),
-                                            Some("session_replaced_or_removed"),
-                                            Some(format!(
-                                                "peer={} session_instance={:?} direct_ingress=stale",
-                                                inbound.peer_id, inbound.session_instance,
-                                            )),
+                                            Some(if session_contended {
+                                                "session_evidence_fence_contended"
+                                            } else {
+                                                "session_replaced_or_removed"
+                                            }),
+                                            || {
+                                                format!(
+                                                "peer={} session_instance={:?} direct_ingress={}",
+                                                inbound.peer_id,
+                                                inbound.session_instance,
+                                                if session_contended {
+                                                    "contended"
+                                                } else {
+                                                    "stale"
+                                                },
+                                            )
+                                            },
                                         );
                                     } else {
                                         peers
@@ -1240,11 +1270,11 @@ impl WireGuardTransport {
                                                     )
                                             });
                                     if let Some(timeline) = feed.timeline.as_ref() {
-                                        timeline.emit(
+                                        timeline.observe_hot_path(
                                             if session_guard_contended {
-                                                "business_ingress_evidence_deferred"
+                                                HotPathObservation::BusinessIngressDeferred
                                             } else {
-                                                "stale_session_evidence"
+                                                HotPathObservation::BusinessIngressStale
                                             },
                                             Some(match path {
                                                 crate::peer::NetworkPath::Relay => "relay",
@@ -1255,7 +1285,7 @@ impl WireGuardTransport {
                                             } else {
                                                 "session_replaced_or_removed"
                                             }),
-                                            Some(format!(
+                                            || format!(
                                                 "peer={} session_instance={:?} business_ingress={} evidence_retained={retained} queued_writer=false",
                                                 inbound.peer_id,
                                                 inbound.session_instance,
@@ -1264,7 +1294,7 @@ impl WireGuardTransport {
                                                 } else {
                                                     "stale"
                                                 },
-                                            )),
+                                            ),
                                         );
                                     }
                                 }

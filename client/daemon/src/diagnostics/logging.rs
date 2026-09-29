@@ -2,7 +2,7 @@ use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -15,6 +15,7 @@ const LOG_MAX_BYTES: u64 = 10 * 1024 * 1024;
 const LOG_BACKUPS: usize = 4;
 const LOG_QUEUE_CAPACITY: usize = 512;
 const LOG_ENTRY_MAX_BYTES: usize = 16 * 1024;
+const LOG_SEGMENT_HEADER_MAX_BYTES: usize = 128;
 const LOG_DRAIN_BUDGET: Duration = Duration::from_millis(500);
 
 #[derive(Clone, Copy)]
@@ -185,15 +186,51 @@ fn local_calendar(_seconds: i64) -> Option<Calendar> {
 
 #[derive(Clone)]
 pub struct NonBlockingLog {
-    sender: mpsc::SyncSender<Vec<u8>>,
+    sender: mpsc::SyncSender<LogCommand>,
     dropped: Arc<AtomicUsize>,
     stopping: Arc<AtomicBool>,
+    runtime_generation: Arc<AtomicU64>,
+}
+
+enum LogCommand {
+    Record {
+        generation: u64,
+        bytes: Vec<u8>,
+    },
+    BeginRuntime {
+        generation: u64,
+        completed: mpsc::SyncSender<io::Result<()>>,
+    },
+}
+
+impl NonBlockingLog {
+    /// Android keeps its subscriber across daemon restarts. Serialize the new
+    /// runtime boundary behind previous records before admitting its new logs.
+    pub fn begin_runtime(&self) -> io::Result<()> {
+        let generation = self.runtime_generation.fetch_add(1, Ordering::AcqRel) + 1;
+        let (completed, receiver) = mpsc::sync_channel(1);
+        self.sender
+            .try_send(LogCommand::BeginRuntime {
+                generation,
+                completed,
+            })
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "log runtime boundary queue unavailable",
+                )
+            })?;
+        receiver.recv_timeout(LOG_DRAIN_BUDGET).map_err(|_| {
+            io::Error::new(io::ErrorKind::TimedOut, "log runtime boundary timed out")
+        })?
+    }
 }
 
 pub struct LogEventWriter {
     sink: NonBlockingLog,
     bytes: Vec<u8>,
     truncated: bool,
+    runtime_generation: u64,
 }
 
 impl<'a> MakeWriter<'a> for NonBlockingLog {
@@ -204,6 +241,7 @@ impl<'a> MakeWriter<'a> for NonBlockingLog {
             sink: self.clone(),
             bytes: Vec::with_capacity(512),
             truncated: false,
+            runtime_generation: self.runtime_generation.load(Ordering::Acquire),
         }
     }
 }
@@ -238,7 +276,10 @@ impl Drop for LogEventWriter {
         if self
             .sink
             .sender
-            .try_send(std::mem::take(&mut self.bytes))
+            .try_send(LogCommand::Record {
+                generation: self.runtime_generation,
+                bytes: std::mem::take(&mut self.bytes),
+            })
             .is_err()
         {
             self.sink.dropped.fetch_add(1, Ordering::Relaxed);
@@ -269,7 +310,8 @@ impl Drop for LogWorkerGuard {
 
 pub fn bounded_file_writer(path: &Path) -> io::Result<(NonBlockingLog, LogWorkerGuard)> {
     let mut file = RollingFile::open(path, LOG_MAX_BYTES, LOG_BACKUPS)?;
-    let (sender, receiver) = mpsc::sync_channel::<Vec<u8>>(LOG_QUEUE_CAPACITY);
+    file.begin_runtime()?;
+    let (sender, receiver) = mpsc::sync_channel::<LogCommand>(LOG_QUEUE_CAPACITY);
     let (completed_tx, completed) = mpsc::channel();
     let dropped = Arc::new(AtomicUsize::new(0));
     let stopping = Arc::new(AtomicBool::new(false));
@@ -280,6 +322,8 @@ pub fn bounded_file_writer(path: &Path) -> io::Result<(NonBlockingLog, LogWorker
         .spawn(move || {
             let mut drain_deadline = None;
             let mut write_failures = 0usize;
+            let mut runtime_generation = 0u64;
+            let mut stale_records = 0usize;
             loop {
                 if worker_stopping.load(Ordering::Acquire) && drain_deadline.is_none() {
                     drain_deadline = Some(Instant::now() + LOG_DRAIN_BUDGET);
@@ -297,6 +341,44 @@ pub fn bounded_file_writer(path: &Path) -> io::Result<(NonBlockingLog, LogWorker
                         Ok(bytes) => bytes,
                         Err(mpsc::RecvTimeoutError::Timeout) => continue,
                         Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    }
+                };
+                let bytes = match bytes {
+                    LogCommand::Record { generation, bytes } => {
+                        // Even if the explicit boundary command could not enter
+                        // a full queue, a new runtime can never append under the
+                        // old runtime marker. Retry its boundary before writing.
+                        if generation < runtime_generation {
+                            stale_records = stale_records.saturating_add(1);
+                            if stale_records == 1 || stale_records.is_power_of_two() {
+                                let notice = format!(
+                                    "{} WARN p2wlan_daemon::logging: log_runtime_stale_record dropped_total={}\n",
+                                    local_timestamp(SystemTime::now()), stale_records
+                                );
+                                let _ = file.write_record(notice.as_bytes());
+                            }
+                            continue;
+                        }
+                        if generation != runtime_generation {
+                            if let Err(error) = file.begin_runtime() {
+                                write_failures = write_failures.saturating_add(1);
+                                if write_failures == 1 || write_failures.is_power_of_two() {
+                                    eprintln!("P2WLAN log runtime boundary failed ({write_failures}): {error}");
+                                }
+                                continue;
+                            }
+                            runtime_generation = generation;
+                        }
+                        bytes
+                    }
+                    LogCommand::BeginRuntime { generation, completed } => {
+                        let result = if generation > runtime_generation {
+                            file.begin_runtime().map(|()| runtime_generation = generation)
+                        } else {
+                            Ok(())
+                        };
+                        let _ = completed.send(result);
+                        continue;
                     }
                 };
                 let dropped_count = worker_dropped.swap(0, Ordering::Relaxed);
@@ -340,6 +422,7 @@ pub fn bounded_file_writer(path: &Path) -> io::Result<(NonBlockingLog, LogWorker
             sender,
             dropped,
             stopping: stopping.clone(),
+            runtime_generation: Arc::new(AtomicU64::new(0)),
         },
         LogWorkerGuard {
             stopping,
@@ -355,6 +438,7 @@ struct RollingFile {
     length: u64,
     max_bytes: u64,
     backups: usize,
+    runtime_segment: Option<(String, u64)>,
     #[cfg(unix)]
     owner: (u32, u32),
 }
@@ -467,9 +551,45 @@ impl RollingFile {
             length,
             max_bytes,
             backups,
+            runtime_segment: None,
             #[cfg(unix)]
             owner,
         })
+    }
+
+    fn begin_runtime(&mut self) -> io::Result<()> {
+        if self.max_bytes <= LOG_SEGMENT_HEADER_MAX_BYTES as u64 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "log segment budget too small",
+            ));
+        }
+        self.runtime_segment = None;
+        if self.length > 0 {
+            self.rotate()?;
+        }
+        // Correlation only: this random ID is never an authentication secret.
+        self.runtime_segment = Some((hex::encode(rand::random::<[u8; 16]>()), 0));
+        self.write_segment_header()
+    }
+
+    fn write_segment_header(&mut self) -> io::Result<()> {
+        if let (Some((runtime_id, segment)), Some(file)) =
+            (&self.runtime_segment, self.file.as_mut())
+        {
+            let marker = format!(
+                "[p2wlan-log-segment] version=1 runtime_id={runtime_id} segment={segment}\n"
+            );
+            if let Err(error) = file.write_all(marker.as_bytes()) {
+                self.length = file
+                    .metadata()
+                    .map(|metadata| metadata.len())
+                    .unwrap_or(self.max_bytes);
+                return Err(error);
+            }
+            self.length += marker.len() as u64;
+        }
+        Ok(())
     }
 
     fn rotate(&mut self) -> io::Result<()> {
@@ -495,7 +615,10 @@ impl RollingFile {
         let file = self.open_replacement()?;
         self.file = Some(file);
         self.length = 0;
-        Ok(())
+        if let Some((_, segment)) = self.runtime_segment.as_mut() {
+            *segment = segment.saturating_add(1);
+        }
+        self.write_segment_header()
     }
 
     fn open_replacement(&self) -> io::Result<File> {
@@ -516,11 +639,20 @@ impl RollingFile {
     }
 
     fn write_record(&mut self, bytes: &[u8]) -> io::Result<()> {
-        let bytes = &bytes[..bytes.len().min(self.max_bytes as usize)];
+        let reserved = if self.runtime_segment.is_some() {
+            LOG_SEGMENT_HEADER_MAX_BYTES
+        } else {
+            0
+        };
+        let record_budget = (self.max_bytes as usize).saturating_sub(reserved);
+        let bytes = &bytes[..bytes.len().min(record_budget)];
         if self.file.is_none() {
             let mut file = self.open_replacement()?;
             self.length = trim_oversized_log(&mut file, self.max_bytes)?;
             self.file = Some(file);
+        }
+        if self.length == 0 {
+            self.write_segment_header()?;
         }
         if self.length > 0 && self.length + bytes.len() as u64 > self.max_bytes {
             self.rotate()?;
@@ -623,6 +755,120 @@ mod tests {
     }
 
     #[test]
+    fn segment_markers_link_rotations_but_separate_restarted_runtimes() {
+        let path = temp_log();
+        let mut file = RollingFile::open(&path, 256, 2).unwrap();
+        file.begin_runtime().unwrap();
+        let first_marker = std::fs::read_to_string(&path).unwrap();
+        for _ in 0..4 {
+            file.write_record(b"a complete record that causes a bounded rotation\n")
+                .unwrap();
+        }
+        let rotated = std::fs::read_to_string(archive_path(&path, 1)).unwrap();
+        let current = std::fs::read_to_string(&path).unwrap();
+        assert!(rotated.starts_with(&first_marker));
+        assert!(current.starts_with(&first_marker.replace("segment=0", "segment=1")));
+        assert!(current.len() <= 256);
+        file.begin_runtime().unwrap();
+        let restarted = std::fs::read_to_string(&path).unwrap();
+        assert!(restarted.ends_with("segment=0\n"));
+        assert_ne!(restarted, first_marker);
+        assert_eq!(
+            std::fs::read_to_string(archive_path(&path, 1)).unwrap(),
+            current
+        );
+        drop(file);
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn subscriber_restart_serializes_old_records_before_new_runtime_boundary() {
+        let path = temp_log();
+        let (sink, guard) = bounded_file_writer(&path).unwrap();
+        {
+            let mut writer = sink.make_writer();
+            writer.write_all(b"previous runtime\n").unwrap();
+        }
+        sink.begin_runtime().unwrap();
+        {
+            let mut writer = sink.make_writer();
+            writer.write_all(b"current runtime\n").unwrap();
+        }
+        drop(guard);
+        let previous = std::fs::read_to_string(archive_path(&path, 1)).unwrap();
+        let current = std::fs::read_to_string(&path).unwrap();
+        assert!(previous.contains("previous runtime"));
+        assert!(!current.contains("previous runtime"));
+        assert!(current.contains("current runtime"));
+        assert_ne!(previous.lines().next(), current.lines().next());
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn writer_created_before_restart_cannot_append_old_payload_to_new_runtime() {
+        let path = temp_log();
+        let (sink, guard) = bounded_file_writer(&path).unwrap();
+        let mut delayed = sink.make_writer();
+        delayed.write_all(b"old runtime payload\n").unwrap();
+        sink.begin_runtime().unwrap();
+        drop(delayed);
+        sink.make_writer()
+            .write_all(b"new runtime payload\n")
+            .unwrap();
+        drop(guard);
+        let current = std::fs::read_to_string(&path).unwrap();
+        assert!(!current.contains("old runtime payload"));
+        assert!(current.contains("new runtime payload"));
+        assert!(current.contains("log_runtime_stale_record dropped_total=1"));
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn segment_header_and_oversized_record_share_the_file_budget() {
+        let path = temp_log();
+        let mut file = RollingFile::open(&path, 256, 2).unwrap();
+        file.begin_runtime().unwrap();
+        file.write_record(&[b'x'; 1024]).unwrap();
+        file.write_record(&[b'y'; 1024]).unwrap();
+        file.flush().unwrap();
+        assert!(std::fs::metadata(&path).unwrap().len() <= 256);
+        assert!(std::fs::metadata(archive_path(&path, 1)).unwrap().len() <= 256);
+        drop(file);
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn full_boundary_queue_still_advances_new_record_identity() {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let sink = NonBlockingLog {
+            sender,
+            dropped: Arc::new(AtomicUsize::new(0)),
+            stopping: Arc::new(AtomicBool::new(false)),
+            runtime_generation: Arc::new(AtomicU64::new(0)),
+        };
+        sink.make_writer().write_all(b"old\n").unwrap();
+        assert_eq!(
+            sink.begin_runtime().unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        let LogCommand::Record {
+            generation: old, ..
+        } = receiver.recv().unwrap()
+        else {
+            panic!("expected old record");
+        };
+        sink.make_writer().write_all(b"new\n").unwrap();
+        let LogCommand::Record {
+            generation: new, ..
+        } = receiver.recv().unwrap()
+        else {
+            panic!("expected new record");
+        };
+        assert_eq!(old, 0);
+        assert_eq!(new, 1);
+    }
+
+    #[test]
     fn old_oversized_logs_are_trimmed_with_bounded_tail_reads() {
         let path = temp_log();
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -666,6 +912,7 @@ mod tests {
             sender,
             dropped: dropped.clone(),
             stopping: Arc::new(AtomicBool::new(false)),
+            runtime_generation: Arc::new(AtomicU64::new(0)),
         };
         {
             let mut writer = sink.make_writer();
@@ -678,7 +925,9 @@ mod tests {
             writer.write_all(b"dropped\n").unwrap();
         }
         assert_eq!(dropped.load(Ordering::Relaxed), 1);
-        let bytes = receiver.recv().unwrap();
+        let LogCommand::Record { bytes, .. } = receiver.recv().unwrap() else {
+            panic!("expected log record");
+        };
         assert!(bytes.len() <= LOG_ENTRY_MAX_BYTES);
         assert!(std::str::from_utf8(&bytes)
             .unwrap()

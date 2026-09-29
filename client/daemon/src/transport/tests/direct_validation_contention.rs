@@ -97,19 +97,22 @@ async fn assert_validation_request_during_emit_contention(replace_session: bool)
     assert_eq!(request_seen, !replace_session);
     assert_eq!(ack_sent, !replace_session);
     assert_ne!(connection.state, ConnectionState::Direct);
+    // The contention and session-fence checks above use virtual time, but
+    // loopback UDP readiness is delivered by the real OS. A paused Tokio
+    // clock may advance a receive timeout before that readiness is observed.
+    // Resume only for the network assertion; the bounded emit-wait test
+    // below still verifies the production deadline with virtual time.
+    tokio::time::resume();
     let mut buffer = [0u8; 2048];
     if replace_session {
         assert!(
             matches!(remote_socket.try_recv_from(&mut buffer), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
         );
     } else {
-        let (size, _) = timeout(
-            Duration::from_millis(20),
-            remote_socket.recv_from(&mut buffer),
-        )
-        .await
-        .unwrap()
-        .unwrap();
+        let (size, _) = timeout(Duration::from_secs(1), remote_socket.recv_from(&mut buffer))
+            .await
+            .unwrap()
+            .unwrap();
         let message = MessageTransport::from_bytes(&buffer[..size]).unwrap();
         let ack = remote_session.decrypt(&message).unwrap();
         let token = parse_direct_validation_token(&ack).unwrap();

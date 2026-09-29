@@ -298,6 +298,39 @@ impl PeerManager {
         }
     }
 
+    pub(crate) fn observe_hot_path<F>(
+        &self,
+        observation: crate::connection_timeline::HotPathObservation,
+        path: Option<&str>,
+        reason_code: Option<&str>,
+        detail: F,
+    ) where
+        F: FnOnce() -> String,
+    {
+        let timeline = self
+            .timeline
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        if let Some(timeline) = timeline {
+            timeline.observe_hot_path(observation, path, reason_code, detail);
+        }
+    }
+
+    pub(crate) fn count_hot_path(
+        &self,
+        observation: crate::connection_timeline::HotPathObservation,
+    ) {
+        let timeline = self
+            .timeline
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        if let Some(timeline) = timeline {
+            timeline.count_hot_path(observation);
+        }
+    }
+
     /// Emit a correlation-aware diagnostic event at DEBUG level.  High-volume
     /// Direct lifecycle records are intentionally log-only; the peer's
     /// protected `direct_events` ring remains the structured `/status` source

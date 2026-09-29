@@ -221,6 +221,7 @@ async fn run_candidate_offer_worker(
             punch_at_ms,
             punch_at_server_ms,
             fresh_ownership,
+            publication_fence,
             response_tx,
         } = command;
         let mut response_tx = response_tx;
@@ -243,6 +244,12 @@ async fn run_candidate_offer_worker(
         {
             let _ = response_tx.send(PeerOfferSendOutcome::Cancelled);
             continue;
+        }
+        if let Some(fence) = publication_fence.as_ref() {
+            if !fence.is_current().await {
+                let _ = response_tx.send(PeerOfferSendOutcome::Cancelled);
+                continue;
+            }
         }
         // `wait_for_critical_control_auth` uses a clone of this receiver. Mark
         // the worker's receiver as having observed the same registration so a
@@ -324,6 +331,17 @@ async fn run_candidate_offer_worker(
                     let request = async {
                         if attempt > 1 {
                             time::sleep(Duration::from_millis(25)).await;
+                        }
+                        // A candidate refresh may have waited behind the
+                        // per-peer command lane and auth. Recheck its exact
+                        // network, peer session and snapshot at the final
+                        // HTTP boundary, including after retry backoff.
+                        if let Some(fence) = publication_fence.as_ref() {
+                            if !fence.is_current().await {
+                                return Err(DaemonError::ControlPlane(
+                                    "candidate publication identity expired before delivery".into(),
+                                ));
+                            }
                         }
                         if Instant::now() >= deadline
                             || request_auth.has_changed().is_err()
@@ -456,6 +474,15 @@ async fn run_candidate_offer_worker(
                 continue;
             }
         };
+        if let Some(fence) = publication_fence.as_ref() {
+            if !fence.is_current().await {
+                // A network handover or peer replacement may have raced the
+                // request completion. Its delivery is then ambiguous, but it
+                // must not start a new local punch against that old snapshot.
+                let _ = response_tx.send(PeerOfferSendOutcome::Cancelled);
+                continue;
+            }
+        }
         let outcome = match result {
             Ok(()) => {
                 debug!("Sent candidate peer_offer to {to_node_id} punch_at_ms={punch_at_ms:?}");

@@ -45,6 +45,18 @@ class NetworkMatrixTests(unittest.TestCase):
                     json.dumps({"peers": [{"state": "relay", "active_path": "relay", "online": True}]}))
             self.assertTrue(MATRIX.read_case(root, 0)["valid"])
             self.assertFalse(MATRIX.read_case(root, 1)["valid"])
+            samples = [{"monotonic_ns": 1_000_000_000, "direct": {"a": 2, "b": 2}},
+                       {"monotonic_ns": 5_000_000_000, "direct": {"a": 5, "b": 5}}]
+            sample_path = round_dir / "business-samples.jsonl"
+            sample_path.write_text("\n".join(map(json.dumps, samples)) + "\n")
+            self.assertFalse(MATRIX.read_case(root, 0, True)["valid"], "Relay cannot satisfy Direct")
+            for side in ("a", "b"):
+                (round_dir / f"node-{side}.status.json").write_text(
+                    json.dumps({"peers": [{"state": "direct", "active_path": "direct", "online": True}]}))
+            self.assertTrue(MATRIX.read_case(root, 0, True)["valid"])
+            samples[1]["direct"] = samples[0]["direct"]
+            sample_path.write_text("\n".join(map(json.dumps, samples)) + "\n")
+            self.assertFalse(MATRIX.read_case(root, 0, True)["valid"], "historic Direct is insufficient")
             for name in data:
                 path = round_dir / f"{name}.json"
                 original = path.read_text()

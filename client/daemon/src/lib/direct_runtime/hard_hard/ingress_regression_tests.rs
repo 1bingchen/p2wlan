@@ -242,7 +242,7 @@ async fn hard_hard_startup_roster_endpoint_revision_preserves_measuring_owner() 
                 generation,
                 record.local_network_generation,
                 1,
-                PUNCH_PRIORITY_FRESH_PREDICTION,
+                PUNCH_PRIORITY_HARD_HARD,
                 None,
                 Some(hard_hard_now_ms() + 3_500),
             )
@@ -401,7 +401,7 @@ async fn hard_hard_startup_candidate_refresh_waits_before_session_registration()
             generation,
             record.local_network_generation,
             1,
-            PUNCH_PRIORITY_FRESH_PREDICTION,
+            PUNCH_PRIORITY_HARD_HARD,
             None,
             Some(hard_hard_now_ms() + 3_500),
         )

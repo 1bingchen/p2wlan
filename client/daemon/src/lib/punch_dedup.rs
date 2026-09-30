@@ -130,6 +130,10 @@ const PUNCH_PRIORITY_SYNCHRONIZED: u8 = 1;
 /// this session must preempt every older ordinary/birthday session so the
 /// prediction is used while it is still fresh.
 const PUNCH_PRIORITY_FRESH_PREDICTION: u8 = 2;
+/// A bilateral measured rendezvous cannot be ordered against a one-sided
+/// prediction's boot/generation ID. Give it its own priority while retaining
+/// the same lifecycle fences and bounded first-send protection below.
+const PUNCH_PRIORITY_HARD_HARD: u8 = 3;
 
 #[derive(Debug, Default)]
 pub(crate) struct PunchSessionCancellation {
@@ -518,7 +522,7 @@ impl PunchAttemptDeduplicator {
                 PunchCancellationReason::NetworkGenerationChanged
             } else if epoch_preempts {
                 PunchCancellationReason::RecoveryEpochChanged
-            } else if priority == PUNCH_PRIORITY_FRESH_PREDICTION {
+            } else if priority >= PUNCH_PRIORITY_FRESH_PREDICTION {
                 PunchCancellationReason::FreshPredictionPreempted
             } else {
                 PunchCancellationReason::SynchronizedPreemptedBackground
@@ -620,7 +624,7 @@ impl PunchAttemptDeduplicator {
             .active
             .get(peer_id)
             .is_some_and(|active| {
-                active.priority == PUNCH_PRIORITY_FRESH_PREDICTION
+                active.priority == PUNCH_PRIORITY_HARD_HARD
                     && active.fresh_generation.is_none()
                     && active.network_generation == network_generation
                     && Some(active.peer_session_generation) == peer_session

@@ -9,6 +9,7 @@ from pathlib import Path
 import struct
 from typing import Any
 from network_conditions import load_profiles
+from background_evidence import sustained_background_coverage
 
 
 def summarize_mapping_evidence(round_dir: Path, expected: dict[str, str]) -> dict[str, Any]:
@@ -44,13 +45,19 @@ def summarize_mapping_evidence(round_dir: Path, expected: dict[str, str]) -> dic
         if features.get("network_profiles") != {name: profile.to_dict() for name, profile in profiles.items()}:
             errors.append("nat_feature_mismatch:network_profiles")
     background_devices = int(expected.get("BACKGROUND_DEVICES", "0"))
+    background_duration_ms = int(expected.get("BACKGROUND_DURATION_MS", "0"))
+    if background_duration_ms and features.get("background_duration_ms") != background_duration_ms:
+        errors.append("nat_feature_mismatch:background_duration_ms")
     if background_devices:
         for field in ("background_devices", "background_flows", "background_interval_ms"):
             wanted = int(expected.get(field.upper(), {"background_flows": "32", "background_interval_ms": "250"}.get(field, "0")))
             if features.get(field) != wanted:
                 errors.append(f"nat_feature_mismatch:{field}")
-    background = {nat: {"started": 0, "completed": 0, "failed": 0} for nat in ("A", "B")}
+    background = {nat: {"started": 0, "completed": 0, "failed": 0, "cancelled": 0} for nat in ("A", "B")}
     background_times = {nat: [] for nat in ("A", "B")}
+    background_rows = {nat: [] for nat in ("A", "B")}
+    capture_clocks = {nat: [] for nat in ("A", "B")}
+    sustained = {}
     capture_window = {nat: [] for nat in ("A", "B")}
     captures = {"A": 0, "B": 0}
     capture_bytes = {"A": 0, "B": 0}
@@ -91,6 +98,7 @@ def summarize_mapping_evidence(round_dir: Path, expected: dict[str, str]) -> dic
                 elif event == "egress_captured":
                     captures[nat] += 1
                     capture_window[nat].append(sequence)
+                    capture_clocks[nat].append(row.get("monotonic_ns"))
                     if type(row.get("bytes")) is not int or row["bytes"] < 0:
                         errors.append("egress_capture_bytes_missing")
                     else:
@@ -101,6 +109,7 @@ def summarize_mapping_evidence(round_dir: Path, expected: dict[str, str]) -> dic
                         background[nat][kind] += 1
                         if kind == "started":
                             background_times[nat].append(sequence)
+                            background_rows[nat].append(row)
                 elif event in {"egress_rejected", "outbound_queue_rejected", "outbound_mapping_error", "network_packet_task_failed"}:
                     rejected += 1
                 elif event == "stun_mapping_observed":
@@ -173,6 +182,15 @@ def summarize_mapping_evidence(round_dir: Path, expected: dict[str, str]) -> dic
             complete = (background[nat]["started"] == wanted
                         and background[nat]["completed"] + background[nat]["failed"] == wanted
                         and background[nat]["completed"] > 0)
+            if background_duration_ms:
+                complete = (background[nat]["started"] >= background_devices
+                            and sum(background[nat][k] for k in ("completed", "failed", "cancelled"))
+                            == background[nat]["started"] and background[nat]["completed"] > 0)
+                sustained[nat] = sustained_background_coverage(
+                    background_rows[nat], capture_clocks[nat], background_devices,
+                    int(expected.get("BACKGROUND_INTERVAL_MS", "250")))
+                if not sustained[nat]["valid"]:
+                    errors.append(f"{nat.lower()}_sustained_background_coverage_incomplete")
             if not complete or (not impaired and background[nat]["failed"]):
                 errors.append(f"{nat.lower()}_background_traffic_incomplete")
             window = capture_window[nat]
@@ -197,6 +215,7 @@ def summarize_mapping_evidence(round_dir: Path, expected: dict[str, str]) -> dic
         "reciprocal_mapping_pairs": pairs,
         "injected_allocations": noise,
         "background_traffic": background,
+        "sustained_background_coverage": sustained,
         "features": {key: features.get(key) for key in expected_features},
     }
 

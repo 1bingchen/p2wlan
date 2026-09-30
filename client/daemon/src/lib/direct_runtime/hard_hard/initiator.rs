@@ -259,7 +259,7 @@ pub(crate) async fn spawn_hard_hard_initiator(
             peer_session_generation,
             plan.local_network_generation,
             epoch,
-            PUNCH_PRIORITY_FRESH_PREDICTION,
+            PUNCH_PRIORITY_HARD_HARD,
             None,
             Some(punch_at_ms),
         )
@@ -351,7 +351,8 @@ pub(crate) async fn spawn_hard_hard_initiator(
     };
     let mut coordination = hard_hard_coordination_from_plan(token, HardHardRole::Initiator, plan);
     if coordinated {
-        let timing = signal.control.hard_hard_timing_hint();
+        let (rtt_ms, uncertainty_ms) =
+            hard_hard_wire_timing(signal.control.hard_hard_timing_hint());
         coordination.v2 = Some(HardHardV2Envelope {
             stage: HardHardV2Stage::Offer,
             local: Default::default(),
@@ -359,10 +360,8 @@ pub(crate) async fn spawn_hard_hard_initiator(
             phase: rand::random(),
             agreement: None,
             strategy_order: peers.hard_hard_strategy_order(&peer_id).await,
-            rtt_ms: timing.map_or(0, |hint| hint.rtt_ms.min(u64::from(u16::MAX)) as u16),
-            uncertainty_ms: timing.map_or(0, |hint| {
-                hint.uncertainty_ms.min(u64::from(u16::MAX)) as u16
-            }),
+            rtt_ms,
+            uncertainty_ms,
         });
     }
     hard_hard_a0_stage_log(

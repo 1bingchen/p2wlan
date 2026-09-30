@@ -3,6 +3,19 @@
 /// hh2 is sent only after explicit endpoint capability negotiation.
 const HARD_HARD_V2_BYTES: usize = 90;
 
+/// Zero denotes unavailable timing on the wire. The short-RPC clock rounds
+/// submillisecond RTTs down to zero, while positive uncertainty identifies a
+/// real sample. Preserve that evidence conservatively as one millisecond.
+fn hard_hard_wire_timing(hint: Option<control::ControlTimingHint>) -> (u16, u16) {
+    hint.filter(|hint| hint.uncertainty_ms > 0)
+        .map_or((0, 0), |hint| {
+            (
+                hint.rtt_ms.clamp(1, u64::from(u16::MAX)) as u16,
+                hint.uncertainty_ms.min(u64::from(u16::MAX)) as u16,
+            )
+        })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub(crate) enum HardHardV2Stage {

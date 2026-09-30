@@ -621,7 +621,7 @@ async fn claim_hard_hard_responder_session(
             peer_session_generation,
             plan.local_network_generation,
             epoch,
-            PUNCH_PRIORITY_FRESH_PREDICTION,
+            PUNCH_PRIORITY_HARD_HARD,
             None,
             Some(punch_at_ms),
         )
@@ -754,7 +754,7 @@ async fn claim_hard_hard_responder_session(
             peer_session_generation,
             plan.local_network_generation,
             epoch,
-            PUNCH_PRIORITY_FRESH_PREDICTION,
+            PUNCH_PRIORITY_HARD_HARD,
             None,
             Some(punch_at_ms),
         )
@@ -943,7 +943,7 @@ async fn claim_hard_hard_initiator_response_session(
             peer_session_generation,
             record.local_network_generation,
             epoch,
-            PUNCH_PRIORITY_FRESH_PREDICTION,
+            PUNCH_PRIORITY_HARD_HARD,
             None,
             Some(record.punch_at_ms),
         )
@@ -1041,7 +1041,7 @@ async fn claim_hard_hard_initiator_response_session(
             peer_session_generation,
             record.local_network_generation,
             epoch,
-            PUNCH_PRIORITY_FRESH_PREDICTION,
+            PUNCH_PRIORITY_HARD_HARD,
             None,
             Some(record.punch_at_ms),
         )

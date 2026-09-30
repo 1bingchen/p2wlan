@@ -17,7 +17,7 @@ from network_conditions import load_profiles
 
 
 # These are synthetic stress configurations, not calibrated mobile operators.
-# All cases use normal production traversal. No forced HH lane or Direct gate.
+# All cases use normal production traversal. No forced HH lane or delayed UDP gate.
 SCENARIOS = {
     "strict-normal": ({}, {}),
     "relaxed-filtering": ({"STRICT_FILTERING_A": "0", "STRICT_FILTERING_B": "0"}, {}),
@@ -65,6 +65,12 @@ SCENARIOS = {
     "established-direct-rebind": ({"STRICT_FILTERING_A": "0", "STRICT_FILTERING_B": "0",
                                    "NORMAL_REQUIRE_DIRECT_BEFORE_FAULT": "1"},
                                   {"A": {"rebind_after_ms": 18000}}),
+    "shared-allocator-continuous": ({"BACKGROUND_DEVICES": "8", "BACKGROUND_FLOWS": "16",
+                                     "BACKGROUND_INTERVAL_MS": "150", "BACKGROUND_DURATION_MS": "120000",
+                                     "NORMAL_OBSERVE_S": "60",
+                                     "STEP_A": "2", "STEP_B": "3"},
+                                    {"A": {"jitter_ms": 20, "impair_stun": True},
+                                     "B": {"jitter_ms": 40, "impair_stun": True}}),
 }
 
 
@@ -94,7 +100,7 @@ def case_environment(base: dict, changes: dict, directory: Path, profile: Path, 
     return env
 
 
-def read_case(directory: Path, exit_code: int) -> dict:
+def read_case(directory: Path, exit_code: int, require_direct: bool = False) -> dict:
     errors, evidence = [], {}
     for name in ("nat-evidence", "mapping-evidence", "continuity-evidence", "cleanup"):
         try:
@@ -133,7 +139,23 @@ def read_case(directory: Path, exit_code: int) -> dict:
                 errors.append(f"final_path_unavailable:{side}")
         except (OSError, ValueError, KeyError, TypeError):
             errors.append(f"final_path_missing:{side}")
+    direct_progress = None
+    if require_direct:
+        if any(final_paths.get(side, {}).get("active_path") != "direct" for side in ("a", "b")):
+            errors.append("bilateral_direct_missing")
+        try:
+            samples = [json.loads(line) for line in
+                       (directory / "round-1" / "business-samples.jsonl").read_text().splitlines()]
+            final = samples[-1]
+            base = next(row for row in samples
+                        if 2_000_000_000 <= final["monotonic_ns"] - row["monotonic_ns"] <= 5_000_000_000)
+            direct_progress = {side: final["direct"][side] - base["direct"][side] for side in ("a", "b")}
+            if any(type(delta) is not int or delta < 2 for delta in direct_progress.values()):
+                errors.append("recent_bidirectional_direct_business_missing")
+        except (OSError, ValueError, KeyError, TypeError, IndexError, StopIteration):
+            errors.append("direct_business_evidence_invalid")
     return {"valid": not errors, "errors": errors,
+            "direct_required": require_direct, "recent_direct_business_delta": direct_progress,
             "first_business_paths": {side: observed.get(side, {}).get("first_usable", {}).get("path") for side in ("a", "b")},
             "final_paths": final_paths, "continuity": evidence.get("continuity-evidence"),
             "mapping": evidence.get("mapping-evidence"), "business": evidence.get("nat-evidence", {}).get("decision")}
@@ -145,6 +167,8 @@ def main(argv=None):
     parser.add_argument("--scenario", action="append", choices=SCENARIOS)
     parser.add_argument("--rounds", type=int, default=1)
     parser.add_argument("--seed", type=int, default=931200)
+    parser.add_argument("--require-direct", action="store_true",
+                        help="require both final Direct paths and recent bidirectional Direct business")
     parser.add_argument("--output", type=Path)
     args = parser.parse_args(argv)
     if args.list:
@@ -198,7 +222,7 @@ def main(argv=None):
                         process.wait()
                     interrupted = isinstance(error, KeyboardInterrupt)
                     code = 130 if interrupted else 124
-            row = read_case(directory, code)
+            row = read_case(directory, code, args.require_direct)
             row.update(scenario=name, repetition=repetition + 1, seed_base=seed,
                        actual_nat_seed=seed + 1, environment_overrides=changes,
                        network_profile={"schema_version": 1, **options},

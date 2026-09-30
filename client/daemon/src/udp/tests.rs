@@ -9,6 +9,7 @@ include!("tests/part06.rs");
 include!("tests/part07.rs");
 include!("tests/part08.rs");
 include!("tests/part09.rs");
+include!("tests/socket_handoff.rs");
 
 #[tokio::test]
 async fn audit_cancel_inbound_must_release_primary_socket_with_ipv6() {

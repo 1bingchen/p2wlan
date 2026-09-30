@@ -37,6 +37,7 @@ import random
 import socket
 import struct
 import time
+from background_traffic import run_background
 from typing import Deque, Dict, List, Optional, Set, Tuple
 
 
@@ -192,6 +193,7 @@ class EgressGatewayProtocol(asyncio.DatagramProtocol):
         self.nat.record_client(client)
         self.nat.record("egress_captured", client=format_address(client),
                         destination=format_address(destination), bytes=len(data) - 16)
+        self.nat.egress_activity.set()
         for transport, observer in self.nat.observers:
             if destination == observer:
                 transaction = parse_binding_request(data[16:])
@@ -369,9 +371,11 @@ class Nat:
         self.observed_sequence: List[int] = []
         self._egress_refresh_task: Optional[asyncio.Task] = None
         self._egress_refresh_needed = False
+        self.egress_activity = None
 
     async def start(self, fabric: Optional[NatFabric] = None) -> "Nat":
         self.loop = asyncio.get_running_loop()
+        self.egress_activity = asyncio.Event()
         self.fabric = fabric
         if fabric is not None:
             fabric.add_nat(self)
@@ -924,11 +928,19 @@ def main() -> None:
     parser.add_argument("--base-a", type=int, default=16000)
     parser.add_argument("--base-b", type=int, default=26000)
     parser.add_argument("--trace-file", type=str)
+    parser.add_argument("--background-devices", type=int, default=0)
+    parser.add_argument("--background-flows", type=int, default=32)
+    parser.add_argument("--background-interval-ms", type=int, default=250)
     args = parser.parse_args()
+    if not 0 <= args.background_devices <= 16 or not 1 <= args.background_flows <= 64 or not 10 <= args.background_interval_ms <= 5000:
+        parser.error("background limits: devices 0..16, flows 1..64, interval 10..5000 ms")
+    if args.background_devices and args.egress_capture != "shim":
+        parser.error("background traffic requires complete shim capture")
 
     async def run() -> None:
         trace = NatTrace(args.trace_file) if args.trace_file else None
         fabric = NatFabric(trace)
+        background_tasks = []
         nat_a = Nat(
             "A",
             "127.0.0.1",
@@ -976,6 +988,17 @@ def main() -> None:
             await nat_b.start(fabric)
             observer_a = [await nat_a.add_observer() for _ in range(args.observers)]
             observer_b = [await nat_b.add_observer() for _ in range(args.observers)]
+            if args.background_devices:
+                async def background_after_join(nat, seed):
+                    # Start the other clients when this subscriber first joins;
+                    # their independent schedule does not observe measurements
+                    # or target candidates. Slow peer startup cannot silently
+                    # move all interference outside the tested traffic window.
+                    await nat.egress_activity.wait()
+                    await run_background(nat, args.background_devices, args.background_flows,
+                                         args.background_interval_ms, seed)
+                background_tasks = [asyncio.create_task(background_after_join(nat, args.seed + offset))
+                    for offset, nat in enumerate((nat_a, nat_b))]
             if args.egress_capture == "shim":
                 gateway_a = await nat_a.add_egress_gateway()
                 gateway_b = await nat_b.add_egress_gateway()
@@ -994,6 +1017,9 @@ def main() -> None:
                 + json.dumps(
                     {
                         "egress_capture": args.egress_capture,
+                        "background_devices": args.background_devices,
+                        "background_flows": args.background_flows,
+                        "background_interval_ms": args.background_interval_ms,
                         "consume_a": args.consume_a,
                         "consume_b": args.consume_b,
                         "sweep_noise_every": args.sweep_noise_every,
@@ -1019,6 +1045,9 @@ def main() -> None:
             )
             await asyncio.Event().wait()
         finally:
+            for task in background_tasks:
+                task.cancel()
+            await asyncio.gather(*background_tasks, return_exceptions=True)
             await nat_a.close()
             await nat_b.close()
             if trace is not None:

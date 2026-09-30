@@ -487,6 +487,7 @@ def _apply_first_usable_budget(
     counterpart: dict[str, Any],
     expected_path: str,
     reason: str | None,
+    normal_join: bool = False,
 ) -> str | None:
     """Fence one local ingress delta with the paired protection window.
 
@@ -496,6 +497,22 @@ def _apply_first_usable_budget(
     remaining windows.  Direct topology never receives this allowance.
     """
     first = side["observed"]["first_usable"]
+    # Normal joining does not wait for Relay before generating business.
+    # A valid durable Direct commit may therefore precede Relay readiness.
+    # Keep its Relay delta unknown, rather than fabricating zero or rejecting
+    # a faster working path. Calibrated Direct/Relay gates retain their SLO.
+    if (normal_join and expected_path == "direct"
+            and first.get("source") == "persistent_summary"
+            and first.get("path") == "direct"
+            and first.get("relay_ready_at_ms") is None
+            and first.get("delta_ms") is None
+            and type(first.get("first_usable_at_ms")) is int
+            and type(side["final"].get("captured_at_ms")) is int
+            and 0 <= first["first_usable_at_ms"] <= side["final"]["captured_at_ms"]):
+        first["relay_ready_delta_applicable"] = False
+        first["budget_ms"] = None
+        side["invariants"]["first_usable_delta_fenced"] = True
+        return None if reason == "first_usable_delta_missing" else reason
     counterpart_first = counterpart["observed"]["first_usable"]
     budget_remaining_ms = 0
     if expected_path == "relay":
@@ -588,10 +605,10 @@ def build_record(args: argparse.Namespace) -> dict[str, Any]:
             allow_replay_rejects,
         )
         reason_a = _apply_first_usable_budget(
-            side_a, side_b, args.expected_path, reason_a
+            side_a, side_b, args.expected_path, reason_a, topology == "normal-join"
         )
         reason_b = _apply_first_usable_budget(
-            side_b, side_a, args.expected_path, reason_b
+            side_b, side_a, args.expected_path, reason_b, topology == "normal-join"
         )
         hard_hard_experiment = topology == "hard-hard-experiment"
         if hard_hard_experiment:
@@ -720,7 +737,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument(
         "--topology",
         required=True,
-        choices=["relay-blackhole", "direct-cold-start", "hard-hard-experiment"],
+        choices=["relay-blackhole", "direct-cold-start", "hard-hard-experiment", "normal-join"],
     )
     parser.add_argument("--replica", required=True, type=int)
     parser.add_argument("--round", required=True, type=int)

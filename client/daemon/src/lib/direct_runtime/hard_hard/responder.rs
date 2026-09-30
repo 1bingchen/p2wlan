@@ -1135,11 +1135,7 @@ pub(crate) async fn spawn_hard_hard_responder(
         );
         let server_deadline_field = punch_at_server_ms
             .map_or_else(|| "unknown".to_string(), |deadline| deadline.to_string());
-        let remote_network_generation = if sweep_record.remote_network_generation == 0 {
-            "unknown".to_string()
-        } else {
-            sweep_record.remote_network_generation.to_string()
-        };
+        let remote_network_generation = sweep_record.remote_network_generation.to_string();
         info!(
             event = "hard_hard_rendezvous_scheduled",
             role = "responder",

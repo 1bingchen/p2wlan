@@ -14,6 +14,8 @@
 #   run --validate-overlay --overlay-any-path and a round PASSES when BOTH
 #   sides complete the bidirectional encrypted overlay loopback over Relay.
 #   Direct results are reported separately as informational and must be 0.
+# - normal: production traversal without rendezvous gates or lane isolation;
+#   observes both encrypted business directions for NORMAL_OBSERVE_S seconds.
 # - hard-hard: the same production daemons and encrypted overlay validator run
 #   with an unforced data path. Direct success, Relay fallback, and bounded
 #   failure are experimental outcomes; this mode never weakens either gate.
@@ -26,6 +28,10 @@ source "$ROOT_DIR/scripts/nat-sim/baseline_gate.sh"
 # harness uses NETWORK_ID explicitly and requires a provisioned test network.
 NETWORK_ID=${NETWORK_ID:-default}
 MODE=${MODE:-direct}
+NORMAL_OBSERVE_S=${NORMAL_OBSERVE_S:-20}
+BACKGROUND_DEVICES=${BACKGROUND_DEVICES:-0}
+BACKGROUND_FLOWS=${BACKGROUND_FLOWS:-32}
+BACKGROUND_INTERVAL_MS=${BACKGROUND_INTERVAL_MS:-250}
 # Keep the local regression logs at the same diagnostic granularity as the
 # dual-end harness: per-packet counter/order and transport handoff boundaries
 # are DEBUG, while the rest remains INFO. Override this for a quieter run.
@@ -67,7 +73,7 @@ SWEEP_NOISE_LIMIT=${SWEEP_NOISE_LIMIT:-64}
 # Legacy gates retain their existing simulator route unless explicitly opted in.
 EGRESS_CAPTURE=${EGRESS_CAPTURE:-}
 if [[ -z "$EGRESS_CAPTURE" ]]; then
-  if [[ "$MODE" == "hard-hard" ]]; then EGRESS_CAPTURE=shim; else EGRESS_CAPTURE=listeners; fi
+  if [[ "$MODE" == "hard-hard" || "$MODE" == "normal" ]]; then EGRESS_CAPTURE=shim; else EGRESS_CAPTURE=listeners; fi
 fi
 if [[ "$EGRESS_CAPTURE" != shim && "$EGRESS_CAPTURE" != listeners ]]; then
   echo "[nat-sim] EGRESS_CAPTURE must be shim or listeners" >&2
@@ -219,8 +225,16 @@ if ! [[ "$NAT_SIM_RUN_ID" =~ ^[A-Za-z0-9_.-]{1,80}$ ]]; then
   echo "[nat-sim] NAT_SIM_RUN_ID must contain only letters, digits, '.', '_' or '-' and be <= 80 characters" >&2
   exit 2
 fi
-if [[ "$MODE" != "direct" && "$MODE" != "relay-only" && "$MODE" != "hard-hard" ]]; then
-  echo "[nat-sim] MODE must be direct, relay-only, or hard-hard" >&2
+if [[ "$MODE" != "direct" && "$MODE" != "relay-only" && "$MODE" != "hard-hard" && "$MODE" != "normal" ]]; then
+  echo "[nat-sim] MODE must be direct, relay-only, hard-hard, or normal" >&2
+  exit 2
+fi
+if ! [[ "$NORMAL_OBSERVE_S" =~ ^[0-9]+$ ]] || (( NORMAL_OBSERVE_S < 10 || NORMAL_OBSERVE_S > 120 )); then
+  echo "[nat-sim] NORMAL_OBSERVE_S must be in 10..120" >&2
+  exit 2
+fi
+if [[ "$MODE" == normal && ( "$EGRESS_CAPTURE" != shim || "$UNASSIGNED_EGRESS_LISTENERS" != 0 ) ]]; then
+  echo "[nat-sim] normal mode requires complete shim capture without preview listeners" >&2
   exit 2
 fi
 for label in "$EXPERIMENT_VARIANT" "$EXPERIMENT_SCENARIO" "$EXPERIMENT_BASELINE_SHA"; do
@@ -1155,6 +1169,7 @@ echo "[nat-sim] building control server, relay and daemon..."
   go build -o "$BASE_DIR/relay-server" ./relay
 )
 cargo build -p p2wlan-daemon --manifest-path "$ROOT_DIR/client/daemon/Cargo.toml" >/dev/null
+DAEMON_TARGET_DIR=$(cargo metadata --no-deps --format-version 1 --manifest-path "$ROOT_DIR/client/daemon/Cargo.toml" | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')
 
 # One relay keypair for the whole run (tickets are per-device). The helper
 # uses only Go's standard library, so the harness does not depend on Python
@@ -1182,6 +1197,9 @@ for round in $(seq 1 "$ROUNDS"); do
   if [[ "$STRICT_FILTERING" == "1" ]]; then STRICT_FILTERING_FLAG="--strict-filtering"; fi
   NAT_FEATURE_FLAGS=(
     --egress-capture "$EGRESS_CAPTURE"
+    --background-devices "$BACKGROUND_DEVICES"
+    --background-flows "$BACKGROUND_FLOWS"
+    --background-interval-ms "$BACKGROUND_INTERVAL_MS"
     --sweep-noise-every "$SWEEP_NOISE_EVERY"
     --sweep-noise-count "$SWEEP_NOISE_COUNT"
     --sweep-noise-limit "$SWEEP_NOISE_LIMIT"
@@ -1197,8 +1215,8 @@ for round in $(seq 1 "$ROUNDS"); do
     # prevents the ordinary startup probes from winning the loopback race
     # before the freshly observed NAT profile is rebound to the current
     # candidate epoch. The gate remains closed after both real Hard<->Hard
-    # workers have scheduled the same 3500ms rendezvous, then opens 10ms before
-    # their validated server-clock deadline. This keeps earlier control-path
+    # workers have activated the same final SYNC start, then opens 10ms before
+    # their validated server-clock start. The initial deadline may be superseded. This keeps earlier control-path
     # Direct copies from winning before the measured experiment. The shim
     # still allocates their source mappings; the gate affects delivery only.
     DIRECT_GATE_FILE="$ROUND_DIR/hard-hard-direct.open"
@@ -1239,8 +1257,8 @@ for round in $(seq 1 "$ROUNDS"); do
     exit 1
   fi
 
-  DAEMON_A_CMD=("$ROOT_DIR/target/debug/p2wlan-daemon")
-  DAEMON_B_CMD=("$ROOT_DIR/target/debug/p2wlan-daemon")
+  DAEMON_A_CMD=("$DAEMON_TARGET_DIR/debug/p2wlan-daemon")
+  DAEMON_B_CMD=("$DAEMON_TARGET_DIR/debug/p2wlan-daemon")
   if [[ "$EGRESS_CAPTURE" == shim ]]; then
     EGRESS_A_PORT=$(sed -n 's/^EGRESS_A_PORT=//p' "$ROUND_DIR/nat-sim.out")
     EGRESS_B_PORT=$(sed -n 's/^EGRESS_B_PORT=//p' "$ROUND_DIR/nat-sim.out")
@@ -1459,8 +1477,8 @@ for round in $(seq 1 "$ROUNDS"); do
       HARD_HARD_GATE_DEADLINE=$(stage_deadline 20)
       HARD_HARD_GATE_RESULT=pending
       while [[ "$SECONDS" -lt "$HARD_HARD_GATE_DEADLINE" ]]; do
-        if grep -q 'event="hard_hard_rendezvous_scheduled"' "$ROUND_DIR/node-a.log" 2>/dev/null \
-          && grep -q 'event="hard_hard_rendezvous_scheduled"' "$ROUND_DIR/node-b.log" 2>/dev/null; then
+        if grep -q 'event="hard_hard_start_activated"' "$ROUND_DIR/node-a.log" 2>/dev/null \
+          && grep -q 'event="hard_hard_start_activated"' "$ROUND_DIR/node-b.log" 2>/dev/null; then
           HARD_HARD_GATE_RESULT=ready
           break
         fi
@@ -1545,6 +1563,7 @@ for round in $(seq 1 "$ROUNDS"); do
     A_BURST_BAD=0
     B_BURST_BAD=0
     OVERLAY_DEADLINE=$(stage_deadline "$OVERLAY_TIMEOUT_S")
+    NORMAL_OBSERVE_UNTIL=$((SECONDS + NORMAL_OBSERVE_S))
     # Deterministic Direct impossibility must be active before verification:
     # the blackhole is asserted from the simulator banner, not assumed.  Like
     # a simulator that failed to start, a missing banner is an infrastructure
@@ -1591,6 +1610,10 @@ for round in $(seq 1 "$ROUNDS"); do
         # punch/sweep window closes, so keep observing within this same bounded
         # overlay deadline instead of snapshotting a still-running attempt.
         if [[ "$overlay_ok" -eq 1 ]]; then
+          if [[ "$MODE" == normal && "$SECONDS" -lt "$NORMAL_OBSERVE_UNTIL" ]]; then
+            deadline_pause 0.5 "$OVERLAY_DEADLINE" || break
+            continue
+          fi
           if [[ "$MODE" != "hard-hard" ]] || {
             grep -q 'event="hard_hard_attempt_report"' "$ROUND_DIR/node-a.log" 2>/dev/null &&
             grep -q 'event="hard_hard_attempt_report"' "$ROUND_DIR/node-b.log" 2>/dev/null
@@ -1738,8 +1761,9 @@ for round in $(seq 1 "$ROUNDS"); do
   if [[ "$MODE" == "relay-only" ]]; then
     TOPOLOGY="relay-blackhole"
     EXPECTED_PATH="relay"
-  elif [[ "$MODE" == "hard-hard" ]]; then
+  elif [[ "$MODE" == "hard-hard" || "$MODE" == normal ]]; then
     TOPOLOGY="hard-hard-experiment"
+    if [[ "$MODE" == normal ]]; then TOPOLOGY="normal-join"; fi
     OBSERVED_PATHS=$(python3 - \
       "$ROUND_DIR/node-a.status.json" "$ROUND_DIR/node-b.status.json" <<'PY'
 import json
@@ -1857,7 +1881,11 @@ PY
   B_BUDGET_DIRECT_FIRST_REMAINING="$EVIDENCE_B_BUDGET_DIRECT_FIRST_REMAINING"
   DELTA_OK=1
   BUDGET_EVIDENCE_OK=1
-  if [[ -z "$A_DELTA" || -z "$B_DELTA" || -z "$A_BUDGET" || -z "$B_BUDGET" \
+  if [[ "$MODE" == normal && "$EXPECTED_PATH" == direct && "$EVIDENCE_PASS" -eq 1 \
+        && ( "$A_DELTA" -lt 0 || "$B_DELTA" -lt 0 ) ]]; then
+    echo "[nat-sim] normal Direct business preceded Relay readiness; Relay delta is not applicable"
+    SUM_DELTA=-1
+  elif [[ -z "$A_DELTA" || -z "$B_DELTA" || -z "$A_BUDGET" || -z "$B_BUDGET" \
         || "$A_DELTA" -lt 0 || "$B_DELTA" -lt 0 \
         || "$A_BUDGET" -lt 0 || "$B_BUDGET" -lt 0 ]]; then
     echo "[nat-sim] ROUND $round: FAIL reason_code=${EVIDENCE_REASON:-first_usable_delta_missing} a_delta=${A_DELTA:-missing} b_delta=${B_DELTA:-missing} a_budget_ms=${A_BUDGET:-missing} b_budget_ms=${B_BUDGET:-missing}" >&2
@@ -2032,7 +2060,7 @@ except Exception:
       echo "[nat-sim] ROUND $round: FAIL reason_code=$RELAY_REASON relay_first_evidence overlay_ok=$overlay_ok a_direct=$A_DIRECT b_direct=$B_DIRECT a_overlay=$A_OVERLAY b_overlay=$B_OVERLAY a_relay_confirmed=$A_RELAY_CONFIRMED b_relay_confirmed=$B_RELAY_CONFIRMED a_ingress=${A_INGRESS:-none} b_ingress=${B_INGRESS:-none} a_delta_ms=$A_DELTA b_delta_ms=$B_DELTA a_budget_ms=$A_BUDGET b_budget_ms=$B_BUDGET a_direct_first_remaining_ms=$A_DIRECT_FIRST_REMAINING b_direct_first_remaining_ms=$B_DIRECT_FIRST_REMAINING a_budget_direct_first_remaining_ms=$A_BUDGET_DIRECT_FIRST_REMAINING b_budget_direct_first_remaining_ms=$B_BUDGET_DIRECT_FIRST_REMAINING slo_base_ms=3000 sum_delta_ms=$SUM_DELTA drops_a=$A_DROPS drops_b=$B_DROPS replay_a=$A_REPLAY replay_b=$B_REPLAY invalid_a=$A_INVALID invalid_b=$B_INVALID burst_a=$A_BURST burst_b=$B_BURST burst_bad_a=$A_BURST_BAD burst_bad_b=$B_BURST_BAD status_http_200_a=$A_STATUS_200_COUNT/$A_STATUS_SAMPLE_COUNT status_http_200_b=$B_STATUS_200_COUNT/$B_STATUS_SAMPLE_COUNT status_always_200_a=$A_STATUS_ALWAYS_200 status_always_200_b=$B_STATUS_ALWAYS_200 task_health_a=$A_TASKS_OK task_health_b=$B_TASKS_OK elapsed_ms=$ELAPSED_MS failure_reason=${FAIL_CODE:-none} (strict relay-first evidence required: both RelayPeerConfirmed, ingress=relay:*, per-daemon delta <= paired maximum remaining DirectFirst protection + 3000ms, zero drops/replay/invalid, burst complete, status always HTTP 200, no supervised task exit)"
       overall=1
     fi
-  elif [[ "$MODE" == "hard-hard" ]]; then
+  elif [[ "$MODE" == "hard-hard" || "$MODE" == normal ]]; then
     read -r A_DROPS A_DROP_BYTES < <(python3 -c "
 import json
 try:
@@ -2061,6 +2089,10 @@ except Exception:
     elif [[ "$ALLOW_REPLAY_REJECTS" == "1" && $((A_REPLAY + B_REPLAY)) -gt 0 ]]; then
       REPLAY_POLICY_OK=1
     fi
+    ATTEMPTS_OK=0
+    if [[ "$MODE" == normal || ( "$A_HARD_HARD" -ge 1 && "$B_HARD_HARD" -ge 1 ) ]]; then ATTEMPTS_OK=1; fi
+    OBSERVATION_OK=1
+    if [[ "$MODE" == normal && "$SECONDS" -lt "$NORMAL_OBSERVE_UNTIL" ]]; then OBSERVATION_OK=0; fi
     outcome="relay_fallback"
     if [[ "$EXPECTED_PATH" == "direct" ]]; then
       outcome="direct_first_usable"
@@ -2071,14 +2103,14 @@ except Exception:
           && "$EVIDENCE_PASS" -eq 1 && "$overlay_ok" -eq 1 \
           && "$A_STATUS_ALWAYS_200" -eq 1 && "$B_STATUS_ALWAYS_200" -eq 1 \
           && "$A_TASKS_OK" -eq 1 && "$B_TASKS_OK" -eq 1 \
-          && "$A_HARD_HARD" -ge 1 && "$B_HARD_HARD" -ge 1 \
+          && "$ATTEMPTS_OK" -eq 1 && "$OBSERVATION_OK" -eq 1 \
           && "$A_DROPS" -eq 0 && "$B_DROPS" -eq 0 \
           && "$REPLAY_POLICY_OK" -eq 1 \
           && "$A_INVALID" -eq 0 && "$B_INVALID" -eq 0 ]]; then
-      echo "[nat-sim] ROUND $round: PASS hard_hard_experiment outcome=$outcome first_path=$EXPECTED_PATH overlay_ok=$overlay_ok a_direct=$A_DIRECT b_direct=$B_DIRECT a_ingress=${A_INGRESS:-none} b_ingress=${B_INGRESS:-none} hard_hard_a=$A_HARD_HARD hard_hard_b=$B_HARD_HARD drops_a=$A_DROPS drops_b=$B_DROPS replay_a=$A_REPLAY replay_b=$B_REPLAY invalid_a=$A_INVALID invalid_b=$B_INVALID elapsed_ms=$ELAPSED_MS evidence=$ROUND_DIR/nat-evidence.json"
+      echo "[nat-sim] ROUND $round: PASS traversal_mode=$MODE outcome=$outcome first_path=$EXPECTED_PATH overlay_ok=$overlay_ok a_direct=$A_DIRECT b_direct=$B_DIRECT a_ingress=${A_INGRESS:-none} b_ingress=${B_INGRESS:-none} hard_hard_a=$A_HARD_HARD hard_hard_b=$B_HARD_HARD drops_a=$A_DROPS drops_b=$B_DROPS replay_a=$A_REPLAY replay_b=$B_REPLAY invalid_a=$A_INVALID invalid_b=$B_INVALID elapsed_ms=$ELAPSED_MS evidence=$ROUND_DIR/nat-evidence.json"
     else
       EXPERIMENT_REASON="${EVIDENCE_REASON:-hard_hard_experiment_invalid}"
-      if [[ "$A_HARD_HARD" -lt 1 || "$B_HARD_HARD" -lt 1 ]]; then
+      if [[ "$ATTEMPTS_OK" -ne 1 ]]; then
         EXPERIMENT_REASON="hard_hard_attempt_missing"
       elif [[ "$overlay_ok" -ne 1 ]]; then
         EXPERIMENT_REASON="overlay_verification_failed"
@@ -2087,7 +2119,7 @@ except Exception:
       elif [[ "$REPLAY_POLICY_OK" -ne 1 ]]; then
         EXPERIMENT_REASON="replay_policy_unsatisfied"
       fi
-      echo "[nat-sim] ROUND $round: FAIL reason_code=$EXPERIMENT_REASON hard_hard_experiment outcome=$outcome first_path=$EXPECTED_PATH overlay_ok=$overlay_ok a_direct=$A_DIRECT b_direct=$B_DIRECT a_ingress=${A_INGRESS:-none} b_ingress=${B_INGRESS:-none} hard_hard_a=$A_HARD_HARD hard_hard_b=$B_HARD_HARD drops_a=$A_DROPS drops_b=$B_DROPS replay_a=$A_REPLAY replay_b=$B_REPLAY invalid_a=$A_INVALID invalid_b=$B_INVALID elapsed_ms=$ELAPSED_MS evidence=$ROUND_DIR/nat-evidence.json" >&2
+      echo "[nat-sim] ROUND $round: FAIL reason_code=$EXPERIMENT_REASON traversal_mode=$MODE outcome=$outcome first_path=$EXPECTED_PATH overlay_ok=$overlay_ok a_direct=$A_DIRECT b_direct=$B_DIRECT a_ingress=${A_INGRESS:-none} b_ingress=${B_INGRESS:-none} hard_hard_a=$A_HARD_HARD hard_hard_b=$B_HARD_HARD drops_a=$A_DROPS drops_b=$B_DROPS replay_a=$A_REPLAY replay_b=$B_REPLAY invalid_a=$A_INVALID invalid_b=$B_INVALID elapsed_ms=$ELAPSED_MS evidence=$ROUND_DIR/nat-evidence.json" >&2
       overall=1
     fi
   else
@@ -2312,6 +2344,17 @@ except Exception:
     fi
   fi
   stop_pid_group_bounded "$SERVER_PID" "$NAT_PID" "${RELAY_PIDS[@]}"
+  if [[ "$EGRESS_CAPTURE" == shim ]]; then
+    if ! STRICT_FILTERING_A="$STRICT_FILTERING_A" STRICT_FILTERING_B="$STRICT_FILTERING_B" \
+      CONSUME_A="$CONSUME_A" CONSUME_B="$CONSUME_B" SWEEP_NOISE_EVERY="$SWEEP_NOISE_EVERY" \
+      SWEEP_NOISE_COUNT="$SWEEP_NOISE_COUNT" SWEEP_NOISE_LIMIT="$SWEEP_NOISE_LIMIT" \
+      BACKGROUND_DEVICES="$BACKGROUND_DEVICES" BACKGROUND_FLOWS="$BACKGROUND_FLOWS" \
+      BACKGROUND_INTERVAL_MS="$BACKGROUND_INTERVAL_MS" \
+      python3 "$ROOT_DIR/scripts/nat-sim/mapping_evidence.py" "$ROUND_DIR"; then
+      echo "[nat-sim] ROUND $round: FAIL reason_code=mapping_evidence_invalid" >&2
+      overall=1
+    fi
+  fi
   CLEANUP_END_MS=$(python3 -c 'import time; print(int(time.time()*1000))')
   python3 - "$ROUND_DIR/cleanup.json" "$((CLEANUP_END_MS - CLEANUP_START_MS))" \
     "$CLEANUP_PROCESS_COUNT" "$CLEANUP_FORCED" <<'PY'

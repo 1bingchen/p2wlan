@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Callable
 
 
-EVENT_RE = re.compile(r'\bevent="hard_hard_rendezvous_scheduled"')
+EVENT_RE = re.compile(r'\bevent="hard_hard_start_activated"')
 FIELD_RE = re.compile(r'\b([a-z_]+)=(?:"([^"\\]*(?:\\.[^"\\]*)*)"|([^\s]+))')
 REQUIRED_FIELDS = (
     "session_tag",

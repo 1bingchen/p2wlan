@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import argparse
+import os
 from pathlib import Path
 import struct
 from typing import Any
@@ -36,6 +38,15 @@ def summarize_mapping_evidence(round_dir: Path, expected: dict[str, str]) -> dic
     for field, value in expected_features.items():
         if features.get(field) != value or type(features.get(field)) is not type(value):
             errors.append(f"nat_feature_mismatch:{field}")
+    background_devices = int(expected.get("BACKGROUND_DEVICES", "0"))
+    if background_devices:
+        for field in ("background_devices", "background_flows", "background_interval_ms"):
+            wanted = int(expected.get(field.upper(), {"background_flows": "32", "background_interval_ms": "250"}.get(field, "0")))
+            if features.get(field) != wanted:
+                errors.append(f"nat_feature_mismatch:{field}")
+    background = {nat: {"started": 0, "completed": 0, "failed": 0} for nat in ("A", "B")}
+    background_times = {nat: [] for nat in ("A", "B")}
+    capture_window = {nat: [] for nat in ("A", "B")}
     captures = {"A": 0, "B": 0}
     capture_bytes = {"A": 0, "B": 0}
     gateways: dict[str, int] = {}
@@ -74,10 +85,17 @@ def summarize_mapping_evidence(round_dir: Path, expected: dict[str, str]) -> dic
                         errors.append("egress_gateway_port_invalid")
                 elif event == "egress_captured":
                     captures[nat] += 1
+                    capture_window[nat].append(sequence)
                     if type(row.get("bytes")) is not int or row["bytes"] < 0:
                         errors.append("egress_capture_bytes_missing")
                     else:
                         capture_bytes[nat] += row["bytes"]
+                elif event.startswith("background_flow_"):
+                    kind = event.removeprefix("background_flow_")
+                    if kind in background[nat]:
+                        background[nat][kind] += 1
+                        if kind == "started":
+                            background_times[nat].append(sequence)
                 elif event in {"egress_rejected", "outbound_queue_rejected", "outbound_mapping_error"}:
                     rejected += 1
                 elif event == "stun_mapping_observed":
@@ -136,6 +154,14 @@ def summarize_mapping_evidence(round_dir: Path, expected: dict[str, str]) -> dic
                 errors.append(f"{nat.lower()}_sweep_noise_not_exercised")
         if noise[nat]["during_sweep"] > expected_features["sweep_noise_limit"]:
             errors.append(f"{nat.lower()}_sweep_noise_limit_exceeded")
+        if background_devices:
+            wanted = background_devices * int(expected.get("BACKGROUND_FLOWS", "32"))
+            if background[nat] != {"started": wanted, "completed": wanted, "failed": 0}:
+                errors.append(f"{nat.lower()}_background_traffic_incomplete")
+            window = capture_window[nat]
+            overlap = bool(window) and any(window[0] <= event <= window[-1] for event in background_times[nat])
+            if not overlap:
+                errors.append(f"{nat.lower()}_background_traffic_no_overlap")
     if rejected:
         errors.append("egress_or_queue_rejection")
     pairs = sum(mappings["B"].get(destination) == endpoint
@@ -153,5 +179,16 @@ def summarize_mapping_evidence(round_dir: Path, expected: dict[str, str]) -> dic
         "bound_mapping_counts": {nat: len(values) for nat, values in mappings.items()},
         "reciprocal_mapping_pairs": pairs,
         "injected_allocations": noise,
+        "background_traffic": background,
         "features": {key: features.get(key) for key in expected_features},
     }
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("round_dir", type=Path)
+    args = parser.parse_args()
+    evidence = summarize_mapping_evidence(args.round_dir, dict(os.environ))
+    (args.round_dir / "mapping-evidence.json").write_text(json.dumps(evidence, indent=2) + "\n")
+    print(json.dumps({"mapping_evidence_valid": evidence["valid"], "errors": evidence["errors"]}))
+    raise SystemExit(0 if evidence["valid"] else 1)

@@ -207,6 +207,7 @@ impl PeerManager {
         if state.epoch != expected.epoch
             || state.network_generation != expected.network_generation
             || state.allocation_id != expected.allocation_id
+            || state.peer_session_generation != self.peer_session_generation_sync(peer)
             || state.epoch_http_quota_remaining
                 <= u32::from(crate::HARD_HARD_BARRIER_MAX_ATTEMPTS)
                     + u32::from(crate::control::HARD_HARD_START_ACK_MAX_ATTEMPTS)
@@ -293,6 +294,24 @@ impl PeerManager {
             record.measurement.planned_send_at_ms.map(|value| {
                 value.saturating_sub(plan.canonical_server_deadline - start.server_time_ms)
             });
+        // The initial rendezvous log is an outer deadline. SYNC advances it;
+        // publish the committed activation so diagnostics and the NAT harness
+        // cannot mistake that old deadline for the actual first-send schedule.
+        info!(
+            event = "hard_hard_start_activated",
+            role = if record.initiator { "initiator" } else { "responder" },
+            session_tag = %crate::hard_hard_anonymized_tag(token, "session"),
+            plan_tag = %crate::hard_hard_rendezvous_plan_tag(token),
+            punch_at_ms = record.punch_at_ms.saturating_sub(plan.canonical_server_deadline - start.server_time_ms),
+            punch_at_server_ms = start.server_time_ms,
+            clock_domain = "host_unix_ms",
+            network_generation = record.local_network_generation,
+            remote_network_generation = record.remote_network_generation,
+            remote_candidate_epoch = record.remote_candidate_epoch,
+            local_profile_generation = record.local_profile_generation,
+            remote_profile_generation = record.remote_profile_generation,
+            "Hard-Hard agreed start activated"
+        );
         true
     }
 
@@ -359,9 +378,10 @@ impl PeerManager {
                 && record.expires_at_ms >= hard_hard_now_ms()
         })?;
         let plan = record.coordinated_plan.as_mut()?;
-        if remote_network_generation == 0
-            || remote_confidence == 0
-            || (record.remote_network_generation != 0
+        // Zero is the valid cold-start generation. Knowledge is established
+        // by the reciprocal offer/confidence, never by the generation value.
+        if remote_confidence == 0
+            || ((plan.remote_offer.is_some() || record.remote_prediction_confidence > 0)
                 && record.remote_network_generation != remote_network_generation)
         {
             return None;

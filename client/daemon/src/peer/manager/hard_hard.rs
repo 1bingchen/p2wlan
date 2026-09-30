@@ -761,17 +761,14 @@ impl PeerManager {
             }
             record.birthday = plan.agreement?.strategy != HardHardProbeStrategy::Predictable;
         }
-        if record.remote_network_generation != 0
-            && remote_network_generation != 0
+        if record.remote_prediction_confidence > 0
             && record.remote_network_generation != remote_network_generation
         {
             return None;
         }
         record.remote_prediction = remote_prediction;
         record.remote_prediction_confidence = remote_prediction_confidence;
-        if record.remote_network_generation == 0 {
-            record.remote_network_generation = remote_network_generation;
-        }
+        record.remote_network_generation = remote_network_generation;
         record.state = HardHardSessionState::Sweeping;
         record.attempt_count = record.attempt_count.saturating_add(1);
         record.measurement.evidence.begin_sweep(

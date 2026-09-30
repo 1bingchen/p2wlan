@@ -80,7 +80,7 @@ def log_line(value: RendezvousMarker) -> str:
         else str(value.remote_network_generation)
     )
     return (
-        'event="hard_hard_rendezvous_scheduled" '
+        'event="hard_hard_start_activated" '
         f'session_tag="{value.session_tag}" plan_tag="{value.plan_tag}" '
         f'role="{value.role}" punch_at_ms={value.punch_at_ms} '
         f'punch_at_server_ms={value.punch_at_server_ms} '
@@ -101,6 +101,17 @@ class HardHardGateTests(unittest.TestCase):
             log.write_text(log_line(a) + "\n", encoding="utf-8")
             extracted = extract_rendezvous_markers(log)
         self.assertEqual(extracted, [a])
+
+    def test_initial_outer_deadline_cannot_open_the_activation_gate(self):
+        a, _ = complementary("session-one")
+        with tempfile.TemporaryDirectory() as temporary:
+            log = Path(temporary) / "node.log"
+            obsolete = log_line(a).replace("hard_hard_start_activated", "hard_hard_rendezvous_scheduled")
+            log.write_text(obsolete + "\n", encoding="utf-8")
+            with self.assertRaises(GateError):
+                extract_rendezvous_markers(log)
+            log.write_text(obsolete + "\n" + log_line(a) + "\n", encoding="utf-8")
+            self.assertEqual(extract_rendezvous_markers(log), [a])
 
     def test_interleaved_sessions_select_latest_common_plan(self):
         a1, b1 = complementary("session-one", punch_a=9_000, punch_b=9_002)

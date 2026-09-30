@@ -100,6 +100,17 @@ control_reconnect_counter_survives_timeline_eviction 是必须保持的回归契
 
 高熵场景是负对照：允许 Direct 失败并以 Relay 有界兜底，但不允许缺证据、任务泄漏或无界退出。取消的 generation/session fencing 由隔离 Rust 回归覆盖；本地双进程模拟不代表两台物理设备、真实运营商 NAT 或公网成功率。
 
+Hard↔Hard 实验的 Direct 放行时间来自双方 `hard_hard_start_activated` 的最终 SYNC 起点。最初的 `hard_hard_rendezvous_scheduled` 是协商上界，不能用于放行已提前的实际扫描。
+
+`MODE=normal` 使用正常后台重试和路径选择，不启用 Hard↔Hard 独占开关或 Direct 放行屏障；默认观察 20 秒，可用 `NORMAL_OBSERVE_S` 设置为 10–120 秒，并相应增加 `OVERLAY_TIMEOUT_S` 和总轮次时限。业务允许通过 Direct 或 Relay，证据保留实际路径，并继续执行首业务时限、HTTP 状态、任务健康、无损坏载荷和完整 UDP 捕获检查。若持久化摘要证明首个 Direct 业务发生在 Relay 就绪之前，Relay 参考时间差保留为空并标记不适用，不伪造零延迟；专用 Direct/Relay 拓扑的时限门禁保持不变。它不要求本轮一定出现 Hard↔Hard attempt，业务可用与直连成功分别报告。
+
+    MODE=normal ROUNDS=1 STRICT_FILTERING=1 \
+      BACKGROUND_DEVICES=8 BACKGROUND_FLOWS=32 BACKGROUND_INTERVAL_MS=250 \
+      NAT_SIM_ARTIFACT_DIR=/absolute/path/outside/repository/normal-nat-evidence \
+      bash scripts/nat-sim/nat-sim-smoke.sh
+
+背景流量在每端第一次 daemon UDP 出站后启动：每个逻辑设备使用独立 socket 和带种子的时间抖动发送真实 STUN 请求，与该端共享端口分配器，不读取候选或扫描阶段。设备数上限 16，每设备最多 64 个短流，间隔 10–5000 ms；默认关闭。`mapping-evidence.json` 核对请求完成数、失败数以及与 daemon 流量的时间重叠，噪声未实际覆盖测试窗口时判定失败。该模型覆盖共享端口分配干扰；无线频谱竞争、真实基站切换、IPv6/NAT64、多层 CGNAT 和 TCP 控制/中继链路拥塞仍需要额外测试。`LOSS`、`REORDER` 和 UDP 延迟仅作用于通过 NAT 过滤后的 peer UDP，不能据此宣称测过控制或中继链路的弱网。
+
 manifest 分开报告 requested 场景/轮次、smoke 执行结果、证据有效性、保护期内 Direct 首业务、Relay-first、Relay 后升级 Direct、固定观测期最终 Direct、全部可读 typed attempt 失败/终态分布、测量年龄与计划偏差、候选执行和确认命中位置、条件延迟样本量、全部 requested 与 valid-only 两套 packet/byte/STUN/候选逻辑 payload 成本、同一 session/plan 的配对和不完整报告数、计划 Socket 峰值、清理耗时、子进程 CPU/RSS 和 critical task 数。部分无效轮次中可读的单侧成本保留，未读到的字段以 unknown/incomplete 表示；完整控制传输字节当前未知。`first_usable` 的请求级路径结果、attempt 级身份归因和有效轮次统计是独立分母。资源数包含本地构建、启动、实验与清理，不是跨主机性能比较；本轮没有隔离的遥测开/关性能 A/B，只用确定性回归约束候选顺序、预算、路径和取消不变。它不把不同 seed 当作不同真实网络，也不从无因果证据的数据宣称成功率提升。
 
 ## 活动路径遥测契约（path_telemetry_v1）

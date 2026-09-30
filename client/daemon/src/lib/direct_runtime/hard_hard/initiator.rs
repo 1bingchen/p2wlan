@@ -1033,7 +1033,7 @@ pub(crate) async fn spawn_hard_hard_initiator(
             HardHardA0Stage::RendezvousSchedule,
             HardHardA0Reason::Scheduled,
         );
-        let remote_network_generation = if coordination.remote_network_generation == 0 {
+        let remote_network_generation = if coordination.remote_prediction_confidence == 0 {
             "unknown".to_string()
         } else {
             coordination.remote_network_generation.to_string()

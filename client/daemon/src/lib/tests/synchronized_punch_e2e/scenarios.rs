@@ -533,6 +533,89 @@ async fn hard_hard_initiator_deferred_claim_refunds_exact_fresh_quota() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn normal_background_retry_revisits_hard_hard_after_protected_owner_releases() {
+    let (_daemon, peers, udp, control) = build_hard_hard_ordinary_fallback_fixture().await;
+    let observers = [
+        UdpSocket::bind("127.0.0.1:0").await.unwrap(),
+        UdpSocket::bind("127.0.0.1:0").await.unwrap(),
+        UdpSocket::bind("127.0.0.1:0").await.unwrap(),
+    ];
+    let observer_addresses = observers
+        .iter()
+        .map(|observer| observer.local_addr().unwrap())
+        .collect::<Vec<_>>();
+    let signal = hard_hard_fallback_signal(control.clone(), 1, observer_addresses.clone());
+    let deduplicator = PunchAttemptDeduplicator::default();
+    let RecoveryAdmission::Accepted { epoch } = peers.recovery_epoch_admit(HARD_HARD_B).await
+    else {
+        panic!("admission");
+    };
+    let RendezvousPunchClaim::Claimed(existing) = deduplicator
+        .claim_for_epoch_with_rendezvous(
+            HARD_HARD_B,
+            peers.current_network_generation_sync(),
+            epoch,
+            PUNCH_PRIORITY_FRESH_PREDICTION,
+            None,
+            None,
+        )
+        .await
+    else {
+        panic!("owner");
+    };
+    assert_eq!(
+        spawn_hard_hard_initiator(
+            udp.clone(),
+            peers.clone(),
+            deduplicator.clone(),
+            HARD_HARD_B.into(),
+            signal,
+            None,
+            None
+        )
+        .await,
+        HardHardInitiatorStart::ExistingPunchOwner
+    );
+    drop(existing);
+    let task = tokio::spawn(run_direct_probe_loop(
+        peers.clone(),
+        Arc::new(RwLock::new(Some(udp))),
+        Arc::new(RwLock::new(vec!["198.51.100.10:41000".into()])),
+        Arc::new(RwLock::new(None)),
+        deduplicator,
+        control,
+        Arc::new(RwLock::new(observer_addresses.clone())),
+        Arc::new(RwLock::new(Duration::from_millis(25))),
+        1,
+        Duration::from_millis(50),
+        Duration::from_millis(5),
+        1,
+    ));
+    let observed = timeout(Duration::from_secs(2), async {
+        loop {
+            if peers
+                .get_connection(HARD_HARD_B)
+                .await
+                .unwrap()
+                .direct_events
+                .iter()
+                .any(|event| event.stage == "hard_hard_measurement_failed")
+            {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    task.abort();
+    let _ = task.await;
+    assert!(
+        observed.is_ok(),
+        "normal retries must reconsider the unused HH lane after a deferred owner releases"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn hard_hard_measurement_lane_contention_refunds_without_sending_stun() {
     let (_daemon, peers, udp, _) = build_hard_hard_ordinary_fallback_fixture().await;
     let remote_public: SocketAddr = "198.51.100.20:42000".parse().unwrap();

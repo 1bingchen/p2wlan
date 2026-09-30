@@ -362,6 +362,9 @@ pub(crate) struct PendingRecoveryTarget {
 pub(crate) struct RecoveryEpochState {
     pub epoch: u64,
     pub network_generation: u64,
+    /// Fencing snapshot of the authoritative membership lifecycle. Candidate
+    /// and heartbeat updates retain this identity; authenticated restarts do not.
+    pub peer_session_generation: Option<PeerSessionGeneration>,
     /// Process-monotonic identity of this exact state allocation. Unlike the
     /// per-peer `epoch`, this value never restarts after state removal.
     pub allocation_id: u64,
@@ -431,10 +434,17 @@ pub(crate) struct RecoveryBudgetEvent {
 }
 
 impl RecoveryEpochState {
-    fn new(epoch: u64, network_generation: u64, allocation_id: u64, now: Instant) -> Self {
+    fn new(
+        epoch: u64,
+        network_generation: u64,
+        allocation_id: u64,
+        peer_session_generation: Option<PeerSessionGeneration>,
+        now: Instant,
+    ) -> Self {
         Self {
             epoch,
             network_generation,
+            peer_session_generation,
             allocation_id,
             stage: RecoveryStage::Initial,
             stage_started_at: now,
@@ -488,7 +498,6 @@ impl PeerManager {
     /// plan or start a session, so the 1-second retry tick can never
     /// resurrect a 778/3072-candidate plan.
     pub(crate) async fn recovery_epoch_admit(&self, peer_id: &str) -> RecoveryAdmission {
-        let generation = self.current_network_generation().await;
         let now = Instant::now();
 
         if self.is_direct(peer_id).await || self.get_connection(peer_id).await.is_none() {
@@ -506,6 +515,11 @@ impl PeerManager {
         self.apply_cached_liveness_block(peer_id).await;
 
         let mut epochs = self.recovery_epochs.write().await;
+        let generation = self.current_network_generation_sync();
+        let Some(peer_session) = self.peer_session_generation_sync(peer_id) else {
+            return RecoveryAdmission::Superseded;
+        };
+        let peer_session_generation = Some(peer_session);
         if !epochs.contains_key(peer_id) {
             let Some(allocation_id) = self.next_recovery_epoch_allocation_id() else {
                 warn!(
@@ -518,7 +532,7 @@ impl PeerManager {
             };
             epochs.insert(
                 peer_id.to_string(),
-                RecoveryEpochState::new(1, generation, allocation_id, now),
+                RecoveryEpochState::new(1, generation, allocation_id, peer_session_generation, now),
             );
         }
         let entry = epochs
@@ -527,6 +541,8 @@ impl PeerManager {
         let mut new_epoch = None;
         let rotation_reason = if entry.network_generation != generation {
             "network_generation_changed"
+        } else if entry.peer_session_generation != peer_session_generation {
+            "peer_session_generation_changed"
         } else if now.duration_since(entry.epoch_started_at) >= RECOVERY_EPOCH_MAX_AGE {
             "epoch_max_age_exceeded"
         } else {
@@ -560,7 +576,13 @@ impl PeerManager {
                 generation,
                 rotation_reason,
             );
-            *entry = RecoveryEpochState::new(epoch, generation, allocation_id, now);
+            *entry = RecoveryEpochState::new(
+                epoch,
+                generation,
+                allocation_id,
+                peer_session_generation,
+                now,
+            );
         }
         // A frozen epoch stays frozen until its controlled backoff elapses.
         // The freeze survives pending targets and offers: only the backoff
@@ -619,6 +641,21 @@ impl PeerManager {
             .get(peer_id)
             .map(|state| state.epoch)
             .unwrap_or(0)
+    }
+
+    /// Retry hint only; the initiator must still reserve against this exact
+    /// allocation and revalidate the owner before starting any measurement.
+    pub(crate) async fn recovery_hard_hard_available(&self, peer: &str, epoch: u64) -> bool {
+        self.recovery_epochs
+            .read()
+            .await
+            .get(peer)
+            .is_some_and(|state| {
+                state.epoch == epoch
+                    && state.network_generation == self.current_network_generation_sync()
+                    && state.peer_session_generation == self.peer_session_generation_sync(peer)
+                    && state.epoch_hard_hard_generation_quota_remaining > 0
+            })
     }
 
     /// Current recovery stage for a peer (Initial when no epoch exists).
@@ -841,6 +878,7 @@ impl PeerManager {
             || state.epoch != expected.epoch
             || state.network_generation != expected.network_generation
             || state.allocation_id != expected.allocation_id
+            || state.peer_session_generation != self.peer_session_generation_sync(peer_id)
             || self.current_network_generation_sync() != expected.network_generation
         {
             return RecoveryProbeCreditAdmission::IdentityStale;
@@ -882,7 +920,10 @@ impl PeerManager {
     ) -> Option<FreshGenerationReservation> {
         let mut epochs = self.recovery_epochs.write().await;
         let state = epochs.get_mut(peer_id)?;
-        if state.epoch != expected_epoch || state.epoch_fresh_generation_quota_remaining == 0 {
+        if state.epoch != expected_epoch
+            || state.peer_session_generation != self.peer_session_generation_sync(peer_id)
+            || state.epoch_fresh_generation_quota_remaining == 0
+        {
             return None;
         }
         state.epoch_fresh_generation_quota_remaining -= 1;
@@ -913,6 +954,7 @@ impl PeerManager {
         if state.epoch != expected.epoch
             || state.network_generation != expected.network_generation
             || state.allocation_id != expected.allocation_id
+            || state.peer_session_generation != self.peer_session_generation_sync(peer_id)
             || state.epoch_fresh_generation_quota_remaining == 0
         {
             return None;
@@ -935,7 +977,10 @@ impl PeerManager {
     ) -> Option<FreshGenerationReservation> {
         let mut epochs = self.recovery_epochs.write().await;
         let state = epochs.get_mut(peer_id)?;
-        if state.epoch != expected_epoch || state.epoch_hard_hard_generation_quota_remaining == 0 {
+        if state.epoch != expected_epoch
+            || state.peer_session_generation != self.peer_session_generation_sync(peer_id)
+            || state.epoch_hard_hard_generation_quota_remaining == 0
+        {
             return None;
         }
         state.epoch_hard_hard_generation_quota_remaining -= 1;
@@ -965,6 +1010,7 @@ impl PeerManager {
             || state.epoch != expected.epoch
             || state.network_generation != expected.network_generation
             || state.allocation_id != expected.allocation_id
+            || state.peer_session_generation != self.peer_session_generation_sync(peer_id)
             || state.epoch_hard_hard_generation_quota_remaining == 0
         {
             return None;
@@ -994,6 +1040,7 @@ impl PeerManager {
         if state.epoch != expected.epoch
             || state.network_generation != expected.network_generation
             || state.allocation_id != expected.allocation_id
+            || state.peer_session_generation != self.peer_session_generation_sync(peer_id)
             || state.epoch_http_quota_remaining == 0
         {
             return false;
@@ -1640,7 +1687,7 @@ mod hard_hard_credit_reserve_tests {
         let exploration = RecoveryProbePurpose::HardHardExploration;
         let triggered = RecoveryProbePurpose::HardHardTriggered;
         let nomination = RecoveryProbePurpose::HardHardNomination;
-        let mut state = RecoveryEpochState::new(1, 0, 9, Instant::now());
+        let mut state = RecoveryEpochState::new(1, 0, 9, None, Instant::now());
         state.epoch_probe_credit_remaining = exploration.confirmation_credit_reserve();
         manager
             .recovery_epochs
@@ -1689,7 +1736,7 @@ mod hard_hard_credit_reserve_tests {
         );
         manager.recovery_epochs.write().await.insert(
             "peer".into(),
-            RecoveryEpochState::new(1, 0, 10, Instant::now()),
+            RecoveryEpochState::new(1, 0, 10, None, Instant::now()),
         );
         assert_eq!(
             manager

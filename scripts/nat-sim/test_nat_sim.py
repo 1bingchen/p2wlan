@@ -329,6 +329,25 @@ class NatEvidenceContractTests(unittest.TestCase):
     SOURCE_SHA = "a" * 40
     WORKFLOW_SHA = "b" * 40
 
+    def test_normal_direct_before_relay_preserves_unknown_delta_and_strict_legacy_gate(self):
+        a, b = self._status(1, "direct"), self._status(2, "direct")
+        for status in (a, b):
+            summary = status["connection_timeline"]["first_usable_summaries"][0]
+            for field in ("relay_ready_at_ms", "first_usable_delta_ms", "direct_first_remaining_ms_at_relay_ready"):
+                summary[field] = None
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            record = self._build_record(root, "normal-join", 1, a, b, a, b)
+            self.assertEqual(record["result"], "pass", record["decision"])
+            first = record["observed"]["a"]["first_usable"]
+            self.assertIsNone(first["delta_ms"])
+            self.assertFalse(first["relay_ready_delta_applicable"])
+            legacy = self._build_record(root, "direct-cold-start", 1, a, b, a, b)
+            self.assertEqual(legacy["result"], "fail")
+            a["connection_timeline"]["first_usable_summaries"][0]["first_usable_at_ms"] = 100
+            future = self._build_record(root, "normal-join", 2, a, b, a, b)
+            self.assertEqual(future["result"], "fail")
+
     @staticmethod
     def _status(process_id: int, expected_path: str = "relay", revision: int = 4) -> dict:
         peer = {

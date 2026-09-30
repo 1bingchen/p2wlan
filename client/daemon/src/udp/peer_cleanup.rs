@@ -237,10 +237,11 @@ impl UdpTransport {
     /// Drop every pending probe that was sent from `socket_index` and release
     /// its send lease.
     ///
-    /// Called by the detach path AFTER the lease-drain grace expired: the
-    /// reader is about to be aborted, so those probes can never be matched
-    /// anymore; removing them releases their leases so the detach never
-    /// blocks on a probe that will never be ACKed.
+    /// Ordinary detach calls this after the lease-drain grace expires. Exact
+    /// Hard↔Hard token cleanup may also call it after revoking the socket:
+    /// that socket cannot confirm Direct, so its ACK wait cannot authorize
+    /// further progress. Preserved or committed Direct sockets are excluded
+    /// by the cleanup owner's socket selection.
     pub(super) async fn drop_pending_probes_for_socket(&self, socket_index: usize) {
         self.pending_probes
             .lock()

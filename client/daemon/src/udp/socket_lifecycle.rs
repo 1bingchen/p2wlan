@@ -1165,6 +1165,13 @@ impl UdpTransport {
             entries
         };
         for entry in entries {
+            // This exact token's entry is already revoked from SocketState;
+            // it can no longer win a HH confirmation. Waiting for its pending
+            // ACKs would serialize a two-second grace for every losing socket
+            // and block the next rendezvous. Preserve live send-lease drain,
+            // but release only the pending probes of this removed socket.
+            self.drop_pending_probes_for_socket(entry.socket_index)
+                .await;
             self.detach_dynamic_entry(entry, reason).await;
         }
     }

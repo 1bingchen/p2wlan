@@ -26,6 +26,11 @@
     <a href="https://github.com/yhan-sun/p2wlan/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/yhan-sun/p2wlan/ci.yml?branch=main&label=CI" alt="CI" /></a>
     <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT License" /></a>
   </p>
+
+  <p>
+    <a href="https://trendshift.io/repositories/239992"><img src="https://trendshift.io/api/badge/trendshift/repositories/239992/daily?language=Rust" width="250" height="55" alt="P2WLAN · Trendshift Rust 日榜" /></a>
+    <a href="https://trendshift.io/repositories/239992"><img src="https://trendshift.io/api/badge/trendshift/repositories/239992/weekly?language=Rust" width="250" height="55" alt="P2WLAN · Trendshift Rust 周榜" /></a>
+  </p>
 </div>
 
 ## P2WLAN 是什么

@@ -1,5 +1,6 @@
 include!("control_events/event_loop.rs");
 include!("control_events/ingress.rs");
+include!("control_events/candidate_deferral.rs");
 include!("control_events/incarnation.rs");
 include!("control_events/deferred_initiator.rs");
 include!("control_events/candidate_coordination.rs");

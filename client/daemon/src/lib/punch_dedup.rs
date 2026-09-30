@@ -604,8 +604,32 @@ impl PunchAttemptDeduplicator {
         }
     }
 
+    /// A locally measured HH owner claims fresh priority before its session
+    /// record exists. Ordinary fresh predictions instead carry their remote
+    /// prediction identity. Consult this same permit ledger during candidate
+    /// deferral so measurement cannot be invalidated by unrelated refreshes.
+    fn has_local_fresh_owner(
+        &self,
+        peer_id: &str,
+        network_generation: u64,
+        peer_session: Option<crate::peer::PeerSessionGeneration>,
+    ) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .active
+            .get(peer_id)
+            .is_some_and(|active| {
+                active.priority == PUNCH_PRIORITY_FRESH_PREDICTION
+                    && active.fresh_generation.is_none()
+                    && active.network_generation == network_generation
+                    && Some(active.peer_session_generation) == peer_session
+                    && !active.cancellation.is_cancelled()
+            })
+    }
+
     /// Cancel the current owner without retiring its peer lifecycle. This is
-    /// for same-lifecycle endpoint churn, Direct convergence and quarantine.
+    /// for Direct convergence and quarantine, not roster endpoint metadata.
     /// Structural cleanup must use `retire_peer_session` instead.
     pub(crate) fn cancel(&self, peer_id: &str) {
         let mut state = self

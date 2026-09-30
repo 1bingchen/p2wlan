@@ -204,23 +204,26 @@ extension DaemonControllerElevation on DaemonController {
       throw StateError(stderr.isEmpty ? 'Windows UAC 启动失败。' : stderr);
     }
     final pid = parseWindowsChildPidMarker(result.stdout.toString());
-    if (pid != null) {
-      _launchedProcessId = pid;
-      if (await _waitForWindowsChildIdentity(pid)) return pid;
-      _launchedProcessId = null;
-    }
+    if (pid != null) return pid;
     throw StateError(
       'PID_MARKER_FAILED: Windows UAC did not return the elevated child PID.',
     );
   }
 
-  Future<bool> _waitForWindowsChildIdentity(int pid) async {
-    final deadline = DateTime.now().add(const Duration(seconds: 3));
-    while (DateTime.now().isBefore(deadline)) {
-      if (await _processLooksLikeDaemon(pid)) return true;
-      await Future<void>.delayed(const Duration(milliseconds: 100));
-    }
-    return await _processLooksLikeDaemon(pid);
+  Future<void> _verifyWindowsChildIdentity(int pid) async {
+    final process = await waitForWindowsProcess(pid);
+    await _startupTrace?.detail(
+      '10 child_identity state=${process.state.name} '
+      'pid=$pid operation=${process.operation ?? 'none'} '
+      'win32_error=${process.win32Error ?? 0} '
+      'exit_code=${process.exitCode ?? 'unknown'}',
+    );
+    final failure = classifyWindowsChildIdentity(
+      process: process,
+      pid: pid,
+      launchedProcessId: _launchedProcessId,
+    );
+    if (failure != null) throw _WindowsChildIdentityException(failure);
   }
 
   Future<String?> _windowsCurrentUserSid() async {
@@ -259,6 +262,40 @@ extension DaemonControllerElevation on DaemonController {
     }
     return '无法启动 p2wlan-daemon：$raw';
   }
+}
+
+DaemonStartupFailure? classifyWindowsChildIdentity({
+  required WindowsProcessProbe process,
+  required int pid,
+  required int? launchedProcessId,
+}) {
+  if (process.state == WindowsProcessState.exited) {
+    return const DaemonStartupFailure(
+      DaemonStartupFailureCode.daemonExitedDuringStartup,
+      'p2wlan-daemon 在启动身份校验前已退出，请查看启动日志。',
+    );
+  }
+  if (trustedWindowsDaemonIdentityMatches(
+    pid: pid,
+    launchedProcessId: launchedProcessId,
+    authenticatedProcessId: null,
+    processName: process.processName,
+  )) {
+    return null;
+  }
+  return const DaemonStartupFailure(
+    DaemonStartupFailureCode.pidMarkerFailed,
+    '无法确认 Windows 后台网络服务的进程身份，请查看启动日志。',
+  );
+}
+
+class _WindowsChildIdentityException implements Exception {
+  const _WindowsChildIdentityException(this.failure);
+
+  final DaemonStartupFailure failure;
+
+  @override
+  String toString() => failure.codeValue;
 }
 
 /// The native bridge only displays the secure input field and pipes the

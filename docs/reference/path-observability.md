@@ -102,6 +102,10 @@ control_reconnect_counter_survives_timeline_eviction 是必须保持的回归契
 
 Hard↔Hard 实验的 Direct 放行时间来自双方 `hard_hard_start_activated` 的最终 SYNC 起点。最初的 `hard_hard_rendezvous_scheduled` 是协商上界，不能用于放行已提前的实际扫描。
 
+manifest 分开报告 requested 场景/轮次、smoke 执行结果、证据有效性、保护期内 Direct 首业务、Relay-first、Relay 后升级 Direct、固定观测期最终 Direct、全部可读 typed attempt 失败/终态分布、测量年龄与计划偏差、候选执行和确认命中位置、条件延迟样本量、全部 requested 与 valid-only 两套 packet/byte/STUN/候选逻辑 payload 成本、同一 session/plan 的配对和不完整报告数、计划 Socket 峰值、清理耗时、子进程 CPU/RSS 和 critical task 数。部分无效轮次中可读的单侧成本保留，未读到的字段以 unknown/incomplete 表示；完整控制传输字节当前未知。`first_usable` 的请求级路径结果、attempt 级身份归因和有效轮次统计是独立分母。资源数包含本地构建、启动、实验与清理，不是跨主机性能比较；本轮没有隔离的遥测开/关性能 A/B，只用确定性回归约束候选顺序、预算、路径和取消不变。它不把不同 seed 当作不同真实网络，也不从无因果证据的数据宣称成功率提升。
+
+## 正常接入与动态网络条件
+
 `MODE=normal` 使用正常后台重试和路径选择，不启用 Hard↔Hard 独占开关或 Direct 放行屏障；默认观察 20 秒，可用 `NORMAL_OBSERVE_S` 设置为 10–120 秒，并相应增加 `OVERLAY_TIMEOUT_S` 和总轮次时限。业务允许通过 Direct 或 Relay，证据保留实际路径，并继续执行首业务时限、HTTP 状态、任务健康、无损坏载荷和完整 UDP 捕获检查。若持久化摘要证明首个 Direct 业务发生在 Relay 就绪之前，Relay 参考时间差保留为空并标记不适用，不伪造零延迟；专用 Direct/Relay 拓扑的时限门禁保持不变。它不要求本轮一定出现 Hard↔Hard attempt，业务可用与直连成功分别报告。
 
     MODE=normal ROUNDS=1 STRICT_FILTERING=1 \
@@ -111,7 +115,40 @@ Hard↔Hard 实验的 Direct 放行时间来自双方 `hard_hard_start_activated
 
 背景流量在每端第一次 daemon UDP 出站后启动：每个逻辑设备使用独立 socket 和带种子的时间抖动发送真实 STUN 请求，与该端共享端口分配器，不读取候选或扫描阶段。设备数上限 16，每设备最多 64 个短流，间隔 10–5000 ms；默认关闭。`mapping-evidence.json` 核对请求完成数、失败数以及与 daemon 流量的时间重叠，噪声未实际覆盖测试窗口时判定失败。该模型覆盖共享端口分配干扰；无线频谱竞争、真实基站切换、IPv6/NAT64、多层 CGNAT 和 TCP 控制/中继链路拥塞仍需要额外测试。`LOSS`、`REORDER` 和 UDP 延迟仅作用于通过 NAT 过滤后的 peer UDP，不能据此宣称测过控制或中继链路的弱网。
 
-manifest 分开报告 requested 场景/轮次、smoke 执行结果、证据有效性、保护期内 Direct 首业务、Relay-first、Relay 后升级 Direct、固定观测期最终 Direct、全部可读 typed attempt 失败/终态分布、测量年龄与计划偏差、候选执行和确认命中位置、条件延迟样本量、全部 requested 与 valid-only 两套 packet/byte/STUN/候选逻辑 payload 成本、同一 session/plan 的配对和不完整报告数、计划 Socket 峰值、清理耗时、子进程 CPU/RSS 和 critical task 数。部分无效轮次中可读的单侧成本保留，未读到的字段以 unknown/incomplete 表示；完整控制传输字节当前未知。`first_usable` 的请求级路径结果、attempt 级身份归因和有效轮次统计是独立分母。资源数包含本地构建、启动、实验与清理，不是跨主机性能比较；本轮没有隔离的遥测开/关性能 A/B，只用确定性回归约束候选顺序、预算、路径和取消不变。它不把不同 seed 当作不同真实网络，也不从无因果证据的数据宣称成功率提升。
+`run-network-matrix.py` 全部使用 `MODE=normal`，覆盖严格/宽松过滤、两端不同的时延抖动、单侧丢包、连续丢包、UDP 限速与有限队列、共享分配器、随机端口、接入期间短时 UDP 中断、单/双侧 NAT 映射重建、加速映射超时、错峰信令和慢中继。需要 Python 3.11 或更高版本及 smoke 入口使用的 Rust、Go 和本机编译器。
+
+    python3 scripts/nat-sim/run-network-matrix.py --list
+    python3 scripts/nat-sim/run-network-matrix.py \
+      --scenario asymmetric-jitter --scenario live-nat-rebind \
+      --rounds 2 --output /absolute/path/outside/repository/network-evidence
+
+不指定 `--scenario` 时运行全部 16 个配置，默认每个配置 1 轮，总执行数上限 32。每轮独立冷启动，使用固定种子、不做失败重试，默认观察 30 秒。输出目录必须是仓库外尚不存在的绝对路径。manifest 记录源代码 commit 与包含未跟踪文件的补丁摘要、参数、实际 NAT seed、原始证据路径、每方向首业务路径和最终活动路径。两端首业务可以分别来自 Direct 和 Relay，收发方向不必使用同一路径，但双方都必须有真实业务 ingress；固定 Direct/Relay 拓扑仍执行原有路径要求。配置不是运营商实测画像，不能用于推算移动网络直连成功率。
+
+单轮使用 `NETWORK_PROFILE=/absolute/path/profile.json` 传入版本化配置，例如：
+
+```json
+{
+  "schema_version": 1,
+  "A": {"jitter_ms": 40, "impair_stun": true},
+  "B": {"rebind_after_ms": 12000}
+}
+```
+
+| 字段 | 行为与范围 |
+| --- | --- |
+| `jitter_ms` | 入站 UDP 固定时延上的均匀抖动幅度，0–5000 ms；最终时延不为负 |
+| `loss_rate` | 该端独立丢包概率，0–1；省略时沿用 `LOSS` |
+| `burst_loss_rate` / `burst_loss_packets` | 每个非连续丢包期间的包触发一段连续丢包的概率，以及每段 2–256 个包的长度 |
+| `impair_stun` | 将丢包、抖动和限速同时应用于 STUN 响应；默认关闭 |
+| `rate_kbps` | 每端共享入站 UDP 序列化速率，0 表示不限速，最大 1000000；不限制 TCP Relay |
+| `queue_limit` / `max_queue_delay_ms` | 等待中的 STUN/UDP 投递任务数上限 1–4096，排队延迟上限 1–30000 ms；超限记录丢弃 |
+| `outage_after_ms` / `outage_duration_ms` | 首次 UDP 活动后何时中断该端双向 UDP，以及中断时长；两项同时设置，分别不超过 120000/30000 ms |
+| `rebind_after_ms` | 首次 UDP 活动后清除该端 NAT 映射，后续出站重新分配端口；0 关闭，最大 120000 ms |
+| `mapping_idle_ms` | 未收到出站刷新时回收映射；0 关闭，启用范围 100–600000 ms |
+
+重建和超时会关闭旧映射、取消其发送工作，延迟投递在执行前重新验证源/目标映射身份。该行为模拟 NAT 状态丢失及端口变化，不模拟手机操作系统的换网通知或真实小区切换。`short-idle-stress` 的 1.5–2 秒超时用于加速触发边界；[RFC 4787](https://www.rfc-editor.org/info/rfc4787/) 对一般 UDP 映射要求至少 2 分钟，不能把这个压力参数当作合规 NAT 的默认值。
+
+正常模式还生成 `business-samples.jsonl` 与 `continuity-evidence.json`。它们使用同一主机单调时钟，要求结束前的观测窗口仍有双向业务增长；发生中断或映射重建时，还要求最后一个故障边界之后持续观察至少 2 秒，并看到新的双向业务。仅有故障前的累计成功不能通过。`established-direct-outage` 和 `established-direct-rebind` 还要求首次故障前双方各有至少两个验证通过的 Direct 业务包；采样读取完成时间必须早于故障，只有连接提升日志或故障后才建立 Direct 都不能满足该前置条件。单轮可用 `NORMAL_REQUIRE_DIRECT_BEFORE_FAULT=1` 启用这一检查。故障后允许正常选择 Direct 或 Relay，最终快照还必须保有活动路径。故障事件、抖动值、重建后的新映射与超时必须在 trace 中实际出现；未触发配置故障会报告 `fault_not_exercised`。背景流的成功和超时分别记录，配置会影响 STUN 时允许实际超时，但所有已请求流仍须结束且至少有成功回复。测试进程与任务健康、原始发送捕获、损坏报文、业务首包时限和完整回收的检查继续保留。
 
 ## 活动路径遥测契约（path_telemetry_v1）
 

@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import struct
 from typing import Any
+from network_conditions import load_profiles
 
 
 def summarize_mapping_evidence(round_dir: Path, expected: dict[str, str]) -> dict[str, Any]:
@@ -38,6 +39,10 @@ def summarize_mapping_evidence(round_dir: Path, expected: dict[str, str]) -> dic
     for field, value in expected_features.items():
         if features.get(field) != value or type(features.get(field)) is not type(value):
             errors.append(f"nat_feature_mismatch:{field}")
+    profiles = load_profiles(expected.get("NETWORK_PROFILE") or None)
+    if expected.get("NETWORK_PROFILE"):
+        if features.get("network_profiles") != {name: profile.to_dict() for name, profile in profiles.items()}:
+            errors.append("nat_feature_mismatch:network_profiles")
     background_devices = int(expected.get("BACKGROUND_DEVICES", "0"))
     if background_devices:
         for field in ("background_devices", "background_flows", "background_interval_ms"):
@@ -96,7 +101,7 @@ def summarize_mapping_evidence(round_dir: Path, expected: dict[str, str]) -> dic
                         background[nat][kind] += 1
                         if kind == "started":
                             background_times[nat].append(sequence)
-                elif event in {"egress_rejected", "outbound_queue_rejected", "outbound_mapping_error"}:
+                elif event in {"egress_rejected", "outbound_queue_rejected", "outbound_mapping_error", "network_packet_task_failed"}:
                     rejected += 1
                 elif event == "stun_mapping_observed":
                     observed[key] = sequence
@@ -129,6 +134,14 @@ def summarize_mapping_evidence(round_dir: Path, expected: dict[str, str]) -> dic
                         if endpoint in mappings[nat] and mappings[nat][endpoint] != destination:
                             errors.append("mapping_endpoint_reassigned_without_expiry")
                         mappings[nat][endpoint] = destination
+                elif event == "mapping_retired":
+                    endpoint, destination = row.get("public_endpoint"), row.get("destination")
+                    if (not isinstance(endpoint, str) or not isinstance(destination, str)
+                            or row.get("reason") not in {"network_rebind", "idle_timeout"}
+                            or (endpoint in mappings[nat] and mappings[nat][endpoint] != destination)):
+                        errors.append("mapping_retirement_invalid")
+                    else:
+                        mappings[nat].pop(endpoint, None)
                 elif event == "outbound_destination_unmapped":
                     unbound[nat] += 1
     except OSError:
@@ -156,7 +169,11 @@ def summarize_mapping_evidence(round_dir: Path, expected: dict[str, str]) -> dic
             errors.append(f"{nat.lower()}_sweep_noise_limit_exceeded")
         if background_devices:
             wanted = background_devices * int(expected.get("BACKGROUND_FLOWS", "32"))
-            if background[nat] != {"started": wanted, "completed": wanted, "failed": 0}:
+            impaired = profiles[nat].impair_stun or bool(profiles[nat].outage_after_ms or profiles[nat].rebind_after_ms)
+            complete = (background[nat]["started"] == wanted
+                        and background[nat]["completed"] + background[nat]["failed"] == wanted
+                        and background[nat]["completed"] > 0)
+            if not complete or (not impaired and background[nat]["failed"]):
                 errors.append(f"{nat.lower()}_background_traffic_incomplete")
             window = capture_window[nat]
             overlap = bool(window) and any(window[0] <= event <= window[-1] for event in background_times[nat])

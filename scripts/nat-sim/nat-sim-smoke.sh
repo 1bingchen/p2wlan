@@ -29,6 +29,8 @@ source "$ROOT_DIR/scripts/nat-sim/baseline_gate.sh"
 NETWORK_ID=${NETWORK_ID:-default}
 MODE=${MODE:-direct}
 NORMAL_OBSERVE_S=${NORMAL_OBSERVE_S:-20}
+NORMAL_REQUIRE_DIRECT_BEFORE_FAULT=${NORMAL_REQUIRE_DIRECT_BEFORE_FAULT:-0}
+NETWORK_PROFILE=${NETWORK_PROFILE:-}
 BACKGROUND_DEVICES=${BACKGROUND_DEVICES:-0}
 BACKGROUND_FLOWS=${BACKGROUND_FLOWS:-32}
 BACKGROUND_INTERVAL_MS=${BACKGROUND_INTERVAL_MS:-250}
@@ -233,9 +235,22 @@ if ! [[ "$NORMAL_OBSERVE_S" =~ ^[0-9]+$ ]] || (( NORMAL_OBSERVE_S < 10 || NORMAL
   echo "[nat-sim] NORMAL_OBSERVE_S must be in 10..120" >&2
   exit 2
 fi
+if [[ "$NORMAL_REQUIRE_DIRECT_BEFORE_FAULT" != 0 && "$NORMAL_REQUIRE_DIRECT_BEFORE_FAULT" != 1 ]] \
+    || [[ "$NORMAL_REQUIRE_DIRECT_BEFORE_FAULT" == 1 && "$MODE" != normal ]]; then
+  echo "[nat-sim] NORMAL_REQUIRE_DIRECT_BEFORE_FAULT must be 0 or 1 and requires normal mode" >&2
+  exit 2
+fi
 if [[ "$MODE" == normal && ( "$EGRESS_CAPTURE" != shim || "$UNASSIGNED_EGRESS_LISTENERS" != 0 ) ]]; then
   echo "[nat-sim] normal mode requires complete shim capture without preview listeners" >&2
   exit 2
+fi
+if [[ -n "$NETWORK_PROFILE" ]]; then
+  python3 - "$ROOT_DIR/scripts/nat-sim" "$NETWORK_PROFILE" <<'PY'
+import sys
+sys.path.insert(0, sys.argv[1])
+from network_conditions import load_profiles
+load_profiles(sys.argv[2])
+PY
 fi
 for label in "$EXPERIMENT_VARIANT" "$EXPERIMENT_SCENARIO" "$EXPERIMENT_BASELINE_SHA"; do
   if ! [[ "$label" =~ ^[A-Za-z0-9_.-]{1,80}$ ]]; then
@@ -1209,6 +1224,9 @@ for round in $(seq 1 "$ROUNDS"); do
     --duplicate-rate "$DUPLICATE_RATE"
     --unassigned-egress-listeners "$UNASSIGNED_EGRESS_LISTENERS"
   )
+  if [[ -n "$NETWORK_PROFILE" ]]; then
+    NAT_FEATURE_FLAGS+=(--network-profile "$NETWORK_PROFILE")
+  fi
   DIRECT_GATE_FILE=""
   if [[ "$MODE" == "hard-hard" ]]; then
     # Hold only inter-NAT UDP while STUN, signaling and Relay continue. This
@@ -1595,6 +1613,9 @@ for round in $(seq 1 "$ROUNDS"); do
         "$NODE_B_PID"
       A_OVERLAY=$(grep -c 'overlay_payload_verified' "$ROUND_DIR/node-a.log" 2>/dev/null || true)
       B_OVERLAY=$(grep -c 'overlay_payload_verified' "$ROUND_DIR/node-b.log" 2>/dev/null || true)
+      if [[ "$MODE" == normal ]]; then
+        python3 "$ROOT_DIR/scripts/nat-sim/continuity_evidence.py" sample "$ROUND_DIR"
+      fi
       A_BURST=$(grep -c 'overlay_burst_complete' "$ROUND_DIR/node-a.log" 2>/dev/null || true)
       B_BURST=$(grep -c 'overlay_burst_complete' "$ROUND_DIR/node-b.log" 2>/dev/null || true)
       if [[ "$A_OVERLAY" -gt 0 && "$B_OVERLAY" -gt 0 ]]; then
@@ -1786,6 +1807,9 @@ PY
     if [[ "$OBSERVED_PATH_A" == "$OBSERVED_PATH_B" \
           && ( "$OBSERVED_PATH_A" == "direct" || "$OBSERVED_PATH_A" == "relay" ) ]]; then
       EXPECTED_PATH="$OBSERVED_PATH_A"
+    elif [[ "$MODE" == normal && ( "$OBSERVED_PATH_A" == direct || "$OBSERVED_PATH_A" == relay ) \
+          && ( "$OBSERVED_PATH_B" == direct || "$OBSERVED_PATH_B" == relay ) ]]; then
+      EXPECTED_PATH="mixed"
     else
       # Fail closed through the existing collector while retaining both raw
       # status snapshots for diagnosis.
@@ -1808,7 +1832,7 @@ PY
     --final-b "$ROUND_DIR/node-b.status.json" \
     --log-a "$ROUND_DIR/node-a.log" \
     --log-b "$ROUND_DIR/node-b.log" \
-    --expected-path "$EXPECTED_PATH" \
+    --expected-path "${EXPECTED_PATH/mixed/direct}" \
     --overlay-burst "$OVERLAY_BURST" \
     $COLLECT_REPLAY_FLAG \
     --output "$ROUND_DIR/nat-evidence.json"
@@ -1881,7 +1905,7 @@ PY
   B_BUDGET_DIRECT_FIRST_REMAINING="$EVIDENCE_B_BUDGET_DIRECT_FIRST_REMAINING"
   DELTA_OK=1
   BUDGET_EVIDENCE_OK=1
-  if [[ "$MODE" == normal && "$EXPECTED_PATH" == direct && "$EVIDENCE_PASS" -eq 1 \
+  if [[ "$MODE" == normal && "$EVIDENCE_PASS" -eq 1 \
         && ( "$A_DELTA" -lt 0 || "$B_DELTA" -lt 0 ) ]]; then
     echo "[nat-sim] normal Direct business preceded Relay readiness; Relay delta is not applicable"
     SUM_DELTA=-1
@@ -2096,6 +2120,8 @@ except Exception:
     outcome="relay_fallback"
     if [[ "$EXPECTED_PATH" == "direct" ]]; then
       outcome="direct_first_usable"
+    elif [[ "$EXPECTED_PATH" == mixed ]]; then
+      outcome="mixed_first_usable"
     elif [[ "$A_DIRECT" -gt 0 && "$B_DIRECT" -gt 0 ]]; then
       outcome="relay_then_direct"
     fi
@@ -2350,8 +2376,18 @@ except Exception:
       SWEEP_NOISE_COUNT="$SWEEP_NOISE_COUNT" SWEEP_NOISE_LIMIT="$SWEEP_NOISE_LIMIT" \
       BACKGROUND_DEVICES="$BACKGROUND_DEVICES" BACKGROUND_FLOWS="$BACKGROUND_FLOWS" \
       BACKGROUND_INTERVAL_MS="$BACKGROUND_INTERVAL_MS" \
+      NETWORK_PROFILE="$NETWORK_PROFILE" \
       python3 "$ROOT_DIR/scripts/nat-sim/mapping_evidence.py" "$ROUND_DIR"; then
       echo "[nat-sim] ROUND $round: FAIL reason_code=mapping_evidence_invalid" >&2
+      overall=1
+    fi
+  fi
+  if [[ "$MODE" == normal ]]; then
+    CONTINUITY_ARGS=(verify "$ROUND_DIR")
+    if [[ -n "$NETWORK_PROFILE" ]]; then CONTINUITY_ARGS+=(--network-profile "$NETWORK_PROFILE"); fi
+    if [[ "$NORMAL_REQUIRE_DIRECT_BEFORE_FAULT" == 1 ]]; then CONTINUITY_ARGS+=(--require-direct-before-fault); fi
+    if ! python3 "$ROOT_DIR/scripts/nat-sim/continuity_evidence.py" "${CONTINUITY_ARGS[@]}"; then
+      echo "[nat-sim] ROUND $round: FAIL reason_code=continuity_evidence_invalid" >&2
       overall=1
     fi
   fi

@@ -33,11 +33,13 @@ import dataclasses
 import errno
 import json
 import os
+from pathlib import Path
 import random
 import socket
 import struct
 import time
 from background_traffic import run_background
+from network_conditions import Impairments, NetworkProfile, load_profiles
 from typing import Deque, Dict, List, Optional, Set, Tuple
 
 
@@ -137,6 +139,7 @@ class Mapping:
     bind_task: Optional[asyncio.Task] = None
     send_task: Optional[asyncio.Task] = None
     pending: Deque[Tuple[bytes, Address]] = dataclasses.field(default_factory=collections.deque)
+    last_outbound_at: float = 0.0
 
 
 class StunObserverProtocol(asyncio.DatagramProtocol):
@@ -194,6 +197,7 @@ class EgressGatewayProtocol(asyncio.DatagramProtocol):
         self.nat.record("egress_captured", client=format_address(client),
                         destination=format_address(destination), bytes=len(data) - 16)
         self.nat.egress_activity.set()
+        self.nat.activate_network()
         for transport, observer in self.nat.observers:
             if destination == observer:
                 transaction = parse_binding_request(data[16:])
@@ -222,6 +226,9 @@ class NatFabric:
     def route_translated(self, sender: "Nat", mapping: Mapping, data: bytes, destination: Address) -> None:
         # Source mapping already exists even when the destination is unbound.
         # Never send raw packets to arbitrary host sockets/private daemon ports.
+        if sender.network_outage:
+            sender.record("packet_dropped_outage", direction="outbound", bytes=len(data))
+            return
         if sender.block_direct or (
             sender.direct_gate_file is not None and not os.path.exists(sender.direct_gate_file)
         ):
@@ -303,6 +310,7 @@ class Nat:
         sweep_noise_every: int = 0,
         sweep_noise_count: int = 0,
         sweep_noise_limit: int = 64,
+        network_profile: Optional[NetworkProfile] = None,
     ) -> None:
         if mapping_mode not in {"step", "random"}:
             raise ValueError("mapping_mode must be 'step' or 'random'")
@@ -372,6 +380,15 @@ class Nat:
         self._egress_refresh_task: Optional[asyncio.Task] = None
         self._egress_refresh_needed = False
         self.egress_activity = None
+        self.network_profile = network_profile or NetworkProfile()
+        self.impairments = Impairments(self.network_profile, seed)
+        self.network_outage = False
+        self._network_started_at = None
+        self._network_task = None
+        self._network_rebound = False
+        self._packet_tasks: Set[asyncio.Task] = set()
+        self._retired_tasks: Set[asyncio.Task] = set()
+        self._closed = False
 
     async def start(self, fabric: Optional[NatFabric] = None) -> "Nat":
         self.loop = asyncio.get_running_loop()
@@ -383,7 +400,12 @@ class Nat:
         return self
 
     async def close(self) -> None:
-        tasks = []
+        self._closed = True
+        tasks = list(self._packet_tasks | self._retired_tasks)
+        if self._network_task is not None:
+            tasks.append(self._network_task)
+        for task in tasks:
+            task.cancel()
         if self._egress_refresh_task is not None and not self._egress_refresh_task.done():
             self._egress_refresh_task.cancel()
             tasks.append(self._egress_refresh_task)
@@ -406,6 +428,77 @@ class Nat:
         self.observers.clear()
         self.forwarders.clear()
         self.provisional_forwarders.clear()
+
+    def activate_network(self) -> None:
+        if self._network_started_at is not None or self.loop is None or self._closed:
+            return
+        self._network_started_at = self.loop.time()
+        self.record("network_conditions_started", profile=self.network_profile.to_dict())
+        profile = self.network_profile
+        if profile.outage_after_ms or profile.rebind_after_ms or profile.mapping_idle_ms:
+            self._network_task = self.loop.create_task(self._run_network_events())
+
+    async def _run_network_events(self) -> None:
+        while not self._closed:
+            self.advance_network(self.loop.time())
+            await asyncio.sleep(0.05)
+
+    def advance_network(self, now: float) -> None:
+        if self._network_started_at is None:
+            return
+        profile = self.network_profile
+        elapsed = (now - self._network_started_at) * 1000
+        outage = (profile.outage_after_ms > 0
+                  and profile.outage_after_ms <= elapsed < profile.outage_after_ms + profile.outage_duration_ms)
+        if outage != self.network_outage:
+            self.network_outage = outage
+            self.record("network_outage_started" if outage else "network_outage_ended")
+        if profile.rebind_after_ms and elapsed >= profile.rebind_after_ms and not self._network_rebound:
+            self._network_rebound = True
+            count = len(self.mappings)
+            for mapping in list(self.mappings.values()):
+                self.retire_mapping(mapping, "network_rebind")
+            self.record("network_rebound", retired_mappings=count)
+        if profile.mapping_idle_ms:
+            for mapping in list(self.mappings.values()):
+                if (now - mapping.last_outbound_at) * 1000 >= profile.mapping_idle_ms:
+                    self.retire_mapping(mapping, "idle_timeout")
+
+    def mapping_is_current(self, mapping: Mapping) -> bool:
+        return not self._closed and self.mappings.get((mapping.client, mapping.destination)) is mapping
+
+    def retire_mapping(self, mapping: Mapping, reason: str) -> None:
+        if not self.mapping_is_current(mapping):
+            return
+        del self.mappings[(mapping.client, mapping.destination)]
+        self.mapping_by_port.pop(mapping.port, None)
+        transport = self.forwarders.pop(mapping.port, None)
+        if transport is not None:
+            transport.close()
+        mapping.transport = None
+        mapping.pending.clear()
+        for task in (mapping.bind_task, mapping.send_task):
+            if task is not None and not task.done():
+                self._retired_tasks.add(task)
+                task.add_done_callback(self._retired_tasks.discard)
+                task.cancel()
+        self.record("mapping_retired", public_endpoint=f"{self.public_ip}:{mapping.port}",
+                    client=format_address(mapping.client), destination=format_address(mapping.destination),
+                    reason=reason)
+
+    def spawn_packet_task(self, coroutine, packet_kind: str) -> None:
+        if self._closed or self.loop is None or len(self._packet_tasks) >= self.network_profile.queue_limit:
+            coroutine.close()
+            self.record("packet_dropped_queue", packet_kind=packet_kind, reason="pending_packet_limit")
+            return
+        task = self.loop.create_task(coroutine)
+        self._packet_tasks.add(task)
+        def completed(done):
+            self._packet_tasks.discard(done)
+            if not done.cancelled() and done.exception() is not None:
+                self.record("network_packet_task_failed", packet_kind=packet_kind,
+                            error_type=type(done.exception()).__name__)
+        task.add_done_callback(completed)
 
     def alloc_port(self) -> int:
         if self.mapping_mode == "random":
@@ -507,8 +600,10 @@ class Nat:
         key = (client, destination)
         mapping = self.mappings.get(key)
         if mapping is not None:
+            mapping.last_outbound_at = self.loop.time() if self.loop else time.monotonic()
             return mapping
         mapping = Mapping(client=client, destination=destination, port=self._allocate_unused_port())
+        mapping.last_outbound_at = self.loop.time() if self.loop else time.monotonic()
         self.mappings[key] = mapping
         self.mapping_by_port[mapping.port] = mapping
         provisional = self.provisional_forwarders.pop(mapping.port, None)
@@ -567,6 +662,8 @@ class Nat:
             self.fabric.mapping_bound(self, mapping)
 
     async def ensure_bound(self, mapping: Mapping) -> None:
+        if not self.mapping_is_current(mapping):
+            return
         if mapping.transport is not None:
             self._report_bound(mapping)
             return
@@ -581,7 +678,8 @@ class Nat:
                 raise RuntimeError("start the NAT before allocating mappings")
             mapping.bind_task = self.loop.create_task(self._bind_mapping(mapping))
         await asyncio.shield(mapping.bind_task)
-        self._report_bound(mapping)
+        if self.mapping_is_current(mapping):
+            self._report_bound(mapping)
 
     async def _bind_mapping(self, mapping: Mapping) -> None:
         if self.loop is None:
@@ -605,6 +703,9 @@ class Nat:
                 # Reallocate before either STUN or peer traffic observes it.
                 self._reassign_mapping_port(mapping)
                 continue
+            if not self.mapping_is_current(mapping):
+                transport.close()
+                return
             mapping.transport = transport
             self.forwarders[port] = transport
 
@@ -616,6 +717,7 @@ class Nat:
         transaction: bytes,
     ) -> None:
         self.record_client(client)
+        self.activate_network()
         self.measurements[client] = self.measurements.get(client, 0) + 1
         mapping = self.mapping_for(client, observer)
         self.record("stun_mapping_observed", client=format_address(client),
@@ -623,9 +725,8 @@ class Nat:
                     public_endpoint=f"{self.public_ip}:{mapping.port}")
         if self.loop is None:
             return
-        self.loop.create_task(
-            self._reply_to_stun_after_bind(observer_transport, client, transaction, mapping)
-        )
+        self.spawn_packet_task(
+            self._reply_to_stun_after_bind(observer_transport, client, transaction, mapping), "stun")
 
     async def _reply_to_stun_after_bind(
         self,
@@ -638,9 +739,31 @@ class Nat:
             await self.ensure_bound(mapping)
         except OSError:
             return
+        if not self.mapping_is_current(mapping):
+            return
+        if self.network_outage:
+            self.record("packet_dropped_outage", packet_kind="stun", bytes=20)
+            return
         response = binding_response(transaction, self.public_ip, mapping.port)
-        if self.stun_delay_ms > 0:
-            await asyncio.sleep(self.stun_delay_ms / 1000.0)
+        delay = self.stun_delay_ms / 1000
+        if self.network_profile.impair_stun:
+            reason = self.impairments.loss(self.loss_rate)
+            if reason:
+                self.record(reason, packet_kind="stun", bytes=len(response))
+                return
+            delay = self.impairments.delay(self.loop.time(), self.stun_delay_ms, len(response))
+            if delay is None:
+                self.record("packet_dropped_queue", packet_kind="stun", reason="queue_deadline")
+                return
+            self.record("packet_conditioned", packet_kind="stun", delay_ms=round(delay * 1000, 3))
+        if delay > 0:
+            await asyncio.sleep(delay)
+        if not self.mapping_is_current(mapping):
+            self.record("packet_dropped_stale_mapping", packet_kind="stun")
+            return
+        if self.network_outage:
+            self.record("packet_dropped_outage", packet_kind="stun", bytes=len(response))
+            return
         observer_transport.sendto(response, client)
 
     def translate_outbound(self, client: Address, destination: Address, data: bytes) -> None:
@@ -682,6 +805,8 @@ class Nat:
     async def _flush_outbound(self, mapping: Mapping) -> None:
         try:
             await self.ensure_bound(mapping)
+            if not self.mapping_is_current(mapping):
+                return
             while mapping.pending:
                 data, destination = mapping.pending.popleft()
                 if mapping.transport is not None:
@@ -758,6 +883,9 @@ class Nat:
         # cannot create or impersonate a NAT mapping.
         if mapping is None:
             return
+        if self.network_outage:
+            self.record("packet_dropped_outage", direction="inbound", bytes=len(data))
+            return
         if not self.inbound_allowed(mapping, addr):
             if self.fabric is not None:
                 self.fabric.record(
@@ -768,33 +896,38 @@ class Nat:
                     actual_source=format_address(addr),
                 )
             return
-        if self.loss_rate > 0 and self.rng.random() < self.loss_rate:
+        loss_reason = self.impairments.loss(self.loss_rate)
+        if loss_reason:
             if self.fabric is not None:
                 self.fabric.record(
-                    "packet_dropped_loss",
+                    loss_reason,
                     nat=self.name,
                     receiver_endpoint=f"{self.public_ip}:{mapping.port}",
                     bytes=len(data),
                     **wireguard_transport_trace_fields(data),
                 )
             return
-        delay_seconds = self.delivery_delay_ms / 1000.0
-        reorder_delay_injected = self.reorder and self.rng.random() < 0.25
+        delay_seconds = self.impairments.delay(self.loop.time(), self.delivery_delay_ms, len(data))
+        if delay_seconds is None:
+            self.record("packet_dropped_queue", packet_kind="peer", reason="queue_deadline")
+            return
+        reorder_delay_injected = self.reorder and self.impairments.rng.random() < 0.25
         if reorder_delay_injected:
             delay_seconds += 0.02
-        duplicate = self.duplicate_rate > 0 and self.rng.random() < self.duplicate_rate
+        duplicate = self.duplicate_rate > 0 and self.impairments.rng.random() < self.duplicate_rate
         if delay_seconds > 0:
+            source_mapping = self.fabric.mapping_for_public_endpoint(self, addr) if self.fabric else None
             if self.loop is not None:
-                self.loop.create_task(
+                self.spawn_packet_task(
                     self._delayed_delivery(
-                        mapping, data, addr, delay_seconds, duplicate_copy=0
-                    )
+                        mapping, data, addr, delay_seconds, duplicate_copy=0, source_mapping=source_mapping
+                    ), "peer"
                 )
                 if duplicate:
-                    self.loop.create_task(
+                    self.spawn_packet_task(
                         self._delayed_delivery(
-                            mapping, data, addr, delay_seconds + 0.001, duplicate_copy=1
-                        )
+                            mapping, data, addr, delay_seconds + 0.001, duplicate_copy=1, source_mapping=source_mapping
+                        ), "peer"
                     )
             if self.fabric is not None:
                 self.fabric.record(
@@ -846,6 +979,12 @@ class Nat:
         source: Address,
         duplicate_copy: int = 0,
     ) -> None:
+        if not self.mapping_is_current(mapping):
+            self.record("packet_dropped_stale_mapping", packet_kind="peer")
+            return
+        if self.network_outage:
+            self.record("packet_dropped_outage", direction="inbound", bytes=len(data))
+            return
         if self.fabric is not None:
             self.fabric.record(
                 "simulator_delivery",
@@ -885,8 +1024,12 @@ class Nat:
         source: Address,
         delay: float,
         duplicate_copy: int = 0,
+        source_mapping=None,
     ) -> None:
         await asyncio.sleep(delay)
+        if source_mapping is not None and not source_mapping[0].mapping_is_current(source_mapping[1]):
+            self.record("packet_dropped_stale_mapping", packet_kind="peer_source")
+            return
         self._deliver(mapping, data, source, duplicate_copy=duplicate_copy)
 
 
@@ -931,7 +1074,14 @@ def main() -> None:
     parser.add_argument("--background-devices", type=int, default=0)
     parser.add_argument("--background-flows", type=int, default=32)
     parser.add_argument("--background-interval-ms", type=int, default=250)
+    parser.add_argument("--network-profile", type=Path)
     args = parser.parse_args()
+    try:
+        profiles = load_profiles(args.network_profile)
+    except (OSError, ValueError, TypeError) as error:
+        parser.error(str(error))
+    if args.network_profile and args.egress_capture != "shim":
+        parser.error("network profiles require complete shim capture")
     if not 0 <= args.background_devices <= 16 or not 1 <= args.background_flows <= 64 or not 10 <= args.background_interval_ms <= 5000:
         parser.error("background limits: devices 0..16, flows 1..64, interval 10..5000 ms")
     if args.background_devices and args.egress_capture != "shim":
@@ -961,6 +1111,7 @@ def main() -> None:
             args.sweep_noise_every,
             args.sweep_noise_count,
             args.sweep_noise_limit,
+            profiles["A"],
         )
         nat_b = Nat(
             "B",
@@ -982,6 +1133,7 @@ def main() -> None:
             args.sweep_noise_every,
             args.sweep_noise_count,
             args.sweep_noise_limit,
+            profiles["B"],
         )
         try:
             await nat_a.start(fabric)
@@ -1020,6 +1172,7 @@ def main() -> None:
                         "background_devices": args.background_devices,
                         "background_flows": args.background_flows,
                         "background_interval_ms": args.background_interval_ms,
+                        "network_profiles": {name: profile.to_dict() for name, profile in profiles.items()},
                         "consume_a": args.consume_a,
                         "consume_b": args.consume_b,
                         "sweep_noise_every": args.sweep_noise_every,

@@ -260,6 +260,43 @@ void main() {
     },
   );
 
+  test('Windows health cannot replace an unavailable child identity', () {
+    final pending = classifyDaemonStartupProbe(
+      healthReady: true,
+      childAlive: null,
+      requireChildIdentity: true,
+      deadlineReached: false,
+    );
+    expect(pending.ready, isFalse);
+    expect(pending.failure, isNull);
+    final timeout = classifyDaemonStartupProbe(
+      healthReady: true,
+      childAlive: null,
+      requireChildIdentity: true,
+      deadlineReached: true,
+    );
+    expect(timeout.failure?.code, DaemonStartupFailureCode.startupTimeout);
+    final exited = classifyDaemonStartupProbe(
+      healthReady: true,
+      childAlive: false,
+      requireChildIdentity: true,
+      deadlineReached: false,
+    );
+    expect(
+      exited.failure?.code,
+      DaemonStartupFailureCode.daemonExitedDuringStartup,
+    );
+    // PID-less platform launchers retain their established readiness path.
+    expect(
+      classifyDaemonStartupProbe(
+        healthReady: true,
+        childAlive: null,
+        deadlineReached: false,
+      ).ready,
+      isTrue,
+    );
+  });
+
   test('classifies UAC cancellation and launch failures', () {
     expect(
       classifyWindowsLaunchFailure('The operation was canceled by the user.')

@@ -82,39 +82,41 @@ class _WindowsProcessApi {
   static const _invalidParameter = 87;
   static const _pathCapacity = 32768;
 
-  final _kernel = DynamicLibrary.open('kernel32.dll');
-  late final _openProcess = _kernel
+  static final _kernel = DynamicLibrary.open('kernel32.dll');
+  // Resolve every symbol before any query so first-use symbol lookup cannot
+  // overwrite the Win32 error between a failed call and GetLastError.
+  final _openProcess = _kernel
       .lookupFunction<
         Pointer<Void> Function(Uint32, Int32, Uint32),
         Pointer<Void> Function(int, int, int)
       >('OpenProcess');
-  late final _closeHandle = _kernel
+  final _closeHandle = _kernel
       .lookupFunction<
         Int32 Function(Pointer<Void>),
         int Function(Pointer<Void>)
       >('CloseHandle');
-  late final _getLastError = _kernel
+  final _getLastError = _kernel
       .lookupFunction<Uint32 Function(), int Function()>('GetLastError');
-  late final _getProcessHeap = _kernel
+  final _getProcessHeap = _kernel
       .lookupFunction<Pointer<Void> Function(), Pointer<Void> Function()>(
         'GetProcessHeap',
       );
-  late final _heapAlloc = _kernel
+  final _heapAlloc = _kernel
       .lookupFunction<
         Pointer<Void> Function(Pointer<Void>, Uint32, UintPtr),
         Pointer<Void> Function(Pointer<Void>, int, int)
       >('HeapAlloc');
-  late final _heapFree = _kernel
+  final _heapFree = _kernel
       .lookupFunction<
         Int32 Function(Pointer<Void>, Uint32, Pointer<Void>),
         int Function(Pointer<Void>, int, Pointer<Void>)
       >('HeapFree');
-  late final _getExitCode = _kernel
+  final _getExitCode = _kernel
       .lookupFunction<
         Int32 Function(Pointer<Void>, Pointer<Uint32>),
         int Function(Pointer<Void>, Pointer<Uint32>)
       >('GetExitCodeProcess');
-  late final _queryImageName = _kernel
+  final _queryImageName = _kernel
       .lookupFunction<
         Int32 Function(Pointer<Void>, Uint32, Pointer<Uint16>, Pointer<Uint32>),
         int Function(Pointer<Void>, int, Pointer<Uint16>, Pointer<Uint32>)

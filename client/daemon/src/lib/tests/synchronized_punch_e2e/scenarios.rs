@@ -621,6 +621,144 @@ async fn hard_hard_responder_claim_supersedes_ordinary_fresh_prediction() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn hard_hard_responder_cleanup_wait_is_bounded_and_fenced() {
+    for outcome in ["release", "timeout", "network_changed", "live_owner"] {
+        let (_daemon, peers, _udp, _control) = build_hard_hard_ordinary_fallback_fixture().await;
+        let plan = peers.hard_hard_plan_for_peer(HARD_HARD_B).await.unwrap();
+        let generation = peers.peer_session_generation_sync(HARD_HARD_B).unwrap();
+        let RecoveryAdmission::Accepted { epoch } = peers.recovery_epoch_admit(HARD_HARD_B).await
+        else {
+            panic!("fixture admission");
+        };
+        let deduplicator = PunchAttemptDeduplicator::default();
+        let Some(RendezvousPunchClaim::Claimed(old)) = deduplicator
+            .claim_for_epoch_with_rendezvous_for_peer_session(
+                &peers,
+                HARD_HARD_B,
+                generation,
+                plan.local_network_generation,
+                epoch,
+                PUNCH_PRIORITY_HARD_HARD,
+                None,
+                None,
+            )
+            .await
+        else {
+            panic!("previous HH owner");
+        };
+        let cleanup = old.clone_for_cleanup();
+        if outcome != "live_owner" {
+            old.cancellation_handle().cancel_for_hard_hard_cleanup();
+        }
+        drop(old);
+        assert_eq!(deduplicator.active_session_count(), 1);
+
+        let claim = claim_hard_hard_responder_session(
+            &peers,
+            &deduplicator,
+            HARD_HARD_B,
+            generation,
+            plan,
+            epoch,
+            unix_time_millis() + 3500,
+        );
+        tokio::pin!(claim);
+        let early = timeout(Duration::from_millis(60), &mut claim).await;
+        if outcome == "live_owner" {
+            assert!(matches!(
+                early,
+                Ok(Err(HardHardClaimFailure {
+                    reason: HardHardClaimFailureReason::Deferred(
+                        PunchClaimDeferredReason::SameEpochActive
+                    ),
+                    ..
+                }))
+            ));
+            assert!(!cleanup.is_cancelled());
+        } else {
+            assert!(
+                early.is_err(),
+                "cleanup ownership must survive the primary's drop"
+            );
+        }
+        assert_eq!(
+            peers
+                .recovery_epoch_work_budget_report(HARD_HARD_B)
+                .await
+                .unwrap()
+                .hard_hard_generations_remaining,
+            4,
+            "a deferred claim refunds before waiting: {outcome}"
+        );
+
+        match outcome {
+            "release" => {
+                drop(cleanup);
+                let (next, _) = timeout(Duration::from_secs(1), &mut claim)
+                    .await
+                    .expect("cleanup release must wake the bounded retry")
+                    .expect("fresh rendezvous should acquire the released owner");
+                assert_eq!(deduplicator.active_session_count(), 1);
+                assert_eq!(
+                    peers
+                        .recovery_epoch_work_budget_report(HARD_HARD_B)
+                        .await
+                        .unwrap()
+                        .hard_hard_generations_remaining,
+                    3,
+                    "only the successful claim consumes one generation"
+                );
+                drop(next);
+            }
+            "timeout" => {
+                let result = timeout(Duration::from_secs(1), &mut claim)
+                    .await
+                    .expect("cleanup wait must remain bounded");
+                assert!(matches!(
+                    result,
+                    Err(HardHardClaimFailure {
+                        reason: HardHardClaimFailureReason::Deferred(
+                            PunchClaimDeferredReason::CancelledOwnerCleanup
+                        ),
+                        ..
+                    })
+                ));
+                assert_eq!(deduplicator.active_session_count(), 1);
+                assert_eq!(
+                    peers
+                        .recovery_epoch_work_budget_report(HARD_HARD_B)
+                        .await
+                        .unwrap()
+                        .hard_hard_generations_remaining,
+                    4
+                );
+                drop(cleanup);
+            }
+            "network_changed" => {
+                peers
+                    .advance_network_generation("test HH cleanup wait fence")
+                    .await;
+                drop(cleanup);
+                let result = timeout(Duration::from_secs(1), &mut claim).await.unwrap();
+                assert!(
+                    matches!(
+                        result,
+                        Err(HardHardClaimFailure {
+                            reason: HardHardClaimFailureReason::PlanChanged
+                                | HardHardClaimFailureReason::PlanUnavailable,
+                            ..
+                        })
+                    ),
+                    "the old measured plan cannot claim after network replacement"
+                );
+            }
+            _ => drop(cleanup),
+        }
+        assert_eq!(deduplicator.active_session_count(), 0);
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn normal_background_retry_revisits_hard_hard_after_protected_owner_releases() {
     let (_daemon, peers, udp, control) = build_hard_hard_ordinary_fallback_fixture().await;
     let observers = [

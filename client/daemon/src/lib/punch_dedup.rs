@@ -56,6 +56,7 @@ struct PunchAttemptRecord {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PunchClaimDeferredReason {
     SameEpochActive,
+    CancelledOwnerCleanup,
     LowerPriorityActive,
     SameOrOlderFreshPrediction,
     RendezvousLeadProtected,
@@ -66,6 +67,7 @@ impl PunchClaimDeferredReason {
     fn label(self) -> &'static str {
         match self {
             Self::SameEpochActive => "same_epoch_active_session",
+            Self::CancelledOwnerCleanup => "cancelled_owner_cleanup_pending",
             Self::LowerPriorityActive => "higher_priority_active_session",
             Self::SameOrOlderFreshPrediction => "same_or_older_fresh_prediction",
             Self::RendezvousLeadProtected => "active_rendezvous_lead_protected",
@@ -478,7 +480,12 @@ impl PunchAttemptDeduplicator {
                 || priority_preempts
                 || newer_fresh_preempts;
             if !preempt {
-                let reason = if priority < active.priority {
+                let reason = if priority == PUNCH_PRIORITY_HARD_HARD
+                    && active.priority == PUNCH_PRIORITY_HARD_HARD
+                    && active.cancellation.is_cancelled()
+                {
+                    PunchClaimDeferredReason::CancelledOwnerCleanup
+                } else if priority < active.priority {
                     PunchClaimDeferredReason::LowerPriorityActive
                 } else if priority == PUNCH_PRIORITY_FRESH_PREDICTION {
                     PunchClaimDeferredReason::SameOrOlderFreshPrediction
@@ -605,6 +612,35 @@ impl PunchAttemptDeduplicator {
             .filter(|active| active.session_id == session_id)
         {
             active.owner_count = active.owner_count.saturating_add(1);
+        }
+    }
+
+    /// An exact cancelled owner still holds its UDP cleanup transaction.
+    /// Observe the authoritative permit ledger until its last reference is
+    /// released, without preempting cleanup or retaining a lock across await.
+    /// The caller retries once and rechecks all lifecycle/time fences.
+    async fn wait_for_cancelled_owner_release(
+        &self,
+        peer_id: &str,
+        session_id: u64,
+        max_wait: Duration,
+    ) {
+        let deadline = tokio::time::Instant::now() + max_wait;
+        loop {
+            let pending = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .active
+                .get(peer_id)
+                .is_some_and(|active| {
+                    active.session_id == session_id && active.cancellation.is_cancelled()
+                });
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if !pending || remaining.is_zero() {
+                return;
+            }
+            sleep(remaining.min(Duration::from_millis(20))).await;
         }
     }
 

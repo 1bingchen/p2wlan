@@ -246,7 +246,7 @@ fn build_control_http_pools(
     match (primary, candidate) {
         (Ok(primary), Ok(candidate)) => ControlHttpPoolState {
             pool_id: NEXT_CONTROL_HTTP_POOL_ID
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |id| id.checked_add(1))
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |id| id.checked_add(1))
                 .unwrap_or(0),
             primary: Some(Arc::new(primary)),
             candidate: Some(Arc::new(candidate)),

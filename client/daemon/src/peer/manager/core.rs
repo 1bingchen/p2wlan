@@ -567,7 +567,7 @@ impl PeerManager {
                 *current = Some(profile.clone());
                 let previous = self
                     .local_profile_generation
-                    .fetch_update(
+                    .try_update(
                         std::sync::atomic::Ordering::AcqRel,
                         std::sync::atomic::Ordering::Acquire,
                         |generation| Some(generation.saturating_add(1)),
@@ -629,7 +629,7 @@ impl PeerManager {
         let observation = if live_observation {
             let previous = self
                 .local_profile_observation
-                .fetch_update(
+                .try_update(
                     std::sync::atomic::Ordering::AcqRel,
                     std::sync::atomic::Ordering::Acquire,
                     |observation| Some(observation.saturating_add(1)),

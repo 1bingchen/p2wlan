@@ -52,6 +52,10 @@ func (s *Server) account(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) networks(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Query().Get("pagination") == "cursor" {
+		s.snapshot(w, r, "networks", "")
+		return
+	}
 	ctx, cancel := adminReadRequestContext(r)
 	defer cancel()
 	filter, ok := parseAdminResourceFilter(w, r)
@@ -71,6 +75,10 @@ func (s *Server) networks(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) rooms(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Query().Get("pagination") == "cursor" {
+		s.snapshot(w, r, "rooms", "")
+		return
+	}
 	ctx, cancel := adminReadRequestContext(r)
 	defer cancel()
 	filter, ok := parseAdminResourceFilter(w, r)

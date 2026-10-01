@@ -475,7 +475,7 @@ impl RecoveryEpochState {
 impl PeerManager {
     fn next_recovery_epoch_allocation_id(&self) -> Option<u64> {
         self.recovery_epoch_allocation_id
-            .fetch_update(
+            .try_update(
                 std::sync::atomic::Ordering::AcqRel,
                 std::sync::atomic::Ordering::Acquire,
                 |current| current.checked_add(1),

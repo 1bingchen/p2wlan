@@ -11,7 +11,7 @@ import { SnapshotExport } from './SnapshotExport'
 import { CopyValue } from './CopyValue'
 import { usePageState, useCursorPage, connectionLink, accountReturnState, readAccountReturn, useResourceTabState, resourceOriginState } from './pageState'
 import { QueryStatus, useAutoRefresh } from './refresh'
-import { AccountMark, DataTable, Panel, ErrorBlock, PendingBlock, CursorPagination, Pagination, ResourceTabs, formatAgo, formatDate, useDebouncedValue, ResourceEmptyState, ResourceReturnLink } from './ResourceUI'
+import { AccountMark, DataTable, Panel, ErrorBlock, PendingBlock, CursorPagination, ResourceTabs, formatAgo, formatDate, useDebouncedValue, ResourceEmptyState, ResourceReturnLink } from './ResourceUI'
 import { DeviceTable, NetworkTable, RoomTable } from './ResourceTables'
 import { RelationshipsPage } from './ResourceRelationships'
 import type { AdminAccount } from './types'
@@ -27,7 +27,7 @@ export function AccountsPage() {
   const debounced = useDebouncedValue(query)
   const result = useQuery({
     queryKey: ['accounts', 'cursor', debounced, paging.cursor],
-    queryFn: ({ signal }) => adminApi.accountsCursor(debounced, paging.cursor, PAGE_SIZE, signal),
+    queryFn: ({ signal }) => adminApi.accountsSnapshot(debounced, paging.cursor, PAGE_SIZE, signal),
     refetchInterval: refreshInterval,
     enabled: debounced === query,
   })
@@ -107,7 +107,7 @@ export function DevicesPage({ accountScope }: { accountScope?: ResourceAccountSc
   const debounced = useDebouncedValue(query)
   const result = useQuery({
     queryKey: ['devices', 'cursor', accountId, debounced, status, paging.cursor],
-    queryFn: ({ signal }) => adminApi.devicesCursor(debounced, status, paging.cursor, PAGE_SIZE, signal, accountId),
+    queryFn: ({ signal }) => adminApi.devicesSnapshot(debounced, status, paging.cursor, PAGE_SIZE, signal, accountId),
     refetchInterval: refreshInterval, enabled: debounced === query,
   })
   return <div className="page-stack">
@@ -137,31 +137,26 @@ export function NetworksPage({ accountScope, fixedTab }: { accountScope?: Resour
   const debounced = useDebouncedValue(query)
   const accountId = accountScope?.id || params.get('account_id') || ''
   const account = accountScope || (accountId ? { id: accountId, username: params.get('account_name') || accountId } : null)
-  const pageKey = tab === 'networks' ? 'network_page' : 'room_page'
-  const rawPage = Number(params.get(pageKey))
-  const offset = Number.isSafeInteger(rawPage) && rawPage > 0 && rawPage <= 100_000 ? rawPage * PAGE_SIZE : 0
+  const paging = useCursorPage()
   const filters = { query: debounced, accountId }
-  const networks = useQuery({ queryKey: ['networks', accountId, debounced, offset], queryFn: ({ signal }) => adminApi.networksPage(filters, PAGE_SIZE, offset, signal), enabled: tab === 'networks' && debounced === query, refetchInterval: refreshInterval })
-  const rooms = useQuery({ queryKey: ['rooms', accountId, debounced, offset], queryFn: ({ signal }) => adminApi.roomsPage(filters, PAGE_SIZE, offset, signal), enabled: tab === 'rooms' && debounced === query, refetchInterval: refreshInterval })
+  const networks = useQuery({ queryKey: ['networks', 'snapshot', tab, accountId, debounced, paging.cursor], queryFn: ({ signal }) => adminApi.networksSnapshot(filters, paging.cursor, PAGE_SIZE, signal), enabled: tab === 'networks' && debounced === query, refetchInterval: refreshInterval })
+  const rooms = useQuery({ queryKey: ['rooms', 'snapshot', tab, accountId, debounced, paging.cursor], queryFn: ({ signal }) => adminApi.roomsSnapshot(filters, paging.cursor, PAGE_SIZE, signal), enabled: tab === 'rooms' && debounced === query, refetchInterval: refreshInterval })
   const active = tab === 'networks' ? networks : rooms
-  const total = active.data?.total
-  useEffect(() => {
-    if (debounced === query && active.isSuccess && total !== undefined && offset > 0 && offset >= total) update({ [pageKey]: String(Math.max(0, Math.ceil(total / PAGE_SIZE) - 1)) }, true)
-  }, [total, offset, pageKey, debounced, query, active.isSuccess])
   return <div className="page-stack">
     {!accountScope && <ResourceReturnLink />}
     <div className="page-intro"><div><h2>{tr(fixedTab ? tab === 'rooms' ? '房间网络' : '全部网络' : '网络与房间')}</h2><p>{tr('全部网络包含普通网络和房间网络，房间网络提供加入状态和房间码。')}</p></div><div className="toolbar-controls">
-      <div className="search-field"><Search size={16} /><input value={query} onChange={(event) => update({ q: event.target.value, network_page: '', room_page: '' }, true)} placeholder={tr('搜索名称、ID、网段或房间码')} aria-label={tr('搜索名称、ID、网段或房间码')} /></div>
-      {!accountScope && <AccountScopePicker value={account} onChange={(next) => update({ account_id: next?.id || '', account_name: next?.username || '', network_page: '', room_page: '' })} />}
+      <div className="search-field"><Search size={16} /><input value={query} onChange={(event) => update({ q: event.target.value, network_page: '', room_page: '', cursor: '', page: '' }, true)} placeholder={tr('搜索名称、ID、网段或房间码')} aria-label={tr('搜索名称、ID、网段或房间码')} /></div>
+      {!accountScope && <AccountScopePicker value={account} onChange={(next) => update({ account_id: next?.id || '', account_name: next?.username || '', network_page: '', room_page: '', cursor: '', page: '' })} />}
     </div></div>
     {!fixedTab && <ResourceTabs id="network-resources" label="网络类型" value={tab} onChange={setTab} tabs={[{ value: 'networks', label: tr('全部网络') }, { value: 'rooms', label: tr('房间网络') }]} />}
     <div {...(!fixedTab ? { role: 'tabpanel', id: 'network-resources-panel', 'aria-labelledby': `network-resources-${tab}`, tabIndex: 0 } : {})}>
       <QueryStatus queries={[active]} />
-      <Panel action={debounced === query && tab === 'networks' && networks.data ? <SnapshotExport items={networks.data.items} filename="networks" generatedAt={networks.data.generated_at} total={networks.data.total} scope={{ q: query, account_id: accountId, offset }} /> : debounced === query && tab === 'rooms' && rooms.data ? <SnapshotExport items={rooms.data.items} filename="rooms" generatedAt={rooms.data.generated_at} total={rooms.data.total} scope={{ q: query, account_id: accountId, offset }} /> : undefined}>
+      <Panel action={debounced === query && tab === 'networks' && networks.data ? <SnapshotExport items={networks.data.items} filename="networks" generatedAt={networks.data.generated_at} total={networks.data.total} scope={{ q: query, account_id: accountId, cursor: paging.cursor }} /> : debounced === query && tab === 'rooms' && rooms.data ? <SnapshotExport items={rooms.data.items} filename="rooms" generatedAt={rooms.data.generated_at} total={rooms.data.total} scope={{ q: query, account_id: accountId, cursor: paging.cursor }} /> : undefined}>
+        {debounced === query && paging.cursor && active.error instanceof ApiError && active.error.status === 400 && <div className="resource-query-recovery"><button type="button" className="button secondary compact" onClick={() => update({ cursor: '', page: '' }, true)}>{tr('重新从首页加载')}</button></div>}
         {active.isPending || debounced !== query ? <PendingBlock queries={[active]} /> : active.error && !active.data ? <ErrorBlock error={active.error} onRetry={() => { void active.refetch() }} /> : <>
-          {tab === 'networks' && networks.data && (networks.data.items.length ? <NetworkTable networks={networks.data.items} accountId={accountId} /> : <ResourceEmptyState message="没有符合条件的网络" onClear={query || (!accountScope && accountId) ? () => update({ q: '', network_page: '', room_page: '', ...(!accountScope ? { account_id: '', account_name: '' } : {}) }) : undefined} />)}
-          {tab === 'rooms' && rooms.data && (rooms.data.items.length ? <RoomTable rooms={rooms.data.items} accountId={accountId} /> : <ResourceEmptyState message="没有符合条件的房间" onClear={query || (!accountScope && accountId) ? () => update({ q: '', network_page: '', room_page: '', ...(!accountScope ? { account_id: '', account_name: '' } : {}) }) : undefined} />)}
-          {active.data && <Pagination total={active.data.total} offset={offset} limit={PAGE_SIZE} onChange={(value) => update({ [pageKey]: value ? String(value / PAGE_SIZE) : '' })} />}
+          {tab === 'networks' && networks.data && (networks.data.items.length ? <NetworkTable networks={networks.data.items} accountId={accountId} /> : <ResourceEmptyState message="没有符合条件的网络" onClear={query || (!accountScope && accountId) ? () => update({ q: '', network_page: '', room_page: '', cursor: '', page: '', ...(!accountScope ? { account_id: '', account_name: '' } : {}) }) : undefined} />)}
+          {tab === 'rooms' && rooms.data && (rooms.data.items.length ? <RoomTable rooms={rooms.data.items} accountId={accountId} /> : <ResourceEmptyState message="没有符合条件的房间" onClear={query || (!accountScope && accountId) ? () => update({ q: '', network_page: '', room_page: '', cursor: '', page: '', ...(!accountScope ? { account_id: '', account_name: '' } : {}) }) : undefined} />)}
+          {active.data && <CursorPagination total={active.data.total} pageIndex={paging.pageIndex} itemCount={active.data.items.length} limit={PAGE_SIZE} canNext={Boolean(active.data.next_cursor)} canPrev={paging.canPrev} previousIsFirst={paging.previousIsFirst} onPrev={paging.prev} onNext={() => paging.next(active.data?.next_cursor || '')} />}
         </>}
       </Panel>
     </div>

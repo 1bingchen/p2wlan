@@ -42,7 +42,7 @@ use timing::ServerClockEstimate;
 mod websocket;
 
 /// Single control-plane HTTP client builder shared by the ordinary loop and the
-/// critical lane (see [`control_http_client`](crate::control::control_http_client)).
+/// critical lane (see [`control_http_client`]).
 pub use http::control_http_client;
 pub(crate) use http::incarnation_fits_candidate_generation_encoding;
 #[cfg(test)]
@@ -51,7 +51,7 @@ pub(crate) use http::prepare_signal_payload as prepare_signal_payload_for_test;
 /// variables for control-plane HTTP traffic (diagnostics only).
 pub use http::proxy_consults_environment;
 /// Short, non-sensitive HTTP proxy behavior label (diagnostics/structured
-/// events).  See [`control_http_client`](crate::control::control_http_client) for the policy.
+/// events).  See [`control_http_client`] for the policy.
 pub use http::proxy_http_behavior_label;
 pub(crate) use http::{
     candidate_generation_incarnation, candidate_generation_is_malformed_encoded,

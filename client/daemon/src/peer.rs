@@ -543,6 +543,7 @@ pub const REASON_PATH_DIRECT_CONFIRMED: &str = "path_direct_confirmed";
 /// Path selector kept an encrypted-confirmed Direct pair under the
 /// `direct-sticky` policy.
 pub const REASON_PATH_DIRECT_STICKY: &str = "path_direct_sticky";
+pub const REASON_PATH_DIRECT_FIRST_WAIT: &str = "path_direct_first_wait";
 /// Path selector selected Direct because the configured score policy ranked
 /// it at least as well as the confirmed Relay path.
 pub const REASON_PATH_SCORE_DIRECT: &str = "path_score_direct";
@@ -639,8 +640,11 @@ use probe_budget::{
 };
 pub use types::{
     ActivePathSnapshot, CandidatePair, CandidatePairSource, CandidatePairState, ConnectionState,
-    DirectPathType, DirectTraversalEvent, DirectValidationEventMetadata, NetworkPath, PathHealth,
-    PathScore, PathScoreDiagnostics, PathSelection, PathSelectionDiagnostics, PathSelectionEvent,
+    DirectPathType, DirectTraversalEvent, DirectValidationEventMetadata, HardHardAttemptCounts,
+    HardHardAttemptReport, HardHardAttemptTimeline, HardHardBirthdaySweepDiagnostics,
+    HardHardBusinessAttributionIdentity, HardHardConfirmationCosts, HardHardDatagramCost,
+    NetworkPath, PathHealth, PathScore, PathScoreDiagnostics, PathSelection,
+    PathSelectionDiagnostics, PathSelectionEvent, HARD_HARD_ATTEMPT_REPORT_SCHEMA_VERSION,
 };
 
 mod path_observability;
@@ -651,12 +655,18 @@ pub use path_observability::{
     PathTransitionDiagnostics, PathValidationDiagnostics,
 };
 
+pub mod path_telemetry;
+pub use path_telemetry::{
+    PathTelemetryAckFrame, PathTelemetryFrame, PathTelemetryHub, PathTelemetryMetrics,
+    PathTelemetryObservation, PathTelemetryPayload, PathTelemetrySender,
+};
+
 mod path_state_machine;
 pub(crate) use path_state_machine::{
     ActiveBusinessPath, DirectAttemptNumber, DirectCandidateContinuity, DirectValidationIdentity,
     PathEpoch, PathEvent, PathRetention, PathStateMachine, PathStateMachineSnapshot,
     PathTransitionOutcome, PeerPathLifecycle, RelayBusinessObservation, RelayConnectionIdentity,
-    RelayHealthObservationIdentity,
+    RelayHealthObservationIdentity, DIRECT_FIRST_WINDOW,
 };
 
 include!("peer/connection/core.rs");
@@ -675,6 +685,9 @@ include!("peer/manager/direct_failure.rs");
 include!("peer/manager/relay.rs");
 include!("peer/manager/fresh_mapping.rs");
 include!("peer/manager/hard_hard.rs");
+include!("peer/manager/hard_hard_observation.rs");
+include!("peer/manager/hard_hard_plan.rs");
+include!("peer/manager/hard_hard_learning.rs");
 include!("peer/manager/recovery_epoch.rs");
 include!("peer/manager/outbound_liveness.rs");
 include!("peer/manager/c0_coordination.rs");

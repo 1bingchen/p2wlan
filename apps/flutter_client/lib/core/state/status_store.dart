@@ -724,7 +724,10 @@ class StatusStore extends ChangeNotifier {
         _statusSnapshotTimedOut = snapshotTimedOut;
         if (!snapshotTimedOut) {
           _clearSnapshot();
-          _lastStatusError = 'GET /status failed: $error';
+          _lastStatusError =
+              error is DiagnosticsApiException && error.statusCode == 401
+              ? 'local_diagnostics_auth_failed'
+              : 'GET /status failed: $error';
           _lastError = _lastStatusError;
         } else {
           _lastStatusError = null;

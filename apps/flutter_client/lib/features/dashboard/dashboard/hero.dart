@@ -211,6 +211,8 @@ class _NetworkHero extends StatelessWidget {
                 ? (strings.isZh ? '正在连接 P2WLAN' : 'Connecting to P2WLAN')
                 : showStartGuide
                 ? strings.homeStoppedTitle
+                : status == _NetworkStatus.unavailable
+                ? strings.issueStatusUnavailableTitle
                 : strings.homeUnavailableTitle,
             style: TextStyle(
               color: theme.colorScheme.onSurface,
@@ -227,6 +229,8 @@ class _NetworkHero extends StatelessWidget {
                       : 'Waiting for the local network service. Complete the system permission prompt if shown.')
                 : showStartGuide
                 ? strings.homeStoppedDetail
+                : status == _NetworkStatus.unavailable
+                ? strings.issueStatusUnavailableDetail
                 : strings.homeUnavailableDetail,
             maxLines: 2,
             overflow: TextOverflow.ellipsis,

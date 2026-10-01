@@ -17,6 +17,8 @@ impl Fixture {
         ));
         peers
             .add_peer(&PeerInfo {
+                capabilities: crate::control::PeerCapabilities::default(),
+                registration_seq: 0,
                 node_id: "b".into(),
                 virtual_ip: "10.21.1.3".into(),
                 public_key: "pk".into(),

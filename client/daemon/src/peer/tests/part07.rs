@@ -4,6 +4,8 @@ async fn test_peer_manager_active_connections() {
     let manager = PeerManager::new(config);
 
     let peer_info = PeerInfo {
+        capabilities: crate::control::PeerCapabilities::default(),
+        registration_seq: 0,
         node_id: "peer1".to_string(),
         device_name: String::new(),
         app_version: String::new(),

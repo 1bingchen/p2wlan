@@ -546,12 +546,18 @@ impl Daemon {
     ) {
         'work: loop {
             let peer_id = offer.from_node_id.clone();
+            let mut hh_trace =
+                HardHardCandidateTrace::begin(&offer, reservation.owner, &self.peers);
             if *reservation.cancellation.borrow()
                 || !self
                     .pending_handshakes
                     .lock()
                     .candidate_offer_work_is_current(&peer_id, reservation.owner)
             {
+                HardHardCandidateTrace::outcome(
+                    &mut hh_trace,
+                    "candidate_owner_cancelled_or_replaced",
+                );
                 return;
             }
             if !self
@@ -562,6 +568,10 @@ impl Daemon {
                 )
                 .await
             {
+                HardHardCandidateTrace::outcome(
+                    &mut hh_trace,
+                    "peer_identity_unavailable_or_cancelled",
+                );
                 let Some(next) = self
                     .pending_handshakes
                     .lock()
@@ -572,15 +582,58 @@ impl Daemon {
                 offer = next;
                 continue;
             }
-            if let Some(newest) = self
+            if !self
+                .wait_for_hard_hard_profile_publication(&offer, &mut reservation)
+                .await
+            {
+                HardHardCandidateTrace::outcome(
+                    &mut hh_trace,
+                    "profile_wait_cancelled_or_identity_changed",
+                );
+                let Some(next) = self
+                    .pending_handshakes
+                    .lock()
+                    .finish_candidate_offer_work(&peer_id, reservation.owner)
+                else {
+                    return;
+                };
+                offer = next;
+                continue;
+            }
+            let newest = self
                 .pending_handshakes
                 .lock()
-                .take_queued_candidate_offer_work(&peer_id, reservation.owner)
-            {
+                .take_queued_candidate_offer_work_before_commit(
+                    &peer_id,
+                    reservation.owner,
+                    &offer,
+                );
+            if let Some(newest) = newest {
+                HardHardCandidateTrace::outcome(
+                    &mut hh_trace,
+                    "superseded_before_candidate_commit",
+                );
                 offer = newest;
                 continue;
             }
             if self.peers.current_network_generation_sync() != offer.network_generation {
+                HardHardCandidateTrace::outcome(&mut hh_trace, "network_generation_changed");
+                let Some(next) = self
+                    .pending_handshakes
+                    .lock()
+                    .finish_candidate_offer_work(&peer_id, reservation.owner)
+                else {
+                    return;
+                };
+                offer = next;
+                continue;
+            }
+
+            // An owned HH2 token is immutable before either candidate or
+            // incarnation mutation. A conflicting replay must not retire the
+            // valid owner merely by changing its generation declaration.
+            if let Some(handling) = self.handle_hard_hard_repeated_signal(&offer).await {
+                HardHardCandidateTrace::outcome(&mut hh_trace, handling.diagnostic_label());
                 let Some(next) = self
                     .pending_handshakes
                     .lock()
@@ -607,6 +660,7 @@ impl Daemon {
                     RemoteIncarnationResetOutcome::Unchanged => break false,
                     RemoteIncarnationResetOutcome::RejectedIdentity
                     | RemoteIncarnationResetOutcome::RejectedLifecycle => {
+                        HardHardCandidateTrace::outcome(&mut hh_trace, outcome.reason_code());
                         let Some(next) = self
                             .pending_handshakes
                             .lock()
@@ -620,11 +674,19 @@ impl Daemon {
                     RemoteIncarnationResetOutcome::PendingCleanup
                     | RemoteIncarnationResetOutcome::ContendedEpoch
                     | RemoteIncarnationResetOutcome::ContendedConnections => {
-                        if let Some(newest) = self
+                        let newest = self
                             .pending_handshakes
                             .lock()
-                            .take_queued_candidate_offer_work(&peer_id, reservation.owner)
-                        {
+                            .take_queued_candidate_offer_work_before_commit(
+                                &peer_id,
+                                reservation.owner,
+                                &offer,
+                            );
+                        if let Some(newest) = newest {
+                            HardHardCandidateTrace::outcome(
+                                &mut hh_trace,
+                                "superseded_during_incarnation_wait",
+                            );
                             offer = newest;
                             continue 'work;
                         }
@@ -668,7 +730,7 @@ impl Daemon {
             {
                 if matches!(
                     fresh_prediction_from_sources(&offer.candidate_sources),
-                    Ok(None)
+                    FreshPredictionSources::None
                 ) {
                     // Ordinary candidate revisions are the common cold-start
                     // path. Never hold the epoch while queueing a connection
@@ -817,13 +879,15 @@ impl Daemon {
             }
             #[cfg(test)]
             let postprocess_test_gate = self.pause_candidate_postprocess_for_test(&peer_id).await;
-            self.apply_deferred_peer_offer_punch_for_candidate_work(
-                &offer,
-                candidate_apply_result,
-                fresh_punch,
-                &mut reservation,
-            )
-            .await;
+            let handling = self
+                .apply_deferred_peer_offer_punch_for_candidate_work(
+                    &offer,
+                    candidate_apply_result,
+                    fresh_punch,
+                    &mut reservation,
+                )
+                .await;
+            HardHardCandidateTrace::outcome(&mut hh_trace, handling.diagnostic_label());
             #[cfg(test)]
             if let Some(gate) = postprocess_test_gate {
                 gate.completed.notify_one();

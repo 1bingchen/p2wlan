@@ -13,59 +13,31 @@ impl Config {
     }
 
     /// Save configuration to a JSON file using atomic write (temp + rename)
-    /// and sets 0600 permissions on Unix. When an elevated daemon updates an
-    /// existing user config, preserve that file's owner across the rename.
+    /// and sets 0600 permissions on Unix. An elevated daemon inherits the
+    /// owner of the pinned config directory, including on first creation.
     pub fn save_to_file(&self, path: &Path) -> Result<()> {
         let content = serde_json::to_string_pretty(self)
             .map_err(|e| DaemonError::Config(format!("failed to serialize config: {e}")))?;
 
         #[cfg(unix)]
-        let existing_owner = std::fs::metadata(path).ok().map(|metadata| {
-            use std::os::unix::fs::MetadataExt;
-            (metadata.uid(), metadata.gid())
-        });
-
-        // Write to temp file first for atomicity
-        let tmp_path = path.with_extension("tmp");
-        let mut file = std::fs::File::create(&tmp_path)
-            .map_err(|e| DaemonError::Config(format!("failed to create temp config: {e}")))?;
-
-        #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = file
-                .metadata()
-                .map_err(|e| {
-                    DaemonError::Config(format!("failed to get temp config metadata: {e}"))
-                })?
-                .permissions();
-            perms.set_mode(0o600);
-            file.set_permissions(perms).map_err(|e| {
-                DaemonError::Config(format!("failed to set config permissions: {e}"))
-            })?;
-
-            if let Some((uid, gid)) = existing_owner {
-                use std::os::fd::AsRawFd;
-                if unsafe { libc::fchown(file.as_raw_fd(), uid, gid) } != 0 {
-                    return Err(DaemonError::Config(format!(
-                        "failed to preserve config ownership: {}",
-                        std::io::Error::last_os_error()
-                    )));
-                }
-            }
+            private_file::save(path, content.as_bytes())
+                .map_err(|e| DaemonError::Config(format!("failed to save private config: {e}")))
         }
-
-        file.write_all(content.as_bytes())
-            .map_err(|e| DaemonError::Config(format!("failed to write temp config: {e}")))?;
-
-        file.sync_all()
-            .map_err(|e| DaemonError::Config(format!("failed to sync temp config: {e}")))?;
-        drop(file);
-
-        std::fs::rename(&tmp_path, path)
-            .map_err(|e| DaemonError::Config(format!("failed to rename config: {e}")))?;
-
-        Ok(())
+        #[cfg(not(unix))]
+        {
+            let tmp_path = path.with_extension("tmp");
+            let mut file = std::fs::File::create(&tmp_path)
+                .map_err(|e| DaemonError::Config(format!("failed to create temp config: {e}")))?;
+            file.write_all(content.as_bytes())
+                .map_err(|e| DaemonError::Config(format!("failed to write temp config: {e}")))?;
+            file.sync_all()
+                .map_err(|e| DaemonError::Config(format!("failed to sync temp config: {e}")))?;
+            drop(file);
+            std::fs::rename(&tmp_path, path)
+                .map_err(|e| DaemonError::Config(format!("failed to rename config: {e}")))?;
+            Ok(())
+        }
     }
 
     /// Generate a default config with a new identity (X25519 + Ed25519).
@@ -114,6 +86,7 @@ impl Config {
                 fresh_mapping_punch_enabled: true,
                 predicted_candidates_enabled: true,
                 fresh_mapping_harness_loopback: false,
+                hard_hard_experiment_only: false,
                 gather_host_candidates: true,
                 validate_overlay: false,
                 overlay_start_gate_file: None,

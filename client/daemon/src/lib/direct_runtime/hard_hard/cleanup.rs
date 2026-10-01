@@ -35,6 +35,10 @@ struct HardHardCleanupDescriptor {
     fresh_socket: crate::peer::HardHardFreshSocketIdentity,
     expires_at_ms: u64,
     cancellation: Arc<crate::PunchSessionCancellation>,
+    // Existing cleanup owner retains its initial observation if a replacement
+    // removes the live ledger before this watcher wakes. The shared attempt
+    // counter prevents an AwaitingPeer fallback from reporting a later sweep.
+    initial_record: HardHardSessionRecord,
 }
 
 impl HardHardCleanupDescriptor {
@@ -46,6 +50,7 @@ impl HardHardCleanupDescriptor {
             fresh_socket: record.fresh_socket.clone(),
             expires_at_ms: record.expires_at_ms,
             cancellation: record.cancellation.clone(),
+            initial_record: record.clone(),
         }
     }
 }
@@ -213,6 +218,84 @@ fn spawn_hard_hard_session_cleanup_with_owner(
             && !descriptor.cancellation.is_cancelled()
             && hard_hard_exact_direct_socket_is_current_for_cleanup(&udp, &peers, &current_socket)
                 .await;
+
+        // An initiator can finish measurement and advertisement but never
+        // receive an admissible reciprocal prediction. That is still an
+        // executed experiment attempt, not missing evidence. Commit one typed
+        // zero-send terminal report while the exact session identity is still
+        // current; ordinary sweep paths have already advanced state/attempt
+        // and therefore cannot be double reported here.
+        if let Some(record) = snapshot
+            .as_ref()
+            .or(Some(&descriptor.initial_record))
+            .filter(|record| {
+                matches!(
+                    record.state,
+                    crate::peer::HardHardSessionState::AwaitingPeer
+                        | crate::peer::HardHardSessionState::Retiring
+                ) && record.attempt_count == 0
+            })
+        {
+            if let Some(peer_session_generation) =
+                record.measurement.evidence.peer_session_generation()
+            {
+                let targets = record.remote_prediction.as_slice();
+                let planned_sockets = record.requested_socket_indices.len();
+                let planned_socket_target_combinations = if record.birthday {
+                    targets
+                        .len()
+                        .saturating_mul(hard_hard_birthday_wave_count(planned_sockets))
+                } else {
+                    targets.len()
+                };
+                let planned_logical_probes = if record.birthday {
+                    planned_socket_target_combinations
+                } else {
+                    targets
+                        .len()
+                        .saturating_mul(HARD_HARD_SWEEP_ATTEMPTS as usize)
+                };
+                // A same-owner response may have advanced the epoch before
+                // ledger removal. Preserve that committed diagnostic identity
+                // while retaining the original measurement/unsent-plan facts.
+                let observation_socket = record
+                    .measurement
+                    .evidence
+                    .socket_snapshot()
+                    .unwrap_or_else(|| record.fresh_socket.clone());
+                let probe_rx = record.measurement.evidence.receive_snapshot();
+                let _ = record_hard_hard_terminal_attempt(
+                    &peers,
+                    &descriptor.peer_id,
+                    peer_session_generation,
+                    &observation_socket,
+                    &record.session_token,
+                    if record.initiator {
+                        "initiator"
+                    } else {
+                        "responder"
+                    },
+                    record.birthday,
+                    record.attempt_count,
+                    &record.measurement,
+                    targets,
+                    planned_sockets,
+                    planned_socket_target_combinations,
+                    planned_logical_probes,
+                    None,
+                    &PunchSendReport::default(),
+                    probe_rx,
+                    false,
+                    None,
+                    if expiry_woke {
+                        "peer_response_timeout"
+                    } else {
+                        "session_cancelled"
+                    },
+                )
+                .await;
+            }
+        }
 
         // The ledger is retired before any UDP cleanup await. This is the
         // completion-fence boundary: no admission/fence query can revive the

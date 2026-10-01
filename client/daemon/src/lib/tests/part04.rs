@@ -24,6 +24,7 @@ fn sample_result() -> FreshMappingResult {
         public_ip: Some(IpAddr::V4(Ipv4Addr::new(220, 163, 6, 190))),
         first_punch_sent_at_ms: 1100,
         last_punch_sent_at_ms: 1120,
+        measurement: crate::udp::HardHardMeasurementStats::default(),
     }
 }
 
@@ -240,4 +241,29 @@ fn fresh_mapping_signal_payload_without_public_ip_falls_back_to_unspecified_ip()
         build_fresh_mapping_signal_payload(&result, 1_742_987_654_321, &[], &HashMap::new());
     let first: SocketAddr = candidates[0].parse().unwrap();
     assert_eq!(first.port(), 45393);
+}
+
+#[test]
+fn signal_candidate_contract_keeps_upstream_reduction_distinct_from_wire_cap() {
+    let candidates = (0..32)
+        .map(|offset| format!("198.51.100.1:{}", 40000 + offset))
+        .collect::<Vec<_>>();
+    let sources = candidates
+        .iter()
+        .map(|candidate| (candidate.clone(), "predicted".to_string()))
+        .collect::<HashMap<_, _>>();
+    let (wire, wire_sources, contract) =
+        crate::candidate_refresh::normalize_signal_candidates_with_counts(
+            &candidates,
+            &sources,
+            96,
+            96,
+        );
+    assert_eq!(contract.generated_candidate_count, 96);
+    assert_eq!(contract.input_candidate_count, 32);
+    assert_eq!(contract.pre_normalization_reduced_count, 64);
+    assert_eq!(contract.signaled_candidate_count, 32);
+    assert!(!contract.capped);
+    assert_eq!(wire, candidates);
+    assert_eq!(wire_sources, sources);
 }

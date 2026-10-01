@@ -12,7 +12,8 @@ async fn apply_active_behavior_probes(
     };
     let probe_timeout = active_probe_timeout(config.stun_timeout);
 
-    if let Some(filtering_behavior) = probe_filtering_behavior(socket, server, probe_timeout).await
+    if let Some(filtering_behavior) =
+        probe_filtering_behavior(socket, server, probe_timeout, &config.stun_servers).await
     {
         profile.filtering_behavior = filtering_behavior;
     }
@@ -60,6 +61,7 @@ async fn probe_filtering_behavior(
     socket: &UdpSocket,
     server: SocketAddr,
     probe_timeout: Duration,
+    contacted_servers: &[SocketAddr],
 ) -> Option<FilteringBehavior> {
     let stun_client = StunClient::with_timeout(probe_timeout);
 
@@ -68,7 +70,9 @@ async fn probe_filtering_behavior(
         .await
     {
         Ok(response) => {
-            if let Some(behavior) = classify_changed_ip_port_response(server, response.from_addr) {
+            if let Some(behavior) =
+                classify_filtering_probe_response(server, response.from_addr, contacted_servers)
+            {
                 debug!(
                     "Active NAT filtering probe: {:?} response from {} via {}",
                     behavior, response.from_addr, server
@@ -88,42 +92,26 @@ async fn probe_filtering_behavior(
         }
     }
 
-    match stun_client
-        .binding_request_with_change(socket, server, false, true)
-        .await
-    {
-        Ok(response) if response.from_addr.ip() == server.ip() && response.from_addr != server => {
-            debug!(
-                "Active NAT filtering probe: address-dependent response from {} via {}",
-                response.from_addr, server
-            );
-            Some(FilteringBehavior::AddressDependent)
-        }
-        Ok(response) => {
-            debug!(
-                "Active NAT filtering probe: server {} ignored change-port (response from {})",
-                server, response.from_addr
-            );
-            None
-        }
-        Err(error) => {
-            debug!(
-                "Active NAT filtering probe change-port via {} failed: {}",
-                server, error
-            );
-            None
-        }
-    }
+    // A same-IP response from a different port proves only that this source
+    // port was admitted. Without verified change-IP support, a missing reply
+    // cannot distinguish filtering from an unsupported request or packet loss.
+    None
 }
 
-fn classify_changed_ip_port_response(
+/// Positive filtering evidence requires a reply from an IP this socket did
+/// not already contact. A port-only change does not distinguish EIF from ADF;
+/// absent replies do not prove APDF when server capability/loss is unknown.
+pub fn classify_filtering_probe_response(
     server: SocketAddr,
     from_addr: SocketAddr,
+    contacted_servers: &[SocketAddr],
 ) -> Option<FilteringBehavior> {
-    if from_addr.ip() != server.ip() {
+    if from_addr.ip() != server.ip()
+        && !contacted_servers
+            .iter()
+            .any(|prior| prior.ip() == from_addr.ip())
+    {
         Some(FilteringBehavior::EndpointIndependent)
-    } else if from_addr != server {
-        Some(FilteringBehavior::AddressDependent)
     } else {
         None
     }
@@ -221,7 +209,8 @@ fn infer_filtering_behavior(
         // stable port, strict filtering.  Only the active CHANGE-REQUEST
         // probe may upgrade this to endpoint/address-dependent filtering.
         MappingBehavior::EndpointIndependent => FilteringBehavior::Unknown,
-        MappingBehavior::AddressOrPortDependent => FilteringBehavior::AddressOrPortDependent,
+        // Destination-dependent allocation says nothing about ingress filtering.
+        MappingBehavior::AddressOrPortDependent => FilteringBehavior::Unknown,
         MappingBehavior::Unknown | MappingBehavior::UdpBlocked => FilteringBehavior::Unknown,
     }
 }

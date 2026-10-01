@@ -1197,6 +1197,8 @@ async fn hard_local_nat_uses_single_peer_reflexive_public_candidate_without_scat
     let manager = PeerManager::new(test_config());
     let peer_reflexive: SocketAddr = "8.8.8.8:41000".parse().unwrap();
     let peer = PeerInfo {
+        capabilities: crate::control::PeerCapabilities::default(),
+        registration_seq: 0,
         node_id: "peer1".to_string(),
         device_name: String::new(),
         app_version: String::new(),

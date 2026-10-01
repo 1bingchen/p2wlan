@@ -561,6 +561,30 @@ class AppStrings {
   String get settingsConnectionGroup => isZh ? '连接配置' : 'Connection';
   String get settingsAppVersion => isZh ? '应用版本' : 'App version';
   String get settingsAboutGroup => isZh ? '版本与服务' : 'Version & service';
+  String get checkForUpdates => isZh ? '检查更新' : 'Check for updates';
+  String get checkingForUpdates => isZh ? '检查中...' : 'Checking...';
+  String get updateNotChecked => isZh ? '未检查' : 'Not checked';
+  String get updateUpToDate => isZh ? '当前已是最新版本' : 'You are up to date';
+  String updateAvailableStatus(String version) =>
+      isZh ? '发现 $version' : 'Update $version available';
+  String get updateCheckFailed =>
+      isZh ? '检查更新失败' : 'Could not check for updates';
+  String get updateDevelopmentBuild => isZh
+      ? '当前开发构建没有正式版本身份，无法可靠比较。'
+      : 'This development build has no release identity, so it cannot be compared reliably.';
+  String get updateInvalidRelease =>
+      isZh ? '最新客户端发布信息无效' : 'The latest client release is invalid';
+  String get currentVersionLabel => isZh ? '当前版本' : 'Current version';
+  String get latestVersionLabel => isZh ? '最新版本' : 'Latest version';
+  String get viewNewVersion => isZh ? '查看新版本' : 'View new version';
+  String get updateOpenFailed => isZh
+      ? '无法打开新版本页面，请稍后重试。'
+      : 'Could not open the release page. Try again later.';
+  String get updateBannerTitle => isZh ? '发现新版本' : 'New version available';
+  String updateBannerBody(String current, String latest) => isZh
+      ? '当前版本：$current\n最新版本：$latest'
+      : 'Current version: $current\nLatest version: $latest';
+  String get dismissUpdate => isZh ? '稍后' : 'Later';
   String get settingsLogsGroup => isZh ? '日志与支持' : 'Logs & support';
   String get settingsBuildDetails => isZh ? '构建详情' : 'Build details';
   String get settingsBuildDetailsHint => isZh
@@ -1236,6 +1260,11 @@ class AppStrings {
 
   String? statusMessage(String? message) {
     if (message == 'daemon_operation_failed') return daemonOperationFailed;
+    if (message == 'local_diagnostics_auth_failed') {
+      return isZh
+          ? '本地服务可以访问，但认证凭据暂不可用。请刷新重试；若持续出现，请检查本地运行目录的访问权限。'
+          : 'The local service is reachable, but its authentication credentials are unavailable. Refresh to retry; if this continues, check access to the local runtime directory.';
+    }
     if (message == null || !isZh) return message;
     if (message == 'GET /health is offline or unreadable') {
       return 'GET /health 离线或不可读';

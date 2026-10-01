@@ -26,6 +26,11 @@
     <a href="https://github.com/yhan-sun/p2wlan/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/yhan-sun/p2wlan/ci.yml?branch=main&label=CI" alt="CI" /></a>
     <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT License" /></a>
   </p>
+
+  <p>
+    <a href="https://trendshift.io/repositories/239992"><img src="https://trendshift.io/api/badge/trendshift/repositories/239992/daily?language=Rust" width="250" height="55" alt="P2WLAN · Trendshift Rust daily ranking" /></a>
+    <a href="https://trendshift.io/repositories/239992"><img src="https://trendshift.io/api/badge/trendshift/repositories/239992/weekly?language=Rust" width="250" height="55" alt="P2WLAN · Trendshift Rust weekly ranking" /></a>
+  </p>
 </div>
 
 ## What is P2WLAN?
@@ -78,16 +83,18 @@ The client surfaces network health, peer availability, rooms, active paths, and 
 
 ## Use Cases
 
-P2WLAN provides a virtual layer-3 network rather than defining what must run on top of it. If an application communicates over IP, it can usually use the P2WLAN virtual network in the same way it would use a normal private LAN.
+P2WLAN provides a virtual layer-3 network. Applications connect to a peer's virtual IP and service port; the target service must listen on a reachable address and allow the corresponding traffic through its firewall.
 
 | Scenario | Example |
 | --- | --- |
-| **NAS / HomeLab** | Reach NAS administration pages, home servers, VMs, and internal services without exposing each one through a public port. |
+| **NAS / HomeLab** | Reach services on a NAS, home server, or VM running P2WLAN without exposing each one through a public port. |
 | **Minecraft** | Put friends' computers in the same room and connect to a self-hosted Minecraft server through its virtual IP. |
 | **Terraria** | Place players on different real networks into one virtual network for multiplayer sessions. |
 | **Self-hosted services** | Reach web apps, APIs, databases, admin panels, and game servers that should stay private. |
 | **Remote development** | SSH, RDP, database access, development machines, and cross-region testing. |
 | **Cross-region networking** | Link home broadband, mobile hotspots, campus networks, cloud instances, and different cloud providers. |
+
+Installing P2WLAN does not automatically connect other devices on the same home or office network. The examples above assume that the target device also runs P2WLAN.
 
 ### Rooms: organize who should be connected
 
@@ -95,102 +102,96 @@ Rooms are useful when a network needs its own boundary: a Minecraft survival ser
 
 ## Quick Start
 
+**Prepare a Control address first.** Fresh installs do not contain or contact a project-operated Control Plane or Relay, and do not automatically register an account. Obtain a trusted Control address from your administrator, or complete [self-hosting setup](docs/guides/self-hosting.md) first. Devices that need to communicate should use the same Control; different accounts connect through a shared room.
+
 ### 1. Download
 
-Get the latest build from [GitHub Releases](https://github.com/yhan-sun/p2wlan/releases).
+Choose the appropriate platform artifact from a client **`vX.Y.Z`** release on [GitHub Releases](https://github.com/yhan-sun/p2wlan/releases). Server **`server-vX.Y.Z`** releases are separate and are not client installers.
 
 | Platform | Release artifact | Status |
 | --- | --- | --- |
 | macOS 12+ Apple Silicon | `p2wlan-macos-arm64.dmg` | Supported |
 | macOS 12+ Intel | `p2wlan-macos-x64.dmg` | Supported |
 | Windows x64 | `p2wlan-windows-x64-setup.exe` | Supported |
-| Linux x64 | Flutter `.tar.gz` / CLI `.tar.gz` | Supported |
-| Linux arm64 | CLI `.tar.gz` | Supported |
+| Linux x64 | `p2wlan-linux-x64.tar.gz` (GUI) / `p2wlan-linux-x64-cli.tar.gz` (CLI + daemon) | Supported |
+| Linux arm64 | `p2wlan-linux-arm64-cli.tar.gz` (CLI + daemon) | Supported |
 | Android 7.0+ (API 24+) arm64 | `p2wlan-android-arm64-release.apk` | Supported |
 | iOS 15+ arm64 | `p2wlan-ios-arm64-unsigned.ipa` | Experimental, requires signing |
 
-### 2. Sign in
-
-Open the GUI and sign in. Servers and headless systems can use the CLI:
+For headless Linux, choose the CLI package or use the installer with a fixed version. Replace `vX.Y.Z` with an actual client Release tag:
 
 ```bash
-p2wlan login -u you@example.com
+P2WLAN_VERSION=vX.Y.Z
+curl -fsSL "https://raw.githubusercontent.com/yhan-sun/p2wlan/$P2WLAN_VERSION/scripts/install-linux-cli.sh" -o /tmp/p2wlan-install.sh
+sudo sh /tmp/p2wlan-install.sh --version "$P2WLAN_VERSION"
 ```
 
-### 3. Start the virtual network
+### 2. Configure Control
 
-Start networking from the client, or run:
+On the client's sign-in page, enter the Control address under **Advanced options → Self-hosted server**. `https://control.example.com` is a placeholder and must be replaced with your actual server address. For the CLI:
+
+```bash
+p2wlan config set control https://control.example.com
+```
+
+### 3. Register / sign in
+
+Register an account or sign in to an existing account in the client. To sign in with the CLI:
+
+```bash
+p2wlan login -u your-name
+p2wlan account show
+```
+
+If you do not have an account, use `p2wlan register -u you@example.com` to register and save the session. Registration requires an email; sign-in accepts an email or a username you have set. Passwords are prompted in the terminal. Run configuration and authentication commands as your normal user, without `sudo`.
+
+### 4. Connect devices
+
+**Connect your own devices:** sign in to the same account on each device, complete first-run setup, and start the personal network. For the CLI:
 
 ```bash
 p2wlan up
 p2wlan status
 ```
 
-### 4. Use the virtual IP
+**Connect friends or other accounts:** use the same Control on each device. Create a room or join by room code / invitation in the client, then select the room's **连接本机** (connect this device) action. Joining a room establishes membership; it does not automatically start the local network.
 
-Once the peer is connected, use its P2WLAN virtual IP like any other private address:
+For the CLI, the owner first creates a room with `p2wlan room create --name my-room`, enters a room password when prompted, and shares the room code with the other members. After joining, both the owner and members must connect to the room:
 
 ```bash
-ping 10.20.0.5
-ssh user@10.20.0.5
+# Members: replace 12345678 with the actual eight-digit code; enter the room password when prompted
+p2wlan room join --code 12345678
+# Owner and members: list rooms and connect this device
+p2wlan room list
+p2wlan room connect 12345678
+p2wlan room show 12345678
 ```
 
-The same applies to game servers, NAS services, web panels, databases, and other IP-based applications: connect to the peer's virtual IP and the service port.
+Rooms have independent networks and virtual IPs. `p2wlan up` starts the personal network and does not replace `p2wlan room connect`. A device may need the owner's approval before it can communicate. See the [room guide](docs/guides/rooms.md) for details.
 
-### 5. Check the connection path
+### 5. Use the virtual IP
+
+Wait for the peer to connect, then find its virtual IP for the current network in the device list or room details. The following uses the demo room address `10.21.0.5`; replace it with the actual address:
+
+```bash
+ping 10.21.0.5
+ssh user@10.21.0.5
+```
+
+The same applies to game servers, NAS services, web panels, and databases: connect to the peer's virtual IP and service port. Successful sign-in, an online device, or a Direct/Relay label alone does not prove that the application is reachable; verify the actual service.
+
+### 6. Check the connection path
 
 The client shows the active peer path. For CLI diagnostics:
 
 ```bash
+p2wlan status --json
 p2wlan doctor
+p2wlan route verify
 p2wlan logs -f
 ```
 
-The repository also includes a Linux CLI installer:
-
-```bash
-VERSION=vX.Y.Z
-curl -fsSL https://raw.githubusercontent.com/yhan-sun/p2wlan/$VERSION/scripts/install-linux-cli.sh -o /tmp/p2wlan-install.sh
-sudo sh /tmp/p2wlan-install.sh --version "$VERSION"
-```
-
-See the [client guide](docs/guides/client.md) and [CLI reference](docs/reference/cli.md) for room management, Direct/Relay path policies, route repair, support bundles, and systemd deployment. Common commands include:
-
-```bash
-p2wlan room list
-p2wlan room connect <room-code-or-id>
-p2wlan route verify
-p2wlan support-bundle --upload
-```
-
-Fresh installs do not contain or contact a project-owned Control Plane or Relay. Configure the server supplied by your administrator before signing in:
-
-```bash
-p2wlan config set control https://control.example.com
-p2wlan login -u your-name                 # email or username
-p2wlan account show                       # show the current account identity
-```
-
-Self-hosted Control/Relay installation, checksum verification, systemd operation, backups, and independent upgrades are documented in the [self-hosting guide](docs/guides/self-hosting.md) and [upgrade and recovery guide](docs/guides/upgrade-and-recovery.md):
-
-```bash
-sudo ./scripts/install-server.sh --version server-vX.Y.Z --role all
-sudo p2wlan-server status
-sudo p2wlan-server update --version server-vX.Y.Z
-sudo p2wlan-server backup
-sudo p2wlan-server rollback
-```
-
-After a server release, upload it from your workstation or let an already installed manager fetch it on the host:
-
-```bash
-./scripts/deploy-server.sh --host <server> --user <ssh-user> \
-  --version server-vX.Y.Z --start
-./scripts/deploy-server.sh --mode fetch --host <server> \
-  --user <ssh-user> --version server-vX.Y.Z --start
-```
-
-When `--identity` is omitted, OpenSSH prompts for the server password and remote `sudo` prompts for the administrator password; passwords are never command-line arguments. The deployment entry points and staging variables are defined by the [self-hosting guide](docs/guides/self-hosting.md) and release workflows; concrete hosts and private keys are never stored in the repository.
+`p2wlan support-bundle` creates a local diagnostic bundle. Add `--upload` explicitly only after checking the recipient, contents, and retention period. See the [client guide](docs/guides/client.md), [CLI reference](docs/reference/cli.md), and [troubleshooting guide](docs/guides/troubleshooting.md) for more operations.
 
 ## How It Works
 
@@ -239,23 +240,15 @@ P2WLAN uses a self-contained **WireGuard-like Noise** data plane with X25519, Ch
 
 ## Self-hosting
 
-For complete configuration, Windows native operation and Docker Compose, see the [self-hosting guide](docs/guides/self-hosting.md) (Chinese).
+The Control Plane and Relay live under [`server/`](server/). Fixed server packages use **`server-vX.Y.Z`** tags; the public installation and upgrade path is **Linux + systemd**. Ordinary deployments do not require Go or Node.js on the server.
 
-The Control Plane and Relay live under [`server/`](server/). Linux CLI / daemon components are part of the Rust workspace. A minimal build from the repository root is:
+Deployment requires a trusted Control HTTPS/WSS endpoint, a Relay TLS endpoint, persistent storage, and matching authentication configuration. Starting server services does not automatically make the host a virtual-network node; install and connect a client if it should participate as a node.
 
-```bash
-cd server
-go build -o p2wlan-control .
-go build -o p2wlan-relay ./relay
-```
+The detailed guides are currently in Chinese:
 
-Build the CLI and daemon from the repository root:
-
-```bash
-cargo build --release -p p2wlan-cli -p p2wlan-daemon
-```
-
-Production deployment also requires HTTPS/WSS, database, authentication secrets, and Relay addresses to be configured according to the current code. This README keeps only the high-level entry point; use the implementation under [`server/`](server/) as the source of truth for deployment details.
+- [Self-hosting guide](docs/guides/self-hosting.md): fixed-version installation, configuration, TLS, admin console, and Docker Compose boundaries.
+- [Upgrade and recovery](docs/guides/upgrade-and-recovery.md): backups, upgrades, restore, and rollback.
+- [Operations guide](docs/guides/operations.md): service management, health checks, logs, and certificates.
 
 ## Security Boundaries
 
@@ -282,7 +275,7 @@ Repository structure:
 - [`server/`](server/) — Go Control Plane
 - [`server/relay/`](server/relay/) — Go Relay
 
-Prefer source, tests, and CI as the source of truth for implementation details.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for build, validation, and contribution rules, and [docs/README.md](docs/README.md) for the complete documentation index. Prefer source, tests, and CI as the source of truth for implementation details.
 
 ## License
 

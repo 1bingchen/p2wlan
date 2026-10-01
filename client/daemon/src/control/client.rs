@@ -1,4 +1,138 @@
+fn hard_hard_a0_control_identity(session_id: &str) -> Option<(&'static str, String)> {
+    // Use the authoritative wire parser so HH2 binary envelopes share the
+    // same redacted identity as endpoint diagnostics and legacy HH1 signals.
+    let coordination = crate::HardHardCoordination::parse(session_id)?;
+    let role = match coordination.role {
+        crate::HardHardRole::Initiator => "initiator",
+        crate::HardHardRole::Responder => "responder",
+    };
+    Some((role, coordination.token))
+}
+
+fn hard_hard_a0_control_tag(token: &str, label: &str) -> String {
+    use sha2::Digest as _;
+
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(b"p2wlan-hard-hard-report-v1\0");
+    hasher.update(token.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(label.as_bytes());
+    let digest = hex::encode(hasher.finalize());
+    digest[..16].to_string()
+}
+
+pub(crate) fn hard_hard_a0_control_stage(
+    session_id: Option<&str>,
+    stage: &'static str,
+    reason_code: &'static str,
+) {
+    if std::env::var("P2WLAN_EXPERIMENT_VARIANT").ok().as_deref() != Some("a0-phase-diagnosis")
+        || std::env::var("P2WLAN_EXPERIMENT_SCENARIO")
+            .ok()
+            .is_none_or(|scenario| scenario.is_empty())
+    {
+        return;
+    }
+    let Some((role, token)) = session_id.and_then(hard_hard_a0_control_identity) else {
+        return;
+    };
+    tracing::info!(
+        event = "hard_hard_attempt_stage",
+        role,
+        identity_scope = "shared_session",
+        session_tag = %hard_hard_a0_control_tag(&token, "session"),
+        plan_tag = %hard_hard_a0_control_tag(&token, "rendezvous-plan"),
+        stage,
+        reason_code,
+        "Hard-Hard A0 control signaling stage"
+    );
+}
+
 impl ControlClient {
+    /// Timing from a fresh short control request; never from a long poll.
+    pub(crate) fn hard_hard_timing_hint(&self) -> Option<ControlTimingHint> {
+        self.server_clock
+            .timing_hint(Instant::now(), self.local_registration_seq()?)
+    }
+
+    /// Translate one local Hard<->Hard deadline into the most recently
+    /// observed control-server clock domain. A stale or missing sample fails
+    /// closed; callers keep Relay and the ordinary bounded fallback rather
+    /// than letting HTTP queue latency create two rendezvous windows.
+    pub(crate) fn hard_hard_server_deadline(&self, local_deadline_ms: u64) -> Option<u64> {
+        let local_now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .ok()?
+            .as_millis()
+            .try_into()
+            .ok()?;
+        self.server_clock
+            .server_deadline_for_local(local_deadline_ms, local_now_ms)
+    }
+
+    /// Server-accepted live control registration, from the existing auth owner.
+    pub(crate) fn local_registration_seq(&self) -> Option<u64> {
+        if self.registration_rx.has_changed().is_err()
+            || self
+                .shutdown_lifecycle
+                .as_ref()
+                .is_some_and(|lifecycle| *lifecycle.requested.borrow())
+        {
+            return None;
+        }
+        self.registration_rx
+            .borrow()
+            .as_ref()?
+            .registration_seq
+            .filter(|seq| *seq > 0)
+    }
+
+    pub(crate) fn local_supports_hh2(&self) -> bool {
+        self.local_hh2_registration_seq().is_some()
+    }
+
+    /// Read capability and registration from one immutable auth publication.
+    pub(crate) fn local_hh2_registration_seq(&self) -> Option<u64> {
+        if !PeerCapabilities::current().supports_hh2()
+            || self.registration_rx.has_changed().is_err()
+            || self
+                .shutdown_lifecycle
+                .as_ref()
+                .is_some_and(|lifecycle| *lifecycle.requested.borrow())
+        {
+            return None;
+        }
+        let auth = self.registration_rx.borrow();
+        let auth = auth.as_ref()?;
+        auth.accepted_peer_capabilities
+            .supports_hh2()
+            .then_some(auth.registration_seq.filter(|seq| *seq > 0))
+            .flatten()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_local_registration_for_test(
+        &self,
+        sequence: Option<u64>,
+        capabilities: PeerCapabilities,
+    ) {
+        if let Some(sender) = &self.test_registration_tx {
+            sender.send_replace(sequence.map(|registration_seq| CriticalControlAuth {
+                accepted_peer_capabilities: capabilities,
+                base_url: "http://control.invalid".to_string(),
+                token: "test-registration".to_string(),
+                self_node_id: self.test_signal_from_node_id.clone(),
+                registration_seq: Some(registration_seq),
+                signal_signing_identity: None,
+            }));
+        }
+    }
+
+    /// Synchronous edge for the authoritative network-generation cancellation hook.
+    pub(crate) fn invalidate_network_timing(&self) {
+        self.server_clock.invalidate_network();
+    }
+
     pub async fn register_room_profile(config: &mut Config) -> Result<()> {
         if !config.network.network_id.starts_with("room-")
             || config.network.manual
@@ -12,7 +146,7 @@ impl ControlClient {
         // Only Android's explicit room preparation calls this method. The
         // background registration loop must never resume a remotely paused device.
         Self::request_room_device_access(&http, config).await?;
-        let (node_id, virtual_ip, cidr, relays, _, _) = register_device(
+        let (node_id, virtual_ip, cidr, relays, _, _, _) = register_device(
             &http,
             &normalize_http_base_url(&config.control.server_url),
             &config.control.auth_token,
@@ -88,14 +222,16 @@ impl ControlClient {
             relay_selection,
             timeline,
             None,
+            None,
         )
     }
 
     /// Create a control client and attach the daemon health state directly to
     /// the HTTP polling runtime.  The control event consumer also handles the
-    /// same health events, but it may be busy processing a peer handover; the
-    /// polling task must be able to refresh the health timestamp independently
-    /// so a slow data-plane transition cannot produce a false stale warning.
+    /// heartbeat and route recovery; having the runtime update the heartbeat
+    /// timestamp prevents normal message processing from reporting false
+    /// control-plane stalls.
+    #[allow(clippy::too_many_arguments)]
     pub fn new_with_health(
         config: &Config,
         enabled: bool,
@@ -103,6 +239,7 @@ impl ControlClient {
         relay_selection: Option<Arc<RwLock<RelaySelectionDiagnostics>>>,
         timeline: Arc<ConnectionTimeline>,
         health: Option<Arc<crate::tasks::HealthState>>,
+        telemetry_hub: Option<Arc<crate::peer::PathTelemetryHub>>,
     ) -> (Self, mpsc::UnboundedReceiver<ControlEvent>) {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
@@ -114,8 +251,11 @@ impl ControlClient {
             mpsc::channel(CANDIDATE_OFFER_QUEUE_CAPACITY);
         let (critical_auth_tx, critical_auth_rx) = watch::channel(None);
         let event_loop_ready = Arc::new(AtomicBool::new(false));
+        let server_clock = Arc::new(ServerClockEstimate::default());
+        let network_changes = Arc::new(ControlNetworkChanges::default());
 
         let state = Arc::new(RwLock::new(ClientState {
+            server_clock: server_clock.clone(),
             room_authorization: Arc::new(crate::rooms::RoomAuthorization::new(
                 &config.network.network_id,
             )),
@@ -136,14 +276,19 @@ impl ControlClient {
         });
         let critical_lifecycle_tx = cmd_tx.clone();
         let client = Self {
+            registration_rx: critical_auth_rx.clone(),
+            #[cfg(test)]
+            test_registration_tx: None,
             shutdown_lifecycle,
             event_loop_ready: event_loop_ready.clone(),
             event_tx: event_tx.clone(),
             cmd_tx: cmd_tx.clone(),
+            network_changes: network_changes.clone(),
             critical_offer_tx,
             critical_answer_tx,
             critical_ctrl_tx,
             candidate_offer_tx,
+            server_clock: server_clock.clone(),
             state: state.clone(),
             #[cfg(test)]
             test_signal_forwarder: None,
@@ -163,6 +308,7 @@ impl ControlClient {
             let (http, candidate_http) = route_aware_control_http_clients(
                 config.control.proxy_mode,
                 &config.control.server_url,
+                Some(server_clock.clone()),
             );
             let config = config.clone();
             let event_tx = client.event_tx.clone();
@@ -216,6 +362,9 @@ impl ControlClient {
                     health,
                     advertised_snapshot,
                     event_loop_ready,
+                    telemetry_hub,
+                    server_clock,
+                    network_changes,
                 )
                 .await;
             };
@@ -251,6 +400,9 @@ impl ControlClient {
             mpsc::channel::<CriticalControlCommand>(CRITICAL_CTRL_QUEUE_CAPACITY);
         let (candidate_offer_tx, mut candidate_offer_rx) =
             mpsc::channel::<CandidateOfferCommand>(CANDIDATE_OFFER_QUEUE_CAPACITY);
+        let server_clock = Arc::new(ServerClockEstimate::default());
+        let test_now_ms = test_signal_now_ms();
+        server_clock.observe(test_now_ms, test_now_ms);
         tokio::spawn(async move {
             while let Some(cmd) = critical_offer_rx.recv().await {
                 let _ = cmd.response_tx.send(PeerOfferSendOutcome::Sent);
@@ -277,21 +429,27 @@ impl ControlClient {
             }
         });
         let state = Arc::new(RwLock::new(ClientState {
+            server_clock: server_clock.clone(),
             room_authorization: Arc::new(crate::rooms::RoomAuthorization::new("default")),
             registered: false,
             peers: HashMap::new(),
             virtual_ip: None,
             _relay_servers: Vec::new(),
         }));
+        let (registration_tx, registration_rx) = watch::channel(None);
         Self {
+            registration_rx,
+            test_registration_tx: Some(registration_tx),
             shutdown_lifecycle: None,
             event_loop_ready: Arc::new(AtomicBool::new(false)),
             event_tx,
             cmd_tx,
+            network_changes: Arc::new(ControlNetworkChanges::default()),
             critical_offer_tx,
             critical_answer_tx,
             critical_ctrl_tx,
             candidate_offer_tx,
+            server_clock,
             state,
             #[cfg(test)]
             test_signal_forwarder: None,
@@ -324,9 +482,20 @@ impl ControlClient {
         public_key: impl Into<String>,
         forwarder: Arc<dyn Fn(TestControlSignal) + Send + Sync>,
     ) {
+        // The in-process forwarder stands in for one control server shared by
+        // both endpoints. Give it the same fresh clock sample that a real
+        // HTTP signal response carries; production manual mode remains
+        // fail-closed because this adapter is compiled only for tests.
+        self.refresh_server_clock_for_test();
         self.test_signal_from_node_id = from_node_id.into();
         self.test_signal_public_key = public_key.into();
         self.test_signal_forwarder = Some(forwarder);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn refresh_server_clock_for_test(&self) {
+        let now_ms = test_signal_now_ms();
+        self.server_clock.observe(now_ms, now_ms);
     }
 
     /// Deliver a candidate signal through the test-only control boundary.
@@ -512,6 +681,29 @@ impl ControlClient {
         punch_at_ms: Option<u64>,
         fresh_ownership: Option<Arc<crate::PunchSessionCancellation>>,
     ) -> std::result::Result<(), PeerOfferSendFailure> {
+        self.send_peer_offer_with_sources_and_punch_at_fenced(
+            to_node_id,
+            candidates,
+            candidate_sources,
+            handshake_init,
+            punch_at_ms,
+            fresh_ownership,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn send_peer_offer_with_sources_and_punch_at_fenced(
+        &self,
+        to_node_id: &str,
+        candidates: &[String],
+        candidate_sources: &HashMap<String, String>,
+        handshake_init: &[u8],
+        punch_at_ms: Option<u64>,
+        fresh_ownership: Option<Arc<crate::PunchSessionCancellation>>,
+        publication_fence: Option<Arc<CandidatePublicationFence>>,
+    ) -> std::result::Result<(), PeerOfferSendFailure> {
         #[cfg(test)]
         if let Some(result) = self.maybe_forward_test_signal(
             to_node_id,
@@ -543,6 +735,10 @@ impl ControlClient {
         let (response_tx, response_rx) = oneshot::channel();
         self.candidate_offer_tx
             .try_send(CandidateOfferCommand {
+                expected_registration_seq: None,
+                not_after: None,
+                attempt_timeout: None,
+                prepaid_attempts: 1,
                 to_node_id: to_node_id.to_string(),
                 candidates: candidates.to_vec(),
                 session_id: None,
@@ -550,7 +746,9 @@ impl ControlClient {
                 candidate_sources: candidate_sources.clone(),
                 handshake_init: handshake_init.to_vec(),
                 punch_at_ms,
+                punch_at_server_ms: None,
                 fresh_ownership,
+                publication_fence,
                 response_tx,
             })
             .map_err(|error| match error {
@@ -612,6 +810,37 @@ impl ControlClient {
         session_id: Option<String>,
         fresh_ownership: Arc<crate::PunchSessionCancellation>,
     ) -> std::result::Result<(), PeerOfferSendFailure> {
+        self.send_fresh_peer_offer_with_session_and_punch_schedule(
+            to_node_id,
+            candidates,
+            candidate_sources,
+            handshake_init,
+            punch_at_ms,
+            None,
+            session_id,
+            fresh_ownership,
+        )
+        .await
+    }
+
+    /// Send a reciprocal fresh-mapping prediction while preserving the
+    /// server-clock rendezvous deadline delivered with the initiating offer.
+    /// This mirrors the existing peer-answer scheduling contract: the local
+    /// `punch_at_ms` remains useful to WebSocket/test transports, while REST
+    /// can echo one canonical server deadline instead of adding another
+    /// request-processing delay.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn send_fresh_peer_offer_with_session_and_punch_schedule(
+        &self,
+        to_node_id: &str,
+        candidates: &[String],
+        candidate_sources: &HashMap<String, String>,
+        handshake_init: &[u8],
+        punch_at_ms: Option<u64>,
+        punch_at_server_ms: Option<u64>,
+        session_id: Option<String>,
+        fresh_ownership: Arc<crate::PunchSessionCancellation>,
+    ) -> std::result::Result<(), PeerOfferSendFailure> {
         #[cfg(test)]
         if let Some(result) = self.maybe_forward_test_signal(
             to_node_id,
@@ -625,22 +854,47 @@ impl ControlClient {
             return result;
         }
         let (response_tx, response_rx) = oneshot::channel();
-        self.candidate_offer_tx
-            .try_send(CandidateOfferCommand {
-                to_node_id: to_node_id.to_string(),
-                candidates: candidates.to_vec(),
-                session_id,
-                probe_ephemeral_public_key: None,
-                candidate_sources: candidate_sources.clone(),
-                handshake_init: handshake_init.to_vec(),
-                punch_at_ms,
-                fresh_ownership: Some(fresh_ownership),
-                response_tx,
-            })
-            .map_err(|error| match error {
-                mpsc::error::TrySendError::Full(_) => PeerOfferSendFailure::SendFailed,
-                mpsc::error::TrySendError::Closed(_) => PeerOfferSendFailure::ChannelClosed,
-            })?;
+        let a0_session_id = session_id.clone();
+        let enqueue_result = self.candidate_offer_tx.try_send(CandidateOfferCommand {
+            expected_registration_seq: None,
+            not_after: None,
+            attempt_timeout: None,
+            prepaid_attempts: 1,
+            to_node_id: to_node_id.to_string(),
+            candidates: candidates.to_vec(),
+            session_id,
+            probe_ephemeral_public_key: None,
+            candidate_sources: candidate_sources.clone(),
+            handshake_init: handshake_init.to_vec(),
+            punch_at_ms,
+            punch_at_server_ms,
+            fresh_ownership: Some(fresh_ownership),
+            publication_fence: None,
+            response_tx,
+        });
+        match enqueue_result {
+            Ok(()) => hard_hard_a0_control_stage(
+                a0_session_id.as_deref(),
+                "offer_api_dispatch",
+                "enqueued",
+            ),
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                hard_hard_a0_control_stage(
+                    a0_session_id.as_deref(),
+                    "offer_api_dispatch",
+                    "queue_full",
+                );
+                return Err(PeerOfferSendFailure::SendFailed);
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                hard_hard_a0_control_stage(
+                    a0_session_id.as_deref(),
+                    "offer_api_dispatch",
+                    "channel_closed",
+                );
+                return Err(PeerOfferSendFailure::ChannelClosed);
+            }
+        }
         match response_rx.await {
             Ok(PeerOfferSendOutcome::Sent) => Ok(()),
             Ok(PeerOfferSendOutcome::Cancelled) => Err(PeerOfferSendFailure::Cancelled),
@@ -847,8 +1101,13 @@ impl ControlClient {
     /// changed. The loop rebuilds its pooled HTTP clients and reconnects the
     /// optional signaling WebSocket through its normal registration path.
     #[cfg_attr(not(target_os = "android"), allow(dead_code))]
-    pub(crate) fn network_changed(&self) {
-        let _ = self.cmd_tx.send(ControlCommand::NetworkChanged);
+    pub(crate) fn network_changed(&self, hint: crate::AndroidNetworkChangeHint) {
+        self.invalidate_network_timing();
+        if self.network_changes.observe(hint) {
+            let _ = self
+                .cmd_tx
+                .send(ControlCommand::NetworkChanged(self.network_changes.clone()));
+        }
     }
 
     /// Shutdown the control client without waiting behind ordinary HTTP work.

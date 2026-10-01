@@ -17,6 +17,8 @@ async fn initiator_arbiter_is_released_before_candidate_refresh_wait() {
         }
     };
     let peer_info = control::PeerInfo {
+        capabilities: crate::control::PeerCapabilities::default(),
+        registration_seq: 0,
         node_id: "peer-arbiter-candidate-wait".to_string(),
         device_name: String::new(),
         app_version: String::new(),
@@ -85,6 +87,8 @@ async fn initiator_publish_releases_epoch_while_connection_writer_is_contended()
         }
     };
     let peer_info = control::PeerInfo {
+        capabilities: crate::control::PeerCapabilities::default(),
+        registration_seq: 0,
         node_id: "peer-initiator-connection-contention".to_string(),
         device_name: String::new(),
         app_version: String::new(),
@@ -220,6 +224,8 @@ async fn initiator_publish_epoch_contention_releases_emit_and_retries_exact_offe
         }
     };
     let peer_info = control::PeerInfo {
+        capabilities: crate::control::PeerCapabilities::default(),
+        registration_seq: 0,
         node_id: "peer-initiator-epoch-contention".to_string(),
         public_key: hex::encode(remote_identity.public_key()),
         virtual_ip: "10.20.0.2".to_string(),
@@ -342,6 +348,8 @@ async fn responder_probe_binding_contention_retains_exact_answer_without_queued_
     daemon
         .peers
         .add_peer(&control::PeerInfo {
+            capabilities: crate::control::PeerCapabilities::default(),
+            registration_seq: 0,
             node_id: peer_id.to_string(),
             public_key: hex::encode(remote_identity.public_key()),
             virtual_ip: "10.20.0.3".to_string(),
@@ -445,6 +453,8 @@ async fn relay_probe_snapshot_contention_preserves_exact_publish_retry_without_q
         }
     };
     let peer_info = control::PeerInfo {
+        capabilities: crate::control::PeerCapabilities::default(),
+        registration_seq: 0,
         node_id: "peer-relay-snapshot-contention".to_string(),
         device_name: String::new(),
         app_version: String::new(),

@@ -14,12 +14,32 @@ pub(super) async fn direct_business_budget_ready_for_active_path(
         // Relay is fully isolated: do not even inspect a Direct publication.
         ActiveBusinessPath::Relay(_) | ActiveBusinessPath::Unavailable => true,
         ActiveBusinessPath::Direct(_) => {
-            let budget_ready = udp_transport
-                .read()
-                .await
-                .as_ref()
-                .is_some_and(|udp| udp.direct_business_budget_ready_for_peer(peer_id));
+            let (budget_ready, business_attribution_identity) = {
+                let udp_guard = udp_transport.read().await;
+                udp_guard.as_ref().map_or((false, None), |udp| {
+                    let ready = udp.direct_business_budget_ready_for_peer(peer_id);
+                    let identity = ready
+                        .then(|| udp.hard_hard_business_attribution_identity(peer_id))
+                        .flatten();
+                    (ready, identity)
+                })
+            };
             if budget_ready {
+                // Record the point where the production outbound selector
+                // observes the authoritative Direct business-MTU admission
+                // bit. This is deliberately later than encrypted path
+                // validation and does not feed back into selection.
+                peers.emit_timeline_first_with_business_attribution_identity(
+                    peer_id,
+                    generation,
+                    "direct_business_mtu_ready",
+                    Some("direct"),
+                    None,
+                    Some(format!(
+                        "peer={peer_id} generation={generation} source=outbound_selector"
+                    )),
+                    business_attribution_identity,
+                );
                 return true;
             }
             // Make-before-break: while the committed Direct path is still
@@ -28,7 +48,7 @@ pub(super) async fn direct_business_budget_ready_for_active_path(
             // the first budget-confirmed packet switches it to Direct.
             relay_available
                 && peers
-                    .is_relay_peer_confirmed_for_generation(peer_id, generation)
+                    .is_relay_business_admitted_for_generation(peer_id, generation)
                     .await
         }
     }
@@ -39,6 +59,7 @@ pub(super) async fn direct_business_budget_ready_for_active_path(
 /// when no confirmed Relay exists, leaving the bounded Pending semantics in
 /// place instead of silently dropping the make-before-break guarantee.
 pub(super) async fn relay_make_before_break_fallback(
+    epoch_guard: &tokio::sync::MutexGuard<'_, ()>,
     peers: &PeerManager,
     peer_id: &str,
     generation: u64,
@@ -47,7 +68,7 @@ pub(super) async fn relay_make_before_break_fallback(
 ) -> bool {
     let usable = relay_available
         && peers
-            .is_relay_peer_confirmed_for_generation(peer_id, generation)
+            .is_relay_business_admitted_in_epoch(epoch_guard, peer_id, generation)
             .await;
     if usable {
         peers.emit_timeline(

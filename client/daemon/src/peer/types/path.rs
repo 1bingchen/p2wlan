@@ -329,7 +329,238 @@ pub struct DirectTraversalEvent {
     pub probe_tx_alt_socket_count: Option<u32>,
     pub probe_tx_unique_target_ports: Option<u32>,
     pub probe_tx_repeated_target_ports: Option<u32>,
+    /// Typed, endpoint-free terminal report for one bounded Hard↔Hard
+    /// attempt.  Ordinary traversal events leave this absent.  The report is
+    /// observation-only and never feeds path selection or send admission.
+    pub hard_hard_attempt: Option<HardHardAttemptReport>,
     pub detail: String,
+}
+
+pub const HARD_HARD_ATTEMPT_REPORT_SCHEMA_VERSION: u32 = 2;
+
+/// Exact local Direct path identity used only to join one attempt report to
+/// later business timeline milestones. The validation owner is already an
+/// endpoint-local diagnostic identity; no endpoint address or payload is
+/// included.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HardHardBusinessAttributionIdentity {
+    pub validation_session_id: u64,
+    pub direct_commit_sequence: u64,
+    pub transport_instance_id: u64,
+    pub socket_index: usize,
+}
+
+/// Candidate and physical-send accounting for one Hard↔Hard attempt.
+///
+/// "Candidate" is deliberately not overloaded: model output, unique wire
+/// candidates, received targets, scheduled socket×target work and actual UDP
+/// datagrams remain separate dimensions.  Target order is represented by
+/// session-keyed tags so local diagnostics retain ordering without exposing
+/// IP addresses or ports.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HardHardAttemptCounts {
+    pub requested: u32,
+    pub generated: u32,
+    pub unique: u32,
+    pub advertised: u32,
+    /// Parsed remote targets admitted to the local plan. This is not the raw
+    /// pre-parse signal count, which is not available at this owner boundary.
+    pub parsed_targets_for_plan: u32,
+    pub planned_targets: u32,
+    pub planned_sockets: u32,
+    pub planned_socket_target_combinations: u32,
+    pub planned_logical_probes: u32,
+    /// Upper bound on physical sends when every logical Probe also needs its
+    /// one bounded legacy compatibility copy.
+    pub planned_physical_datagram_cap: u32,
+    /// Distinct remote endpoints that received at least one logical probe.
+    /// Repeated waves are counted by `logical_probes_attempted`, not here.
+    pub attempted_targets: u32,
+    pub logical_probes_attempted: u32,
+    pub logical_probes_sent: u32,
+    pub send_success_datagrams: u32,
+    pub send_success_bytes: u64,
+    pub send_errors: u32,
+    pub send_error_bytes: u64,
+    pub budget_skipped: u32,
+    pub planned_logical_probes_not_attempted: u32,
+    pub stun_send_success_datagrams: u32,
+    pub stun_send_success_bytes: u64,
+    pub stun_send_errors: u32,
+    pub stun_send_error_bytes: u64,
+    pub stun_responses: u32,
+    /// Candidate/source strings handed to the existing signaling API. This is
+    /// logical payload content, not REST/WebSocket/TLS network bytes.
+    pub candidate_signal_payload_logic_bytes: u64,
+}
+
+/// Process-local monotonic milestones and derived durations.  Every absolute
+/// value uses the same daemon-start timeline; no field is a remote clock or a
+/// UNIX timestamp.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HardHardAttemptTimeline {
+    pub measurement_started_at_ms: Option<u64>,
+    pub last_measurement_send_at_ms: Option<u64>,
+    pub measurement_completed_at_ms: Option<u64>,
+    /// Local API acceptance of this endpoint's offer; it does not prove peer
+    /// receipt, persistence, preparation, or reciprocal readiness.
+    pub candidate_signal_accepted_at_ms: Option<u64>,
+    pub planned_send_at_ms: Option<u64>,
+    pub send_dispatch_at_ms: Option<u64>,
+    pub actual_first_send_at_ms: Option<u64>,
+    /// The last authenticated probe or matched ACK observed before validation.
+    pub probe_last_hit_at_ms: Option<u64>,
+    pub probe_last_hit_source: Option<String>,
+    pub encrypted_validation_completed_at_ms: Option<u64>,
+    /// Filled by the existing process timeline/experiment collector. A sweep
+    /// report may be emitted before either business milestone exists.
+    pub business_ready_at_ms: Option<u64>,
+    pub first_business_success_at_ms: Option<u64>,
+    pub measurement_age_at_send_ms: Option<u64>,
+    pub measurement_to_first_send_ms: Option<u64>,
+    pub schedule_deviation_ms: Option<i64>,
+    pub last_probe_hit_to_validation_ms: Option<u64>,
+    pub connection_to_first_business_ms: Option<u64>,
+    pub validation_to_first_business_ms: Option<u64>,
+    pub business_evidence_attribution: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HardHardDatagramCost {
+    pub datagrams: u64,
+    pub bytes: u64,
+}
+
+/// Additional HH2 confirmation traffic, separate from the unchanged sweep
+/// counters. Only successful kernel handoffs spend datagrams/bytes here.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HardHardConfirmationCosts {
+    pub triggered_check: HardHardDatagramCost,
+    pub nomination: HardHardDatagramCost,
+    pub probe_ack: HardHardDatagramCost,
+    pub validation_request: HardHardDatagramCost,
+    pub validation_ack: HardHardDatagramCost,
+    pub retryable_not_sent: u64,
+    pub budget_deferred: u64,
+    pub delivery_unknown: u64,
+    pub stopped: u64,
+}
+
+/// Endpoint-free terminal snapshot of the bounded Birthday/fixed-anchor
+/// scheduler and its physical-send ledger. These are observations, not a new
+/// send authority. Counts retain the scheduler's existing dimensions and
+/// compatibility aliases; zero is a measured value only when this snapshot
+/// is present in the enclosing report.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HardHardBirthdaySweepDiagnostics {
+    pub requested_level: usize,
+    pub generated_candidate_count: usize,
+    pub signaled_candidate_count: usize,
+    pub effective_target_count: usize,
+    pub requested_socket_count: usize,
+    pub attached_socket_count: usize,
+    pub usable_socket_count: usize,
+    pub unavailable_socket_count: usize,
+    pub socket_count: usize,
+    pub degraded_reason: Option<String>,
+    pub waves_planned: usize,
+    pub waves_started: usize,
+    pub waves_fully_completed: usize,
+    pub waves_completed: usize,
+    pub packets_planned: usize,
+    pub targets_assigned: usize,
+    pub targets_examined: usize,
+    pub targets_attempted: usize,
+    pub logical_probes_attempted: usize,
+    pub logical_probes_sent: usize,
+    pub logical_probe_send_failures: usize,
+    pub physical_datagrams_sent: usize,
+    pub physical_send_errors: usize,
+    pub partial_physical_send_errors: usize,
+    pub targets_budget_skipped: usize,
+    pub targets_cancelled: usize,
+    pub stop_reason: Option<String>,
+    pub packets_sent: u32,
+    pub unique_target_endpoints: u32,
+    pub budget_skipped: u32,
+    pub physical_bytes_sent: u64,
+    pub physical_send_error_bytes: u64,
+    pub probe_path_errors: u32,
+    /// Stable reason code from the sender's typed failure, not Debug output.
+    pub failure_kind: Option<String>,
+    /// Exact successful physical datagrams by local socket index, sorted by
+    /// index. No remote address or port is included.
+    pub per_socket_sent: Vec<(usize, u32)>,
+    /// Original PunchSendReport wall-clock UNIX milliseconds. The enclosing
+    /// report's `timeline` retains its separate daemon-monotonic semantics.
+    pub first_send_at_ms: Option<u64>,
+    pub last_send_at_ms: Option<u64>,
+    pub epoch_budget_exhausted: bool,
+    pub candidate_iteration_capped: bool,
+    pub pacing_deadline_reached: bool,
+    pub worker_failed: bool,
+    pub target_processing_completed: bool,
+    pub sweep_budget_stop: Option<String>,
+}
+
+/// Endpoint-free report emitted once when a Hard↔Hard sweep reaches a
+/// terminal result. Build identity is embedded so a copied peer record still
+/// proves which binary produced it; scenario/seed/attempt identity remains in
+/// the bounded harness run id and experiment manifest rather than accepting
+/// arbitrary production labels.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HardHardAttemptReport {
+    pub schema_version: u32,
+    pub baseline_git_commit: String,
+    pub source_git_commit: String,
+    pub build_id: String,
+    pub experiment_variant: Option<String>,
+    pub scenario_id: Option<String>,
+    pub seed: Option<u64>,
+    pub role: String,
+    pub mode: String,
+    pub session_tag: String,
+    /// De-identified identity of the single plan owned by this hh1 session.
+    pub plan_tag: String,
+    /// Exact Direct commit/socket identity when this attempt completed
+    /// encrypted validation and the published DPLPMTUD path can be verified.
+    /// Missing means business milestones cannot be attributed to this attempt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub business_attribution_identity: Option<HardHardBusinessAttributionIdentity>,
+    pub network_generation: u64,
+    pub peer_session_generation: u64,
+    pub remote_candidate_epoch: u64,
+    pub local_profile_generation: u64,
+    pub remote_profile_generation: u64,
+    pub punch_generation: u64,
+    /// Exact local dynamic socket for an admitted sweep. Measurement/model
+    /// failures can terminate before a socket identity exists and leave this
+    /// absent; their plan/generation/session fences remain mandatory.
+    pub socket_index: Option<usize>,
+    pub attempt: u8,
+    pub counts: HardHardAttemptCounts,
+    /// None means confirmation instrumentation was unavailable (legacy/pre-session).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confirmation: Option<HardHardConfirmationCosts>,
+    /// Absent for older schema-2 reports or attempts without a Birthday
+    /// terminal ledger. Missing evidence must not be presented as zero sends.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub birthday_sweep: Option<Box<HardHardBirthdaySweepDiagnostics>>,
+    pub candidate_cap: u32,
+    pub truncation_reason: String,
+    pub target_order_tags: Vec<String>,
+    /// Zero-based position in `target_order_tags` of the endpoint selected by
+    /// encrypted Direct validation. `None` means either Direct was not
+    /// confirmed or the learned endpoint was outside the advertised plan.
+    pub confirmed_target_rank: Option<u32>,
+    pub timeline: HardHardAttemptTimeline,
+    pub probe_packets_received: u64,
+    pub matched_probe_acks: u64,
+    pub authenticated_probe_packets_received: u64,
+    pub authenticated_probe_acks_unmatched: u64,
+    pub direct_confirmed: bool,
+    pub failure_class: String,
+    pub terminal_reason: String,
 }
 
 impl DirectTraversalEvent {
@@ -361,8 +592,14 @@ impl DirectTraversalEvent {
             probe_tx_alt_socket_count: None,
             probe_tx_unique_target_ports: None,
             probe_tx_repeated_target_ports: None,
+            hard_hard_attempt: None,
             detail: detail.into(),
         }
+    }
+
+    pub(super) fn with_hard_hard_attempt(mut self, report: HardHardAttemptReport) -> Self {
+        self.hard_hard_attempt = Some(report);
+        self
     }
 
     pub(super) fn with_socket_index(mut self, socket_index: Option<usize>) -> Self {

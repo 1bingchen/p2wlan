@@ -4,7 +4,7 @@
 //! user-created relay tunnels.  These mappings are short-lived NAT traversal
 //! candidates opened on the local gateway through UPnP IGD, PCP, or NAT-PMP.
 
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -78,9 +78,23 @@ impl Default for GatewayMappingDiagnostics {
     }
 }
 
-/// Local, non-serializable cache for a successful gateway mapping.
+/// Exact discovery scope. Equal private endpoints on two networks do not
+/// authorize reusing either a gateway lease or a failed-discovery backoff.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct GatewayMappingIdentity {
+    pub(crate) bind_endpoint: SocketAddr,
+    pub(crate) local_endpoint: SocketAddr,
+    pub(crate) gateway: Option<Ipv4Addr>,
+    pub(crate) network_generation: u64,
+    pub(crate) transport_instance: u64,
+    pub(crate) publication_owner: u64,
+}
+
+/// One local, non-serializable gateway mapping cache, scoped to its discovery
+/// identity. Replacing the identity also drops the old failure backoff.
 #[derive(Debug, Clone, Default)]
 pub struct GatewayMappingRuntime {
+    identity: Option<GatewayMappingIdentity>,
     pub local_endpoint: Option<SocketAddr>,
     pub candidate_endpoint: Option<String>,
     pub candidate_source: Option<&'static str>,
@@ -89,41 +103,67 @@ pub struct GatewayMappingRuntime {
 }
 
 impl GatewayMappingRuntime {
-    pub fn needs_discovery(&self, local_endpoint: SocketAddr, now: Instant) -> bool {
-        self.local_endpoint != Some(local_endpoint)
+    pub(crate) fn bind_identity(&mut self, identity: GatewayMappingIdentity) {
+        if self.identity != Some(identity) {
+            *self = Self {
+                identity: Some(identity),
+                local_endpoint: Some(identity.local_endpoint),
+                ..Self::default()
+            };
+        }
+    }
+
+    pub(crate) fn matches_identity(&self, identity: GatewayMappingIdentity) -> bool {
+        self.identity == Some(identity)
+    }
+
+    pub(crate) fn needs_discovery(&self, identity: GatewayMappingIdentity, now: Instant) -> bool {
+        !self.matches_identity(identity)
             || (self.candidate_endpoint.is_none()
                 && self.retry_at.is_none_or(|retry_at| now >= retry_at))
             || self.renew_at.is_some_and(|renew_at| now >= renew_at)
     }
 
-    pub fn retain_candidate(&self, local_endpoint: SocketAddr, now: Instant) -> bool {
-        self.local_endpoint == Some(local_endpoint)
+    pub(crate) fn retain_candidate(&self, identity: GatewayMappingIdentity, now: Instant) -> bool {
+        self.matches_identity(identity)
             && self.candidate_endpoint.is_some()
             && self.renew_at.is_some_and(|renew_at| now < renew_at)
     }
 
-    pub fn record_success(
+    pub(crate) fn record_success(
         &mut self,
-        local_endpoint: SocketAddr,
+        identity: GatewayMappingIdentity,
         candidate_endpoint: String,
         candidate_source: &'static str,
         lease: Duration,
-    ) {
-        self.local_endpoint = Some(local_endpoint);
+    ) -> bool {
+        if !self.matches_identity(identity) {
+            return false;
+        }
+        self.local_endpoint = Some(identity.local_endpoint);
         self.candidate_endpoint = Some(candidate_endpoint);
         self.candidate_source = Some(candidate_source);
         // Renew at half the requested lease.  This provides a retry window
         // without issuing a full discovery on every candidate refresh.
         self.renew_at = Instant::now().checked_add(lease / 2);
         self.retry_at = None;
+        true
     }
 
-    pub fn record_failure(&mut self, local_endpoint: SocketAddr, retry_after: Duration) {
-        self.local_endpoint = Some(local_endpoint);
+    pub(crate) fn record_failure(
+        &mut self,
+        identity: GatewayMappingIdentity,
+        retry_after: Duration,
+    ) -> bool {
+        if !self.matches_identity(identity) {
+            return false;
+        }
+        self.local_endpoint = Some(identity.local_endpoint);
         self.candidate_endpoint = None;
         self.candidate_source = None;
         self.renew_at = None;
         self.retry_at = Instant::now().checked_add(retry_after);
+        true
     }
 
     pub fn snapshot(
@@ -203,20 +243,127 @@ pub fn now_ms() -> u64 {
 mod tests {
     use super::*;
 
+    fn identity() -> GatewayMappingIdentity {
+        GatewayMappingIdentity {
+            bind_endpoint: "0.0.0.0:51820".parse().unwrap(),
+            local_endpoint: "192.168.1.7:51820".parse().unwrap(),
+            gateway: Some("192.168.1.1".parse().unwrap()),
+            network_generation: 4,
+            transport_instance: 2,
+            publication_owner: 3,
+        }
+    }
+
     #[test]
     fn mapping_cache_reuses_a_valid_lease_and_then_renews() {
-        let local = "192.168.1.7:51820".parse().unwrap();
         let mut runtime = GatewayMappingRuntime::default();
-        runtime.record_success(
-            local,
+        let identity = identity();
+        runtime.bind_identity(identity);
+        assert!(runtime.record_success(
+            identity,
             "203.0.113.8:51820".to_string(),
             "upnp",
             Duration::from_secs(120),
-        );
-        assert!(runtime.retain_candidate(local, Instant::now()));
-        assert!(!runtime.needs_discovery(local, Instant::now()));
+        ));
+        assert!(runtime.retain_candidate(identity, Instant::now()));
+        assert!(!runtime.needs_discovery(identity, Instant::now()));
         runtime.renew_at = Some(Instant::now() - Duration::from_millis(1));
-        assert!(runtime.needs_discovery(local, Instant::now()));
+        assert!(runtime.needs_discovery(identity, Instant::now()));
+    }
+
+    #[test]
+    fn changed_discovery_scope_drops_success_and_failure_for_the_same_private_endpoint() {
+        let original = identity();
+        let replacements = [
+            GatewayMappingIdentity {
+                network_generation: 5,
+                ..original
+            },
+            GatewayMappingIdentity {
+                transport_instance: 9,
+                ..original
+            },
+            GatewayMappingIdentity {
+                publication_owner: 8,
+                ..original
+            },
+            GatewayMappingIdentity {
+                gateway: Some("192.168.1.254".parse().unwrap()),
+                ..original
+            },
+            GatewayMappingIdentity {
+                bind_endpoint: "192.168.1.7:51820".parse().unwrap(),
+                ..original
+            },
+            GatewayMappingIdentity {
+                local_endpoint: "192.168.1.8:51820".parse().unwrap(),
+                ..original
+            },
+        ];
+        for replacement in replacements {
+            for success in [false, true] {
+                let mut runtime = GatewayMappingRuntime::default();
+                runtime.bind_identity(original);
+                if success {
+                    assert!(runtime.record_success(
+                        original,
+                        "203.0.113.8:51820".into(),
+                        "upnp",
+                        Duration::from_secs(120)
+                    ));
+                } else {
+                    assert!(runtime.record_failure(original, Duration::from_secs(60)));
+                }
+                assert!(!runtime.needs_discovery(original, Instant::now()));
+                runtime.bind_identity(replacement);
+                assert!(runtime.needs_discovery(replacement, Instant::now()));
+                assert!(!runtime.retain_candidate(replacement, Instant::now()));
+                assert!(runtime.candidate_endpoint.is_none());
+                assert!(runtime.retry_at.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn delayed_old_discovery_cannot_overwrite_replacement_success_or_backoff() {
+        let original = identity();
+        let replacement = GatewayMappingIdentity {
+            network_generation: 5,
+            transport_instance: 8,
+            publication_owner: 9,
+            ..original
+        };
+        let mut runtime = GatewayMappingRuntime::default();
+        runtime.bind_identity(original);
+        runtime.bind_identity(replacement);
+        assert!(runtime.record_success(
+            replacement,
+            "203.0.113.9:51820".into(),
+            "pcp",
+            Duration::from_secs(120)
+        ));
+        assert!(!runtime.record_success(
+            original,
+            "203.0.113.8:51820".into(),
+            "upnp",
+            Duration::from_secs(120)
+        ));
+        assert!(!runtime.record_failure(original, Duration::from_secs(60)));
+        assert_eq!(
+            runtime.candidate_endpoint.as_deref(),
+            Some("203.0.113.9:51820")
+        );
+        assert!(runtime.retry_at.is_none());
+        assert!(runtime.record_failure(replacement, Duration::from_secs(60)));
+        let retry_at = runtime.retry_at;
+        assert!(!runtime.record_success(
+            original,
+            "203.0.113.8:51820".into(),
+            "upnp",
+            Duration::from_secs(120)
+        ));
+        assert_eq!(runtime.retry_at, retry_at);
+        assert!(runtime.candidate_endpoint.is_none());
     }
 
     #[test]

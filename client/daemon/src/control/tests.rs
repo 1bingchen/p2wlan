@@ -1,6 +1,123 @@
 use super::*;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+#[test]
+fn hard_hard_a0_control_tags_match_the_shared_session_identity() {
+    let token = "a01face0-1234abcd";
+    let envelope = format!("hh1:i:{token}:1:2:3:4");
+    let (role, parsed_token) = hard_hard_a0_control_identity(&envelope)
+        .expect("valid Hard-Hard envelope must expose bounded local identity");
+    assert_eq!(role, "initiator");
+    assert_eq!(parsed_token, token);
+    assert_eq!(
+        hard_hard_a0_control_tag(&parsed_token, "session"),
+        "a8d6d3fb9b4788de"
+    );
+    assert_eq!(
+        hard_hard_a0_control_tag(&parsed_token, "rendezvous-plan"),
+        "91a49269735e274e"
+    );
+    assert!(hard_hard_a0_control_identity("hh1:i:not-hex:1:2").is_none());
+}
+
+#[test]
+fn hard_hard_a0_control_tags_cover_native_hh2_stages() {
+    use crate::peer::{HardHardAgreedPlan, HardHardOfferParameters, HardHardProbeStrategy};
+    use crate::{HardHardCoordination, HardHardRole, HardHardV2Envelope, HardHardV2Stage};
+
+    for stage in [
+        HardHardV2Stage::Offer,
+        HardHardV2Stage::Answer,
+        HardHardV2Stage::Ready,
+        HardHardV2Stage::ReadyAck,
+        HardHardV2Stage::Sync,
+        HardHardV2Stage::SyncAck,
+    ] {
+        let mut coordination =
+            HardHardCoordination::parse("hh1:i:00112233445566778899aabbccddeeff:1:2:3:4").unwrap();
+        let responder = matches!(
+            stage,
+            HardHardV2Stage::Answer | HardHardV2Stage::ReadyAck | HardHardV2Stage::SyncAck
+        );
+        if responder {
+            coordination.role = HardHardRole::Responder;
+        }
+        let offer = stage == HardHardV2Stage::Offer;
+        coordination.v2 = Some(HardHardV2Envelope {
+            stage,
+            local: HardHardOfferParameters {
+                socket_count: 4,
+                prediction_count: 2,
+                anchor_port: 40_001,
+            },
+            remote: if offer {
+                HardHardOfferParameters::default()
+            } else {
+                HardHardOfferParameters {
+                    socket_count: 4,
+                    prediction_count: 3,
+                    anchor_port: 50_001,
+                }
+            },
+            phase: true,
+            strategy_order: 2,
+            agreement: (!offer).then_some(HardHardAgreedPlan {
+                strategy: HardHardProbeStrategy::Birthday,
+                digest: [0xa5; 16],
+            }),
+            rtt_ms: 37,
+            uncertainty_ms: 11,
+        });
+        let envelope = coordination.encode();
+        // Golden fixtures are also checked by the server logging projection.
+        if offer {
+            assert_eq!(envelope, "hh2:KAARIjNEVWZ3iJmqu8zd7v8AAAAAAAAAAQAAAAAAAAACAAAAAAAAAAMAAAAAAAAABAAAAAAAAAAAAAAAAAQCnEEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAJQAL");
+        } else if stage == HardHardV2Stage::SyncAck {
+            assert_eq!(envelope, "hh2:bQARIjNEVWZ3iJmqu8zd7v8AAAAAAAAAAQAAAAAAAAACAAAAAAAAAAMAAAAAAAAABAAAAAAAAAAAAAAAAAQCnEEEA8NRA6WlpaWlpaWlpaWlpaWlpaUAJQAL");
+        }
+        let (role, token) = hard_hard_a0_control_identity(&envelope).unwrap();
+        assert_eq!(role, if responder { "responder" } else { "initiator" });
+        assert_eq!(token, coordination.token);
+        assert_eq!(
+            hard_hard_a0_control_tag(&token, "session"),
+            "bc24448362b87728"
+        );
+        assert_eq!(
+            hard_hard_a0_control_tag(&token, "rendezvous-plan"),
+            "b20ba067978b0938"
+        );
+    }
+}
+
+#[test]
+fn hard_hard_a0_control_identity_rejects_malformed_hh2() {
+    use base64::Engine as _;
+    let payload = "KAARIjNEVWZ3iJmqu8zd7v8AAAAAAAAAAQAAAAAAAAACAAAAAAAAAAMAAAAAAAAABAAAAAAAAAAAAAAAAAQCnEEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAJQAL";
+    let wire = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload)
+        .unwrap();
+    let encode = |bytes: &[u8]| {
+        format!(
+            "hh2:{}",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+        )
+    };
+    for (offset, value) in [(0, 0x80), (0, 0x30), (0, 0x42), (0, 4), (57, 101), (61, 1)] {
+        let mut malformed = wire.clone();
+        malformed[offset] = value;
+        assert!(hard_hard_a0_control_identity(&encode(&malformed)).is_none());
+    }
+    for malformed in [
+        "hh2:invalid".to_string(),
+        format!("hh2:{payload}="),
+        format!("hh2:{payload}:suffix"),
+        encode(&wire[..89]),
+        encode(&[wire.as_slice(), &[0]].concat()),
+    ] {
+        assert!(hard_hard_a0_control_identity(&malformed).is_none());
+    }
+}
+
 fn test_config() -> Config {
     Config::generate_default("https://ctrl.test", "net1").unwrap()
 }
@@ -171,3 +288,10 @@ include!("tests/peers.rs");
 include!("tests/messages.rs");
 include!("tests/client.rs");
 include!("tests/commands.rs");
+include!("tests/recovery.rs");
+
+include!("tests/capabilities.rs");
+include!("tests/hard_hard_signal.rs");
+include!("tests/hard_hard_signal_retry.rs");
+include!("tests/candidate_lifecycle.rs");
+include!("tests/critical_capacity.rs");

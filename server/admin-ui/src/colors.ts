@@ -5,6 +5,11 @@ const ACCOUNT_COLORS = [
   '#4338ca', '#115e59', '#7e22ce', '#9a3412', '#075985', '#9f1239',
 ]
 
+/**
+ * Returns a stable, high-contrast account color. The palette is intentionally
+ * bounded instead of generating arbitrary RGB values so labels remain legible
+ * on both the topology canvas and white table surfaces.
+ */
 function accountHash(id?: string): number {
   if (!id) return 0
   let hash = 2166136261
@@ -15,24 +20,19 @@ function accountHash(id?: string): number {
   return hash >>> 0
 }
 
-/**
- * Returns a stable, high-contrast account color. The palette is intentionally
- * bounded instead of generating arbitrary RGB values so labels remain legible
- * on both the topology canvas and white table surfaces.
- */
 export function accountColor(id?: string): string {
   if (!id) return '#64748b'
   return ACCOUNT_COLORS[accountHash(id) % ACCOUNT_COLORS.length]
 }
 
-/**
- * Color is only the first identity channel: a finite accessible palette must
- * eventually repeat. This six-character code is a second stable visual key so
- * hundreds of accounts remain distinguishable even when two share a hue.
- */
-export function accountIdentityCode(id?: string): string {
-  if (!id) return '------'
-  return accountHash(id).toString(36).toUpperCase().padStart(6, '0').slice(-6)
+export function accountIdentity(id?: string): { color: string; code: string } {
+  if (!id) return { color: '#64748b', code: '--' }
+  const hash = accountHash(id)
+  // Color is intentionally bounded for contrast. The independent six-character base36 code
+  // is the second visual channel, so two accounts that share one of the 24
+  // colors are still distinguishable in the graph and legend.
+  const code = (hash % 2176782336).toString(36).toUpperCase().padStart(6, '0')
+  return { color: ACCOUNT_COLORS[hash % ACCOUNT_COLORS.length], code }
 }
 
 export function colorWithAlpha(hex: string, alpha: number): string {

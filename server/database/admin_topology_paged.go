@@ -1,6 +1,7 @@
 package database
 
 import (
+	"context"
 	"database/sql"
 	"encoding/base64"
 	"encoding/json"
@@ -12,7 +13,8 @@ import (
 
 var ErrInvalidAdminTopologyView = errors.New("invalid admin topology view")
 
-type AdminTopologyPage struct {
+type AdminTopologySnapshotPage struct {
+	GraphKind                string              `json:"graph_kind"`
 	GeneratedAt              int64               `json:"generated_at"`
 	SnapshotAt               int64               `json:"snapshot_at"`
 	Scope                    string              `json:"scope"`
@@ -52,7 +54,7 @@ const (
 )
 
 func adminTopologyNote() string {
-	return "Control does not persist the daemon's current Direct/Relay business path; topology edges describe account membership, private default-device ownership, device attachment, and pending signaling only."
+	return "Resource relationships show Control membership, private device ownership, attachment and pending signaling. Authoritative Direct/Relay observations are available separately in Connections."
 }
 
 func topologyBound(alias string, maxRow, snapshotAt int64) string {
@@ -68,17 +70,12 @@ func topologyFocusNetworks(accountID string, snapshot adminTopologySnapshot, sna
 	return query, []any{accountID}
 }
 
-func captureAdminTopologySnapshot(db *DB, accountID string) (adminTopologyCursor, error) {
+func captureAdminTopologySnapshot(ctx context.Context, tx *sql.Tx, accountID string) (adminTopologyCursor, error) {
 	snapshotAt := adminStableSnapshotAt()
-	tx, err := db.Begin()
-	if err != nil {
-		return adminTopologyCursor{}, err
-	}
-	defer tx.Rollback()
 
 	if accountID != "" {
 		var exists int
-		if err := tx.QueryRow(`SELECT COUNT(*) FROM users WHERE id = ? AND id <> 'system' AND created_at <= ?`, accountID, snapshotAt).Scan(&exists); err != nil {
+		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM users WHERE id = ? AND id <> 'system' AND created_at <= ?`, accountID, snapshotAt).Scan(&exists); err != nil {
 			return adminTopologyCursor{}, fmt.Errorf("check paged topology account: %w", err)
 		}
 		if exists == 0 {
@@ -87,7 +84,7 @@ func captureAdminTopologySnapshot(db *DB, accountID string) (adminTopologyCursor
 	}
 
 	var snapshot adminTopologySnapshot
-	if err := tx.QueryRow(`SELECT
+	if err := tx.QueryRowContext(ctx, `SELECT
 		COALESCE((SELECT MAX(rowid) FROM users WHERE created_at <= ?), 0),
 		COALESCE((SELECT MAX(rowid) FROM networks WHERE created_at <= ?), 0),
 		COALESCE((SELECT MAX(rowid) FROM rooms WHERE created_at <= ?), 0),
@@ -97,9 +94,6 @@ func captureAdminTopologySnapshot(db *DB, accountID string) (adminTopologyCursor
 		snapshotAt, snapshotAt, snapshotAt, snapshotAt, snapshotAt, snapshotAt,
 	).Scan(&snapshot.Users, &snapshot.Networks, &snapshot.Rooms, &snapshot.Memberships, &snapshot.Devices, &snapshot.Signals); err != nil {
 		return adminTopologyCursor{}, fmt.Errorf("capture admin topology snapshot: %w", err)
-	}
-	if err := tx.Commit(); err != nil {
-		return adminTopologyCursor{}, err
 	}
 	return adminTopologyCursor{
 		Version:    adminCursorVersion,
@@ -161,26 +155,32 @@ func nextTopologyPhase(phase, view string) string {
 	}
 }
 
-func (db *DB) AdminTopologyPage(accountID, view, cursorRaw string, limit int) (*AdminTopologyPage, error) {
+func (db *DB) AdminTopologySnapshotPage(ctx context.Context, accountID, view, cursorRaw string, limit int) (*AdminTopologySnapshotPage, error) {
 	accountID = strings.TrimSpace(accountID)
 	view = strings.TrimSpace(view)
 	if accountID == "system" {
 		return nil, ErrAdminAccountNotFound
 	}
 	limit = normalizeAdminCursorLimit(limit)
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
 	cursor, err := decodeAdminTopologyCursor(cursorRaw, accountID, view)
 	if err != nil {
 		return nil, err
 	}
 	if cursorRaw == "" {
-		cursor, err = captureAdminTopologySnapshot(db, accountID)
+		cursor, err = captureAdminTopologySnapshot(ctx, tx, accountID)
 		if err != nil {
 			return nil, err
 		}
 		cursor.View = view
 	}
 
-	page := &AdminTopologyPage{
+	page := &AdminTopologySnapshotPage{
+		GraphKind:                "control_relationships",
 		GeneratedAt:              time.Now().Unix(),
 		SnapshotAt:               cursor.SnapshotAt,
 		Scope:                    "global",
@@ -206,17 +206,17 @@ func (db *DB) AdminTopologyPage(accountID, view, cursorRaw string, limit int) (*
 		var hasMore bool
 		switch cursor.Phase {
 		case "accounts":
-			nodes, lastRow, hasMore, err = db.adminTopologyAccountPage(cursor, limit)
+			nodes, lastRow, hasMore, err = adminTopologyAccountPage(ctx, tx, cursor, limit)
 		case "networks":
-			nodes, lastRow, hasMore, err = db.adminTopologyNetworkPage(cursor, limit)
+			nodes, lastRow, hasMore, err = adminTopologyNetworkPage(ctx, tx, cursor, limit)
 		case "memberships":
-			edges, lastRow, hasMore, err = db.adminTopologyMembershipPage(cursor, limit)
+			edges, lastRow, hasMore, err = adminTopologyMembershipPage(ctx, tx, cursor, limit)
 		case "devices":
-			nodes, edges, lastRow, hasMore, err = db.adminTopologyDevicePage(cursor, limit, false)
+			nodes, edges, lastRow, hasMore, err = adminTopologyDevicePage(ctx, tx, cursor, limit, false)
 		case "personal":
-			nodes, edges, lastRow, hasMore, err = db.adminTopologyDevicePage(cursor, limit, true)
+			nodes, edges, lastRow, hasMore, err = adminTopologyDevicePage(ctx, tx, cursor, limit, true)
 		case "signals":
-			edges, lastRow, hasMore, err = db.adminTopologySignalPage(cursor, limit)
+			edges, lastRow, hasMore, err = adminTopologySignalPage(ctx, tx, cursor, limit)
 		}
 		if err != nil {
 			return nil, err
@@ -245,7 +245,7 @@ func (db *DB) AdminTopologyPage(accountID, view, cursorRaw string, limit int) (*
 	return page, nil
 }
 
-func (db *DB) adminTopologyAccountPage(cursor adminTopologyCursor, limit int) ([]AdminTopologyNode, int64, bool, error) {
+func adminTopologyAccountPage(ctx context.Context, tx *sql.Tx, cursor adminTopologyCursor, limit int) ([]AdminTopologyNode, int64, bool, error) {
 	bound := topologyBound("u", cursor.Snapshot.Users, cursor.SnapshotAt)
 	where := `u.id <> 'system' AND ` + bound + fmt.Sprintf(" AND u.rowid > %d", cursor.AfterRow)
 	args := []any{}
@@ -259,7 +259,7 @@ func (db *DB) adminTopologyAccountPage(cursor adminTopologyCursor, limit int) ([
 		args = append(args, focusArgs...)
 	}
 	args = append(args, limit+1)
-	rows, err := db.Query(`SELECT u.rowid, u.id, COALESCE(NULLIF(u.username, ''), u.email)
+	rows, err := tx.QueryContext(ctx, `SELECT u.rowid, u.id, COALESCE(NULLIF(u.username, ''), u.email)
 		FROM users u WHERE `+where+` ORDER BY u.rowid ASC LIMIT ?`, args...)
 	if err != nil {
 		return nil, 0, false, fmt.Errorf("paged topology accounts: %w", err)
@@ -294,7 +294,7 @@ func (db *DB) adminTopologyAccountPage(cursor adminTopologyCursor, limit int) ([
 	return nodes, lastRow, hasMore, nil
 }
 
-func (db *DB) adminTopologyNetworkPage(cursor adminTopologyCursor, limit int) ([]AdminTopologyNode, int64, bool, error) {
+func adminTopologyNetworkPage(ctx context.Context, tx *sql.Tx, cursor adminTopologyCursor, limit int) ([]AdminTopologyNode, int64, bool, error) {
 	where := `n.id <> 'default' AND ` + topologyBound("n", cursor.Snapshot.Networks, cursor.SnapshotAt) + fmt.Sprintf(" AND n.rowid > %d", cursor.AfterRow)
 	args := []any{}
 	if cursor.AccountID != "" {
@@ -304,7 +304,7 @@ func (db *DB) adminTopologyNetworkPage(cursor adminTopologyCursor, limit int) ([
 	}
 	args = append(args, limit+1)
 	roomBound := topologyBound("r", cursor.Snapshot.Rooms, cursor.SnapshotAt)
-	rows, err := db.Query(`SELECT n.rowid, n.id, n.name, n.cidr, n.owner_id,
+	rows, err := tx.QueryContext(ctx, `SELECT n.rowid, n.id, n.name, n.cidr, n.owner_id,
 		EXISTS(SELECT 1 FROM rooms r WHERE r.network_id=n.id AND `+roomBound+`),
 		COALESCE((SELECT r.room_code FROM rooms r WHERE r.network_id=n.id AND `+roomBound+` LIMIT 1), '')
 		FROM networks n WHERE `+where+` ORDER BY n.rowid ASC LIMIT ?`, args...)
@@ -313,7 +313,7 @@ func (db *DB) adminTopologyNetworkPage(cursor adminTopologyCursor, limit int) ([
 	}
 	defer rows.Close()
 	type rowItem struct {
-		rowID, isRoom int64
+		rowID, isRoom                     int64
 		id, name, cidr, ownerID, roomCode string
 	}
 	items := make([]rowItem, 0, limit+1)
@@ -344,7 +344,7 @@ func (db *DB) adminTopologyNetworkPage(cursor adminTopologyCursor, limit int) ([
 	return nodes, lastRow, hasMore, nil
 }
 
-func (db *DB) adminTopologyMembershipPage(cursor adminTopologyCursor, limit int) ([]AdminTopologyEdge, int64, bool, error) {
+func adminTopologyMembershipPage(ctx context.Context, tx *sql.Tx, cursor adminTopologyCursor, limit int) ([]AdminTopologyEdge, int64, bool, error) {
 	where := `m.network_id <> 'default' AND m.user_id <> 'system' AND ` + topologyBound("m", cursor.Snapshot.Memberships, cursor.SnapshotAt) +
 		` AND ` + topologyBound("u", cursor.Snapshot.Users, cursor.SnapshotAt) + ` AND ` + topologyBound("n", cursor.Snapshot.Networks, cursor.SnapshotAt) + fmt.Sprintf(" AND m.rowid > %d", cursor.AfterRow)
 	args := []any{}
@@ -354,14 +354,17 @@ func (db *DB) adminTopologyMembershipPage(cursor adminTopologyCursor, limit int)
 		args = append(args, focusArgs...)
 	}
 	args = append(args, limit+1)
-	rows, err := db.Query(`SELECT m.rowid, m.user_id, m.network_id, COALESCE(m.role, 'member')
+	rows, err := tx.QueryContext(ctx, `SELECT m.rowid, m.user_id, m.network_id, COALESCE(m.role, 'member')
 		FROM network_memberships m JOIN users u ON u.id=m.user_id JOIN networks n ON n.id=m.network_id
 		WHERE `+where+` ORDER BY m.rowid ASC LIMIT ?`, args...)
 	if err != nil {
 		return nil, 0, false, fmt.Errorf("paged topology memberships: %w", err)
 	}
 	defer rows.Close()
-	type rowItem struct{ rowID int64; userID, networkID, role string }
+	type rowItem struct {
+		rowID                   int64
+		userID, networkID, role string
+	}
 	items := make([]rowItem, 0, limit+1)
 	for rows.Next() {
 		var item rowItem
@@ -386,7 +389,7 @@ func (db *DB) adminTopologyMembershipPage(cursor adminTopologyCursor, limit int)
 	return edges, lastRow, hasMore, nil
 }
 
-func (db *DB) adminTopologyDevicePage(cursor adminTopologyCursor, limit int, personal bool) ([]AdminTopologyNode, []AdminTopologyEdge, int64, bool, error) {
+func adminTopologyDevicePage(ctx context.Context, tx *sql.Tx, cursor adminTopologyCursor, limit int, personal bool) ([]AdminTopologyNode, []AdminTopologyEdge, int64, bool, error) {
 	where := topologyBound("d", cursor.Snapshot.Devices, cursor.SnapshotAt) + ` AND ` + topologyBound("u", cursor.Snapshot.Users, cursor.SnapshotAt) + fmt.Sprintf(" AND d.rowid > %d", cursor.AfterRow)
 	args := []any{}
 	if personal {
@@ -408,7 +411,7 @@ func (db *DB) adminTopologyDevicePage(cursor adminTopologyCursor, limit int, per
 	if !personal {
 		joinNetwork = `JOIN networks n ON n.id=d.network_id`
 	}
-	rows, err := db.Query(`SELECT d.rowid, d.id, d.user_id, COALESCE(NULLIF(u.username, ''), u.email),
+	rows, err := tx.QueryContext(ctx, `SELECT d.rowid, d.id, d.user_id, COALESCE(NULLIF(u.username, ''), u.email),
 		d.device_name, d.platform, d.virtual_ip, d.network_id, d.nat_type, d.relay_rtt_ms,
 		d.last_seen, COALESCE(d.app_version, ''), d.online
 		FROM devices d JOIN users u ON u.id=d.user_id `+joinNetwork+`
@@ -418,9 +421,9 @@ func (db *DB) adminTopologyDevicePage(cursor adminTopologyCursor, limit int, per
 	}
 	defer rows.Close()
 	type rowItem struct {
-		rowID, lastSeen, online int64
+		rowID, lastSeen, online                                                         int64
 		id, userID, username, name, platform, virtualIP, networkID, natType, appVersion string
-		relayRTT sql.NullInt64
+		relayRTT                                                                        sql.NullInt64
 	}
 	items := make([]rowItem, 0, limit+1)
 	for rows.Next() {
@@ -454,7 +457,7 @@ func (db *DB) adminTopologyDevicePage(cursor adminTopologyCursor, limit int, per
 	return nodes, edges, lastRow, hasMore, nil
 }
 
-func (db *DB) adminTopologySignalPage(cursor adminTopologyCursor, limit int) ([]AdminTopologyEdge, int64, bool, error) {
+func adminTopologySignalPage(ctx context.Context, tx *sql.Tx, cursor adminTopologyCursor, limit int) ([]AdminTopologyEdge, int64, bool, error) {
 	deviceBoundF := topologyBound("fd", cursor.Snapshot.Devices, cursor.SnapshotAt)
 	deviceBoundT := topologyBound("td", cursor.Snapshot.Devices, cursor.SnapshotAt)
 	userBoundF := topologyBound("fu", cursor.Snapshot.Users, cursor.SnapshotAt)
@@ -476,7 +479,7 @@ func (db *DB) adminTopologySignalPage(cursor adminTopologyCursor, limit int) ([]
 		args = append(args, focusArgs2...)
 	}
 	args = append(args, limit+1)
-	rows, err := db.Query(`SELECT s.rowid, s.id, s.from_node_id, s.to_node_id, s.type, s.created_at
+	rows, err := tx.QueryContext(ctx, `SELECT s.rowid, s.id, s.from_node_id, s.to_node_id, s.type, s.created_at
 		FROM signals s
 		JOIN devices fd ON fd.id=s.from_node_id JOIN users fu ON fu.id=fd.user_id LEFT JOIN networks fn ON fn.id=fd.network_id
 		JOIN devices td ON td.id=s.to_node_id JOIN users tu ON tu.id=td.user_id LEFT JOIN networks tn ON tn.id=td.network_id
@@ -485,7 +488,10 @@ func (db *DB) adminTopologySignalPage(cursor adminTopologyCursor, limit int) ([]
 		return nil, 0, false, fmt.Errorf("paged topology signals: %w", err)
 	}
 	defer rows.Close()
-	type rowItem struct{ rowID, createdAt int64; id, fromID, toID, signalType string }
+	type rowItem struct {
+		rowID, createdAt             int64
+		id, fromID, toID, signalType string
+	}
 	items := make([]rowItem, 0, limit+1)
 	for rows.Next() {
 		var item rowItem

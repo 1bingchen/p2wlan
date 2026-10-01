@@ -217,6 +217,8 @@ async fn duplicate_offer_has_no_candidate_apply_or_fresh_prediction_side_effect(
 
     peers
         .add_peer(&crate::control::PeerInfo {
+            capabilities: crate::control::PeerCapabilities::default(),
+            registration_seq: 0,
             node_id: "node-dupe".to_string(),
             device_name: String::new(),
             app_version: String::new(),

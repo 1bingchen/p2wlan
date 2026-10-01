@@ -37,6 +37,7 @@ pub(super) async fn register_device(
     Vec<String>,
     Vec<RelayCatalogEntry>,
     Option<u64>,
+    super::PeerCapabilities,
 )> {
     let res = http
         .post(format!("{base_url}/api/v1/devices"))
@@ -111,6 +112,7 @@ pub(super) async fn register_device(
             body.relay_servers,
             body.relay_catalog,
             Some(registration_seq),
+            body.accepted_peer_capabilities,
         ));
     }
 
@@ -121,6 +123,7 @@ pub(super) async fn register_device(
         body.relay_servers,
         body.relay_catalog,
         body.registration_seq,
+        super::PeerCapabilities::default(),
     ))
 }
 
@@ -138,6 +141,7 @@ pub(super) fn register_device_payload_with_incarnation(
         "device_name": config.node.device_name,
         "platform": config.node.platform,
         "app_version": env!("CARGO_PKG_VERSION"),
+        "capabilities": super::PeerCapabilities::current(),
         "network_id": config.network.network_id,
     });
 
@@ -196,6 +200,7 @@ pub(super) fn registration_conflict_error(
             | "registration_protocol_upgrade_required"
             | "registration_incarnation_mismatch"
             | "registration_lifecycle_conflict"
+            | "registration_capability_conflict"
     ) {
         return None;
     }

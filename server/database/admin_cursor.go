@@ -1,6 +1,7 @@
 package database
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -13,36 +14,40 @@ var ErrInvalidAdminCursor = errors.New("invalid admin cursor")
 
 const adminCursorVersion = 1
 
-type AdminAccountCursorPage struct {
-	Total      int                   `json:"total"`
-	Limit      int                   `json:"limit"`
-	SnapshotAt int64                 `json:"snapshot_at"`
-	NextCursor string                `json:"next_cursor,omitempty"`
-	Items      []AdminAccountSummary `json:"items"`
+type AdminAccountSnapshotPage struct {
+	Total       int                   `json:"total"`
+	Limit       int                   `json:"limit"`
+	GeneratedAt int64                 `json:"generated_at"`
+	SnapshotAt  int64                 `json:"snapshot_at"`
+	NextCursor  string                `json:"next_cursor,omitempty"`
+	Items       []AdminAccountSummary `json:"items"`
 }
 
-type AdminDeviceCursorPage struct {
-	Total      int                  `json:"total"`
-	Limit      int                  `json:"limit"`
-	SnapshotAt int64                `json:"snapshot_at"`
-	NextCursor string               `json:"next_cursor,omitempty"`
-	Items      []AdminDeviceSummary `json:"items"`
+type AdminDeviceSnapshotPage struct {
+	Total       int                  `json:"total"`
+	Limit       int                  `json:"limit"`
+	GeneratedAt int64                `json:"generated_at"`
+	SnapshotAt  int64                `json:"snapshot_at"`
+	NextCursor  string               `json:"next_cursor,omitempty"`
+	Items       []AdminDeviceSummary `json:"items"`
 }
 
-type AdminNetworkCursorPage struct {
-	Total      int                   `json:"total"`
-	Limit      int                   `json:"limit"`
-	SnapshotAt int64                 `json:"snapshot_at"`
-	NextCursor string                `json:"next_cursor,omitempty"`
-	Items      []AdminNetworkSummary `json:"items"`
+type AdminNetworkSnapshotPage struct {
+	Total       int                   `json:"total"`
+	Limit       int                   `json:"limit"`
+	GeneratedAt int64                 `json:"generated_at"`
+	SnapshotAt  int64                 `json:"snapshot_at"`
+	NextCursor  string                `json:"next_cursor,omitempty"`
+	Items       []AdminNetworkSummary `json:"items"`
 }
 
-type AdminRoomCursorPage struct {
-	Total      int                `json:"total"`
-	Limit      int                `json:"limit"`
-	SnapshotAt int64              `json:"snapshot_at"`
-	NextCursor string             `json:"next_cursor,omitempty"`
-	Items      []AdminRoomSummary `json:"items"`
+type AdminRoomSnapshotPage struct {
+	Total       int                `json:"total"`
+	Limit       int                `json:"limit"`
+	GeneratedAt int64              `json:"generated_at"`
+	SnapshotAt  int64              `json:"snapshot_at"`
+	NextCursor  string             `json:"next_cursor,omitempty"`
+	Items       []AdminRoomSummary `json:"items"`
 }
 
 type adminListCursor struct {
@@ -52,6 +57,7 @@ type adminListCursor struct {
 	SnapshotAt int64  `json:"snapshot_at"`
 	Query      string `json:"q,omitempty"`
 	Status     string `json:"status,omitempty"`
+	AccountID  string `json:"account_id,omitempty"`
 }
 
 func normalizeAdminCursorLimit(limit int) int {
@@ -80,7 +86,7 @@ func encodeAdminCursor(value any) (string, error) {
 	return base64.RawURLEncoding.EncodeToString(payload), nil
 }
 
-func decodeAdminListCursor(raw, kind, query, status string) (adminListCursor, error) {
+func decodeAdminListCursor(raw, kind, query, status, accountID string) (adminListCursor, error) {
 	if raw == "" {
 		return adminListCursor{
 			Version:    adminCursorVersion,
@@ -88,6 +94,7 @@ func decodeAdminListCursor(raw, kind, query, status string) (adminListCursor, er
 			SnapshotAt: adminStableSnapshotAt(),
 			Query:      query,
 			Status:     status,
+			AccountID:  accountID,
 		}, nil
 	}
 	if len(raw) > 2048 {
@@ -101,7 +108,7 @@ func decodeAdminListCursor(raw, kind, query, status string) (adminListCursor, er
 	if err := json.Unmarshal(payload, &cursor); err != nil {
 		return adminListCursor{}, ErrInvalidAdminCursor
 	}
-	if cursor.Version != adminCursorVersion || cursor.Kind != kind || cursor.BeforeRow < 0 || cursor.SnapshotAt <= 0 || cursor.Query != query || cursor.Status != status {
+	if cursor.Version != adminCursorVersion || cursor.Kind != kind || cursor.BeforeRow < 0 || cursor.SnapshotAt <= 0 || cursor.Query != query || cursor.Status != status || cursor.AccountID != accountID || cursor.SnapshotAt > time.Now().Unix() {
 		return adminListCursor{}, ErrInvalidAdminCursor
 	}
 	return cursor, nil
@@ -122,10 +129,15 @@ func adminCursorRowClause(alias string, cursor adminListCursor) (string, []any) 
 	return clause, args
 }
 
-func (db *DB) AdminAccountsCursor(query, cursorRaw string, limit int) (*AdminAccountCursorPage, error) {
+func (db *DB) AdminAccountsSnapshot(ctx context.Context, query, cursorRaw string, limit int) (*AdminAccountSnapshotPage, error) {
 	limit = normalizeAdminCursorLimit(limit)
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
 	query = strings.TrimSpace(query)
-	cursor, err := decodeAdminListCursor(cursorRaw, "accounts", query, "")
+	cursor, err := decodeAdminListCursor(cursorRaw, "accounts", query, "", "")
 	if err != nil {
 		return nil, err
 	}
@@ -141,7 +153,7 @@ func (db *DB) AdminAccountsCursor(query, cursorRaw string, limit int) (*AdminAcc
 		filterArgs = append(filterArgs, pattern, pattern)
 	}
 	var total int
-	if err := db.QueryRow(`SELECT COUNT(*) FROM users u WHERE `+where, countArgs...).Scan(&total); err != nil {
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM users u WHERE `+where, countArgs...).Scan(&total); err != nil {
 		return nil, fmt.Errorf("count cursor admin accounts: %w", err)
 	}
 
@@ -156,7 +168,7 @@ func (db *DB) AdminAccountsCursor(query, cursorRaw string, limit int) (*AdminAcc
 		listArgs = append(listArgs, cursor.BeforeRow)
 	}
 	listArgs = append(listArgs, limit+1)
-	rows, err := db.Query(`SELECT u.rowid, `+adminAccountColumns()+`
+	rows, err := tx.QueryContext(ctx, `SELECT u.rowid, `+adminAccountColumns()+`
 		FROM users u
 		WHERE `+listWhere+`
 		ORDER BY u.rowid DESC
@@ -182,7 +194,7 @@ func (db *DB) AdminAccountsCursor(query, cursorRaw string, limit int) (*AdminAcc
 		return nil, err
 	}
 
-	page := &AdminAccountCursorPage{Total: total, Limit: limit, SnapshotAt: cursor.SnapshotAt, Items: make([]AdminAccountSummary, 0, min(limit, len(items)))}
+	page := &AdminAccountSnapshotPage{Total: total, Limit: limit, GeneratedAt: time.Now().Unix(), SnapshotAt: cursor.SnapshotAt, Items: make([]AdminAccountSummary, 0, min(limit, len(items)))}
 	for i, current := range items {
 		if i >= limit {
 			break
@@ -198,9 +210,15 @@ func (db *DB) AdminAccountsCursor(query, cursorRaw string, limit int) (*AdminAcc
 	return page, nil
 }
 
-func (db *DB) AdminDevicesCursor(query, status, cursorRaw string, limit int) (*AdminDeviceCursorPage, error) {
+func (db *DB) AdminDevicesSnapshot(ctx context.Context, filter AdminResourceFilter, status, cursorRaw string, limit int) (*AdminDeviceSnapshotPage, error) {
 	limit = normalizeAdminCursorLimit(limit)
-	query = strings.TrimSpace(query)
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	query := strings.TrimSpace(filter.Query)
+	filter.AccountID = strings.TrimSpace(filter.AccountID)
 	status = strings.ToLower(strings.TrimSpace(status))
 	if status == "" {
 		status = "all"
@@ -208,7 +226,7 @@ func (db *DB) AdminDevicesCursor(query, status, cursorRaw string, limit int) (*A
 	if status != "all" && status != "online" && status != "offline" {
 		return nil, ErrInvalidAdminDeviceStatus
 	}
-	cursor, err := decodeAdminListCursor(cursorRaw, "devices", query, status)
+	cursor, err := decodeAdminListCursor(cursorRaw, "devices", query, status, filter.AccountID)
 	if err != nil {
 		return nil, err
 	}
@@ -222,6 +240,10 @@ func (db *DB) AdminDevicesCursor(query, status, cursorRaw string, limit int) (*A
 		where = append(where, `(d.device_name LIKE ? ESCAPE '!' OR COALESCE(NULLIF(u.username, ''), u.email) LIKE ? ESCAPE '!' OR d.virtual_ip LIKE ? ESCAPE '!' OR COALESCE(n.name, '') LIKE ? ESCAPE '!')`)
 		args = append(args, pattern, pattern, pattern, pattern)
 	}
+	if filter.AccountID != "" {
+		where = append(where, "d.user_id = ?")
+		args = append(args, filter.AccountID)
+	}
 	switch status {
 	case "online":
 		where = append(where, adminOnlineLeaseSQL("d"))
@@ -232,7 +254,7 @@ func (db *DB) AdminDevicesCursor(query, status, cursorRaw string, limit int) (*A
 	}
 	clause := strings.Join(where, " AND ")
 	var total int
-	if err := db.QueryRow(`SELECT COUNT(*) FROM devices d JOIN users u ON u.id=d.user_id LEFT JOIN networks n ON n.id=d.network_id WHERE `+clause, args...).Scan(&total); err != nil {
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM devices d JOIN users u ON u.id=d.user_id LEFT JOIN networks n ON n.id=d.network_id WHERE `+clause, args...).Scan(&total); err != nil {
 		return nil, fmt.Errorf("count cursor admin devices: %w", err)
 	}
 
@@ -245,7 +267,7 @@ func (db *DB) AdminDevicesCursor(query, status, cursorRaw string, limit int) (*A
 	// adminDeviceColumns returns the raw online flag; scanAdminDevice applies
 	// the heartbeat lease using the same cutoff used by filters.
 	listArgs = append(listArgs, limit+1)
-	rows, err := db.Query(`SELECT d.rowid, `+adminDeviceColumns()+`
+	rows, err := tx.QueryContext(ctx, `SELECT d.rowid, `+adminDeviceColumns()+`
 		FROM devices d JOIN users u ON u.id=d.user_id LEFT JOIN networks n ON n.id=d.network_id
 		WHERE `+listClause+`
 		ORDER BY d.rowid DESC LIMIT ?`, listArgs...)
@@ -263,7 +285,7 @@ func (db *DB) AdminDevicesCursor(query, status, cursorRaw string, limit int) (*A
 		var current rowItem
 		var online int64
 		var relayRTT interface{}
-		if err := rows.Scan(&current.rowID, &current.item.ID, &current.item.Username, &current.item.DeviceName, &current.item.Platform, &current.item.VirtualIP, &current.item.NetworkID, &current.item.NetworkName, &current.item.NATType, &relayRTT, &current.item.LastSeen, &current.item.AppVersion, &online); err != nil {
+		if err := rows.Scan(&current.rowID, &current.item.ID, &current.item.OwnerID, &current.item.Username, &current.item.DeviceName, &current.item.Platform, &current.item.VirtualIP, &current.item.NetworkID, &current.item.NetworkName, &current.item.NATType, &relayRTT, &current.item.LastSeen, &current.item.AppVersion, &online); err != nil {
 			return nil, fmt.Errorf("scan cursor admin device: %w", err)
 		}
 		current.item.Online = adminDeviceOnline(online, current.item.LastSeen, cutoff)
@@ -282,7 +304,7 @@ func (db *DB) AdminDevicesCursor(query, status, cursorRaw string, limit int) (*A
 		return nil, err
 	}
 
-	page := &AdminDeviceCursorPage{Total: total, Limit: limit, SnapshotAt: cursor.SnapshotAt, Items: make([]AdminDeviceSummary, 0, min(limit, len(items)))}
+	page := &AdminDeviceSnapshotPage{Total: total, Limit: limit, GeneratedAt: time.Now().Unix(), SnapshotAt: cursor.SnapshotAt, Items: make([]AdminDeviceSummary, 0, min(limit, len(items)))}
 	for i, current := range items {
 		if i >= limit {
 			break
@@ -298,27 +320,33 @@ func (db *DB) AdminDevicesCursor(query, status, cursorRaw string, limit int) (*A
 	return page, nil
 }
 
-func (db *DB) AdminNetworksCursor(cursorRaw string, limit int) (*AdminNetworkCursorPage, error) {
+func (db *DB) AdminNetworksSnapshot(ctx context.Context, filter AdminResourceFilter, cursorRaw string, limit int) (*AdminNetworkSnapshotPage, error) {
 	limit = normalizeAdminCursorLimit(limit)
-	cursor, err := decodeAdminListCursor(cursorRaw, "networks", "", "")
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	cursor, err := decodeAdminListCursor(cursorRaw, "networks", strings.TrimSpace(filter.Query), "", strings.TrimSpace(filter.AccountID))
 	if err != nil {
 		return nil, err
 	}
 	cutoff := adminOnlineCutoff()
-	where := `n.id <> 'default' AND n.created_at <= ?`
-	countArgs := []any{cursor.SnapshotAt}
+	where, filterArgs := adminResourceWhere(filter)
+	where += ` AND n.created_at <= ?`
+	countArgs := append(append([]any(nil), filterArgs...), cursor.SnapshotAt)
 	var total int
-	if err := db.QueryRow(`SELECT COUNT(*) FROM networks n WHERE `+where, countArgs...).Scan(&total); err != nil {
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM networks n WHERE `+where, countArgs...).Scan(&total); err != nil {
 		return nil, fmt.Errorf("count cursor admin networks: %w", err)
 	}
 	listWhere := where
-	args := []any{cutoff, cursor.SnapshotAt}
+	args := append([]any{cutoff}, countArgs...)
 	if cursor.BeforeRow > 0 {
 		listWhere += ` AND n.rowid < ?`
 		args = append(args, cursor.BeforeRow)
 	}
 	args = append(args, limit+1)
-	rows, err := db.Query(`SELECT n.rowid, n.id, n.name, n.cidr,
+	rows, err := tx.QueryContext(ctx, `SELECT n.rowid, n.id, n.name, n.cidr, n.owner_id,
 		COALESCE(NULLIF(u.username, ''), u.email),
 		(SELECT COUNT(*) FROM network_memberships m WHERE m.network_id=n.id),
 		(SELECT COUNT(*) FROM devices d WHERE d.network_id=n.id),
@@ -339,7 +367,7 @@ func (db *DB) AdminNetworksCursor(cursorRaw string, limit int) (*AdminNetworkCur
 	for rows.Next() {
 		var current rowItem
 		var isRoom int
-		if err := rows.Scan(&current.rowID, &current.item.ID, &current.item.Name, &current.item.CIDR, &current.item.OwnerUsername, &current.item.MemberCount, &current.item.DeviceCount, &current.item.OnlineDevices, &isRoom, &current.item.CreatedAt); err != nil {
+		if err := rows.Scan(&current.rowID, &current.item.ID, &current.item.Name, &current.item.CIDR, &current.item.OwnerID, &current.item.OwnerUsername, &current.item.MemberCount, &current.item.DeviceCount, &current.item.OnlineDevices, &isRoom, &current.item.CreatedAt); err != nil {
 			return nil, fmt.Errorf("scan cursor admin network: %w", err)
 		}
 		current.item.IsRoom = isRoom == 1
@@ -348,7 +376,7 @@ func (db *DB) AdminNetworksCursor(cursorRaw string, limit int) (*AdminNetworkCur
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
-	page := &AdminNetworkCursorPage{Total: total, Limit: limit, SnapshotAt: cursor.SnapshotAt, Items: make([]AdminNetworkSummary, 0, min(limit, len(items)))}
+	page := &AdminNetworkSnapshotPage{Total: total, Limit: limit, GeneratedAt: time.Now().Unix(), SnapshotAt: cursor.SnapshotAt, Items: make([]AdminNetworkSummary, 0, min(limit, len(items)))}
 	for i, current := range items {
 		if i >= limit {
 			break
@@ -364,26 +392,33 @@ func (db *DB) AdminNetworksCursor(cursorRaw string, limit int) (*AdminNetworkCur
 	return page, nil
 }
 
-func (db *DB) AdminRoomsCursor(cursorRaw string, limit int) (*AdminRoomCursorPage, error) {
+func (db *DB) AdminRoomsSnapshot(ctx context.Context, filter AdminResourceFilter, cursorRaw string, limit int) (*AdminRoomSnapshotPage, error) {
 	limit = normalizeAdminCursorLimit(limit)
-	cursor, err := decodeAdminListCursor(cursorRaw, "rooms", "", "")
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	cursor, err := decodeAdminListCursor(cursorRaw, "rooms", strings.TrimSpace(filter.Query), "", strings.TrimSpace(filter.AccountID))
 	if err != nil {
 		return nil, err
 	}
 	cutoff := adminOnlineCutoff()
-	where := `r.created_at <= ?`
+	where, filterArgs := adminResourceWhere(filter)
+	where += ` AND r.created_at <= ?`
+	countArgs := append(append([]any(nil), filterArgs...), cursor.SnapshotAt)
 	var total int
-	if err := db.QueryRow(`SELECT COUNT(*) FROM rooms r WHERE `+where, cursor.SnapshotAt).Scan(&total); err != nil {
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM rooms r JOIN networks n ON n.id=r.network_id WHERE `+where, countArgs...).Scan(&total); err != nil {
 		return nil, fmt.Errorf("count cursor admin rooms: %w", err)
 	}
 	listWhere := where
-	args := []any{cutoff, cursor.SnapshotAt}
+	args := append([]any{cutoff}, countArgs...)
 	if cursor.BeforeRow > 0 {
 		listWhere += ` AND r.rowid < ?`
 		args = append(args, cursor.BeforeRow)
 	}
 	args = append(args, limit+1)
-	rows, err := db.Query(`SELECT r.rowid, r.network_id, r.room_code, n.name, n.cidr,
+	rows, err := tx.QueryContext(ctx, `SELECT r.rowid, r.network_id, r.room_code, n.name, n.cidr, r.owner_id,
 		COALESCE(NULLIF(u.username, ''), u.email),
 		(SELECT COUNT(*) FROM network_memberships m WHERE m.network_id=r.network_id),
 		(SELECT COUNT(*) FROM devices d WHERE d.network_id=r.network_id),
@@ -404,7 +439,7 @@ func (db *DB) AdminRoomsCursor(cursorRaw string, limit int) (*AdminRoomCursorPag
 	for rows.Next() {
 		var current rowItem
 		var locked int
-		if err := rows.Scan(&current.rowID, &current.item.ID, &current.item.Code, &current.item.Name, &current.item.CIDR, &current.item.OwnerUsername, &current.item.MemberCount, &current.item.DeviceCount, &current.item.OnlineDevices, &locked, &current.item.CreatedAt); err != nil {
+		if err := rows.Scan(&current.rowID, &current.item.ID, &current.item.Code, &current.item.Name, &current.item.CIDR, &current.item.OwnerID, &current.item.OwnerUsername, &current.item.MemberCount, &current.item.DeviceCount, &current.item.OnlineDevices, &locked, &current.item.CreatedAt); err != nil {
 			return nil, fmt.Errorf("scan cursor admin room: %w", err)
 		}
 		current.item.JoinLocked = locked == 1
@@ -413,7 +448,7 @@ func (db *DB) AdminRoomsCursor(cursorRaw string, limit int) (*AdminRoomCursorPag
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
-	page := &AdminRoomCursorPage{Total: total, Limit: limit, SnapshotAt: cursor.SnapshotAt, Items: make([]AdminRoomSummary, 0, min(limit, len(items)))}
+	page := &AdminRoomSnapshotPage{Total: total, Limit: limit, GeneratedAt: time.Now().Unix(), SnapshotAt: cursor.SnapshotAt, Items: make([]AdminRoomSummary, 0, min(limit, len(items)))}
 	for i, current := range items {
 		if i >= limit {
 			break

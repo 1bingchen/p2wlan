@@ -16,16 +16,17 @@ import (
 // RegisterDevice handles POST /api/v1/devices.
 func (s *Server) RegisterDevice(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		PublicKey           string `json:"public_key"`
-		RoomProtocolVersion int    `json:"room_protocol_version"`
-		DeviceName          string `json:"device_name"`
-		Platform            string `json:"platform"`
-		NetworkID           string `json:"network_id"`
-		VirtualIP           string `json:"virtual_ip"`
-		AppVersion          string `json:"app_version"`
-		Ed25519PublicKey    string `json:"ed25519_public_key"`
-		ChallengeID         string `json:"challenge_id"`
-		ChallengeSignature  string `json:"challenge_signature"`
+		Capabilities        database.PeerCapabilities `json:"capabilities"`
+		PublicKey           string                    `json:"public_key"`
+		RoomProtocolVersion int                       `json:"room_protocol_version"`
+		DeviceName          string                    `json:"device_name"`
+		Platform            string                    `json:"platform"`
+		NetworkID           string                    `json:"network_id"`
+		VirtualIP           string                    `json:"virtual_ip"`
+		AppVersion          string                    `json:"app_version"`
+		Ed25519PublicKey    string                    `json:"ed25519_public_key"`
+		ChallengeID         string                    `json:"challenge_id"`
+		ChallengeSignature  string                    `json:"challenge_signature"`
 		// RegistrationIncarnation is the daemon's durable monotonic boot
 		// counter. It fences a late registration from an older process that
 		// still holds the same device credential.
@@ -171,6 +172,7 @@ func (s *Server) RegisterDevice(w http.ResponseWriter, r *http.Request) {
 		database.DeviceRegistrationAttempt{
 			Incarnation:        req.RegistrationIncarnation,
 			EnforceIncarnation: true,
+			Capabilities:       req.Capabilities,
 		},
 	)
 	if err != nil {
@@ -201,13 +203,15 @@ func (s *Server) RegisterDevice(w http.ResponseWriter, r *http.Request) {
 	}
 
 	response := map[string]interface{}{
-		"success":                  true,
-		"node_id":                  device.ID,
-		"virtual_ip":               device.VirtualIP,
-		"cidr":                     cidr,
-		"registration_seq":         device.RegistrationSeq,
-		"registration_incarnation": device.RegistrationIncarnation,
-		"relay_servers":            s.relayServers,
+		"success":                    true,
+		"node_id":                    device.ID,
+		"virtual_ip":                 device.VirtualIP,
+		"cidr":                       cidr,
+		"registration_seq":           device.RegistrationSeq,
+		"registration_incarnation":   device.RegistrationIncarnation,
+		"relay_servers":              s.relayServers,
+		"capabilities":               []string{"path_telemetry_v1"},
+		"accepted_peer_capabilities": device.Capabilities,
 	}
 
 	// Include relay catalog for new clients that support it
@@ -240,7 +244,7 @@ func (s *Server) ListNodes(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, `{"error":"failed to list nodes"}`, http.StatusInternalServerError)
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]interface{}{"nodes": devices, "authorization_lease_seconds": 30})
+		writeJSON(w, http.StatusOK, map[string]interface{}{"nodes": devices, "authorization_lease_seconds": 30, "server_time_ms": time.Now().UnixMilli()})
 		return
 	}
 
@@ -268,7 +272,7 @@ func (s *Server) ListNodes(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, `{"error":"failed to list nodes"}`, http.StatusInternalServerError)
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]interface{}{"nodes": devices, "authorization_lease_seconds": 30})
+		writeJSON(w, http.StatusOK, map[string]interface{}{"nodes": devices, "authorization_lease_seconds": 30, "server_time_ms": time.Now().UnixMilli()})
 		return
 	}
 

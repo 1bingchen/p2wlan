@@ -264,6 +264,8 @@ async fn initiator_rekey_keeps_peer_in_direct_state() {
     daemon
         .peers
         .add_peer(&control::PeerInfo {
+            capabilities: crate::control::PeerCapabilities::default(),
+            registration_seq: 0,
             node_id: peer_id.to_string(),
             device_name: String::new(),
             app_version: String::new(),
@@ -333,6 +335,8 @@ async fn peer_answer_from_new_remote_incarnation_rebinds_pending_initiator() {
     daemon
         .peers
         .add_peer(&control::PeerInfo {
+            capabilities: crate::control::PeerCapabilities::default(),
+            registration_seq: 0,
             node_id: peer_id.to_string(),
             device_name: String::new(),
             app_version: String::new(),
@@ -470,6 +474,8 @@ async fn responder_remote_incarnation_reset_does_not_self_lock_lifecycle_arbiter
     daemon
         .peers
         .add_peer(&control::PeerInfo {
+            capabilities: crate::control::PeerCapabilities::default(),
+            registration_seq: 0,
             node_id: peer_id.to_string(),
             device_name: String::new(),
             app_version: String::new(),
@@ -560,6 +566,8 @@ async fn remote_incarnation_replay_republishes_unchanged_local_candidates() {
     daemon
         .peers
         .add_peer(&control::PeerInfo {
+            capabilities: crate::control::PeerCapabilities::default(),
+            registration_seq: 0,
             node_id: peer_id.to_string(),
             device_name: String::new(),
             app_version: String::new(),
@@ -658,6 +666,8 @@ async fn stale_wireguard_answer_does_not_clear_pending_handshake() {
     daemon
         .peers
         .add_peer(&control::PeerInfo {
+            capabilities: crate::control::PeerCapabilities::default(),
+            registration_seq: 0,
             node_id: peer_id.to_string(),
             device_name: String::new(),
             app_version: String::new(),
@@ -708,6 +718,8 @@ async fn wireguard_answer_from_previous_network_generation_cannot_install_sessio
     daemon
         .peers
         .add_peer(&control::PeerInfo {
+            capabilities: crate::control::PeerCapabilities::default(),
+            registration_seq: 0,
             node_id: peer_id.to_string(),
             device_name: String::new(),
             app_version: String::new(),
@@ -851,6 +863,8 @@ async fn incomplete_modern_answer_preserves_pending_handshake_and_old_session() 
     daemon
         .peers
         .add_peer(&control::PeerInfo {
+            capabilities: crate::control::PeerCapabilities::default(),
+            registration_seq: 0,
             node_id: peer_id.to_string(),
             device_name: String::new(),
             app_version: String::new(),
@@ -945,6 +959,8 @@ async fn modern_offer_rejects_missing_or_malformed_probe_ephemeral_key() {
     daemon
         .peers
         .add_peer(&control::PeerInfo {
+            capabilities: crate::control::PeerCapabilities::default(),
+            registration_seq: 0,
             node_id: peer_id.to_string(),
             device_name: String::new(),
             app_version: String::new(),

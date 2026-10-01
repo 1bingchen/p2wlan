@@ -238,7 +238,16 @@ pub struct PathObservabilitySnapshot {
     pub current_path: Option<NetworkPath>,
     pub previous_path: Option<NetworkPath>,
     pub transition_reason: String,
+    /// Reason for the most recent actual active-path change. Ordinary
+    /// accepted observations can update `transition_reason` without switching
+    /// paths, so keep this milestone separate for support diagnostics.
+    #[serde(default)]
+    pub last_path_change_reason: String,
     pub path_age_ms: u64,
+    /// First authenticated Direct commit in the current network generation.
+    /// Retained even after the bounded transition ring evicts its event.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_direct_commit_age_ms: Option<u64>,
     pub path_state_revision: u64,
     pub direct_state: String,
     pub relay_state: String,
@@ -265,7 +274,9 @@ impl Default for PathObservabilitySnapshot {
             current_path: None,
             previous_path: None,
             transition_reason: "initial".to_string(),
+            last_path_change_reason: "initial".to_string(),
             path_age_ms: 0,
+            first_direct_commit_age_ms: None,
             path_state_revision: 0,
             direct_state: "idle".to_string(),
             relay_state: "unavailable".to_string(),
@@ -351,7 +362,9 @@ pub(crate) struct PathObservabilityState {
     previous_path: Option<NetworkPath>,
     current_path_since: Instant,
     last_reason_code: &'static str,
+    last_path_change_reason: &'static str,
     direct_attempt_started: Option<Instant>,
+    first_direct_commit_at: Option<Instant>,
 }
 
 impl Default for PathObservabilityState {
@@ -362,7 +375,9 @@ impl Default for PathObservabilityState {
             previous_path: None,
             current_path_since: Instant::now(),
             last_reason_code: "initial",
+            last_path_change_reason: "initial",
             direct_attempt_started: None,
+            first_direct_commit_at: None,
         }
     }
 }
@@ -409,6 +424,7 @@ impl PathObservabilityState {
             }
             self.previous_path = previous_path;
             self.current_path_since = now;
+            self.last_path_change_reason = reason_code;
         }
         if outcome.applies_side_effects() {
             self.last_reason_code = reason_code;
@@ -437,15 +453,20 @@ impl PathObservabilityState {
 
     fn record_applied_event(&mut self, event: &PathEvent, now: Instant) {
         match event {
-            PathEvent::PeerOnline { .. } => {}
+            PathEvent::PeerOnline { .. }
+            | PathEvent::DirectFirstStarted { .. }
+            | PathEvent::DirectFirstDeadline { .. }
+            | PathEvent::DirectFirstSatisfied { .. } => {}
             PathEvent::PeerLeft { .. } | PathEvent::IdentityReset => {
                 self.metrics.lifecycle_resets = self.metrics.lifecycle_resets.saturating_add(1);
                 self.direct_attempt_started = None;
+                self.first_direct_commit_at = None;
             }
             PathEvent::NetworkGenerationAdvanced { .. } => {
                 self.metrics.network_generation_changes =
                     self.metrics.network_generation_changes.saturating_add(1);
                 self.direct_attempt_started = None;
+                self.first_direct_commit_at = None;
             }
             PathEvent::RemoteCandidateEpochAdvanced { .. } => {
                 self.metrics.candidate_refreshes =
@@ -472,6 +493,7 @@ impl PathObservabilityState {
             }
             PathEvent::DirectCommitted { .. } => {
                 self.metrics.direct_successes = self.metrics.direct_successes.saturating_add(1);
+                self.first_direct_commit_at.get_or_insert(now);
                 if let Some(started) = self.direct_attempt_started.take() {
                     self.metrics
                         .direct_time_to_connect_ms
@@ -510,7 +532,11 @@ impl PathObservabilityState {
             current_path,
             previous_path: self.previous_path,
             transition_reason: self.last_reason_code.to_string(),
+            last_path_change_reason: self.last_path_change_reason.to_string(),
             path_age_ms: duration_millis(self.current_path_since.elapsed()),
+            first_direct_commit_age_ms: self
+                .first_direct_commit_at
+                .map(|committed| duration_millis(committed.elapsed())),
             path_state_revision: machine.revision,
             direct_state: direct_state_label(&machine.state.direct).to_string(),
             relay_state: relay_state_label(&machine.state.relay).to_string(),
@@ -605,6 +631,9 @@ fn latest_candidate_punch(
 
 fn event_kind(event: &PathEvent) -> &'static str {
     match event {
+        PathEvent::DirectFirstStarted { .. } => "direct_first_started",
+        PathEvent::DirectFirstDeadline { .. } => "direct_first_deadline",
+        PathEvent::DirectFirstSatisfied { .. } => "direct_first_satisfied",
         PathEvent::PeerOnline { .. } => "peer_online",
         PathEvent::PeerLeft { .. } => "peer_left",
         PathEvent::IdentityReset => "identity_reset",
@@ -792,6 +821,8 @@ mod tests {
         let snapshot = connection.path_observability.snapshot(&connection);
         assert!(snapshot.metrics.path_changes >= 3);
         assert_eq!(snapshot.metrics.direct_successes, 2);
+        assert!(snapshot.first_direct_commit_age_ms.is_some());
+        assert_eq!(snapshot.last_path_change_reason, "direct_committed");
         assert!(snapshot
             .transitions
             .iter()

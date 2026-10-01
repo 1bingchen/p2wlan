@@ -29,11 +29,17 @@ pub use client::{BindingResponse, StunClient, DEFAULT_TIMEOUT};
 pub use detection::{DetectionConfig, NatDetector};
 pub use error::{NatError, Result};
 pub use ice::{
-    candidate_report_from_observations, candidates_to_addrs, compute_priority,
-    gather_candidate_report, gather_candidates, gather_local_addresses, gather_local_networks,
-    parse_nat_hint, CandidateGatherReport, FilteringBehavior, HairpinBehavior, IceConfig,
-    LocalNetwork, MappingBehavior, MappingLifetime, NatAllocation, NatFingerprintHint, NatProfile,
-    StunObservation,
+    candidate_report_from_observations, candidate_report_from_unordered_observations,
+    candidates_to_addrs, compute_priority, gather_candidate_report, gather_candidates,
+    gather_local_addresses, gather_local_networks, parse_nat_hint, CandidateGatherReport,
+    FilteringBehavior, HairpinBehavior, IceConfig, LocalNetwork, MappingBehavior, MappingLifetime,
+    NatAllocation, NatFingerprintHint, NatProfile, StunObservation,
+};
+pub use mapping::allocation::{
+    infer_port_domain, infer_scoped_allocation, plan_fixed_anchor, validate_allocation_attempts,
+    AllocationAttempt, AllocationAttemptOutcome, AllocationEvidenceRejection, AllocationIdentity,
+    AllocationSample, AllocationScope, FixedAnchorPlan, PortDomainEvidence,
+    ScopedAllocationEvidence, MAX_ALLOCATION_SAMPLES,
 };
 pub use mapping::{
     build_model, build_model_for_batch, infer_allocation_model, model_is_fresh, modular_add,

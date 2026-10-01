@@ -24,12 +24,13 @@ impl PeerManager {
             .accepted()
     }
 
-    pub(crate) async fn finish_direct_validation_attempt(
+    pub(crate) async fn finish_direct_validation_attempt_in_epoch(
         &self,
+        _epoch: &tokio::sync::MutexGuard<'_, ()>,
         node_id: &str,
         validation: DirectValidationIdentity,
     ) -> bool {
-        let (_epoch_guard, mut conns) = self.lock_epoch_and_connections_write().await;
+        let mut conns = self.connections.write().await;
         let Some(conn) = conns.get_mut(node_id) else {
             return false;
         };

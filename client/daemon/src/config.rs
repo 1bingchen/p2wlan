@@ -8,13 +8,20 @@
 //! - Port mappings
 
 use serde::{de::Deserializer, Deserialize, Serialize};
+#[cfg(not(unix))]
 use std::io::Write;
 use std::path::Path;
 
 use crate::error::{DaemonError, Result};
 
 include!("config/types.rs");
+#[cfg(unix)]
+#[path = "config/private_file.rs"]
+mod private_file;
 include!("config/persistence.rs");
 include!("config/hostname.rs");
 #[cfg(test)]
 include!("config/tests.rs");
+#[cfg(all(test, unix))]
+#[path = "config/persistence_tests.rs"]
+mod persistence_tests;

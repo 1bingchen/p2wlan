@@ -328,11 +328,11 @@ fn candidate_offer_work_is_newest_wins_owner_scoped_and_capacity_bounded() {
     };
     assert!(matches!(
         state.enqueue_candidate_offer_work(offer("peer-candidate-owner", 2)),
-        CandidateOfferWorkAdmission::Coalesced,
+        CandidateOfferWorkAdmission::Coalesced { .. },
     ));
     assert!(matches!(
         state.enqueue_candidate_offer_work(offer("peer-candidate-owner", 3)),
-        CandidateOfferWorkAdmission::Coalesced,
+        CandidateOfferWorkAdmission::Coalesced { .. },
     ));
     assert_eq!(first.candidate_generation, 1);
     let newest = state
@@ -442,6 +442,8 @@ async fn deferred_unknown_peer_offer_replays_candidate_admission_after_peer_join
         daemon
             .peers
             .add_peer(&control::PeerInfo {
+                capabilities: crate::control::PeerCapabilities::default(),
+                registration_seq: 0,
                 node_id: peer_id.to_string(),
                 device_name: String::new(),
                 app_version: String::new(),

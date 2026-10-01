@@ -56,17 +56,51 @@ pub(crate) struct HardHardFreshSocketIdentity {
     pub(crate) socket_local_endpoint: SocketAddr,
 }
 
-/// Lock-free snapshot of the pair selected by the latest authoritative Direct
+/// Synchronous snapshot of the pair selected by the latest authoritative Direct
 /// commit.  The snapshot is published while the network-epoch gate and the
 /// connection writer are held, then consumed by the Hard↔Hard confirmation
 /// wait without reacquiring the connection map.  The Direct-set mirror still
-/// supplies the active/inactive bit; this value only proves the exact local
-/// endpoint and remote candidate epoch of the commit.
+/// remains available to legacy consumers; this projection carries the exact
+/// tuple, full epoch and active reducer revision for scoped packet admission.
+/// The revision is absent until the reducer has published its mirrors. The time is
+/// observation-only and lets a terminal Hard↔Hard report preserve the actual
+/// encrypted-validation milestone instead of its later write time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct DirectCommitPairSnapshot {
     pub(crate) generation: u64,
+    pub(crate) peer_session_generation: PeerSessionGeneration,
     pub(crate) remote_candidate_epoch: u64,
     pub(crate) local_endpoint: Option<SocketAddr>,
+    pub(crate) remote_endpoint: SocketAddr,
+    pub(crate) path_revision: Option<u64>,
+    pub(crate) confirmed_at_ms: Option<u64>,
+}
+
+/// Observation-only facts captured while the local side measures and
+/// advertises a Hard↔Hard candidate window.  These values travel with the
+/// authoritative short-lived session record so the terminal report can be
+/// assembled without maintaining a second independently evolving state map.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct HardHardMeasurementObservation {
+    /// Shared only by this token's record, worker and cleanup snapshots.
+    pub(crate) evidence: HardHardAttemptEvidence,
+    pub(crate) measurement_started_at_ms: Option<u64>,
+    pub(crate) last_measurement_send_at_ms: Option<u64>,
+    pub(crate) measurement_completed_at_ms: Option<u64>,
+    pub(crate) candidate_signal_accepted_at_ms: Option<u64>,
+    pub(crate) planned_send_at_ms: Option<u64>,
+    pub(crate) requested_candidate_count: usize,
+    pub(crate) generated_candidate_count: usize,
+    pub(crate) deduplicated_candidate_count: usize,
+    pub(crate) advertised_candidate_count: usize,
+    pub(crate) candidate_cap: usize,
+    pub(crate) truncation_reason: String,
+    pub(crate) stun_datagrams_sent: u32,
+    pub(crate) stun_bytes_sent: u64,
+    pub(crate) stun_send_errors: u32,
+    pub(crate) stun_send_error_bytes: u64,
+    pub(crate) stun_responses: u32,
+    pub(crate) candidate_signal_payload_logic_bytes: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -80,6 +114,10 @@ pub(crate) struct HardHardSessionRecord {
     pub(crate) session_token: String,
     pub(crate) peer_id: String,
     pub(crate) initiator: bool,
+    /// Enabled only after both peers explicitly negotiate hh2. All pair
+    /// transitions belong to this session ledger, never to UDP affinity.
+    pub(crate) pair_nomination: Option<HardHardPairNomination>,
+    pub(crate) coordinated_plan: Option<HardHardCoordinatedPlan>,
     /// The network generation observed at the other endpoint.  The initiator
     /// learns it from the responder envelope; zero means it was not known in
     /// the first directional offer.
@@ -110,6 +148,7 @@ pub(crate) struct HardHardSessionRecord {
     pub(crate) expires_at_ms: u64,
     pub(crate) state: HardHardSessionState,
     pub(crate) attempt_count: u8,
+    pub(crate) measurement: HardHardMeasurementObservation,
     pub(crate) created_at: Instant,
     pub(crate) cancellation: Arc<crate::PunchSessionCancellation>,
 }
@@ -263,6 +302,7 @@ const MAX_REMOTE_IDENTITY_TOMBSTONES: usize = 4_096;
 #[derive(Debug, Clone)]
 struct RemoteIdentityTombstone {
     public_key: String,
+    registration_seq: u64,
     candidate_incarnation_high_water: Option<u64>,
     /// Highest encoded candidate revision that must be rejected for this exact
     /// public-key identity. Usually this is the last accepted generation. While
@@ -281,6 +321,12 @@ struct RemoteIdentityLedger {
 }
 
 impl RemoteIdentityLedger {
+    fn record_registration_seq(&mut self, node_id: &str, public_key: &str, seq: u64) {
+        self.upsert_and_touch(node_id, public_key, None, 0);
+        if let Some(identity) = self.entries.get_mut(node_id) {
+            identity.registration_seq = identity.registration_seq.max(seq);
+        }
+    }
     fn get(&self, node_id: &str) -> Option<&RemoteIdentityTombstone> {
         self.entries.get(node_id)
     }
@@ -328,10 +374,16 @@ impl RemoteIdentityLedger {
                     )
                 },
             );
+        let registration_seq = self
+            .entries
+            .get(node_id)
+            .filter(|identity| identity.public_key == public_key)
+            .map_or(0, |identity| identity.registration_seq);
         self.entries.insert(
             node_id.to_string(),
             RemoteIdentityTombstone {
                 public_key: public_key.to_string(),
+                registration_seq,
                 candidate_incarnation_high_water,
                 candidate_generation_replay_floor,
             },
@@ -414,6 +466,11 @@ type RelayProbeSnapshotTestGateSlot =
 
 /// Manages all peer connections.
 pub struct PeerManager {
+    /// Control-plane-resolved local node ID used by deterministic traversal
+    /// role selection. Managed registration can replace the persisted short
+    /// ID with a fully qualified node ID; comparing mixed formats would make
+    /// both endpoints believe they are the Hard↔Hard initiator.
+    local_node_id_for_traversal: std::sync::RwLock<String>,
     /// Active peer connections, indexed by node ID.
     connections: Arc<RwLock<HashMap<String, PeerConnection>>>,
     /// No-await mirror of connection-map membership and peer lifecycle.
@@ -452,6 +509,10 @@ pub struct PeerManager {
     committed_business_paths: Arc<std::sync::Mutex<HashMap<String, CommittedBusinessPathSnapshot>>>,
     /// Latest-value notification for committed path/lifecycle/epoch changes.
     committed_business_path_change_tx: tokio::sync::watch::Sender<u64>,
+    /// Latest-value wakeup for the single supervised DirectFirst deadline
+    /// owner.  The deadline itself remains in `PathStateMachine`; this stream
+    /// only asks the owner to recompute the earliest pending deadline.
+    direct_first_deadline_change_tx: tokio::sync::watch::Sender<u64>,
     /// Session-bound DPLPMTUD capability mirror.  The immutable map survives
     /// a UDP transport replacement, so a modern peer cannot temporarily fall
     /// back to legacy business sending while the replacement exact path is
@@ -541,6 +602,8 @@ pub struct PeerManager {
     /// measured.  Entries are short-lived and bounded; they are not a path
     /// selector or a Direct authority.
     hard_hard_sessions: Arc<tokio::sync::Mutex<HashMap<(String, String), HardHardSessionRecord>>>,
+    /// Bounded, expiring strategy-order advice; never a path or session owner.
+    hard_hard_strategy_learning: Arc<std::sync::Mutex<HardHardStrategyLearning>>,
     /// Exact cleanup ownership claims. A duplicate registration must not
     /// start a second watcher that could later race a replacement session.
     hard_hard_cleanup_owners: Arc<tokio::sync::Mutex<HashSet<(String, String, String)>>>,
@@ -706,6 +769,8 @@ pub struct PeerManager {
     outbound_loss_default: Arc<tokio::sync::Mutex<OutboundLossCounters>>,
     /// Configuration.
     config: Config,
+    /// Authoritative active-path telemetry hub.
+    pub(crate) telemetry_hub: Arc<path_telemetry::PathTelemetryHub>,
 }
 
 /// Aggregate counter of lost outbound business packets for one reason code.
@@ -750,6 +815,7 @@ pub struct OutboundLossEvent {
 /// Metadata changes observed while applying one control-plane peer snapshot.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PeerUpdate {
+    pub registration_changed: bool,
     pub is_new: bool,
     pub virtual_ip_changed: bool,
     pub endpoint_changed: bool,

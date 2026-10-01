@@ -201,6 +201,8 @@ impl Daemon {
         // spend time on a peer/UDP handover and must not be the only writer of
         // the control-plane heartbeat timestamp.
         let health = tasks::HealthState::new();
+        let punch_attempts = PunchAttemptDeduplicator::default();
+        let peers = Arc::new(PeerManager::new(config.clone()));
         let (control, control_rx) = ControlClient::new_with_health(
             &config,
             control_enabled,
@@ -208,6 +210,7 @@ impl Daemon {
             Some(relay_selection.clone()),
             timeline.clone(),
             Some(health.clone()),
+            Some(peers.telemetry_hub()),
         );
         let (transport, outbound_rx) = WireGuardTransport::new();
         let acl_engine = AclEngine::from_config(&config.acl);
@@ -231,8 +234,6 @@ impl Daemon {
         // stale/404 quarantined peer's in-flight recovery session is
         // cancelled authoritatively (the daemon's own `punch_attempts` is
         // the same deduplicator the daemon hands to the punch tasks).
-        let punch_attempts = PunchAttemptDeduplicator::default();
-        let peers = Arc::new(PeerManager::new(config.clone()));
         let pending_handshakes = Arc::new(PendingHandshakeStore::default());
         peers.set_timeline(timeline.clone());
         transport.set_outbound_loss_context(&peers, timeline.clone());
@@ -254,7 +255,9 @@ impl Daemon {
         {
             let pending_handshakes = pending_handshakes.clone();
             let timeline = timeline.clone();
+            let timing_control = control.clone();
             peers.set_network_generation_handshake_cancel_hook(Arc::new(move |generation| {
+                timing_control.invalidate_network_timing();
                 let (cancelled_reservations, cancelled_pending, stale_probe_bindings) =
                     pending_handshakes
                     .lock()
@@ -415,8 +418,8 @@ impl Daemon {
                         }
                         hint = recv_android_network_change(network_change_rx.clone()) => hint,
                     };
-                    if hint.is_some() {
-                        control.network_changed();
+                    if let Some(hint) = hint {
+                        control.network_changed(hint);
                     } else {
                         break;
                     }
@@ -441,12 +444,5 @@ impl Daemon {
 async fn recv_android_network_change(
     network_change_rx: AndroidNetworkChangeReceiver,
 ) -> Option<AndroidNetworkChangeHint> {
-    let mut receiver = network_change_rx.lock().await;
-    loop {
-        match receiver.recv().await {
-            Ok(hint) => return Some(hint),
-            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-            Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
-        }
-    }
+    crate::android_network_change::recv_latest(&network_change_rx).await
 }

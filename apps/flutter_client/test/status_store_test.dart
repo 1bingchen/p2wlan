@@ -4,6 +4,7 @@ import 'dart:io';
 
 import 'package:flutter/widgets.dart' show AppLifecycleState;
 import 'package:flutter_test/flutter_test.dart';
+import 'package:p2wlan_flutter_client/app/app_strings.dart';
 import 'package:p2wlan_flutter_client/core/api/diagnostics_api.dart';
 import 'package:p2wlan_flutter_client/core/daemon/daemon_controller.dart';
 import 'package:p2wlan_flutter_client/core/models/diagnostics_models.dart';
@@ -12,6 +13,57 @@ import 'package:p2wlan_flutter_client/core/state/settings_store.dart';
 import 'package:p2wlan_flutter_client/core/state/status_store.dart';
 
 void main() {
+  test(
+    'local 401 preserves account and recovers on the next status refresh',
+    () async {
+      final api = _SwitchingDiagnosticsApi(snapshot: await _loadFixture());
+      final stores = await _makeStores(
+        api,
+        authToken: 'control-session-fixture',
+      );
+      addTearDown(stores.dispose);
+      await stores.statusStore.refresh();
+      expect(stores.statusStore.online, isTrue);
+      final revision = stores.statusStore.sessionRevision;
+
+      api.statusFailure = const DiagnosticsApiException(
+        'GET /status returned HTTP 401',
+        statusCode: 401,
+      );
+      await stores.statusStore.refresh();
+      expect(stores.statusStore.healthReachable, isTrue);
+      expect(stores.statusStore.snapshot, isNull);
+      expect(
+        stores.statusStore.lastStatusError,
+        'local_diagnostics_auth_failed',
+      );
+      expect(stores.statusStore.sessionRevision, revision);
+      expect(
+        stores.settingsStore.settings.authToken,
+        'control-session-fixture',
+      );
+      expect(
+        AppStrings.fromCode('zh-CN')
+            .statusMessage(stores.statusStore.lastError),
+        contains('本地服务可以访问'),
+      );
+      expect(
+        AppStrings.fromCode('en').statusMessage(stores.statusStore.lastError),
+        contains('local service is reachable'),
+      );
+
+      api.statusFailure = null;
+      await stores.statusStore.refresh();
+      expect(stores.statusStore.online, isTrue);
+      expect(stores.statusStore.lastStatusError, isNull);
+      expect(stores.statusStore.lastError, isNull);
+      expect(
+        stores.settingsStore.settings.authToken,
+        'control-session-fixture',
+      );
+    },
+  );
+
   test('default polling cadence is 1s foreground and 10s background', () {
     expect(
       StatusStore.defaultActivePollingInterval,
@@ -841,6 +893,7 @@ class _SwitchingDiagnosticsApi implements DiagnosticsApi {
   final eventCursors = <int>[];
   var verifyRoutesCount = 0;
   var statusFetchCount = 0;
+  DiagnosticsApiException? statusFailure;
 
   @override
   Future<bool> fetchHealth(String diagnosticsUrl) async {
@@ -855,6 +908,7 @@ class _SwitchingDiagnosticsApi implements DiagnosticsApi {
   @override
   Future<DiagnosticsSnapshot> fetchStatus(String diagnosticsUrl) async {
     statusFetchCount += 1;
+    if (statusFailure case final failure?) throw failure;
     return snapshots.isEmpty ? snapshot : snapshots.removeAt(0);
   }
 

@@ -155,8 +155,12 @@ if [ "$LOCAL_PACKAGE" -ne 1 ]; then
     exit 1
   fi
   case "$VERSION" in
-    v[A-Za-z0-9._-]*) ;;
+    v?*) ;;
     *) echo "--version must look like vX.Y.Z." >&2; exit 1 ;;
+  esac
+  # Match the complete tag grammar used by the release metadata tools.
+  case "$VERSION" in
+    *[!ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-]*) echo "--version must look like vX.Y.Z." >&2; exit 1 ;;
   esac
   need_cmd uname
   need_cmd mktemp
@@ -210,4 +214,12 @@ echo "Installed p2wlan-daemon to $INSTALL_DIR/p2wlan-daemon"
 if [ -x "$INSTALL_DIR/p2wlan" ]; then
   "$INSTALL_DIR/p2wlan" --version
 fi
-echo "Run 'p2wlan help' to get started."
+cat <<'EOF'
+Next steps:
+  1. p2wlan config set control https://control.example.com
+  2. p2wlan login -u your-name
+  3. p2wlan up
+  4. p2wlan doctor
+
+Use your deployment's real trusted Control URL. Login/configuration should run as your normal user, not with sudo.
+EOF

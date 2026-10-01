@@ -628,33 +628,44 @@ mod android_bridge {
     /// this in its `main`, but Android enters through JNI and otherwise all
     /// `tracing` records would disappear, leaving the user with an empty local
     /// log when the VPN failed during startup.
-    fn init_logging(path: &Path) {
-        static LOGGING: OnceLock<
-            Mutex<Option<p2pnet_daemon::diagnostics::logging::LogWorkerGuard>>,
-        > = OnceLock::new();
+    fn init_logging(path: &Path) -> Result<(), String> {
+        use p2pnet_daemon::diagnostics::logging::{LogWorkerGuard, NonBlockingLog};
+        struct InstalledLog {
+            path: PathBuf,
+            writer: NonBlockingLog,
+            _guard: LogWorkerGuard,
+        }
+        static LOGGING: OnceLock<Mutex<Option<InstalledLog>>> = OnceLock::new();
         let mut installed = LOGGING
             .get_or_init(|| Mutex::new(None))
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if installed.is_some() {
-            return;
+        if let Some(log) = installed.as_ref() {
+            if log.path != path {
+                return Err("Android log path changed after logging initialization".into());
+            }
+            return log
+                .writer
+                .begin_runtime()
+                .map_err(|error| format!("failed to start Android log runtime: {error}"));
         }
-        let Ok((writer, guard)) = p2pnet_daemon::diagnostics::logging::bounded_file_writer(path)
-        else {
-            return;
-        };
+        let (writer, guard) = p2pnet_daemon::diagnostics::logging::bounded_file_writer(path)
+            .map_err(|error| format!("failed to initialize Android log: {error}"))?;
         let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
             .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
-        if tracing_subscriber::fmt()
+        tracing_subscriber::fmt()
             .with_env_filter(env_filter)
             .with_timer(p2pnet_daemon::diagnostics::logging::LocalTimer)
             .with_ansi(false)
-            .with_writer(writer)
+            .with_writer(writer.clone())
             .try_init()
-            .is_ok()
-        {
-            *installed = Some(guard);
-        }
+            .map_err(|error| format!("failed to install Android log subscriber: {error}"))?;
+        *installed = Some(InstalledLog {
+            path: path.to_path_buf(),
+            writer,
+            _guard: guard,
+        });
+        Ok(())
     }
 
     fn start_runtime(
@@ -717,7 +728,12 @@ mod android_bridge {
             .spawn(move || {
                 let mut fd_owned_by_thread = true;
                 let startup_result = catch_unwind(AssertUnwindSafe(|| {
-                    init_logging(&log_path);
+                    if let Err(error) = init_logging(&log_path) {
+                        // Diagnostics are best effort and must not prevent VPN
+                        // startup. The writer retries a failed runtime boundary
+                        // before admitting any new-generation records.
+                        eprintln!("P2WLAN Android logging unavailable: {error}");
+                    }
                     let runtime = Builder::new_multi_thread()
                         .enable_all()
                         .build()

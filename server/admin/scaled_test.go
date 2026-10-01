@@ -1,6 +1,7 @@
 package admin
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -11,11 +12,11 @@ import (
 
 type scaledFakeStore struct{ fakeStore }
 
-func (scaledFakeStore) AdminAccountsCursor(_ string, cursor string, limit int) (*database.AdminAccountCursorPage, error) {
+func (scaledFakeStore) AdminAccountsSnapshot(_ context.Context, _ string, cursor string, limit int) (*database.AdminAccountSnapshotPage, error) {
 	if cursor == "bad" {
 		return nil, database.ErrInvalidAdminCursor
 	}
-	return &database.AdminAccountCursorPage{
+	return &database.AdminAccountSnapshotPage{
 		Total:      2,
 		Limit:      limit,
 		SnapshotAt: 10,
@@ -24,28 +25,28 @@ func (scaledFakeStore) AdminAccountsCursor(_ string, cursor string, limit int) (
 	}, nil
 }
 
-func (scaledFakeStore) AdminDevicesCursor(_, _, cursor string, limit int) (*database.AdminDeviceCursorPage, error) {
+func (scaledFakeStore) AdminDevicesSnapshot(_ context.Context, _ database.AdminResourceFilter, _, cursor string, limit int) (*database.AdminDeviceSnapshotPage, error) {
 	if cursor == "bad" {
 		return nil, database.ErrInvalidAdminCursor
 	}
-	return &database.AdminDeviceCursorPage{Total: 1, Limit: limit, SnapshotAt: 10, Items: []database.AdminDeviceSummary{{ID: "d1", DeviceName: "desktop"}}}, nil
+	return &database.AdminDeviceSnapshotPage{Total: 1, Limit: limit, SnapshotAt: 10, Items: []database.AdminDeviceSummary{{ID: "d1", DeviceName: "desktop"}}}, nil
 }
 
-func (scaledFakeStore) AdminNetworksCursor(cursor string, limit int) (*database.AdminNetworkCursorPage, error) {
+func (scaledFakeStore) AdminNetworksSnapshot(_ context.Context, _ database.AdminResourceFilter, cursor string, limit int) (*database.AdminNetworkSnapshotPage, error) {
 	if cursor == "bad" {
 		return nil, database.ErrInvalidAdminCursor
 	}
-	return &database.AdminNetworkCursorPage{Total: 1, Limit: limit, SnapshotAt: 10, Items: []database.AdminNetworkSummary{{ID: "n1", Name: "home"}}}, nil
+	return &database.AdminNetworkSnapshotPage{Total: 1, Limit: limit, SnapshotAt: 10, Items: []database.AdminNetworkSummary{{ID: "n1", Name: "home"}}}, nil
 }
 
-func (scaledFakeStore) AdminRoomsCursor(cursor string, limit int) (*database.AdminRoomCursorPage, error) {
+func (scaledFakeStore) AdminRoomsSnapshot(_ context.Context, _ database.AdminResourceFilter, cursor string, limit int) (*database.AdminRoomSnapshotPage, error) {
 	if cursor == "bad" {
 		return nil, database.ErrInvalidAdminCursor
 	}
-	return &database.AdminRoomCursorPage{Total: 1, Limit: limit, SnapshotAt: 10, Items: []database.AdminRoomSummary{{ID: "r1", Name: "friends"}}}, nil
+	return &database.AdminRoomSnapshotPage{Total: 1, Limit: limit, SnapshotAt: 10, Items: []database.AdminRoomSummary{{ID: "r1", Name: "friends"}}}, nil
 }
 
-func (scaledFakeStore) AdminTopologyPage(accountID, view, cursor string, _ int) (*database.AdminTopologyPage, error) {
+func (scaledFakeStore) AdminTopologySnapshotPage(_ context.Context, accountID, view, cursor string, _ int) (*database.AdminTopologySnapshotPage, error) {
 	if cursor == "bad" {
 		return nil, database.ErrInvalidAdminCursor
 	}
@@ -59,7 +60,7 @@ func (scaledFakeStore) AdminTopologyPage(accountID, view, cursor string, _ int) 
 	if accountID != "" {
 		scope = "account"
 	}
-	return &database.AdminTopologyPage{
+	return &database.AdminTopologySnapshotPage{
 		GeneratedAt:              10,
 		SnapshotAt:               9,
 		Scope:                    scope,

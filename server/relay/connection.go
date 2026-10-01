@@ -8,9 +8,28 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 	"unicode/utf8"
 )
+
+// Stable close causes keep ordinary peer disconnects distinct from malformed
+// or failed relay reads. Never place the raw error (which can contain network
+// addresses or platform-specific text) in the support-facing cause label.
+func relayReadCloseCause(err error) string {
+	switch {
+	case errors.Is(err, io.EOF):
+		return "peer_closed"
+	case errors.Is(err, io.ErrUnexpectedEOF):
+		return "partial_frame"
+	case errors.Is(err, net.ErrClosed):
+		return "local_closed"
+	case errors.Is(err, syscall.ECONNRESET):
+		return "connection_reset"
+	default:
+		return "read_error"
+	}
+}
 
 // writeFull is the relay's frame boundary: a successful forwarding decision
 // must put the complete encoded frame on the destination connection.  A
@@ -318,7 +337,9 @@ func (s *RelayServer) handlePostRegister(conn net.Conn, p *peer, nodeID, network
 		_ = conn.SetReadDeadline(time.Now().Add(s.config.IdleTimeout))
 		typ, payload, err := readFrame(conn, s.config.MaxFramePayload)
 		if err != nil {
-			atomic.AddUint64(&s.stats.frameErrorsTotal, 1)
+			if !errors.Is(err, io.EOF) && !errors.Is(err, net.ErrClosed) {
+				atomic.AddUint64(&s.stats.frameErrorsTotal, 1)
+			}
 			_ = conn.SetWriteDeadline(time.Now().Add(1 * time.Second))
 			if ne, ok := err.(net.Error); ok && ne.Timeout() {
 				setCloseCause("idle_timeout")
@@ -333,7 +354,7 @@ func (s *RelayServer) handlePostRegister(conn net.Conn, p *peer, nodeID, network
 				setCloseCause("frame_too_large")
 				_, _ = conn.Write(errorFrame(4006, "frame too large"))
 			} else {
-				setCloseCause("read_error")
+				setCloseCause(relayReadCloseCause(err))
 			}
 			return
 		}

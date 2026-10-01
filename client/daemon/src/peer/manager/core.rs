@@ -28,12 +28,14 @@ impl PeerManager {
         traversal_history: TraversalHistory,
     ) -> Self {
         let (committed_business_path_change_tx, _) = tokio::sync::watch::channel(0);
+        let (direct_first_deadline_change_tx, _) = tokio::sync::watch::channel(0);
         let (dplpmtud_capability_tx, _) = tokio::sync::watch::channel(Arc::new(HashMap::new()));
         let (direct_business_budget_change_tx, _) = tokio::sync::watch::channel(0);
         let (ip_to_node_snapshot, _) =
             tokio::sync::watch::channel(Arc::new(HashMap::<String, String>::new()));
         let (local_mtu_feedback_tx, _) = tokio::sync::broadcast::channel(256);
         Self {
+            local_node_id_for_traversal: std::sync::RwLock::new(config.node.node_id.clone()),
             connections: Arc::new(RwLock::new(HashMap::new())),
             peer_membership: Arc::new(std::sync::Mutex::new(PeerMembershipState::default())),
             #[cfg(test)]
@@ -51,6 +53,7 @@ impl PeerManager {
             diagnostics_cache: Arc::new(std::sync::Mutex::new(None)),
             committed_business_paths: Arc::new(std::sync::Mutex::new(HashMap::new())),
             committed_business_path_change_tx,
+            direct_first_deadline_change_tx,
             dplpmtud_capability_tx,
             direct_business_budget_change_tx,
             local_mtu_feedback_tx,
@@ -75,6 +78,9 @@ impl PeerManager {
             punch_generations: Arc::new(RwLock::new(HashMap::new())),
             local_fresh_mappings: Arc::new(RwLock::new(HashMap::new())),
             hard_hard_sessions: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            hard_hard_strategy_learning: Arc::new(std::sync::Mutex::new(
+                HardHardStrategyLearning::default(),
+            )),
             hard_hard_cleanup_owners: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
             hard_hard_winners: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             fresh_mapping_history: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -109,8 +115,17 @@ impl PeerManager {
             outbound_loss_default: Arc::new(tokio::sync::Mutex::new(
                 OutboundLossCounters::default(),
             )),
+            telemetry_hub: Arc::new(path_telemetry::PathTelemetryHub::new(
+                config.node.node_id.clone(),
+                config.network.network_id.clone(),
+            )),
             config,
         }
+    }
+
+    /// Return a handle to the authoritative active-path telemetry hub.
+    pub fn telemetry_hub(&self) -> Arc<path_telemetry::PathTelemetryHub> {
+        self.telemetry_hub.clone()
     }
 
     /// Remember a negotiated capability at the WireGuard peer-session scope.
@@ -209,6 +224,18 @@ impl PeerManager {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(timeline);
     }
 
+    /// Return the current process-local timeline position without emitting an
+    /// event. Hard↔Hard measurement reports use this single clock for every
+    /// local milestone; the value is diagnostic-only and never participates
+    /// in scheduling or admission.
+    pub(crate) fn timeline_uptime_ms(&self) -> Option<u64> {
+        self.timeline
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .map(|timeline| timeline.uptime_ms())
+    }
+
     /// Install or remove the relay-first topology gate after control has
     /// resolved the current relay catalog. The gate is armed for every live
     /// peer under the same network-epoch lock used by Direct/relay commits,
@@ -271,6 +298,39 @@ impl PeerManager {
         }
     }
 
+    pub(crate) fn observe_hot_path<F>(
+        &self,
+        observation: crate::connection_timeline::HotPathObservation,
+        path: Option<&str>,
+        reason_code: Option<&str>,
+        detail: F,
+    ) where
+        F: FnOnce() -> String,
+    {
+        let timeline = self
+            .timeline
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        if let Some(timeline) = timeline {
+            timeline.observe_hot_path(observation, path, reason_code, detail);
+        }
+    }
+
+    pub(crate) fn count_hot_path(
+        &self,
+        observation: crate::connection_timeline::HotPathObservation,
+    ) {
+        let timeline = self
+            .timeline
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        if let Some(timeline) = timeline {
+            timeline.count_hot_path(observation);
+        }
+    }
+
     /// Emit a correlation-aware diagnostic event at DEBUG level.  High-volume
     /// Direct lifecycle records are intentionally log-only; the peer's
     /// protected `direct_events` ring remains the structured `/status` source
@@ -313,6 +373,37 @@ impl PeerManager {
         let scope = format!("peer:{peer_id}:{generation}");
         match timeline {
             Some(timeline) => timeline.emit_first_scoped(&scope, event, path, reason_code, detail),
+            None => false,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn emit_timeline_first_with_business_attribution_identity(
+        &self,
+        peer_id: &str,
+        generation: u64,
+        event: &'static str,
+        path: Option<&str>,
+        reason_code: Option<&str>,
+        detail: Option<String>,
+        business_attribution_identity: Option<crate::peer::HardHardBusinessAttributionIdentity>,
+    ) -> bool {
+        let timeline = self
+            .timeline
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let scope = format!("peer:{peer_id}:{generation}");
+        match timeline {
+            Some(timeline) => timeline.emit_first_scoped_with_business_attribution_identity(
+                &scope,
+                event,
+                event,
+                path,
+                reason_code,
+                detail,
+                business_attribution_identity,
+            ),
             None => false,
         }
     }
@@ -579,15 +670,40 @@ impl PeerManager {
     /// profile generation carried by the same authenticated Hard↔Hard
     /// envelope. A profile that is merely young, but belongs to an older
     /// candidate context, cannot be revived by this method.
+    #[cfg(test)]
     pub(crate) async fn bind_remote_nat_profile_to_candidate_epoch(
         &self,
         node_id: &str,
         profile_generation: u64,
     ) -> bool {
+        matches!(
+            self.bind_remote_nat_profile_to_candidate_epoch_with_snapshot(
+                node_id,
+                profile_generation,
+            )
+            .await,
+            RemoteNatProfileBindResult::Bound(_)
+        )
+    }
+
+    /// Check and bind the remote profile while holding the same connection
+    /// writer used to capture its candidate epoch and profile state. This is
+    /// diagnostic data for the existing Hard↔Hard admission fence; it does
+    /// not relax that fence or retry a rejected signal.
+    pub(crate) async fn bind_remote_nat_profile_to_candidate_epoch_with_snapshot(
+        &self,
+        node_id: &str,
+        profile_generation: u64,
+    ) -> RemoteNatProfileBindResult {
         let mut connections = self.connections.write().await;
-        connections.get_mut(node_id).is_some_and(|connection| {
-            connection.bind_remote_nat_profile_to_candidate_epoch(profile_generation)
-        })
+        match connections.get_mut(node_id) {
+            Some(connection) => connection
+                .bind_remote_nat_profile_to_candidate_epoch_with_snapshot(profile_generation),
+            None => RemoteNatProfileBindResult::Rejected {
+                reason: RemoteNatProfileBindFailure::PeerMissing,
+                snapshot: RemoteNatProfileBindSnapshot::missing_peer(profile_generation),
+            },
+        }
     }
 
     /// Bound probe rounds from the observed local NAT behavior.  Endpoint-
@@ -913,6 +1029,14 @@ impl PeerManager {
         &self,
     ) -> tokio::sync::RwLockWriteGuard<'_, HashMap<String, PeerConnection>> {
         self.connections.write().await
+    }
+
+    /// Pause target snapshot preparation before its connection writer is queued.
+    #[cfg(test)]
+    pub(crate) async fn hold_local_interface_networks_writer_for_test(
+        &self,
+    ) -> tokio::sync::RwLockWriteGuard<'_, Vec<LocalNetwork>> {
+        self.local_interface_networks.write().await
     }
 
     #[cfg(test)]

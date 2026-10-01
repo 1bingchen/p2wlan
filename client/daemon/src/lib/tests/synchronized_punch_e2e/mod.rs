@@ -397,6 +397,8 @@ fn peer_info(
     nat_type: String,
 ) -> control::PeerInfo {
     control::PeerInfo {
+        capabilities: crate::control::PeerCapabilities::default(),
+        registration_seq: 0,
         node_id: node_id.to_string(),
         device_name: "phase-2-2-test".to_string(),
         app_version: "0.2.0-test".to_string(),
@@ -702,9 +704,14 @@ impl NatPacketLink {
         // harness must therefore fall back to a deterministic usable dynamic
         // socket instead of dropping the packet merely because affinity is
         // not committed yet.
-        let has_dynamic_socket = target_udp.has_dynamic_socket_for_peer(target_peer).await;
-        if has_dynamic_socket {
-            if let Some((_, socket)) = target_udp.socket_for_peer(Some(target_peer)).await {
+        // This is an inbound NAT delivery, not admission for ordinary sends.
+        // Reserved rendezvous sockets reject the latter until authentication,
+        // but must still receive the very first authenticated punch/ACK.
+        if let Some(index) = target_udp.dynamic_socket_index_for_peer(target_peer).await {
+            if let Some(socket) = target_udp
+                .socket_for_inbound_peer_index(target_peer, index)
+                .await
+            {
                 if let Ok(target) = socket.local_addr() {
                     return source_socket
                         .send_to(data, target)
@@ -1273,6 +1280,7 @@ async fn install_test_daemon_udp(
     node_id: &str,
     virtual_ip: &str,
     wireguard: &WireGuardTransport,
+    ingress_gate: Option<Arc<crate::udp::TestUdpIngressGate>>,
 ) -> (
     UdpTransport,
     DirectValidationIngress,
@@ -1287,13 +1295,16 @@ async fn install_test_daemon_udp(
     let validation_ingress = DirectValidationIngress::new();
     let peer_reflexive_ingress = PeerReflexiveIngress::new();
     let validation_enabled = Arc::new(AtomicBool::new(true));
-    let udp_base = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers.clone())
+    let mut udp_base = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers.clone())
         .await
         .unwrap()
         .with_local_node_id(node_id)
         .with_wireguard_transport(wireguard.clone())
         .with_inbound_channel(udp_inbound_tx.clone())
         .with_peer_reflexive_observer(peer_reflexive_ingress.clone());
+    if let Some(gate) = ingress_gate {
+        udp_base = udp_base.with_test_ingress_gate(gate);
+    }
     let validation_trigger = validation_ingress.clone();
     let validation_enabled_for_trigger = validation_enabled.clone();
     let udp = udp_base.with_validation_trigger(Arc::new(move |observation| {
@@ -1447,6 +1458,17 @@ async fn build_two_peer_harness_with_stun_mode(
     let (ports, a_public_socket, b_public_socket, stun_observers, candidate_guards) =
         HarnessPorts::allocate_with_mode(stun, nat_mode).await;
     let birthday_enabled = nat_mode == HarnessNatMode::HighEntropy;
+    // The birthday permutation spans the UDP port ring and can otherwise hit
+    // another real loopback socket behind the fake NAT. Every high-entropy
+    // fixture, positive and negative, must receive only via its own NAT link
+    // and STUN observers. Unconfigured gates reject everything until setup
+    // binds the exact source endpoints below, before any offer starts work.
+    let ingress_gates = birthday_enabled.then(|| {
+        [
+            Arc::new(crate::udp::TestUdpIngressGate::default()),
+            Arc::new(crate::udp::TestUdpIngressGate::default()),
+        ]
+    });
     let a_identity = NodeIdentity::generate();
     let b_identity = NodeIdentity::generate();
     let root = std::env::temp_dir().join(format!(
@@ -1623,7 +1645,14 @@ async fn build_two_peer_harness_with_stun_mode(
         mut tasks_a,
         validation_task_a,
         peer_reflexive_task_a,
-    ) = install_test_daemon_udp(&mut daemon_a, HARD_HARD_A, "10.20.0.1", &wg_a).await;
+    ) = install_test_daemon_udp(
+        &mut daemon_a,
+        HARD_HARD_A,
+        "10.20.0.1",
+        &wg_a,
+        ingress_gates.as_ref().map(|gates| gates[0].clone()),
+    )
+    .await;
     let (
         udp_b,
         _validation_b,
@@ -1632,7 +1661,14 @@ async fn build_two_peer_harness_with_stun_mode(
         mut tasks_b,
         validation_task_b,
         peer_reflexive_task_b,
-    ) = install_test_daemon_udp(&mut daemon_b, HARD_HARD_B, "10.20.0.2", &wg_b).await;
+    ) = install_test_daemon_udp(
+        &mut daemon_b,
+        HARD_HARD_B,
+        "10.20.0.2",
+        &wg_b,
+        ingress_gates.as_ref().map(|gates| gates[1].clone()),
+    )
+    .await;
     let primary_a = race_primary.then(|| udp_a.local_addr().unwrap());
     let actual_public = mapping_miss.then(|| {
         (
@@ -1653,6 +1689,20 @@ async fn build_two_peer_harness_with_stun_mode(
         nat_mode == HarnessNatMode::HighEntropy,
     )
     .await;
+    if let Some(gates) = ingress_gates {
+        gates[0].allow_sources_once(
+            ports
+                .a_observers
+                .into_iter()
+                .chain([link._b_source.local_addr().unwrap()]),
+        );
+        gates[1].allow_sources_once(
+            ports
+                .b_observers
+                .into_iter()
+                .chain([link._a_source.local_addr().unwrap()]),
+        );
+    }
 
     let control_a = daemon_a.control.clone();
     let control_b = daemon_b.control.clone();
@@ -1892,38 +1942,77 @@ async fn wait_for_both_direct_compact(harness: &TwoPeerHarness) {
     }
 }
 
-async fn wait_for_current_direct_diagnostics(
-    peers: &PeerManager,
-    peer_id: &str,
-) -> peer::PeerDiagnostics {
-    timeout(Duration::from_secs(1), async {
-        loop {
-            // `diagnostics()` is deliberately nonblocking and may return its
-            // previous cached snapshot while a state commit owns the
-            // connections writer. Assertions about a just-observed Direct
-            // commit must use the current try-read snapshot instead of
-            // turning that intentional cache fallback into an Idle-vs-Direct
-            // failure under the standard parallel workspace load.
-            if let Some((_, diagnostics)) = peers
-                .diagnostic_with_path_selection(peer_id, true, false, Duration::ZERO, None)
-                .await
-            {
-                if diagnostics.state == ConnectionState::Direct {
-                    return diagnostics;
-                }
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("current Direct diagnostics must become readable after the commit")
-}
-
 struct CurrentFreshDirect {
     diagnostics: peer::PeerDiagnostics,
     socket_index: usize,
     socket_local_endpoint: SocketAddr,
     predicted_ports: Vec<u16>,
+}
+
+async fn wait_for_current_birthday_direct(
+    peers: &PeerManager,
+    udp: &UdpTransport,
+    peer_id: &str,
+) -> (peer::PeerDiagnostics, usize) {
+    let current = timeout(Duration::from_secs(1), async {
+        loop {
+            let diagnostics = peers
+                .diagnostic_with_path_selection(peer_id, true, false, Duration::ZERO, None)
+                .await
+                .map(|(_, diagnostics)| diagnostics);
+            let affinity = udp.affinity_pin_for_test(peer_id).await;
+            let selected = udp
+                .socket_for_peer(Some(peer_id))
+                .await
+                .and_then(|(index, socket)| {
+                    socket
+                        .local_addr()
+                        .ok()
+                        .map(|local_endpoint| (index, local_endpoint))
+                });
+            if let (Some(diagnostics), Some(affinity), Some((index, local_endpoint))) =
+                (diagnostics, affinity, selected)
+            {
+                // HighEntropy owns a birthday socket set, not a predictable
+                // LocalFreshMapping. Read the committed pair and actual UDP
+                // owner instead of requiring a prediction-cache entry.
+                let exact_pair = diagnostics
+                    .current_direct_pair
+                    .as_ref()
+                    .is_some_and(|pair| {
+                        pair.selected
+                            && pair.nominated
+                            && pair.source == peer::CandidatePairSource::PeerReflexive
+                            && pair.local_endpoint.as_deref()
+                                == Some(local_endpoint.to_string()).as_deref()
+                    });
+                if diagnostics.state == ConnectionState::Direct
+                    && diagnostics.active_path == Some(NetworkPath::Direct)
+                    && affinity.socket_index == index
+                    && exact_pair
+                    && udp.dynamic_socket_phase_for_test(index).await
+                        == Some(crate::udp::DynamicSocketPhase::Finalized)
+                    && udp.authenticated_evidence_for_socket(index).await > 0
+                {
+                    return (diagnostics, index);
+                }
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    if let Ok(current) = current {
+        return current;
+    }
+    let diagnostics = peers.get_connection(peer_id).await;
+    let affinity = udp.affinity_pin_for_test(peer_id).await;
+    let selected = udp
+        .socket_for_peer(Some(peer_id))
+        .await
+        .map(|(index, socket)| (index, socket.local_addr()));
+    panic!(
+        "birthday Direct socket state did not converge: peer={peer_id} diagnostics={diagnostics:#?} affinity={affinity:#?} selected={selected:#?}"
+    );
 }
 
 async fn wait_for_current_fresh_direct(
@@ -2061,11 +2150,42 @@ async fn wait_for_remote_candidates(
     }
 }
 
-async fn wait_for_both_sweep_failures(harness: &TwoPeerHarness) {
-    let (_a, _b) = tokio::join!(
-        wait_for_stage(&harness.peers_a, HARD_HARD_B, "hard_hard_sweep_failed"),
-        wait_for_stage(&harness.peers_b, HARD_HARD_A, "hard_hard_sweep_failed"),
+async fn wait_for_hard_hard_attempt_report(
+    peers: &PeerManager,
+    peer_id: &str,
+) -> peer::HardHardAttemptReport {
+    let event = wait_for_stage(peers, peer_id, "hard_hard_attempt_report").await;
+    let report = event
+        .hard_hard_attempt
+        .expect("the formal terminal event must retain its typed attempt");
+    assert_eq!(
+        report.attempt, 1,
+        "a pre-sweep report is not sweep evidence"
     );
+    assert!(
+        report.socket_index.is_some(),
+        "sweep must own an exact socket"
+    );
+    report
+}
+
+async fn wait_for_both_sweep_failures(
+    harness: &TwoPeerHarness,
+) -> [peer::HardHardAttemptReport; 2] {
+    let (a, b) = tokio::join!(
+        wait_for_hard_hard_attempt_report(&harness.peers_a, HARD_HARD_B),
+        wait_for_hard_hard_attempt_report(&harness.peers_b, HARD_HARD_A),
+    );
+    for report in [&a, &b] {
+        assert!(!report.direct_confirmed, "{report:?}");
+        assert_eq!(
+            report.terminal_reason, "no_authenticated_direct_confirmation",
+            "only an executed missed rendezvous may satisfy this gate"
+        );
+        assert!(report.counts.logical_probes_attempted > 0, "{report:?}");
+        assert!(report.counts.send_success_datagrams > 0, "{report:?}");
+    }
+    [a, b]
 }
 
 async fn summarize_hard_hard_diagnostics(
@@ -2352,25 +2472,40 @@ async fn wait_for_failed_attempt_cleanup(harness: &TwoPeerHarness) {
 }
 
 async fn assert_relay_remains_available(harness: &TwoPeerHarness) {
-    assert_eq!(
-        harness
-            .peers_a
-            .select_path_for_data(HARD_HARD_B, true, true)
-            .await
-            .path,
-        Some(NetworkPath::Relay)
-    );
-    assert_eq!(
-        harness
-            .peers_b
-            .select_path_for_data(HARD_HARD_A, true, true)
-            .await
-            .path,
-        Some(NetworkPath::Relay)
-    );
+    // A failed speculative session is not the DirectFirst connection
+    // deadline. Keep the default policy: Relay can already be confirmed
+    // while neither side is yet allowed to send business through it.
+    // Require eventual fallback on BOTH sides without ever permitting a
+    // stale/unauthenticated Direct path to satisfy this assertion.
+    timeout(Duration::from_secs(8), async {
+        loop {
+            let a = harness
+                .peers_a
+                .select_path_for_data(HARD_HARD_B, true, true)
+                .await;
+            let b = harness
+                .peers_b
+                .select_path_for_data(HARD_HARD_A, true, true)
+                .await;
+            assert_ne!(a.path, Some(NetworkPath::Direct));
+            assert_ne!(b.path, Some(NetworkPath::Direct));
+            if a.path == Some(NetworkPath::Relay) && b.path == Some(NetworkPath::Relay) {
+                return;
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("both peers must admit confirmed Relay after the bounded DirectFirst window");
 }
 
 async fn build_hard_hard_ordinary_fallback_fixture(
+) -> (Daemon, Arc<PeerManager>, UdpTransport, ControlClient) {
+    build_hard_hard_ordinary_fallback_fixture_with_experiment(false).await
+}
+
+async fn build_hard_hard_ordinary_fallback_fixture_with_experiment(
+    hard_hard_experiment_only: bool,
 ) -> (Daemon, Arc<PeerManager>, UdpTransport, ControlClient) {
     let mut config =
         Config::generate_default("http://hard-hard-fallback.test", "phase-2-2-fallback").unwrap();
@@ -2379,6 +2514,7 @@ async fn build_hard_hard_ordinary_fallback_fixture(
     config.network.udp_bind = "127.0.0.1:0".to_string();
     config.network.fresh_mapping_punch_enabled = true;
     config.network.fresh_mapping_harness_loopback = true;
+    config.network.hard_hard_experiment_only = hard_hard_experiment_only;
     config.network.birthday_probing_enabled = false;
     config.relay.servers = vec!["relay.invalid:443".to_string()];
     let daemon = Daemon::new(config);

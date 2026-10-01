@@ -14,6 +14,8 @@ mod daemon_e2e;
 
 include!("tests/part04.rs");
 include!("tests/part05.rs");
+#[path = "tests/direct_validation_mapping.rs"]
+mod direct_validation_mapping;
 include!("tests/part06.rs");
 #[path = "tests/synchronized_punch_e2e/mod.rs"]
 mod synchronized_punch_e2e;

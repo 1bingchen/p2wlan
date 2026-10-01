@@ -190,7 +190,7 @@ fn log_candidate_pair_state_changed(
             pair.remote_endpoint,
             reason
         ),
-        CandidatePairState::Degraded => info!(
+        CandidatePairState::Degraded if old_state == CandidatePairState::Selected => info!(
             event = "candidate_pair_degraded",
             peer_id = %peer_id,
             local_endpoint = %format_log_endpoint(pair.local_endpoint),
@@ -203,6 +203,10 @@ fn log_candidate_pair_state_changed(
             pair.remote_endpoint,
             reason
         ),
+        // A withdrawn backup is useful in DEBUG diagnostics, but it did not
+        // degrade the selected business path and should not displace Direct
+        // milestones from the ordinary rotating INFO log.
+        CandidatePairState::Degraded => {}
         CandidatePairState::Failed => debug!(
             event = "candidate_pair_failed",
             peer_id = %peer_id,

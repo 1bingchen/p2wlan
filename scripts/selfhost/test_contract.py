@@ -32,6 +32,8 @@ class SelfhostContracts(unittest.TestCase):
         manager=(ROOT/'scripts/p2wlan-server').read_text()
         self.assertIn('WorkingDirectory=${DATA_DIR}', manager)
         self.assertIn('LOG_UPLOAD_DIR=$DATA_DIR/log-uploads', manager)
+        staging=(ROOT/'deploy/staging/control.env.example').read_text()
+        self.assertIn('LOG_UPLOAD_DIR=/var/lib/p2wlan/log-uploads', staging)
 
     def test_staging_deploys_only_the_exact_built_source(self):
         workflow=(ROOT/'.github/workflows/build-server.yml').read_text()

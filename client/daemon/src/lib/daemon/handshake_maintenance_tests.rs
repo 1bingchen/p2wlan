@@ -54,6 +54,8 @@ mod maintenance_integration_tests {
         config.node.public_key = hex::encode(local_public);
         let mut daemon = Daemon::new(config);
         let peer = control::PeerInfo {
+            capabilities: crate::control::PeerCapabilities::default(),
+            registration_seq: 0,
             node_id: "maintenance-remote".to_string(),
             device_name: String::new(),
             app_version: String::new(),
@@ -233,6 +235,8 @@ mod maintenance_integration_tests {
         let config = Config::generate_default("http://127.0.0.1:1", "net1").unwrap();
         let daemon = Daemon::new(config);
         let peer = control::PeerInfo {
+            capabilities: crate::control::PeerCapabilities::default(),
+            registration_seq: 0,
             node_id: "binding-peer".to_string(),
             device_name: String::new(),
             app_version: String::new(),

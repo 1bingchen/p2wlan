@@ -23,6 +23,7 @@ async fn spawn_hole_punch_task(
         fresh_prediction,
         frozen_targets,
         None,
+        None,
     )
     .await;
 }
@@ -74,16 +75,32 @@ async fn spawn_hole_punch_task_with_lifecycle(
     fresh_prediction: Option<FreshPredictionId>,
     frozen_targets: Option<Vec<SocketAddr>>,
     invocation_shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>,
+    publication_fence: Option<Arc<crate::control::CandidatePublicationFence>>,
 ) {
     if punch_invocation_is_cancelled(invocation_shutdown_rx.as_ref()) {
         return;
     }
+    let hard_hard_experiment_only = peers.hard_hard_experiment_only();
     // Bind every delayed result from this invocation to the exact online
     // lifecycle that admitted it.  Peer IDs are reusable after PeerLeft, so a
     // worker which merely re-reads `online=true` at completion can otherwise
     // publish an old send error into a same-node replacement (ABA).
-    let Some(peer_session_generation) = peers.peer_session_generation_sync(&peer_id) else {
-        return;
+    let (network_generation, peer_session_generation) = match publication_fence.as_ref() {
+        Some(fence) => {
+            // The control worker's oneshot can be delivered after a handover.
+            // Carry the offer's identity through admission instead of adopting
+            // the replacement network/session when this receiver is polled.
+            if !fence.is_current().await {
+                return;
+            }
+            fence.lifecycle()
+        }
+        None => {
+            let Some(session) = peers.peer_session_generation_sync(&peer_id) else {
+                return;
+            };
+            (peers.current_network_generation_sync(), session)
+        }
     };
     // A peer that is already Direct must not schedule a synchronized punch
     // session at all: the fresh-mapping measurement, the candidate sweep and
@@ -104,7 +121,10 @@ async fn spawn_hole_punch_task_with_lifecycle(
         debug!("Skipping UDP punch for {peer_id}; Direct path is already confirmed");
         return;
     }
-    if punch_invocation_is_cancelled(invocation_shutdown_rx.as_ref()) {
+    if punch_invocation_is_cancelled(invocation_shutdown_rx.as_ref())
+        || peers.current_network_generation_sync() != network_generation
+        || !peers.peer_session_is_current_sync(&peer_id, peer_session_generation)
+    {
         return;
     }
     // Hard↔Hard is a planner-gated replacement for the ordinary first punch
@@ -112,10 +132,8 @@ async fn spawn_hole_punch_task_with_lifecycle(
     // fresh socket and publishes the first prediction; the responder is
     // entered exclusively by the matching `hh1` fresh signal.  Other NAT
     // strategies continue through the existing scheduler below.
-    if fresh_prediction.is_none()
-        && frozen_targets.is_none()
-        && peers.local_node_id_for_traversal() < peer_id.as_str()
-    {
+    let local_is_hard_hard_initiator = peers.local_node_id_for_traversal() < peer_id;
+    if fresh_prediction.is_none() && frozen_targets.is_none() && local_is_hard_hard_initiator {
         if let Some(plan) = peers.hard_hard_plan_for_peer(&peer_id).await {
             if let Some(signal) = signal.clone() {
                 peers
@@ -141,6 +159,7 @@ async fn spawn_hole_punch_task_with_lifecycle(
                     peer_id.clone(),
                     signal,
                     invocation_shutdown_rx.clone(),
+                    Some((network_generation, peer_session_generation)),
                 )
                 .await;
                 if hard_hard_start.is_handled() {
@@ -154,20 +173,74 @@ async fn spawn_hole_punch_task_with_lifecycle(
                         None,
                         None,
                         format!(
-                            "Hard↔Hard did not acquire a traversal owner; continuing with ordinary synchronized punching reason={}",
+                            "Hard↔Hard did not acquire a traversal owner; {} reason={}",
+                            if hard_hard_experiment_only {
+                                "ordinary fallback suppressed by the explicit experiment lane"
+                            } else {
+                                "continuing with ordinary synchronized punching"
+                            },
                             hard_hard_start
                                 .fallback_reason()
                                 .unwrap_or("unknown_not_started")
                         ),
                     )
                     .await;
+            } else {
+                hard_hard_a0_stage_log(
+                    &peers,
+                    "initiator",
+                    None,
+                    HardHardA0Stage::OwnerAdmission,
+                    HardHardA0Reason::SignalContextUnavailable,
+                );
             }
+        } else {
+            hard_hard_a0_stage_log(
+                &peers,
+                "initiator",
+                None,
+                HardHardA0Stage::PlannerEligibility,
+                HardHardA0Reason::PlanUnavailable,
+            );
         }
+    }
+    if hard_hard_experiment_only {
+        if !local_is_hard_hard_initiator && fresh_prediction.is_none() && frozen_targets.is_none() {
+            hard_hard_a0_stage_log(
+                &peers,
+                "responder",
+                None,
+                HardHardA0Stage::PeerSignalAdmission,
+                HardHardA0Reason::AwaitingPeerSignal,
+            );
+        }
+        peers
+            .record_direct_event(
+                &peer_id,
+                "hard_hard_experiment_waiting",
+                None,
+                None,
+                None,
+                if fresh_prediction.is_some() || frozen_targets.is_some() {
+                    "suppressed an ordinary predicted/frozen-target punch in the isolated Hard↔Hard experiment lane"
+                } else if local_is_hard_hard_initiator {
+                    "planner prerequisites are not currently authorized; Relay remains available while the experiment waits for a fresh fenced trigger"
+                } else {
+                    "deterministic responder is waiting for the initiator's authenticated hh1 signal"
+                },
+            )
+            .await;
+        return;
     }
     // Every trigger enters the authoritative recovery-epoch scheduler: one
     // traversal plan per (peer_id, generation, epoch) with shared hard
     // budgets.  A trigger inside the current epoch can never spawn a parallel
     // session; it only updates the newest-wins pending target.
+    if peers.current_network_generation_sync() != network_generation
+        || !peers.peer_session_is_current_sync(&peer_id, peer_session_generation)
+    {
+        return;
+    }
     let RecoveryAdmission::Accepted { epoch } = peers.recovery_epoch_admit(&peer_id).await else {
         peers
             .record_direct_event(
@@ -205,7 +278,11 @@ async fn spawn_hole_punch_task_with_lifecycle(
     if punch_invocation_is_cancelled(invocation_shutdown_rx.as_ref()) {
         return;
     }
-    let network_generation = peers.current_network_generation().await;
+    if let Some(fence) = publication_fence.as_ref() {
+        if !fence.is_current().await {
+            return;
+        }
+    }
     let Some(claimed) = punch_deduplicator
         .claim_for_epoch_with_rendezvous_for_peer_session(
             &peers,
@@ -292,7 +369,9 @@ async fn spawn_hole_punch_task_with_lifecycle(
     let invocation_cancellation = session.cancellation_handle();
     tokio::spawn(async move {
         let worker = async move {
-            if !peers.peer_session_is_current_sync(&peer_id, peer_session_generation) {
+            if peers.current_network_generation_sync() != network_generation
+                || !peers.peer_session_is_current_sync(&peer_id, peer_session_generation)
+            {
                 return;
             }
             peers

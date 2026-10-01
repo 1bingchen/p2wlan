@@ -1,6 +1,7 @@
 package admin
 
 import (
+	"context"
 	"crypto/sha256"
 	"crypto/subtle"
 	"embed"
@@ -24,23 +25,23 @@ var embeddedWeb embed.FS
 type Store interface {
 	AdminOverviewSnapshot() (*database.AdminOverview, error)
 	AdminAccounts(query string, limit, offset int) (*database.AdminAccountPage, error)
+	AdminAccountsCursor(query, afterID string, limit int) (*database.AdminAccountCursorPage, error)
 	AdminAccount(accountID string) (*database.AdminAccountDetail, error)
+	AdminAccountSummary(context.Context, string) (*database.AdminAccountSummaryResponse, error)
 	AdminTopology(accountID string) (*database.AdminTopology, error)
+	AdminTopologyPage(afterAccountID string, accountLimit, nodeBudget int) (*database.AdminTopologyPage, error)
+	AdminTopologyNetwork(context.Context, string, int) (*database.AdminTopologyPage, error)
 	AdminDevices(query, status string, limit, offset int) (*database.AdminDevicePage, error)
+	AdminDevicesCursor(query, status, cursor string, limit int) (*database.AdminDeviceCursorPage, error)
+	AdminDevicesCursorScoped(context.Context, string, string, string, int, string) (*database.AdminDeviceCursorPage, error)
 	AdminNetworks(limit, offset int) (*database.AdminNetworkPage, error)
 	AdminRooms(limit, offset int) (*database.AdminRoomPage, error)
-}
-
-// ScaledStore is the bounded administration contract used by the modern
-// console. Store remains intentionally backwards-compatible for callers that
-// still use the original offset/full endpoints; the browser opts into this
-// interface with pagination=cursor or view=summary|full.
-type ScaledStore interface {
-	AdminAccountsCursor(query, cursor string, limit int) (*database.AdminAccountCursorPage, error)
-	AdminDevicesCursor(query, status, cursor string, limit int) (*database.AdminDeviceCursorPage, error)
-	AdminNetworksCursor(cursor string, limit int) (*database.AdminNetworkCursorPage, error)
-	AdminRoomsCursor(cursor string, limit int) (*database.AdminRoomCursorPage, error)
-	AdminTopologyPage(accountID, view, cursor string, limit int) (*database.AdminTopologyPage, error)
+	AdminNetworksFiltered(context.Context, database.AdminResourceFilter, int, int) (*database.AdminNetworkPage, error)
+	AdminRoomsFiltered(context.Context, database.AdminResourceFilter, int, int) (*database.AdminRoomPage, error)
+	AdminConnections(filter database.AdminConnectionFilter, limit, offset int) (*database.AdminConnectionPage, error)
+	AdminConnectionTransitions(filter database.AdminConnectionTransitionFilter, limit int, cursor string) (*database.AdminConnectionTransitionPage, error)
+	AdminConnectionHealth(filter database.AdminConnectionHealthFilter) (*database.AdminConnectionHealth, error)
+	AdminConnectionTrends(filter database.AdminConnectionTrendsFilter) (*database.AdminConnectionTrends, error)
 }
 
 type Config struct {
@@ -105,12 +106,18 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /admin", s.redirectConsole)
 	mux.HandleFunc("GET /admin/api/v1/overview", s.requireAdmin(s.overview))
 	mux.HandleFunc("GET /admin/api/v1/accounts", s.requireAdmin(s.accounts))
+	mux.HandleFunc("GET /admin/api/v1/accounts/cursor", s.requireAdmin(s.accountsCursor))
 	mux.HandleFunc("GET /admin/api/v1/accounts/{id}/topology", s.requireAdmin(s.accountTopology))
 	mux.HandleFunc("GET /admin/api/v1/accounts/{id}", s.requireAdmin(s.account))
 	mux.HandleFunc("GET /admin/api/v1/topology", s.requireAdmin(s.topology))
 	mux.HandleFunc("GET /admin/api/v1/devices", s.requireAdmin(s.devices))
+	mux.HandleFunc("GET /admin/api/v1/devices/cursor", s.requireAdmin(s.devicesCursor))
 	mux.HandleFunc("GET /admin/api/v1/networks", s.requireAdmin(s.networks))
 	mux.HandleFunc("GET /admin/api/v1/rooms", s.requireAdmin(s.rooms))
+	mux.HandleFunc("GET /admin/api/v1/connections", s.requireAdmin(s.connections))
+	mux.HandleFunc("GET /admin/api/v1/connection-transitions", s.requireAdmin(s.connectionTransitions))
+	mux.HandleFunc("GET /admin/api/v1/connection-health", s.requireAdmin(s.connectionHealth))
+	mux.HandleFunc("GET /admin/api/v1/connection-trends", s.requireAdmin(s.connectionTrends))
 	mux.HandleFunc("GET /admin/api/v1/runtime", s.requireAdmin(s.runtime))
 	mux.HandleFunc("GET /admin/", s.serveConsole)
 }
@@ -134,17 +141,24 @@ func (s *Server) serveConsole(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
 
 	asset := strings.TrimPrefix(r.URL.Path, "/admin/")
-	switch asset {
-	case "", "index.html":
+	if asset == "" {
 		asset = "index.html"
-	case "app.css", "app.js":
-		// Static build artifacts are served as-is.
-	default:
+	} else if !fs.ValidPath(asset) {
+		http.NotFound(w, r)
+		return
+	} else if info, err := fs.Stat(embeddedWeb, "web/"+asset); err == nil {
+		// Serve every real build artifact, including lazy-loaded chunks. Never
+		// expose a directory listing or invent an asset from an SPA fallback.
+		if info.IsDir() {
+			http.NotFound(w, r)
+			return
+		}
+	} else {
 		// BrowserRouter uses clean paths such as /admin/accounts/:id. Any path
 		// without a file extension is an SPA route and must receive index.html so
 		// refresh/deep-link navigation works. Unknown asset-looking paths remain
 		// 404 instead of accidentally serving HTML as JavaScript or CSS.
-		if strings.Contains(asset, ".") {
+		if !errors.Is(err, fs.ErrNotExist) || strings.Contains(asset, ".") {
 			http.NotFound(w, r)
 			return
 		}
@@ -189,14 +203,6 @@ func (s *Server) writeUnauthorized(w http.ResponseWriter) {
 	writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "admin authentication required"})
 }
 
-func (s *Server) scaledStore(w http.ResponseWriter) (ScaledStore, bool) {
-	store, ok := s.store.(ScaledStore)
-	if !ok {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "bounded admin queries are unavailable"})
-	}
-	return store, ok
-}
-
 func (s *Server) overview(w http.ResponseWriter, _ *http.Request) {
 	value, err := s.store.AdminOverviewSnapshot()
 	if err != nil {
@@ -208,19 +214,7 @@ func (s *Server) overview(w http.ResponseWriter, _ *http.Request) {
 
 func (s *Server) accounts(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Query().Get("pagination") == "cursor" {
-		limit, ok := parseCursorLimit(w, r)
-		if !ok {
-			return
-		}
-		store, ok := s.scaledStore(w)
-		if !ok {
-			return
-		}
-		value, err := store.AdminAccountsCursor(r.URL.Query().Get("q"), r.URL.Query().Get("cursor"), limit)
-		if writeScaledError(w, err, "unable to load accounts") {
-			return
-		}
-		writeJSON(w, http.StatusOK, value)
+		s.snapshot(w, r, "accounts", "")
 		return
 	}
 	limit, offset, ok := parsePage(w, r)
@@ -235,25 +229,54 @@ func (s *Server) accounts(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, value)
 }
 
-func (s *Server) account(w http.ResponseWriter, r *http.Request) {
-	value, err := s.store.AdminAccount(r.PathValue("id"))
-	if errors.Is(err, database.ErrAdminAccountNotFound) {
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": "account not found"})
+func (s *Server) accountsCursor(w http.ResponseWriter, r *http.Request) {
+	limit, err := parseBoundedInt(r.URL.Query().Get("limit"), 25, 1, 200)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "limit must be between 1 and 200"})
 		return
 	}
+	cursor := strings.TrimSpace(r.URL.Query().Get("cursor"))
+	if len(cursor) > 128 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "cursor is too long"})
+		return
+	}
+	value, err := s.store.AdminAccountsCursor(r.URL.Query().Get("q"), cursor, limit)
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "unable to load account"})
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "unable to load accounts"})
 		return
 	}
 	writeJSON(w, http.StatusOK, value)
 }
 
 func (s *Server) topology(w http.ResponseWriter, r *http.Request) {
-	if view := strings.TrimSpace(r.URL.Query().Get("view")); view != "" {
-		s.topologyPage(w, r, "", view)
+	if r.URL.Query().Get("view") != "" {
+		s.snapshot(w, r, "topology", "")
 		return
 	}
-	value, err := s.store.AdminTopology("")
+	if strings.TrimSpace(r.URL.Query().Get("network_id")) != "" {
+		s.networkTopology(w, r)
+		return
+	}
+	accountLimit, err := parseBoundedInt(r.URL.Query().Get("limit"), 12, 1, 50)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "limit must be between 1 and 50"})
+		return
+	}
+	nodeBudget, err := parseBoundedInt(r.URL.Query().Get("node_limit"), 600, 1, 2000)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "node_limit must be between 1 and 2000"})
+		return
+	}
+	if nodeBudget < accountLimit {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "node_limit must be greater than or equal to limit"})
+		return
+	}
+	cursor := strings.TrimSpace(r.URL.Query().Get("cursor"))
+	if len(cursor) > 128 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "cursor is too long"})
+		return
+	}
+	value, err := s.store.AdminTopologyPage(cursor, accountLimit, nodeBudget)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "unable to load topology"})
 		return
@@ -262,8 +285,8 @@ func (s *Server) topology(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) accountTopology(w http.ResponseWriter, r *http.Request) {
-	if view := strings.TrimSpace(r.URL.Query().Get("view")); view != "" {
-		s.topologyPage(w, r, r.PathValue("id"), view)
+	if r.URL.Query().Get("view") != "" {
+		s.snapshot(w, r, "topology", r.PathValue("id"))
 		return
 	}
 	value, err := s.store.AdminTopology(r.PathValue("id"))
@@ -278,45 +301,9 @@ func (s *Server) accountTopology(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, value)
 }
 
-func (s *Server) topologyPage(w http.ResponseWriter, r *http.Request, accountID, view string) {
-	limit, ok := parseCursorLimit(w, r)
-	if !ok {
-		return
-	}
-	store, ok := s.scaledStore(w)
-	if !ok {
-		return
-	}
-	value, err := store.AdminTopologyPage(accountID, view, r.URL.Query().Get("cursor"), limit)
-	if errors.Is(err, database.ErrAdminAccountNotFound) {
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": "account not found"})
-		return
-	}
-	if writeScaledError(w, err, "unable to load topology") {
-		return
-	}
-	writeJSON(w, http.StatusOK, value)
-}
-
 func (s *Server) devices(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Query().Get("pagination") == "cursor" {
-		limit, ok := parseCursorLimit(w, r)
-		if !ok {
-			return
-		}
-		store, ok := s.scaledStore(w)
-		if !ok {
-			return
-		}
-		value, err := store.AdminDevicesCursor(r.URL.Query().Get("q"), r.URL.Query().Get("status"), r.URL.Query().Get("cursor"), limit)
-		if errors.Is(err, database.ErrInvalidAdminDeviceStatus) {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid status filter"})
-			return
-		}
-		if writeScaledError(w, err, "unable to load devices") {
-			return
-		}
-		writeJSON(w, http.StatusOK, value)
+		s.snapshot(w, r, "devices", "")
 		return
 	}
 	limit, offset, ok := parsePage(w, r)
@@ -330,64 +317,6 @@ func (s *Server) devices(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "unable to load devices"})
-		return
-	}
-	writeJSON(w, http.StatusOK, value)
-}
-
-func (s *Server) networks(w http.ResponseWriter, r *http.Request) {
-	if r.URL.Query().Get("pagination") == "cursor" {
-		limit, ok := parseCursorLimit(w, r)
-		if !ok {
-			return
-		}
-		store, ok := s.scaledStore(w)
-		if !ok {
-			return
-		}
-		value, err := store.AdminNetworksCursor(r.URL.Query().Get("cursor"), limit)
-		if writeScaledError(w, err, "unable to load networks") {
-			return
-		}
-		writeJSON(w, http.StatusOK, value)
-		return
-	}
-	limit, offset, ok := parsePage(w, r)
-	if !ok {
-		return
-	}
-	value, err := s.store.AdminNetworks(limit, offset)
-	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "unable to load networks"})
-		return
-	}
-	writeJSON(w, http.StatusOK, value)
-}
-
-func (s *Server) rooms(w http.ResponseWriter, r *http.Request) {
-	if r.URL.Query().Get("pagination") == "cursor" {
-		limit, ok := parseCursorLimit(w, r)
-		if !ok {
-			return
-		}
-		store, ok := s.scaledStore(w)
-		if !ok {
-			return
-		}
-		value, err := store.AdminRoomsCursor(r.URL.Query().Get("cursor"), limit)
-		if writeScaledError(w, err, "unable to load rooms") {
-			return
-		}
-		writeJSON(w, http.StatusOK, value)
-		return
-	}
-	limit, offset, ok := parsePage(w, r)
-	if !ok {
-		return
-	}
-	value, err := s.store.AdminRooms(limit, offset)
-	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "unable to load rooms"})
 		return
 	}
 	writeJSON(w, http.StatusOK, value)
@@ -408,29 +337,16 @@ func (s *Server) runtime(w http.ResponseWriter, _ *http.Request) {
 	})
 }
 
-func writeScaledError(w http.ResponseWriter, err error, fallback string) bool {
-	if err == nil {
-		return false
-	}
-	if errors.Is(err, database.ErrInvalidAdminCursor) || errors.Is(err, database.ErrInvalidAdminTopologyView) {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid or stale admin cursor"})
-		return true
-	}
-	writeJSON(w, http.StatusInternalServerError, map[string]string{"error": fallback})
-	return true
-}
-
-func parseCursorLimit(w http.ResponseWriter, r *http.Request) (int, bool) {
-	raw := strings.TrimSpace(r.URL.Query().Get("limit"))
+func parseBoundedInt(raw string, fallback, minValue, maxValue int) (int, error) {
+	raw = strings.TrimSpace(raw)
 	if raw == "" {
-		return 100, true
+		return fallback, nil
 	}
 	value, err := strconv.Atoi(raw)
-	if err != nil || value < 1 || value > 200 {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "limit must be between 1 and 200"})
-		return 0, false
+	if err != nil || value < minValue || value > maxValue {
+		return 0, errors.New("value outside allowed range")
 	}
-	return value, true
+	return value, nil
 }
 
 func parsePage(w http.ResponseWriter, r *http.Request) (int, int, bool) {

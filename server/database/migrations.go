@@ -178,6 +178,8 @@ func migrate(db *sql.DB) error {
 		{"devices", "relay_rtt_ms", "INTEGER"},
 		{"devices", "registration_seq", "INTEGER NOT NULL DEFAULT 1"},
 		{"devices", "registration_incarnation", "INTEGER NOT NULL DEFAULT 0"},
+		{"devices", "hh2_pair_nomination", "INTEGER NOT NULL DEFAULT 0"},
+		{"devices", "hh2_plan_v2", "INTEGER NOT NULL DEFAULT 0"},
 		{"signals", "protocol_version", "INTEGER NOT NULL DEFAULT 1"},
 		{"signals", "candidate_sources", "TEXT NOT NULL DEFAULT '{}'"},
 		{"signals", "candidate_generation", "INTEGER NOT NULL DEFAULT 0"},

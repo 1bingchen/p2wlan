@@ -170,10 +170,7 @@ fn test_build_nat_profile_detects_port_dependent_mapping() {
     assert_eq!(profile.public_port_stable, Some(false));
     assert_eq!(profile.likely_symmetric, Some(true));
     assert_eq!(profile.port_delta, Some(2));
-    assert_eq!(
-        profile.filtering_behavior,
-        FilteringBehavior::AddressOrPortDependent
-    );
+    assert_eq!(profile.filtering_behavior, FilteringBehavior::Unknown);
     assert_eq!(profile.hairpin_behavior, HairpinBehavior::Unknown);
     assert_eq!(profile.mapping_lifetime, MappingLifetime::Unknown);
     assert!(profile.prediction_candidate);

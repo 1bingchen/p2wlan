@@ -39,6 +39,11 @@ overall=0
 for round in $(seq 1 "$ROUNDS"); do
   ROUND_DIR="$BASE_DIR/round-$round"
   mkdir -p "$ROUND_DIR"
+  # Auth discovery defaults to the config parent without --log-file. These
+  # simultaneous daemons must never share that process-owned directory.
+  NODE_A_RUNTIME="$ROUND_DIR/node-a-runtime"
+  NODE_B_RUNTIME="$ROUND_DIR/node-b-runtime"
+  mkdir -m 700 "$NODE_A_RUNTIME" "$NODE_B_RUNTIME"
   export PORT DB_PATH="$ROUND_DIR/control.db" JWT_SECRET=smoke
   "$BASE_DIR/control-server" >"$ROUND_DIR/server.log" 2>&1 &
   SERVER_PID=$!
@@ -62,7 +67,7 @@ for round in $(seq 1 "$ROUNDS"); do
   START_MS=$(python3 -c 'import time; print(int(time.time()*1000))')
 
   printf '%s\n' "$TOKEN" | P2WLAN_DISABLE_TUN=1 RUST_LOG=info "$ROOT_DIR/target/debug/p2wlan-daemon" \
-    --config "$ROUND_DIR/node-a.json" \
+    --config "$NODE_A_RUNTIME/config.json" \
     --control "http://127.0.0.1:$PORT" \
     --network default \
     --token-stdin \
@@ -81,7 +86,7 @@ for round in $(seq 1 "$ROUNDS"); do
   done
 
   printf '%s\n' "$TOKEN" | P2WLAN_DISABLE_TUN=1 RUST_LOG=info "$ROOT_DIR/target/debug/p2wlan-daemon" \
-    --config "$ROUND_DIR/node-b.json" \
+    --config "$NODE_B_RUNTIME/config.json" \
     --control "http://127.0.0.1:$PORT" \
     --network default \
     --token-stdin \

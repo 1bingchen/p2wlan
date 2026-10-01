@@ -505,7 +505,7 @@ async fn dynamic_attach_waits_for_first_reader_poll_before_immediate_stun() {
         .measure_fresh_mapping_batch(&socket, &nat.observers, FRESH_MAPPING_STUN_TIMEOUT, || true)
         .await;
     assert_eq!(
-        observations.len(),
+        observations.observations.len(),
         3,
         "every immediate sequential observer response must reach the ready dynamic reader"
     );
@@ -792,6 +792,8 @@ async fn hard_hard_measurement_sweeps_from_the_same_exact_socket() {
             &nat.observers,
             Duration::from_millis(500),
             None,
+            Duration::from_millis(500),
+            Duration::from_millis(3_500),
         )
         .await;
     let result = match outcome {
@@ -804,15 +806,77 @@ async fn hard_hard_measurement_sweeps_from_the_same_exact_socket() {
         }
     };
 
+    let token = "exact-measurement-rendezvous";
+    assert!(
+        transport
+            .tag_hard_hard_socket("peer-b", result.socket_index, token)
+            .await
+    );
+    assert!(transport.socket_for_peer(Some("peer-b")).await.is_none());
+    let remote_candidate_epoch = peers
+        .current_remote_candidate_epoch("peer-b")
+        .await
+        .unwrap();
+    let local_profile_generation = peers.current_local_profile_generation_sync();
+    let now = crate::peer::hard_hard_now_ms();
+    assert!(
+        peers
+            .hard_hard_register_session(crate::peer::HardHardSessionRecord {
+                pair_nomination: None,
+                coordinated_plan: None,
+                session_id: "exact-measurement-session".into(),
+                probe_session_id: None,
+                session_token: token.into(),
+                peer_id: "peer-b".into(),
+                initiator: true,
+                remote_network_generation: generation,
+                local_network_generation: generation,
+                remote_candidate_epoch,
+                local_profile_generation,
+                remote_profile_generation: 0,
+                local_prediction_confidence: result.model.confidence,
+                remote_prediction_confidence: 90,
+                requested_birthday_level: 0,
+                generated_candidate_count: result.predicted_ports.len(),
+                signaled_candidate_count: result.predicted_ports.len(),
+                birthday: false,
+                requested_socket_indices: vec![result.socket_index],
+                requested_socket_count: 1,
+                prediction_window: vec![nat.peer_public],
+                remote_prediction: vec![nat.peer_public],
+                fresh_socket: crate::peer::HardHardFreshSocketIdentity {
+                    peer_id: "peer-b".into(),
+                    session_token: token.into(),
+                    network_generation: generation,
+                    remote_candidate_epoch,
+                    local_profile_generation,
+                    remote_profile_generation: 0,
+                    punch_generation: result.punch_generation,
+                    socket_index: result.socket_index,
+                    socket_local_endpoint: result.socket_local_endpoint,
+                },
+                punch_at_ms: now,
+                expires_at_ms: now.saturating_add(30_000),
+                state: crate::peer::HardHardSessionState::Sweeping,
+                attempt_count: 1,
+                measurement: crate::peer::HardHardMeasurementObservation::default(),
+                created_at: Instant::now(),
+                cancellation: Arc::new(crate::PunchSessionCancellation::default()),
+            })
+            .await
+    );
+
     // The measurement phase has no peer-directed send; the first mapping for
     // the peer is created only by the exact-index synchronized sweep below.
     let report = transport
-        .punch_candidates_from_dynamic_socket_index(
+        .punch_candidates_from_dynamic_socket_index_with_profile_fence_and_session(
             "peer-b",
             result.socket_index,
             vec![nat.peer_public],
             Duration::ZERO,
             1,
+            None,
+            Some(token),
         )
         .await
         .unwrap();
@@ -830,6 +894,15 @@ async fn hard_hard_measurement_sweeps_from_the_same_exact_socket() {
     assert_eq!(
         nat.assigned_punch_port(result.socket_local_endpoint).await,
         result.predicted_ports[0]
+    );
+
+    assert_eq!(
+        peers.hard_hard_winner_for_token("peer-b", token).await,
+        Some(result.socket_index)
+    );
+    assert_eq!(
+        transport.socket_for_peer(Some("peer-b")).await.unwrap().0,
+        result.socket_index
     );
 
     listener.abort();
@@ -917,6 +990,7 @@ async fn exact_dynamic_socket_live_recorder_counts_compatibility_success_once() 
             None,
             None,
             Some(live.clone()),
+            None,
         )
         .await
         .unwrap();
@@ -957,6 +1031,7 @@ async fn exact_dynamic_socket_live_recorder_counts_compatibility_failure_as_part
             None,
             None,
             Some(live.clone()),
+            None,
         )
         .await
         .unwrap();
@@ -1045,6 +1120,13 @@ async fn exact_dynamic_socket_all_physical_failures_keep_target_progress() {
 #[tokio::test]
 async fn hard_hard_detached_exact_socket_sweep_fails_closed_without_pool_sends() {
     let (peers, transport, _nat) = generation_env().await;
+    let generation = peers.current_network_generation().await;
+    assert!(
+        peers
+            .confirm_relay_peer("peer-b", "tcp://relay.test:18081", generation)
+            .await
+    );
+
     let (socket_index, socket) = transport.bind_fresh_punch_socket().await.unwrap();
     let handoff = transport
         .attach_dynamic_punch_socket("peer-b", socket_index, socket, 0, 1, None)
@@ -1079,9 +1161,23 @@ async fn hard_hard_detached_exact_socket_sweep_fails_closed_without_pool_sends()
     assert!(!peers.is_direct("peer-b").await);
     assert_eq!(
         peers.select_path_for_data("peer-b", true, true).await.path,
-        Some(NetworkPath::Relay),
-        "a detached exact Hard↔Hard socket must leave Relay as the data path"
+        None,
+        "losing a speculative socket cannot bypass the first Direct window"
     );
+    timeout(Duration::from_secs(8), async {
+        loop {
+            let selection = peers.select_path_for_data("peer-b", true, true).await;
+            assert_ne!(selection.path, Some(NetworkPath::Direct));
+            if selection.path == Some(NetworkPath::Relay) {
+                break;
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("confirmed Relay must become usable after the bounded Direct window");
+    assert!(!peers.is_direct("peer-b").await);
+    assert_eq!(transport.dynamic_socket_count().await, 0);
 }
 
 #[tokio::test]
@@ -1581,7 +1677,7 @@ async fn direct_promotion_cancels_in_flight_fresh_mapping() {
     );
     // Waiter, provisional socket and reader task cleanup.
     assert_eq!(
-        transport.stun_waiters.lock().await.len(),
+        transport.stun_waiters.len(),
         0,
         "no STUN waiter may remain after the cancelled generation"
     );
@@ -1804,12 +1900,43 @@ async fn fresh_mapping_requires_probe_key_before_measuring() {
 
 #[tokio::test]
 async fn relay_availability_does_not_cancel_punch_generation() {
-    let (outcome, peers, _transport, _nat, _seen) = run_generation_roundtrip(1, false).await;
-    // A relay path is available for the peer.
-    peers.set_relay("peer-b", "tcp://relay.test:18081").await;
-    assert!(peers.has_relay_safety_net("peer-b").await);
-    // The generation still completed instead of being cancelled by the relay.
-    assert!(matches!(outcome, FreshMappingOutcome::Accepted(..)));
+    let (peers, transport, nat) = generation_env().await;
+    let generation = peers.current_network_generation().await;
+    // Prepare Relay BEFORE measuring. The former test prepared it only
+    // after the generation had already finished and therefore could not
+    // detect Relay availability accidentally cancelling the measurement.
+    assert!(
+        peers
+            .confirm_relay_peer("peer-b", "tcp://relay.test:18081", generation)
+            .await
+    );
+    assert_eq!(
+        peers.select_path_for_data("peer-b", true, true).await.path,
+        None,
+        "confirmed standby must not preempt the first Direct attempt"
+    );
+    let outcome = transport
+        .run_fresh_mapping_generation(
+            "peer-b",
+            &nat.observers,
+            Duration::from_millis(500),
+            &[nat.peer_public],
+            Duration::from_millis(10),
+            2,
+            None,
+        )
+        .await;
+    let result = accepted_result(outcome).await;
+    assert_eq!(
+        transport.dynamic_socket_index_for_peer("peer-b").await,
+        Some(result.socket_index),
+        "Relay readiness must not revoke the successful measured socket"
+    );
+    assert!(
+        !peers
+            .is_relay_business_admitted_for_generation("peer-b", generation)
+            .await
+    );
 }
 
 /// Both sides with strict Address/Port-Dependent filtering punch each other's
@@ -2940,6 +3067,7 @@ async fn public_key_change_detaches_every_dynamic_socket_and_clears_probes() {
     transport.pending_probes.lock().await.insert(
         nonce,
         PendingProbe {
+            validation_preflight: None,
             sent_at: Instant::now(),
             expires_at: Instant::now() + DIRECT_KEEPALIVE_ACK_TIMEOUT,
             endpoint: nat.peer_public,

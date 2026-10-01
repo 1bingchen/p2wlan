@@ -1,3 +1,5 @@
+include!("candidate_dispatch.rs");
+
 /// Run the independent, bounded handshake lanes used by WireGuard offers,
 /// answers and their endpoint publishes.
 ///
@@ -11,10 +13,10 @@
 /// - answers are dispatched from their own channel ahead of offers and have a
 ///   dedicated in-flight budget: a slow offer or its retries can never delay
 ///   a later answer;
-/// - every lane is bounded (queue capacity + in-flight semaphore);
+/// - every lane bounds both queued commands and spawned tasks;
 /// - dropping the command's response receiver (the handshake owner was
-///   cancelled or replaced) aborts queued and in-flight work: a stale owner
-///   never sends and never holds a lane slot;
+///   cancelled or replaced) skips the command at admission or aborts its
+///   in-flight work, releasing the active lane slot;
 /// - retries reuse the exact prepared payload and are cut off by one overall
 ///   deadline, so a successful round can never become a 3 x 5 s sequence.
 #[allow(clippy::too_many_arguments)]
@@ -40,19 +42,41 @@ async fn run_critical_control_loop(
     let mut offers = JoinSet::new();
     let mut ctrls = JoinSet::new();
     let mut candidate_tasks = JoinSet::new();
-    let mut candidate_workers: HashMap<String, mpsc::Sender<CandidateOfferCommand>> =
-        HashMap::new();
-    let mut candidate_auth: Option<CriticalControlAuth> = None;
+    let mut candidate_workers: HashMap<String, CandidateOfferLane> = HashMap::new();
+    let mut candidate_auth = auth_rx.borrow().clone();
+    let mut pending_candidate_dispatch: Option<PendingCandidateDispatch> = None;
 
     loop {
+        if *shutdown_rx.borrow() || shutdown_rx.has_changed().is_err() {
+            break;
+        }
+        if let Some(command) = pending_candidate_dispatch
+            .as_mut()
+            .and_then(|pending| pending.take_ready_lane_command(&candidate_workers, &auth_rx))
+        {
+            pending_candidate_dispatch = route_candidate_offer(
+                command,
+                &mut candidate_workers,
+                &mut candidate_tasks,
+                &candidate_http,
+                &auth_rx,
+                &event_tx,
+            );
+        }
+        let pending_auth = auth_rx.clone();
         tokio::select! {
             biased;
             _ = control_shutdown_requested(&mut shutdown_rx) => break,
             Some(_) = answers.join_next(), if !answers.is_empty() => {}
             Some(_) = offers.join_next(), if !offers.is_empty() => {}
             Some(_) = ctrls.join_next(), if !ctrls.is_empty() => {}
-            Some(_) = candidate_tasks.join_next(), if !candidate_tasks.is_empty() => {}
-            Some(command) = answer_rx.recv() => {
+            Some(completed) = candidate_tasks.join_next_with_id(), if !candidate_tasks.is_empty() => {
+                reap_candidate_offer_lane(&mut candidate_workers, completed);
+            }
+            // Keep waiting commands in their bounded channels. A semaphore
+            // inside each spawned task limits HTTP, but cannot bound the
+            // number of tasks waiting for it. Each lane remains independent.
+            Some(command) = answer_rx.recv(), if answers.len() < CRITICAL_ANSWER_MAX_INFLIGHT => {
                 answers.spawn(run_critical_answer_command(
                     http.clone(),
                     command,
@@ -61,7 +85,7 @@ async fn run_critical_control_loop(
                     answer_permits.clone(),
                 ));
             }
-            Some(command) = offer_rx.recv() => {
+            Some(command) = offer_rx.recv(), if offers.len() < CRITICAL_OFFER_MAX_INFLIGHT => {
                 offers.spawn(run_critical_offer_command(
                     http.clone(),
                     command,
@@ -70,7 +94,7 @@ async fn run_critical_control_loop(
                     offer_permits.clone(),
                 ));
             }
-            Some(command) = ctrl_rx.recv() => {
+            Some(command) = ctrl_rx.recv(), if ctrls.len() < CRITICAL_CTRL_MAX_INFLIGHT => {
                 match command {
                     CriticalControlCommand::UpdateEndpoint { endpoint, nat_type, response_tx } => {
                         ctrls.spawn(run_critical_endpoint_command(
@@ -108,81 +132,36 @@ async fn run_critical_control_loop(
                     // makes the caller observe a terminal channel failure;
                     // the candidate payload itself remains generation/expiry
                     // checked if the HTTP request was already ambiguous.
+                    pending_candidate_dispatch = None;
                     candidate_tasks.abort_all();
                     while candidate_tasks.join_next().await.is_some() {}
                     candidate_workers.clear();
                 }
                 candidate_auth = current;
             }
-            Some(command) = candidate_rx.recv() => {
-                if command
-                    .fresh_ownership
-                    .as_ref()
-                    .is_some_and(|ownership| ownership.is_cancelled())
-                {
-                    let _ = command.response_tx.send(PeerOfferSendOutcome::Cancelled);
-                    continue;
+            closed_command = async {
+                match pending_candidate_dispatch.as_mut() {
+                    Some(dispatch) => dispatch.poll(pending_auth).await,
+                    None => std::future::pending().await,
                 }
-
-                let peer_id = command.to_node_id.clone();
-                let worker_tx = if let Some(sender) = candidate_workers.get(&peer_id) {
-                    sender.clone()
-                } else {
-                    let sender = spawn_candidate_offer_worker(
-                        &mut candidate_tasks,
-                        candidate_http.clone(),
-                        auth_rx.clone(),
-                        event_tx.clone(),
-                    );
-                    candidate_workers.insert(peer_id.clone(), sender.clone());
-                    sender
-                };
-                match worker_tx.try_send(command) {
-                    Ok(()) => {}
-                    Err(mpsc::error::TrySendError::Full(command)) => {
-                        warn!(
-                            "Candidate offer queue full for {peer_id}; reason_code=candidate_offer_queue_full"
-                        );
-                        let _ = command.response_tx.send(PeerOfferSendOutcome::Failed);
-                    }
-                    Err(mpsc::error::TrySendError::Closed(command)) => {
-                        candidate_workers.remove(&peer_id);
-                        warn!(
-                            "Candidate offer worker closed for {peer_id}; recreating lane reason_code=candidate_offer_worker_closed"
-                        );
-                        // A completed/panicked worker can leave its sender in
-                        // the routing map until this command observes the
-                        // closed receiver. Recreate the per-peer lane and
-                        // retry the SAME immutable command once; dropping the
-                        // first post-rebind candidate offer would otherwise
-                        // leave the remote peer on the retired UDP endpoint.
-                        let replacement = spawn_candidate_offer_worker(
-                            &mut candidate_tasks,
-                            candidate_http.clone(),
-                            auth_rx.clone(),
-                            event_tx.clone(),
-                        );
-                        candidate_workers.insert(peer_id.clone(), replacement.clone());
-                        if let Err(error) = replacement.try_send(command) {
-                            let command = match error {
-                                mpsc::error::TrySendError::Full(command) => command,
-                                mpsc::error::TrySendError::Closed(command) => {
-                                    candidate_workers.remove(&peer_id);
-                                    command
-                                }
-                            };
-                            warn!(
-                                "Replacement candidate offer worker unavailable for {peer_id}; reason_code=candidate_offer_worker_recreate_failed"
-                            );
-                            let _ = command.response_tx.send(PeerOfferSendOutcome::Failed);
-                        }
-                    }
-                }
+            }, if pending_candidate_dispatch.is_some() => {
+                pending_candidate_dispatch = closed_command.and_then(|command| {
+                    // A closed reservation still belongs to its retiring lane.
+                    // Wait for exact task completion before any same-peer restart.
+                    PendingCandidateDispatch::wait_for_closed_lane(command, &auth_rx)
+                });
+            }
+            Some(command) = candidate_rx.recv(), if pending_candidate_dispatch.is_none() => {
+                pending_candidate_dispatch = route_candidate_offer(
+                    CandidateDispatchCommand::new(command), &mut candidate_workers, &mut candidate_tasks,
+                    &candidate_http, &auth_rx, &event_tx,
+                );
             }
             else => break,
         }
     }
 
+    drop(pending_candidate_dispatch);
     answers.abort_all();
     offers.abort_all();
     ctrls.abort_all();
@@ -198,15 +177,18 @@ fn spawn_candidate_offer_worker(
     candidate_http: RouteAwareControlHttpClient,
     auth_rx: watch::Receiver<Option<CriticalControlAuth>>,
     event_tx: mpsc::UnboundedSender<ControlEvent>,
-) -> mpsc::Sender<CandidateOfferCommand> {
+) -> CandidateOfferLane {
     let (sender, receiver) = mpsc::channel(CANDIDATE_OFFER_QUEUE_CAPACITY);
-    candidate_tasks.spawn(run_candidate_offer_worker(
+    let task = candidate_tasks.spawn(run_candidate_offer_worker(
         receiver,
         candidate_http,
         auth_rx,
         event_tx,
     ));
-    sender
+    CandidateOfferLane {
+        sender,
+        task_id: task.id(),
+    }
 }
 
 /// One per-peer candidate worker.  Requests for different peers run in
@@ -223,8 +205,13 @@ async fn run_candidate_offer_worker(
         ResponseClosed,
     }
 
-    while let Some(command) = rx.recv().await {
+    let mut retiring = false;
+    while let Some(command) = receive_candidate_offer(&mut rx, &mut retiring).await {
         let CandidateOfferCommand {
+            expected_registration_seq,
+            not_after,
+            attempt_timeout,
+            prepaid_attempts,
             to_node_id,
             candidates,
             session_id,
@@ -232,11 +219,20 @@ async fn run_candidate_offer_worker(
             candidate_sources,
             handshake_init,
             punch_at_ms,
+            punch_at_server_ms,
             fresh_ownership,
+            publication_fence,
             response_tx,
         } = command;
         let mut response_tx = response_tx;
-        let deadline = Instant::now() + CRITICAL_SIGNAL_OVERALL_DEADLINE;
+        if !(1..=HARD_HARD_START_ACK_MAX_ATTEMPTS).contains(&prepaid_attempts) {
+            let _ = response_tx.send(PeerOfferSendOutcome::Failed);
+            continue;
+        }
+        let deadline = not_after
+            .map_or(Instant::now() + CRITICAL_SIGNAL_OVERALL_DEADLINE, |limit| {
+                limit.min(Instant::now() + CRITICAL_SIGNAL_OVERALL_DEADLINE)
+            });
         let Some(auth) =
             wait_for_critical_control_auth(auth_rx.clone(), &mut response_tx, deadline).await
         else {
@@ -249,6 +245,12 @@ async fn run_candidate_offer_worker(
             let _ = response_tx.send(PeerOfferSendOutcome::Cancelled);
             continue;
         }
+        if let Some(fence) = publication_fence.as_ref() {
+            if !fence.is_current().await {
+                let _ = response_tx.send(PeerOfferSendOutcome::Cancelled);
+                continue;
+            }
+        }
         // `wait_for_critical_control_auth` uses a clone of this receiver. Mark
         // the worker's receiver as having observed the same registration so a
         // duplicate publication of an unchanged token cannot cancel the
@@ -256,7 +258,9 @@ async fn run_candidate_offer_worker(
         let current_auth = auth_rx.borrow_and_update().clone();
         if current_auth
             .as_ref()
-            .is_some_and(|current| !auth.same_identity_as(current))
+            .is_none_or(|current| !auth.same_identity_as(current))
+            || expected_registration_seq
+                .is_some_and(|expected| auth.registration_seq != Some(expected))
         {
             let _ = response_tx.send(PeerOfferSendOutcome::Failed);
             continue;
@@ -275,7 +279,7 @@ async fn run_candidate_offer_worker(
             &candidate_sources,
             &handshake_init,
             punch_at_ms,
-            None,
+            punch_at_server_ms,
             session_id.as_deref(),
             probe_ephemeral_public_key.as_deref(),
             auth.signal_signing_identity.as_ref(),
@@ -291,82 +295,149 @@ async fn run_candidate_offer_worker(
             }
         };
 
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        let result = match http.current() {
-            Err(error) => CandidateOfferAttempt::Completed(Err(error)),
-            Ok(_) if remaining.is_zero() => {
-                CandidateOfferAttempt::Completed(Err(DaemonError::ControlPlane(
-                    "candidate offer deadline exceeded; delivery status is unknown".into(),
-                )))
-            }
-            Ok(current_http) => {
-                // Keep one request future alive across duplicate auth-watch
-                // notifications.  Dropping an in-flight reqwest future does
-                // not prove that the server did not accept its POST; starting
-                // a new future here can therefore duplicate a candidate
-                // publication that already reached the control plane.
-                let request = send_prepared_signal(
-                    &current_http,
-                    &auth.base_url,
-                    &auth.token,
-                    auth.registration_seq,
-                    &payload,
-                );
-                tokio::pin!(request);
-                loop {
-                    let remaining = deadline.saturating_duration_since(Instant::now());
-                    if remaining.is_zero() {
-                        break CandidateOfferAttempt::Completed(Err(DaemonError::ControlPlane(
-                            "candidate offer deadline exceeded; delivery status is unknown".into(),
-                        )));
-                    }
-                    tokio::select! {
-                        biased;
-                        // Fresh ownership can be revoked while the HTTP request is
-                        // already in flight. Drop the local request future and
-                        // report ambiguous delivery so the caller rolls back the
-                        // retired socket; the server may already have accepted it.
-                        // This cancels only the current immutable command, leaving
-                        // the per-peer FIFO worker available for its replacement.
-                        _ = async {
-                            if let Some(ownership) = fresh_ownership.as_ref() {
-                                ownership.cancelled().await;
-                            } else {
-                                std::future::pending::<()>().await;
+        let mut attempt = 0;
+        let result = loop {
+            attempt += 1;
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            // A stalled first request leaves time for prepaid retries only
+            // when the original window can also fit their backoff. Very short
+            // windows keep one full attempt instead of manufacturing retries
+            // whose only remaining time would be spent waiting to send.
+            let retries_left = u32::from(prepaid_attempts.saturating_sub(attempt));
+            let attempt_budget = remaining
+                .checked_sub(Duration::from_millis(25) * retries_left)
+                .filter(|usable| !usable.is_zero())
+                .map_or(remaining, |usable| usable / (retries_left + 1));
+            // A barrier's HTTP slice starts here, after both queue waits and
+            // identity admission. Queue pressure never triggers another paid
+            // attempt, and this slice cannot extend the original phase.
+            let attempt_budget =
+                attempt_timeout.map_or(attempt_budget, |limit| attempt_budget.min(limit));
+            let attempt_deadline = (Instant::now() + attempt_budget).min(deadline);
+            let result = match http.current() {
+                Err(error) => CandidateOfferAttempt::Completed(Err(error)),
+                Ok(_) if remaining.is_zero() => {
+                    CandidateOfferAttempt::Completed(Err(DaemonError::ControlPlane(
+                        "candidate offer deadline exceeded; delivery status is unknown".into(),
+                    )))
+                }
+                Ok(current_http) => {
+                    // Keep one request future alive across duplicate auth-watch
+                    // notifications.  Dropping an in-flight reqwest future does
+                    // not prove that the server did not accept its POST; starting
+                    // a new future here can therefore duplicate a candidate
+                    // publication that already reached the control plane.
+                    let request_auth = auth_rx.clone();
+                    let request = async {
+                        if attempt > 1 {
+                            time::sleep(Duration::from_millis(25)).await;
+                        }
+                        // A candidate refresh may have waited behind the
+                        // per-peer command lane and auth. Recheck its exact
+                        // network, peer session and snapshot at the final
+                        // HTTP boundary, including after retry backoff.
+                        if let Some(fence) = publication_fence.as_ref() {
+                            if !fence.is_current().await {
+                                return Err(DaemonError::ControlPlane(
+                                    "candidate publication identity expired before delivery".into(),
+                                ));
                             }
-                        } => break CandidateOfferAttempt::OwnershipCancelled,
-                        // Cancelling one owner must abort only this immutable
-                        // request. Returning from the whole per-peer worker leaves
-                        // a closed sender cached in `candidate_workers`, so the
-                        // next (often post-rebind) candidate publication is lost.
-                        _ = response_tx.closed() => break CandidateOfferAttempt::ResponseClosed,
-                        result = timeout(remaining, &mut request) => break CandidateOfferAttempt::Completed(match result {
-                            Ok(result) => result,
-                            Err(_) => Err(DaemonError::ControlPlane(
-                                "candidate offer deadline exceeded during request; delivery status is unknown".into(),
-                            )),
-                        }),
-                        changed = auth_rx.changed() => {
-                            if changed.is_err() {
-                                break CandidateOfferAttempt::Completed(Err(DaemonError::ControlPlane(
-                                    "candidate offer control identity watch closed".into(),
-                                )));
+                        }
+                        if Instant::now() >= deadline
+                            || request_auth.has_changed().is_err()
+                            || request_auth
+                                .borrow()
+                                .as_ref()
+                                .is_none_or(|current| !auth.same_identity_as(current))
+                        {
+                            return Err(DaemonError::ControlPlane(
+                            "candidate offer deadline or control identity expired before delivery".into()));
+                        }
+                        crate::control::hard_hard_a0_control_stage(
+                            session_id.as_deref(),
+                            "offer_http_attempt",
+                            "request_started",
+                        );
+                        send_prepared_signal(
+                            &current_http,
+                            &auth.base_url,
+                            &auth.token,
+                            auth.registration_seq,
+                            &payload,
+                        )
+                        .await
+                    };
+                    tokio::pin!(request);
+                    loop {
+                        let remaining = attempt_deadline.saturating_duration_since(Instant::now());
+                        if remaining.is_zero() {
+                            break CandidateOfferAttempt::Completed(Err(
+                                DaemonError::ControlPlane(
+                                    "candidate offer deadline exceeded; delivery status is unknown"
+                                        .into(),
+                                ),
+                            ));
+                        }
+                        tokio::select! {
+                            biased;
+                            // Fresh ownership can be revoked while the HTTP request is
+                            // already in flight. Drop the local request future and
+                            // report ambiguous delivery so the caller rolls back the
+                            // retired socket; the server may already have accepted it.
+                            // This cancels only the current immutable command, leaving
+                            // the per-peer FIFO worker available for its replacement.
+                            _ = async {
+                                if let Some(ownership) = fresh_ownership.as_ref() {
+                                    ownership.cancelled().await;
+                                } else {
+                                    std::future::pending::<()>().await;
+                                }
+                            } => break CandidateOfferAttempt::OwnershipCancelled,
+                            // Cancelling one owner must abort only this immutable
+                            // request. Returning from the whole per-peer worker leaves
+                            // a closed sender cached in `candidate_workers`, so the
+                            // next (often post-rebind) candidate publication is lost.
+                            _ = response_tx.closed() => break CandidateOfferAttempt::ResponseClosed,
+                            result = timeout(remaining, &mut request) => break CandidateOfferAttempt::Completed(match result {
+                                Ok(result) => result,
+                                Err(_) => Err(DaemonError::ControlPlane(
+                                    "candidate offer deadline exceeded during request; delivery status is unknown".into(),
+                                )),
+                            }),
+                            changed = auth_rx.changed() => {
+                                if changed.is_err() {
+                                    break CandidateOfferAttempt::Completed(Err(DaemonError::ControlPlane(
+                                        "candidate offer control identity watch closed".into(),
+                                    )));
+                                }
+                                if auth_rx.borrow().as_ref().is_none_or(|current| {
+                                    !auth.same_identity_as(current)
+                                }) {
+                                    break CandidateOfferAttempt::Completed(Err(DaemonError::ControlPlane(
+                                        "candidate offer control identity changed during request".into(),
+                                    )));
+                                }
+                                // A duplicate publication of the same identity is
+                                // harmless, but the request may already have reached
+                                // the server. Keep polling this exact future instead
+                                // of dropping it and issuing a duplicate POST.
+                                continue;
                             }
-                            if auth_rx.borrow().as_ref().is_some_and(|current| {
-                                !auth.same_identity_as(current)
-                            }) {
-                                break CandidateOfferAttempt::Completed(Err(DaemonError::ControlPlane(
-                                    "candidate offer control identity changed during request".into(),
-                                )));
-                            }
-                            // A duplicate publication of the same identity is
-                            // harmless, but the request may already have reached
-                            // the server. Keep polling this exact future instead
-                            // of dropping it and issuing a duplicate POST.
-                            continue;
                         }
                     }
                 }
+            };
+            let retry = matches!(&result, CandidateOfferAttempt::Completed(Err(error))
+            if attempt < prepaid_attempts
+                && !is_permanent_auth_error(&error.to_string())
+                && !is_registration_conflict_error(&error.to_string())
+                && Instant::now() < deadline
+                && !response_tx.is_closed()
+                && fresh_ownership.as_ref().is_none_or(|owner| !owner.is_cancelled())
+                && auth_rx.has_changed().is_ok()
+                && auth_rx.borrow().as_ref().is_some_and(|current| auth.same_identity_as(current)));
+            if !retry {
+                break result;
             }
         };
         let result = match result {
@@ -378,6 +449,16 @@ async fn run_candidate_offer_worker(
                 // Close the completion race in which HTTP readiness and
                 // ownership revocation become observable in the same poll.
                 let _ = response_tx.send(PeerOfferSendOutcome::Cancelled);
+                continue;
+            }
+            CandidateOfferAttempt::Completed(_)
+                if auth_rx.has_changed().is_err()
+                    || auth_rx
+                        .borrow()
+                        .as_ref()
+                        .is_none_or(|current| !auth.same_identity_as(current)) =>
+            {
+                let _ = response_tx.send(PeerOfferSendOutcome::Failed);
                 continue;
             }
             CandidateOfferAttempt::Completed(result) => result,
@@ -393,6 +474,15 @@ async fn run_candidate_offer_worker(
                 continue;
             }
         };
+        if let Some(fence) = publication_fence.as_ref() {
+            if !fence.is_current().await {
+                // A network handover or peer replacement may have raced the
+                // request completion. Its delivery is then ambiguous, but it
+                // must not start a new local punch against that old snapshot.
+                let _ = response_tx.send(PeerOfferSendOutcome::Cancelled);
+                continue;
+            }
+        }
         let outcome = match result {
             Ok(()) => {
                 debug!("Sent candidate peer_offer to {to_node_id} punch_at_ms={punch_at_ms:?}");
@@ -415,12 +505,16 @@ async fn run_candidate_offer_worker(
 /// the owner already dropped the response receiver (cancelled while queued).
 async fn acquire_critical_permit_or_skip<T>(
     permits: &Arc<Semaphore>,
-    response_tx: &oneshot::Sender<T>,
+    response_tx: &mut oneshot::Sender<T>,
 ) -> Option<OwnedSemaphorePermit> {
     if response_tx.is_closed() {
         return None;
     }
-    let permit = permits.clone().acquire_owned().await.ok()?;
+    let permit = tokio::select! {
+        biased;
+        _ = response_tx.closed() => return None,
+        permit = permits.clone().acquire_owned() => permit.ok()?,
+    };
     if response_tx.is_closed() {
         return None;
     }
@@ -435,7 +529,7 @@ async fn run_critical_answer_command(
     permits: Arc<Semaphore>,
 ) {
     let mut response_tx = command.response_tx;
-    let Some(_permit) = acquire_critical_permit_or_skip(&permits, &response_tx).await else {
+    let Some(_permit) = acquire_critical_permit_or_skip(&permits, &mut response_tx).await else {
         return;
     };
     let deadline = Instant::now() + CRITICAL_SIGNAL_OVERALL_DEADLINE;
@@ -484,7 +578,7 @@ async fn run_critical_offer_command(
     permits: Arc<Semaphore>,
 ) {
     let mut response_tx = command.response_tx;
-    let Some(_permit) = acquire_critical_permit_or_skip(&permits, &response_tx).await else {
+    let Some(_permit) = acquire_critical_permit_or_skip(&permits, &mut response_tx).await else {
         return;
     };
     let deadline = Instant::now() + CRITICAL_SIGNAL_OVERALL_DEADLINE;
@@ -541,7 +635,7 @@ async fn run_critical_endpoint_command(
     advertised_snapshot: Arc<std::sync::Mutex<AdvertisedEndpointSnapshot>>,
     lifecycle_tx: mpsc::UnboundedSender<ControlCommand>,
 ) {
-    let Some(_permit) = acquire_critical_permit_or_skip(&permits, &response_tx).await else {
+    let Some(_permit) = acquire_critical_permit_or_skip(&permits, &mut response_tx).await else {
         return;
     };
     let deadline = Instant::now() + CRITICAL_SIGNAL_OVERALL_DEADLINE;

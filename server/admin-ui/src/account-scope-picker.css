@@ -1,0 +1,31 @@
+.account-scope-picker { position: relative; min-width: 158px; }
+.account-scope-control { display: flex; align-items: center; gap: 6px; }
+.account-scope-trigger { display: flex; align-items: center; justify-content: space-between; gap: 12px; width: 100%; padding-right: 10px; text-align: left; }
+.account-scope-control .account-scope-trigger { min-width: 0; max-width: 280px; height: auto; min-height: var(--control-height); padding-top: 4px; padding-bottom: 4px; }
+.account-scope-trigger strong, .account-scope-trigger small { display: block; overflow: hidden; text-overflow: ellipsis; }
+.account-scope-trigger strong { font-size: var(--font-body); font-weight: 500; }
+.account-scope-trigger small { font: var(--font-caption) ui-monospace, monospace; color: var(--text-3); margin-top: 2px; }
+.account-scope-clear { flex: 0 0 auto; }
+.account-scope-count { text-align: center; line-height: 1.5; color: var(--text-3); }
+.account-scope-count strong { font-weight: 500; }
+.account-scope-notice { background: var(--surface-subtle); border: 1px solid var(--border); border-radius: 6px; }
+.account-scope-notice p { margin: 0; line-height: 1.5; }
+.account-scope-notice .button { margin-top: 8px; }
+.account-scope-id { font-family: ui-monospace, monospace; }
+.account-scope-trigger > span { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.account-scope-trigger > svg { flex-shrink: 0; }
+.account-scope-panel { position: fixed; z-index: 50; width: min(340px, calc(100vw - 24px)); max-height: calc(100dvh - 24px); overflow-y: auto; overscroll-behavior: contain; padding: 12px; border: 1px solid var(--border-strong); border-radius: 12px; background: var(--surface); color: var(--text); box-shadow: var(--shadow-overlay); }
+.account-scope-panel > header, .account-scope-panel > footer { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.account-scope-panel > header { margin-bottom: 10px; }
+.account-scope-panel > footer { padding-top: 10px; border-top: 1px solid var(--border); font-size: 12px; }
+.account-scope-panel > .search-field { width: 100%; margin-bottom: 8px; }
+.account-scope-option { display: flex; align-items: center; justify-content: space-between; gap: 10px; width: 100%; padding: 9px 10px; border: 0; border-radius: 7px; background: transparent; color: var(--text); text-align: left; }
+.account-scope-option:hover, .account-scope-option[aria-pressed='true'] { background: var(--surface-subtle); }
+.account-scope-option > span { min-width: 0; }
+.account-scope-option strong, .account-scope-option small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.account-scope-option small { margin-top: 3px; color: var(--text-2); }
+.account-scope-results { max-height: min(300px, 38vh); overflow-y: auto; margin: 6px 0 10px; }
+.account-scope-results > p, .account-scope-results > div { padding: 10px; color: var(--text-2); font-size: 12px; }
+@media (max-width: 900px) { .account-scope-picker { flex: 1 1 150px; } }
+@media (max-width: 650px) { .account-scope-picker { width: 100%; flex: auto; } .account-scope-control .account-scope-trigger { max-width: none; } }
+@media (pointer: coarse) { .account-scope-control .account-scope-trigger { min-height: 44px; } }

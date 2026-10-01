@@ -27,3 +27,9 @@ include!("tests/room_connectivity.rs");
 
 #[path = "tests/history_contention.rs"]
 mod history_contention;
+
+#[path = "tests/direct_first.rs"]
+mod direct_first;
+
+#[path = "tests/capabilities.rs"]
+mod capabilities;

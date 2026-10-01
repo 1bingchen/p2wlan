@@ -4,7 +4,7 @@ mod tests {
 
     use super::*;
     use crate::control::PeerInfo;
-    use crate::peer::{REASON_DIRECT_PROBE_FAILED, REASON_PATH_UNAVAILABLE};
+    use crate::peer::REASON_DIRECT_PROBE_FAILED;
 
     #[test]
     fn no_browser_cors_is_never_emitted_for_any_origin() {
@@ -195,6 +195,8 @@ mod tests {
         let peers = Arc::new(PeerManager::new((*config).clone()));
         peers
             .add_peer(&PeerInfo {
+                capabilities: crate::control::PeerCapabilities::default(),
+                registration_seq: 0,
                 node_id: "node-b".to_string(),
                 device_name: "Office Mac".to_string(),
                 app_version: String::new(),
@@ -427,7 +429,10 @@ mod tests {
             .current_path_selection
             .as_ref()
             .expect("current path selection should be included in /status");
-        assert_eq!(current_path.reason_code, REASON_PATH_UNAVAILABLE);
+        assert_eq!(
+            current_path.reason_code,
+            crate::peer::REASON_PATH_DIRECT_FIRST_WAIT
+        );
 
         let mut events_stream = TcpStream::connect(addr).await.unwrap();
         let previous_process_id = std::process::id().wrapping_add(1);
@@ -576,6 +581,8 @@ mod tests {
         let peers = PeerManager::new(config);
         peers
             .add_peer(&PeerInfo {
+                capabilities: crate::control::PeerCapabilities::default(),
+                registration_seq: 0,
                 node_id: "node-shape".to_string(),
                 device_name: "Shape peer".to_string(),
                 app_version: String::new(),

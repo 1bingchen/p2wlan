@@ -8,11 +8,15 @@ async fn test_network_outbound_relay_ignores_missing_direct_business_budget_when
     let server = p2pnet_relay::RelayServer::start_random().await.unwrap();
     let relay_endpoint = server.addr.to_string();
 
-    let peers = Arc::new(PeerManager::new(
-        Config::generate_default("https://ctrl.test", "net1").unwrap(),
-    ));
+    let peers = Arc::new(PeerManager::new({
+        let mut config = Config::generate_default("https://ctrl.test", "net1").unwrap();
+        config.relay.path_policy = crate::config::PathPolicy::Auto;
+        config
+    }));
     peers
         .add_peer(&control::PeerInfo {
+            capabilities: crate::control::PeerCapabilities::default(),
+            registration_seq: 0,
             node_id: "node-b".to_string(),
             device_name: String::new(),
             app_version: String::new(),
@@ -67,6 +71,7 @@ async fn test_network_outbound_relay_ignores_missing_direct_business_budget_when
         relay_transport,
         relay_available_rx,
         RelayStartupWait {
+            relay_expected: true,
             timeout: Some(Duration::from_millis(500)),
         },
         relay_probe_kick_tx,
@@ -121,11 +126,15 @@ async fn test_network_outbound_uses_relay_until_direct_is_verified() {
     let direct_sink = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let direct_endpoint = direct_sink.local_addr().unwrap();
 
-    let peers = Arc::new(PeerManager::new(
-        Config::generate_default("https://ctrl.test", "net1").unwrap(),
-    ));
+    let peers = Arc::new(PeerManager::new({
+        let mut config = Config::generate_default("https://ctrl.test", "net1").unwrap();
+        config.relay.path_policy = crate::config::PathPolicy::Auto;
+        config
+    }));
     peers
         .add_peer(&control::PeerInfo {
+            capabilities: crate::control::PeerCapabilities::default(),
+            registration_seq: 0,
             node_id: "node-b".to_string(),
             device_name: String::new(),
             app_version: String::new(),
@@ -178,6 +187,7 @@ async fn test_network_outbound_uses_relay_until_direct_is_verified() {
         relay_transport,
         relay_available_rx,
         RelayStartupWait {
+            relay_expected: true,
             timeout: Some(Duration::from_millis(500)),
         },
         relay_probe_kick_tx,
@@ -247,6 +257,8 @@ async fn test_network_outbound_promotes_direct_before_relay_slot_is_published() 
     ));
     peers
         .add_peer(&control::PeerInfo {
+            capabilities: crate::control::PeerCapabilities::default(),
+            registration_seq: 0,
             node_id: "node-b".to_string(),
             device_name: String::new(),
             app_version: String::new(),
@@ -298,6 +310,7 @@ async fn test_network_outbound_promotes_direct_before_relay_slot_is_published() 
         relay_transport.clone(),
         relay_available_rx,
         RelayStartupWait {
+            relay_expected: true,
             timeout: Some(Duration::from_secs(2)),
         },
         relay_probe_kick_tx,
@@ -497,6 +510,8 @@ async fn responder_answer_uses_cached_candidates_while_refresh_is_blocked() {
     daemon
         .peers
         .add_peer(&control::PeerInfo {
+            capabilities: crate::control::PeerCapabilities::default(),
+            registration_seq: 0,
             node_id: peer_id.to_string(),
             device_name: String::new(),
             app_version: String::new(),
@@ -720,7 +735,12 @@ async fn relay_first_packet_liveness_crosses_responder_status_and_writer_content
         })
     };
 
-    let mut config = Config::generate_default(&format!("http://{address}"), "net1").unwrap();
+    let mut config = {
+        // This regression exercises the explicit legacy Auto policy.
+        let mut config = Config::generate_default(&format!("http://{address}"), "net1").unwrap();
+        config.relay.path_policy = crate::config::PathPolicy::Auto;
+        config
+    };
     config.control.auth_token = "test-token".to_string();
     config.node.node_id = "node-local".to_string();
     let daemon = Arc::new(Daemon::new(config));
@@ -743,6 +763,8 @@ async fn relay_first_packet_liveness_crosses_responder_status_and_writer_content
     daemon
         .peers
         .add_peer(&control::PeerInfo {
+            capabilities: crate::control::PeerCapabilities::default(),
+            registration_seq: 0,
             node_id: peer_id.to_string(),
             public_key: hex::encode(remote_identity.public_key()),
             virtual_ip: "10.20.0.2".to_string(),
@@ -764,11 +786,16 @@ async fn relay_first_packet_liveness_crosses_responder_status_and_writer_content
         p2pnet_relay::RelayClient::connect(&relay_endpoint, peer_id)
             .await
             .unwrap();
-    let remote_peers = Arc::new(PeerManager::new(
-        Config::generate_default("https://ctrl.test", "net1").unwrap(),
-    ));
+    let remote_peers = Arc::new(PeerManager::new({
+        // This regression exercises the explicit legacy Auto policy.
+        let mut config = Config::generate_default("https://ctrl.test", "net1").unwrap();
+        config.relay.path_policy = crate::config::PathPolicy::Auto;
+        config
+    }));
     remote_peers
         .add_peer(&control::PeerInfo {
+            capabilities: crate::control::PeerCapabilities::default(),
+            registration_seq: 0,
             node_id: "node-local".to_string(),
             public_key: hex::encode(local_public),
             virtual_ip: "10.20.0.1".to_string(),
@@ -1304,6 +1331,8 @@ async fn test_network_outbound_relay_wait_timeout_emits_reason_and_never_deliver
     ));
     peers
         .add_peer(&control::PeerInfo {
+            capabilities: crate::control::PeerCapabilities::default(),
+            registration_seq: 0,
             node_id: "node-b".to_string(),
             device_name: String::new(),
             app_version: String::new(),
@@ -1342,6 +1371,7 @@ async fn test_network_outbound_relay_wait_timeout_emits_reason_and_never_deliver
         relay_transport.clone(),
         relay_available_rx,
         RelayStartupWait {
+            relay_expected: true,
             timeout: Some(Duration::from_millis(200)),
         },
         relay_probe_kick_tx,
@@ -1419,6 +1449,8 @@ async fn test_network_outbound_direct_only_degrades_immediately_with_stable_reas
     ));
     peers
         .add_peer(&control::PeerInfo {
+            capabilities: crate::control::PeerCapabilities::default(),
+            registration_seq: 0,
             node_id: "node-b".to_string(),
             device_name: String::new(),
             app_version: String::new(),
@@ -1452,7 +1484,10 @@ async fn test_network_outbound_direct_only_degrades_immediately_with_stable_reas
         udp_transport,
         relay_transport,
         relay_available_rx,
-        RelayStartupWait { timeout: None },
+        RelayStartupWait {
+            relay_expected: false,
+            timeout: None,
+        },
         relay_probe_kick_tx,
         timeline.clone(),
     ));
@@ -1500,12 +1535,17 @@ async fn test_network_outbound_waiting_peer_never_blocks_confirmed_peer() {
     let server = p2pnet_relay::RelayServer::start_random().await.unwrap();
     let relay_endpoint = server.addr.to_string();
 
-    let peers = Arc::new(PeerManager::new(
-        Config::generate_default("https://ctrl.test", "net1").unwrap(),
-    ));
+    let peers = Arc::new(PeerManager::new({
+        // This regression exercises the explicit legacy Auto policy.
+        let mut config = Config::generate_default("https://ctrl.test", "net1").unwrap();
+        config.relay.path_policy = crate::config::PathPolicy::Auto;
+        config
+    }));
     for (peer_id, vip) in [("node-b", "10.20.0.2"), ("node-c", "10.20.0.3")] {
         peers
             .add_peer(&control::PeerInfo {
+                capabilities: crate::control::PeerCapabilities::default(),
+                registration_seq: 0,
                 node_id: peer_id.to_string(),
                 device_name: String::new(),
                 app_version: String::new(),
@@ -1557,6 +1597,7 @@ async fn test_network_outbound_waiting_peer_never_blocks_confirmed_peer() {
         relay_transport,
         relay_available_rx,
         RelayStartupWait {
+            relay_expected: true,
             timeout: Some(Duration::from_secs(2)),
         },
         relay_probe_kick_tx,
@@ -1632,6 +1673,8 @@ async fn test_network_outbound_multi_packet_burst_shares_one_startup_deadline() 
     ));
     peers
         .add_peer(&control::PeerInfo {
+            capabilities: crate::control::PeerCapabilities::default(),
+            registration_seq: 0,
             node_id: "node-b".to_string(),
             device_name: String::new(),
             app_version: String::new(),
@@ -1666,6 +1709,7 @@ async fn test_network_outbound_multi_packet_burst_shares_one_startup_deadline() 
         relay_transport,
         relay_available_rx,
         RelayStartupWait {
+            relay_expected: true,
             timeout: Some(Duration::from_millis(200)),
         },
         relay_probe_kick_tx,
@@ -1746,6 +1790,8 @@ async fn test_network_outbound_direct_commit_is_bounded_fallback_when_relay_neve
     ));
     peers
         .add_peer(&control::PeerInfo {
+            capabilities: crate::control::PeerCapabilities::default(),
+            registration_seq: 0,
             node_id: "node-b".to_string(),
             device_name: String::new(),
             app_version: String::new(),
@@ -1782,6 +1828,7 @@ async fn test_network_outbound_direct_commit_is_bounded_fallback_when_relay_neve
         relay_transport,
         relay_available_rx,
         RelayStartupWait {
+            relay_expected: true,
             timeout: Some(Duration::from_secs(4)),
         },
         relay_probe_kick_tx,
@@ -1843,11 +1890,16 @@ async fn test_network_outbound_relay_confirm_after_deadline_flushes_not_drops() 
     let server = p2pnet_relay::RelayServer::start_random().await.unwrap();
     let relay_endpoint = server.addr.to_string();
 
-    let peers = Arc::new(PeerManager::new(
-        Config::generate_default("https://ctrl.test", "net1").unwrap(),
-    ));
+    let peers = Arc::new(PeerManager::new({
+        // This regression exercises the explicit legacy Auto policy.
+        let mut config = Config::generate_default("https://ctrl.test", "net1").unwrap();
+        config.relay.path_policy = crate::config::PathPolicy::Auto;
+        config
+    }));
     peers
         .add_peer(&control::PeerInfo {
+            capabilities: crate::control::PeerCapabilities::default(),
+            registration_seq: 0,
             node_id: "node-b".to_string(),
             device_name: String::new(),
             app_version: String::new(),
@@ -1889,6 +1941,7 @@ async fn test_network_outbound_relay_confirm_after_deadline_flushes_not_drops() 
         relay_transport,
         relay_available_rx,
         RelayStartupWait {
+            relay_expected: true,
             timeout: Some(Duration::from_millis(150)),
         },
         relay_probe_kick_tx,
@@ -1972,10 +2025,17 @@ async fn test_relay_probe_ack_mismatch_never_confirms_and_404_revokes() {
     // + owner, within TTL) may confirm it.  A stale/foreign ACK no-ops, and a
     // relay 404 / transport invalidation revokes the confirmation so a later
     // relay must re-probe.
-    let config = Config::generate_default("https://ctrl.test", "net1").unwrap();
+    let config = {
+        // This regression exercises the explicit legacy Auto policy.
+        let mut config = Config::generate_default("https://ctrl.test", "net1").unwrap();
+        config.relay.path_policy = crate::config::PathPolicy::Auto;
+        config
+    };
     let peers = Arc::new(PeerManager::new(config));
     peers
         .add_peer(&control::PeerInfo {
+            capabilities: crate::control::PeerCapabilities::default(),
+            registration_seq: 0,
             node_id: "node-b".to_string(),
             device_name: String::new(),
             app_version: String::new(),
@@ -2174,11 +2234,16 @@ async fn test_network_outbound_first_packet_wait_never_blocks_relay_probe() {
     let server = p2pnet_relay::RelayServer::start_random().await.unwrap();
     let relay_endpoint = server.addr.to_string();
 
-    let peers = Arc::new(PeerManager::new(
-        Config::generate_default("https://ctrl.test", "net1").unwrap(),
-    ));
+    let peers = Arc::new(PeerManager::new({
+        // This regression exercises the explicit legacy Auto policy.
+        let mut config = Config::generate_default("https://ctrl.test", "net1").unwrap();
+        config.relay.path_policy = crate::config::PathPolicy::Auto;
+        config
+    }));
     peers
         .add_peer(&control::PeerInfo {
+            capabilities: crate::control::PeerCapabilities::default(),
+            registration_seq: 0,
             node_id: "node-b".to_string(),
             device_name: String::new(),
             app_version: String::new(),
@@ -2219,6 +2284,7 @@ async fn test_network_outbound_first_packet_wait_never_blocks_relay_probe() {
         relay_transport.clone(),
         relay_available_rx,
         RelayStartupWait {
+            relay_expected: true,
             timeout: Some(Duration::from_secs(2)),
         },
         relay_probe_kick_tx,
@@ -2361,6 +2427,8 @@ async fn run_burst_confirmation_replay_test(count: usize) {
     ));
     peers
         .add_peer(&control::PeerInfo {
+            capabilities: crate::control::PeerCapabilities::default(),
+            registration_seq: 0,
             node_id: "node-b".to_string(),
             device_name: String::new(),
             app_version: String::new(),
@@ -2401,6 +2469,7 @@ async fn run_burst_confirmation_replay_test(count: usize) {
         relay_transport.clone(),
         relay_available_rx,
         RelayStartupWait {
+            relay_expected: true,
             timeout: Some(Duration::from_secs(5)),
         },
         relay_probe_kick_tx,
@@ -2542,11 +2611,16 @@ async fn test_network_outbound_control_packet_between_bursts_keeps_monotonic_cou
     let server = p2pnet_relay::RelayServer::start_random().await.unwrap();
     let relay_endpoint = server.addr.to_string();
 
-    let peers = Arc::new(PeerManager::new(
-        Config::generate_default("https://ctrl.test", "net1").unwrap(),
-    ));
+    let peers = Arc::new(PeerManager::new({
+        // This regression exercises the explicit legacy Auto policy.
+        let mut config = Config::generate_default("https://ctrl.test", "net1").unwrap();
+        config.relay.path_policy = crate::config::PathPolicy::Auto;
+        config
+    }));
     peers
         .add_peer(&control::PeerInfo {
+            capabilities: crate::control::PeerCapabilities::default(),
+            registration_seq: 0,
             node_id: "node-b".to_string(),
             device_name: String::new(),
             app_version: String::new(),
@@ -2596,6 +2670,7 @@ async fn test_network_outbound_control_packet_between_bursts_keeps_monotonic_cou
         relay_transport.clone(),
         relay_available_rx,
         RelayStartupWait {
+            relay_expected: true,
             timeout: Some(Duration::from_secs(2)),
         },
         relay_probe_kick_tx,
@@ -2717,6 +2792,8 @@ async fn test_network_outbound_queue_overflow_counts_packets_and_bytes_exactly()
     ));
     peers
         .add_peer(&control::PeerInfo {
+            capabilities: crate::control::PeerCapabilities::default(),
+            registration_seq: 0,
             node_id: "node-b".to_string(),
             device_name: String::new(),
             app_version: String::new(),
@@ -2751,6 +2828,7 @@ async fn test_network_outbound_queue_overflow_counts_packets_and_bytes_exactly()
         relay_transport,
         relay_available_rx,
         RelayStartupWait {
+            relay_expected: true,
             timeout: Some(Duration::from_secs(30)),
         },
         relay_probe_kick_tx,
@@ -2895,6 +2973,8 @@ async fn test_network_outbound_worker_shutdown_counts_parked_packets() {
     ));
     peers
         .add_peer(&control::PeerInfo {
+            capabilities: crate::control::PeerCapabilities::default(),
+            registration_seq: 0,
             node_id: "node-b".to_string(),
             device_name: String::new(),
             app_version: String::new(),
@@ -2928,6 +3008,7 @@ async fn test_network_outbound_worker_shutdown_counts_parked_packets() {
         relay_transport,
         relay_available_rx,
         RelayStartupWait {
+            relay_expected: true,
             timeout: Some(Duration::from_secs(30)),
         },
         relay_probe_kick_tx,
@@ -2998,6 +3079,8 @@ async fn test_relay_probe_old_relay_ack_never_confirms_new_relay_and_duplicate_a
     let peers = Arc::new(PeerManager::new(config));
     peers
         .add_peer(&control::PeerInfo {
+            capabilities: crate::control::PeerCapabilities::default(),
+            registration_seq: 0,
             node_id: "node-b".to_string(),
             device_name: String::new(),
             app_version: String::new(),
@@ -3088,6 +3171,8 @@ async fn test_relay_probe_same_endpoint_replacement_rejects_old_transport_ack() 
     let peers = Arc::new(PeerManager::new(config));
     peers
         .add_peer(&control::PeerInfo {
+            capabilities: crate::control::PeerCapabilities::default(),
+            registration_seq: 0,
             node_id: "node-b".to_string(),
             device_name: String::new(),
             app_version: String::new(),
@@ -3175,6 +3260,8 @@ async fn test_relay_probe_stale_generation_ack_never_confirms() {
     let peers = Arc::new(PeerManager::new(config));
     peers
         .add_peer(&control::PeerInfo {
+            capabilities: crate::control::PeerCapabilities::default(),
+            registration_seq: 0,
             node_id: "node-b".to_string(),
             device_name: String::new(),
             app_version: String::new(),

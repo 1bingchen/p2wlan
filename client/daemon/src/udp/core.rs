@@ -87,8 +87,16 @@ impl UdpTransport {
             peers,
             pending_probes: Arc::new(Mutex::new(HashMap::new())),
             hard_hard_probe_bindings: Arc::new(Mutex::new(HashMap::new())),
-            stun_waiters: Arc::new(Mutex::new(HashMap::new())),
+            hard_hard_measurement_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+            #[cfg(test)]
+            hh2_validation_send_gate: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            hh2_probe_ack_send_gate: Arc::new(Mutex::new(None)),
+            stun_waiters: StunWaiters::default(),
+            #[cfg(test)]
+            test_ingress_gate: None,
             socket_state: Arc::new(Mutex::new(SocketState {
+                hard_hard_pair_modes: HashMap::new(),
                 dynamic: HashMap::new(),
                 affinity: HashMap::new(),
                 affinity_epoch: 0,
@@ -317,6 +325,17 @@ impl UdpTransport {
     pub fn with_validation_trigger(
         mut self,
         trigger: Arc<dyn Fn(PeerReflexiveObservation) + Send + Sync>,
+    ) -> Self {
+        self.validation_trigger = Some(Arc::new(move |observation| {
+            trigger(observation);
+            DirectValidationAdmission::Queued
+        }));
+        self
+    }
+
+    pub(crate) fn with_validation_admission_trigger(
+        mut self,
+        trigger: Arc<dyn Fn(PeerReflexiveObservation) -> DirectValidationAdmission + Send + Sync>,
     ) -> Self {
         self.validation_trigger = Some(trigger);
         self

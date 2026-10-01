@@ -70,6 +70,20 @@ pub(super) const fn birthday_failure_priority(kind: BirthdaySweepFailureKind) ->
 }
 
 pub(super) fn merge_punch_send_reports(destination: &mut PunchSendReport, source: PunchSendReport) {
+    // Inspect the accumulator BEFORE adding this report's assignments. Empty
+    // reports are neutral, but a cancellation/join failure with no returned
+    // assignments must not be erased by the next successful worker.
+    let destination_was_empty = destination.targets_assigned == 0
+        && destination.targets_cancelled == 0
+        && destination.probe_path_errors == 0
+        && !destination.worker_failed
+        && destination.failure_kind.is_none();
+    let processing_completed = if source.targets_assigned == 0 {
+        destination.target_processing_completed
+    } else {
+        (destination_was_empty || destination.target_processing_completed)
+            && source.target_processing_completed
+    };
     let source_logical_sent = source.logical_probes_sent.max(source.packets_sent);
     let source_logical_attempted = source.logical_probes_attempted.max(source_logical_sent);
     let source_targets_examined = source.targets_examined.max(source.targets_attempted);
@@ -89,9 +103,15 @@ pub(super) fn merge_punch_send_reports(destination: &mut PunchSendReport, source
     destination.physical_datagrams_sent = destination
         .physical_datagrams_sent
         .saturating_add(source_physical_datagrams_sent);
+    destination.physical_bytes_sent = destination
+        .physical_bytes_sent
+        .saturating_add(source.physical_bytes_sent);
     destination.physical_send_errors = destination
         .physical_send_errors
         .saturating_add(source.physical_send_errors);
+    destination.physical_send_error_bytes = destination
+        .physical_send_error_bytes
+        .saturating_add(source.physical_send_error_bytes);
     destination.partial_physical_send_errors = destination
         .partial_physical_send_errors
         .saturating_add(source.partial_physical_send_errors);
@@ -113,16 +133,19 @@ pub(super) fn merge_punch_send_reports(destination: &mut PunchSendReport, source
     destination.targets_cancelled = destination
         .targets_cancelled
         .saturating_add(source.targets_cancelled);
-    if destination.targets_assigned == 0 {
-        destination.target_processing_completed = source.target_processing_completed;
-    } else {
-        destination.target_processing_completed &= source.target_processing_completed;
-    }
     destination.worker_failed |=
         source.worker_failed || source.failure_kind == Some(BirthdaySweepFailureKind::WorkerJoin);
     destination.failure_kind =
         combine_birthday_failure_kind(destination.failure_kind, source.failure_kind);
+    destination.target_processing_completed = processing_completed
+        && destination.targets_assigned != 0
+        && destination.targets_cancelled == 0
+        && destination.probe_path_errors == 0
+        && !destination.worker_failed
+        && destination.failure_kind.is_none();
     destination.epoch_budget_exhausted |= source.epoch_budget_exhausted;
+    destination.sweep_budget_stop = destination.sweep_budget_stop.max(source.sweep_budget_stop);
+    destination.pacing_deadline_reached |= source.pacing_deadline_reached;
     destination.candidate_iteration_capped |= source.candidate_iteration_capped;
     destination.first_send_at_ms = match (destination.first_send_at_ms, source.first_send_at_ms) {
         (Some(left), Some(right)) => Some(left.min(right)),
@@ -152,6 +175,10 @@ pub(super) fn merge_punch_send_reports(destination: &mut PunchSendReport, source
     }
     normalize_physical_send_dimensions(destination);
 }
+
+#[cfg(test)]
+#[path = "punch_reports_tests.rs"]
+mod tests;
 
 /// Keep the terminal/live physical-send invariant exact after reports from
 /// several workers have been merged.  Every production Hard↔Hard physical
@@ -233,9 +260,13 @@ pub(crate) fn apply_live_birthday_counters(
     report.physical_datagrams_sent = report
         .physical_datagrams_sent
         .max(counters.physical_datagrams_sent);
+    report.physical_bytes_sent = report.physical_bytes_sent.max(counters.physical_bytes_sent);
     report.physical_send_errors = report
         .physical_send_errors
         .max(counters.physical_send_errors);
+    report.physical_send_error_bytes = report
+        .physical_send_error_bytes
+        .max(counters.physical_send_error_bytes);
     report.partial_physical_send_errors = report
         .partial_physical_send_errors
         .max(counters.partial_physical_send_errors);

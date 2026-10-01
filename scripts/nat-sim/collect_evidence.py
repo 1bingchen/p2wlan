@@ -18,10 +18,12 @@ from pathlib import Path
 from typing import Any
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 REPOSITORY = "yhan-sun/p2wlan"
-SUMMARY_SCHEMA_VERSION = 1
+SUMMARY_SCHEMA_VERSION = 2
 SUMMARY_SOURCE = "authoritative_business_ingress_commit"
+RELAY_READY_TO_USABLE_SLO_MS = 3000
+DIRECT_FIRST_WINDOW_MS = 5000
 
 
 def _load(path: Path) -> dict[str, Any]:
@@ -64,8 +66,10 @@ def _summaries(status: dict[str, Any]) -> list[dict[str, Any]]:
         if isinstance(summaries, list) else []
 
 
-def _event_time(events: list[dict[str, Any]], name: str, peer_id: str, generation: int) -> int | None:
-    values = []
+def _event_record(
+    events: list[dict[str, Any]], name: str, peer_id: str, generation: int
+) -> dict[str, Any] | None:
+    values: list[tuple[int, dict[str, Any]]] = []
     for event in events:
         if event.get("event") != name or event.get("peer_id") not in {None, peer_id}:
             continue
@@ -74,8 +78,8 @@ def _event_time(events: list[dict[str, Any]], name: str, peer_id: str, generatio
             continue
         at_ms = _int(event.get("at_ms"))
         if at_ms is not None:
-            values.append(at_ms)
-    return min(values) if values else None
+            values.append((at_ms, event))
+    return min(values, key=lambda item: item[0])[1] if values else None
 
 
 def _status_identity(status: dict[str, Any]) -> dict[str, Any]:
@@ -124,6 +128,7 @@ def _valid_summary(
         return False
     ready_at_ms = summary.get("relay_ready_at_ms")
     delta_ms = summary.get("first_usable_delta_ms")
+    direct_first_remaining_ms = summary.get("direct_first_remaining_ms_at_relay_ready")
     if ready_at_ms is not None:
         ready_at_ms = _int(ready_at_ms)
         if ready_at_ms is None or ready_at_ms < 0 or ready_at_ms > first_at_ms:
@@ -131,6 +136,14 @@ def _valid_summary(
     if delta_ms is not None:
         delta_ms = _int(delta_ms)
         if delta_ms is None or ready_at_ms is None or delta_ms != first_at_ms - ready_at_ms:
+            return False
+    if direct_first_remaining_ms is not None:
+        direct_first_remaining_ms = _int(direct_first_remaining_ms)
+        if (
+            direct_first_remaining_ms is None
+            or direct_first_remaining_ms < 0
+            or direct_first_remaining_ms > DIRECT_FIRST_WINDOW_MS
+        ):
             return False
     if summary.get("relay_id") is not None and not isinstance(summary.get("relay_id"), str):
         return False
@@ -148,6 +161,8 @@ def _side_evidence(
     log_path: Path,
     expected_path: str,
     overlay_burst: int,
+    allow_replay_rejects: bool = False,
+    normal_join: bool = False,
 ) -> tuple[dict[str, Any], str | None]:
     baseline_identity = _status_identity(baseline)
     final_identity = _status_identity(final)
@@ -206,6 +221,9 @@ def _side_evidence(
         key=lambda item: _int(item.get("at_ms")) if _int(item.get("at_ms")) is not None else 2**63,
         default=None,
     )
+    if normal_join:
+        observed_path = (summary or first_event or {}).get("path")
+        expected_path = observed_path if observed_path in {"direct", "relay"} else "unobserved"
 
     ready_at_ms = None
     first_usable_at_ms = None
@@ -218,7 +236,9 @@ def _side_evidence(
     relay_id = None
     relay_connection_id = None
     delta_ms = None
+    direct_first_remaining_ms = None
     baseline_after_transition = False
+    invalid_timing_present = False
 
     if summary is not None:
         source = "persistent_summary"
@@ -232,6 +252,12 @@ def _side_evidence(
         relay_connection_id = _int(summary.get("relay_connection_id"))
         ready_at_ms = _int(summary.get("relay_ready_at_ms"))
         delta_ms = _int(summary.get("first_usable_delta_ms"))
+        direct_first_remaining_ms = _int(
+            summary.get("direct_first_remaining_ms_at_relay_ready")
+        )
+        invalid_timing_present = expected_path == "relay" and not isinstance(
+            direct_first_remaining_ms, int
+        )
         baseline_after_transition = (
             baseline_revision is not None
             and transition_revision is not None
@@ -250,7 +276,19 @@ def _side_evidence(
             first_usable_at_ms = event_at_ms
             transition_revision = event_revision
             first_path = first_event.get("path")
-            ready_at_ms = _event_time(events, "relay_transport_ready_peer", peer_id, generation)
+            ready_event = _event_record(
+                events, "relay_transport_ready_peer", peer_id, generation
+            )
+            ready_at_ms = _int(ready_event.get("at_ms")) if ready_event is not None else None
+            remaining_value = (
+                ready_event.get("direct_first_remaining_ms") if ready_event is not None else None
+            )
+            direct_first_remaining_ms = _int(remaining_value)
+            invalid_timing_present = expected_path == "relay" and (
+                direct_first_remaining_ms is None
+                or direct_first_remaining_ms < 0
+                or direct_first_remaining_ms > DIRECT_FIRST_WINDOW_MS
+            )
             if ready_at_ms is not None and event_at_ms >= ready_at_ms:
                 delta_ms = event_at_ms - ready_at_ms
             baseline_after_transition = baseline_at_ms is not None and event_at_ms <= baseline_at_ms
@@ -319,9 +357,24 @@ def _side_evidence(
     tasks_ok = tasks_ok and critical_count > 0
 
     source_ok = source in {"persistent_summary", "event"}
-    first_path_ok = first_path == expected_path
-    delta_ok = isinstance(delta_ms, int) and 0 <= delta_ms <= 3000
-    business_ok = business_received and (expected_path != "relay" or business_sent or business_exchange)
+    first_path_ok = first_path in {"direct", "relay"} and first_path == expected_path
+    # This side's remaining DirectFirst window is producer evidence.  The
+    # acceptance budget is paired in build_record: a daemon's first ingress can
+    # be gated by either endpoint's DirectFirst protection / Relay-ready skew.
+    # Keeping those two values separate also makes a forged local-budget match
+    # detectable by the aggregate validator.
+    delta_budget_ms = RELAY_READY_TO_USABLE_SLO_MS
+    delta_ok = (
+        not invalid_timing_present
+        and isinstance(delta_ms, int)
+        and delta_ms >= 0
+    )
+    # Normal joining can receive via Relay while sending via Direct. The
+    # paired record must prove authenticated business ingress at BOTH peers;
+    # requiring a Relay send marker here would reject that working exchange.
+    # Dedicated Relay gates still require both Relay-specific directions.
+    business_ok = business_received and (
+        normal_join or expected_path != "relay" or business_sent or business_exchange)
     # Direct cold-start exits the smoke loop as soon as both sides prove the
     # first authenticated Direct business ingress.  Its overlay generator is
     # intentionally not awaited for a full burst; Relay-only waits for the
@@ -341,7 +394,13 @@ def _side_evidence(
         "critical_tasks_healthy": tasks_ok,
         "overlay_verified": overlay_verified > 0,
         "direct_not_used": direct_upgrade_ok if expected_path == "relay" else True,
-        "no_replay_or_invalid": replay_rejected == 0 and overlay_invalid == 0,
+        # Ordinary topology gates require zero replay rejects. The dedicated
+        # duplicate-injection experiment may instead accept authenticated
+        # WireGuard replay rejection, but never an invalid overlay payload.
+        "no_replay_or_invalid": (
+            (allow_replay_rejects or replay_rejected == 0)
+            and overlay_invalid == 0
+        ),
         "burst_complete": not burst_required or (burst_complete > 0 and burst_incomplete == 0),
         "outbound_drops_zero": drops_packets == 0,
     }
@@ -361,6 +420,8 @@ def _side_evidence(
             reason = "first_usable_never_observed"
     elif invalid_summary_present:
         reason = "evidence_parser_loss"
+    elif invalid_timing_present:
+        reason = "evidence_parser_loss"
     elif source == "event" and baseline_after_transition:
         reason = "baseline_after_transition_event_retained"
     elif not first_path_ok:
@@ -369,7 +430,7 @@ def _side_evidence(
         reason = "first_business_not_passed"
     elif expected_path == "relay" and not relay_confirmed:
         reason = "relay_confirmation_missing"
-    elif not delta_ok:
+    elif not isinstance(delta_ms, int) or delta_ms < 0:
         reason = "first_usable_delta_missing"
     elif not all(invariants.values()):
         reason = next(name for name, value in invariants.items() if not value)
@@ -401,6 +462,10 @@ def _side_evidence(
                 "transition_revision": transition_revision,
                 "relay_ready_at_ms": ready_at_ms,
                 "delta_ms": delta_ms,
+                "direct_first_remaining_ms_at_relay_ready": direct_first_remaining_ms,
+                "budget_direct_first_remaining_ms": None,
+                "slo_base_ms": RELAY_READY_TO_USABLE_SLO_MS,
+                "budget_ms": delta_budget_ms,
                 "source": source,
                 "baseline_after_transition": baseline_after_transition,
             },
@@ -424,6 +489,79 @@ def _side_evidence(
         "invariants": invariants,
     }
     return side, reason
+
+
+def _apply_first_usable_budget(
+    side: dict[str, Any],
+    counterpart: dict[str, Any],
+    expected_path: str,
+    reason: str | None,
+    normal_join: bool = False,
+) -> str | None:
+    """Fence one local ingress delta with the paired protection window.
+
+    Depending on which endpoint becomes Relay-ready first and which produces
+    the initial business/echo, either endpoint's DirectFirst protection can
+    gate a local first ingress.  Use the maximum of the two authoritative
+    remaining windows.  Direct topology never receives this allowance.
+    """
+    first = side["observed"]["first_usable"]
+    # Normal joining does not wait for Relay before generating business.
+    # A valid durable Direct commit may therefore precede Relay readiness.
+    # Keep its Relay delta unknown, rather than fabricating zero or rejecting
+    # a faster working path. Calibrated Direct/Relay gates retain their SLO.
+    if (normal_join and expected_path == "direct"
+            and first.get("source") == "persistent_summary"
+            and first.get("path") == "direct"
+            and first.get("relay_ready_at_ms") is None
+            and first.get("delta_ms") is None
+            and type(first.get("first_usable_at_ms")) is int
+            and type(side["final"].get("captured_at_ms")) is int
+            and 0 <= first["first_usable_at_ms"] <= side["final"]["captured_at_ms"]):
+        first["relay_ready_delta_applicable"] = False
+        first["budget_ms"] = None
+        side["invariants"]["first_usable_delta_fenced"] = True
+        return None if reason == "first_usable_delta_missing" else reason
+    counterpart_first = counterpart["observed"]["first_usable"]
+    budget_remaining_ms = 0
+    if expected_path == "relay":
+        candidates = [
+            first.get("direct_first_remaining_ms_at_relay_ready"),
+            counterpart_first.get("direct_first_remaining_ms_at_relay_ready"),
+        ]
+        if (normal_join and counterpart_first.get("path") == "direct"
+                and counterpart_first.get("relay_ready_delta_applicable") is False):
+            candidates = candidates[:1]
+        for candidate in candidates:
+            if (
+                not isinstance(candidate, int)
+                or isinstance(candidate, bool)
+                or candidate < 0
+                or candidate > DIRECT_FIRST_WINDOW_MS
+            ):
+                first["budget_direct_first_remaining_ms"] = None
+                first["budget_ms"] = None
+                side["invariants"]["first_usable_delta_fenced"] = False
+                return reason or "evidence_parser_loss"
+        budget_remaining_ms = max(candidates)
+
+    budget_ms = RELAY_READY_TO_USABLE_SLO_MS + budget_remaining_ms
+    first["budget_direct_first_remaining_ms"] = budget_remaining_ms
+    first["budget_ms"] = budget_ms
+    delta_ms = first.get("delta_ms")
+    delta_ok = (
+        isinstance(delta_ms, int)
+        and not isinstance(delta_ms, bool)
+        and 0 <= delta_ms <= budget_ms
+    )
+    side["invariants"]["first_usable_delta_fenced"] = delta_ok
+    if reason is None and not delta_ok:
+        return (
+            "first_usable_delta_missing"
+            if not isinstance(delta_ms, int) or isinstance(delta_ms, bool) or delta_ms < 0
+            else "relay_first_slo_exceeded"
+        )
+    return reason
 
 
 def build_record(args: argparse.Namespace) -> dict[str, Any]:
@@ -457,12 +595,69 @@ def build_record(args: argparse.Namespace) -> dict[str, Any]:
         baseline_b = _load(Path(args.baseline_b))
         final_a = _load(Path(args.final_a))
         final_b = _load(Path(args.final_b))
+        allow_replay_rejects = bool(getattr(args, "allow_replay_rejects", False))
+        if allow_replay_rejects and topology != "hard-hard-experiment":
+            raise ValueError("replay_reject_policy_outside_hard_hard")
         side_a, reason_a = _side_evidence(
-            "a", baseline_a, final_a, Path(args.log_a), args.expected_path, int(args.overlay_burst)
+            "a",
+            baseline_a,
+            final_a,
+            Path(args.log_a),
+            args.expected_path,
+            int(args.overlay_burst),
+            allow_replay_rejects,
+            topology == "normal-join",
         )
         side_b, reason_b = _side_evidence(
-            "b", baseline_b, final_b, Path(args.log_b), args.expected_path, int(args.overlay_burst)
+            "b",
+            baseline_b,
+            final_b,
+            Path(args.log_b),
+            args.expected_path,
+            int(args.overlay_burst),
+            allow_replay_rejects,
+            topology == "normal-join",
         )
+        sides = [(side_a, side_b, reason_a), (side_b, side_a, reason_b)]
+        # Mark Direct-before-Relay first, so asymmetric peers do not depend on
+        # which side happened to be named A in the paired timing calculation.
+        if topology == "normal-join":
+            sides.sort(key=lambda item: item[0]["observed"]["first_usable"]["path"] != "direct")
+        reasons = {}
+        for side, counterpart, reason in sides:
+            expected = side["observed"]["first_usable"]["path"] if topology == "normal-join" else args.expected_path
+            reasons[side["label"]] = _apply_first_usable_budget(
+                side, counterpart, expected, reason, topology == "normal-join")
+        reason_a, reason_b = reasons["a"], reasons["b"]
+        hard_hard_experiment = topology == "hard-hard-experiment"
+        if hard_hard_experiment:
+            for side in (side_a, side_b):
+                first = side["observed"]["first_usable"]
+                remaining_ms = first.get(
+                    "direct_first_remaining_ms_at_relay_ready"
+                )
+                delta_ms = first.get("delta_ms")
+                protection_observed = (
+                    type(remaining_ms) is int
+                    and 0 <= remaining_ms <= DIRECT_FIRST_WINDOW_MS
+                    and type(delta_ms) is int
+                    and delta_ms >= 0
+                )
+                first["direct_first_protection_budget_ms"] = (
+                    remaining_ms if protection_observed else None
+                )
+                first["within_direct_first_protection"] = (
+                    first.get("path") == "direct" and delta_ms <= remaining_ms
+                    if protection_observed
+                    else None
+                )
+                side["invariants"][
+                    "direct_first_protection_observed"
+                ] = protection_observed
+            if not side_a["invariants"]["direct_first_protection_observed"]:
+                reason_a = reason_a or "evidence_parser_loss"
+            if not side_b["invariants"]["direct_first_protection_observed"]:
+                reason_b = reason_b or "evidence_parser_loss"
         record["baseline"] = {"a": side_a["baseline"], "b": side_b["baseline"]}
         record["final"] = {"a": side_a["final"], "b": side_b["final"]}
         record["observed"] = {"a": side_a["observed"], "b": side_b["observed"]}
@@ -485,15 +680,67 @@ def build_record(args: argparse.Namespace) -> dict[str, Any]:
             "same_workflow_sha": bool(args.workflow_sha),
         }
         failed_reasons = [reason for reason in (reason_a, reason_b) if reason]
-        all_invariants = all(side_a["invariants"].values()) and all(side_b["invariants"].values())
-        result = not failed_reasons and all_invariants
-        reason = None if result else (failed_reasons[0] if failed_reasons else "invariant_failed")
+        if hard_hard_experiment:
+            replay_rejects_observed = sum(
+                int(side["observed"]["replay_rejected"])
+                for side in (side_a, side_b)
+            )
+            replay_policy_satisfied = (
+                replay_rejects_observed > 0
+                if allow_replay_rejects
+                else replay_rejects_observed == 0
+            )
+            record["invariants"]["replay_policy_satisfied"] = replay_policy_satisfied
+            record["observed"]["replay_policy"] = {
+                "allow_replay_rejects": allow_replay_rejects,
+                "replay_rejects_observed": replay_rejects_observed,
+            }
+            if not replay_policy_satisfied:
+                failed_reasons.append("replay_policy_unsatisfied")
+            # The fixed 3500ms Hard<->Hard rendezvous can legitimately miss
+            # the existing 3000ms cold-start SLO. Keep the calibrated budget,
+            # raw delta, and miss explicit, but do not confuse that measured
+            # performance outcome with corrupt experiment evidence. The
+            # ordinary Direct/Relay records retain their fail-closed gates.
+            evidence_reasons = [
+                reason
+                for reason in failed_reasons
+                if reason != "relay_first_slo_exceeded"
+            ]
+            all_invariants = all(
+                value
+                for side in (side_a, side_b)
+                for name, value in side["invariants"].items()
+                if name != "first_usable_delta_fenced"
+            )
+        else:
+            evidence_reasons = failed_reasons
+            all_invariants = all(side_a["invariants"].values()) and all(
+                side_b["invariants"].values()
+            )
+        result = not evidence_reasons and all_invariants
+        reason = None if result else (
+            evidence_reasons[0] if evidence_reasons else "invariant_failed"
+        )
         record["result"] = "pass" if result else "fail"
         record["decision"] = {
             "result": record["result"],
             "reason_code": reason,
             "observed_decision": "first_usable_committed" if result else "first_usable_not_accepted",
         }
+        if hard_hard_experiment:
+            slo_met = (
+                side_a["invariants"]["first_usable_delta_fenced"]
+                and side_b["invariants"]["first_usable_delta_fenced"]
+            )
+            record["decision"].update(
+                {
+                    "performance_slo_result": "met" if slo_met else "miss",
+                    "performance_slo_reason_code": (
+                        None if slo_met else "relay_first_slo_exceeded"
+                    ),
+                }
+            )
     except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
         reason = str(exc).split(":", 1)[0] or "evidence_parse_failed"
         record["decision"] = {
@@ -506,7 +753,11 @@ def build_record(args: argparse.Namespace) -> dict[str, Any]:
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--topology", required=True, choices=["relay-blackhole", "direct-cold-start"])
+    parser.add_argument(
+        "--topology",
+        required=True,
+        choices=["relay-blackhole", "direct-cold-start", "hard-hard-experiment", "normal-join"],
+    )
     parser.add_argument("--replica", required=True, type=int)
     parser.add_argument("--round", required=True, type=int)
     parser.add_argument("--source-head-sha", required=True)
@@ -519,6 +770,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--log-b", required=True)
     parser.add_argument("--expected-path", required=True, choices=["relay", "direct"])
     parser.add_argument("--overlay-burst", type=int, default=0)
+    parser.add_argument("--allow-replay-rejects", action="store_true")
     parser.add_argument("--output", required=True)
     return parser.parse_args(argv)
 

@@ -114,7 +114,7 @@ fn live_filtering_classifier_distinguishes_changed_sources() {
     );
     assert_eq!(
         classify_live_filtering_response(server, "192.0.2.10:3479".parse().unwrap()),
-        Some(FilteringBehavior::AddressDependent)
+        None
     );
     assert_eq!(classify_live_filtering_response(server, server), None);
 }
@@ -136,7 +136,7 @@ fn live_filtering_probe_timeout_is_bounded_without_becoming_too_short() {
 }
 
 #[tokio::test]
-async fn live_filtering_probe_classifies_changed_port_response() {
+async fn live_filtering_probe_keeps_port_only_response_unknown() {
     let peers = peer_manager();
     let transport = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers)
         .await
@@ -217,7 +217,7 @@ async fn live_filtering_probe_classifies_changed_port_response() {
 
     assert_eq!(
         report.nat_profile.filtering_behavior,
-        FilteringBehavior::AddressDependent
+        FilteringBehavior::Unknown
     );
     server_worker.await.unwrap();
     inbound_worker.abort();

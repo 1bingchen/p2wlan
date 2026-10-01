@@ -921,3 +921,67 @@ async fn heartbeat_yields_to_foreground_probe_budget() {
         "foreground traversal must retain priority and its own admission capacity"
     );
 }
+
+#[tokio::test]
+async fn heartbeat_recovers_after_local_and_global_foreground_windows_expire() {
+    let endpoint = "127.0.0.1:32001".parse().unwrap();
+    let peers = peer_manager();
+    let mut info = peer("idle-foreground", "10.20.0.9", Some(endpoint));
+    info.app_version = "0.1.25".to_string();
+    peers.add_peer(&info).await;
+    let foreground_budget = Arc::new(GlobalOutboundProbeBudget::new());
+    let transport = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers)
+        .await
+        .unwrap()
+        .with_global_probe_budget(foreground_budget.clone())
+        .with_global_heartbeat_budget(Arc::new(GlobalRelayBackoffHeartbeatBudget::new()));
+    let burst = OUTBOUND_PROBE_BUDGET_PER_NETWORK
+        .saturating_sub(RELAY_BACKOFF_HEARTBEAT_FOREGROUND_RESERVE);
+    transport.outbound_probe_budget.lock().await.insert(
+        OutboundProbeBudgetKey::Network,
+        std::iter::repeat_n(Instant::now(), burst).collect(),
+    );
+    assert!(
+        !transport
+            .admit_relay_backoff_heartbeat_probe("idle-foreground", endpoint)
+            .await,
+        "an active local burst must still have priority"
+    );
+
+    // Seed elapsed wall-clock entries without sleeping or admitting another
+    // foreground probe: only the heartbeat query can expire these windows.
+    let elapsed = Instant::now() - Duration::from_secs(2);
+    transport.outbound_probe_budget.lock().await.insert(
+        OutboundProbeBudgetKey::Network,
+        std::iter::repeat_n(elapsed, burst).collect(),
+    );
+    {
+        let mut state = foreground_budget.state.lock().await;
+        state.insert(
+            OutboundProbeBudgetKey::Network,
+            std::iter::repeat_n(elapsed, burst).collect(),
+        );
+        state.insert(
+            OutboundProbeBudgetKey::NetworkPersistent,
+            std::iter::repeat_n(elapsed, burst).collect(),
+        );
+    }
+    assert!(
+        transport
+            .admit_relay_backoff_heartbeat_probe("idle-foreground", endpoint)
+            .await,
+        "heartbeat admission alone must recover from expired foreground usage"
+    );
+    assert!(!transport
+        .outbound_probe_budget
+        .lock()
+        .await
+        .contains_key(&OutboundProbeBudgetKey::Network));
+    let state = foreground_budget.state.lock().await;
+    assert!(!state.contains_key(&OutboundProbeBudgetKey::Network));
+    assert_eq!(
+        state[&OutboundProbeBudgetKey::NetworkPersistent].len(),
+        burst,
+        "expiring the short window must preserve the 60-second allowance"
+    );
+}

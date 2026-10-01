@@ -2,6 +2,317 @@
 // real Rust scope. Everything below is unchanged test code.
 use super::*;
 
+#[derive(Clone, Copy, Debug)]
+enum ContendedLifecycleLane {
+    Initiator,
+    Responder,
+}
+
+async fn assert_lifecycle_commit_drives_granted_lane(lane: ContendedLifecycleLane) {
+    let config = Config::generate_default("http://127.0.0.1:1", "lifecycle-lane-pump").unwrap();
+    let daemon = Daemon::new(config);
+    let peer_id = match lane {
+        ContendedLifecycleLane::Initiator => "peer-granted-initiator-writer",
+        ContendedLifecycleLane::Responder => "peer-granted-responder-writer",
+    };
+    let mut peer_info = control::PeerInfo {
+        capabilities: crate::control::PeerCapabilities::default(),
+        registration_seq: 0,
+        node_id: peer_id.to_string(),
+        public_key: hex::encode(NodeIdentity::generate().public_key()),
+        virtual_ip: "10.20.0.2".to_string(),
+        online: true,
+        ..control::PeerInfo::default()
+    };
+    daemon.peers.add_peer(&peer_info).await;
+
+    // Model the exact fair-lock edge from the failed NAT replica.  A reader
+    // keeps a cooperative handshake lane's writer queued.  The writer is
+    // polled once by the control loop before PeerUpdated enters its serial
+    // lifecycle transaction, so it is ahead of that transaction in Tokio's
+    // fair queue.
+    let connection_reader = daemon.peers.hold_connections_reader_for_test().await;
+    let mut slow_work: FuturesUnordered<ControlEventWork<'_>> = FuturesUnordered::new();
+    let mut retry_work: FuturesUnordered<ControlEventWork<'_>> = FuturesUnordered::new();
+    let mut responder_work: FuturesUnordered<ControlEventWork<'_>> = FuturesUnordered::new();
+    let mut candidate_work: FuturesUnordered<ControlEventWork<'_>> = FuturesUnordered::new();
+    let writer_peers = daemon.peers.clone();
+    let writer_peer_id = peer_id.to_string();
+    let writer: ControlEventWork<'_> = Box::pin(async move {
+        writer_peers
+            .update_state(&writer_peer_id, ConnectionState::HolePunching)
+            .await;
+    });
+    match lane {
+        ContendedLifecycleLane::Initiator => slow_work.push(writer),
+        ContendedLifecycleLane::Responder => responder_work.push(writer),
+    }
+
+    // Poll exactly once to enqueue the cooperative writer without allowing it
+    // to complete while the reader is held.  No sleeps or scheduler luck are
+    // involved in establishing the ordering.
+    let waker = futures_util::task::noop_waker_ref();
+    let mut context = std::task::Context::from_waker(waker);
+    let poll = match lane {
+        ContendedLifecycleLane::Initiator => {
+            let mut next = Box::pin(slow_work.next());
+            std::future::Future::poll(next.as_mut(), &mut context)
+        }
+        ContendedLifecycleLane::Responder => {
+            let mut next = Box::pin(responder_work.next());
+            std::future::Future::poll(next.as_mut(), &mut context)
+        }
+    };
+    assert!(
+        poll.is_pending(),
+        "the cooperative {lane:?} writer completed while the reader was held"
+    );
+    assert!(
+        daemon.peers.connection_map_for_test().try_read().is_err(),
+        "the cooperative {lane:?} writer did not enter the fair queue"
+    );
+
+    peer_info.last_seen = 7;
+    let peers = daemon.peers.clone();
+    let timeline = daemon.timeline.clone();
+    let (peer_add_started_tx, mut peer_add_started_rx) = mpsc::unbounded_channel();
+    peers.install_peer_add_wait_observer_for_test(peer_add_started_tx);
+    let lifecycle_peers = peers.clone();
+    let lifecycle_peer_info = peer_info.clone();
+    let mut deferred_initiators = InitiatorQueue::new();
+    let commit = await_peer_lifecycle_commit_while_driving_work(
+        &daemon,
+        lifecycle_peers.add_peer(&lifecycle_peer_info),
+        &mut slow_work,
+        &mut retry_work,
+        &mut responder_work,
+        &mut candidate_work,
+        &mut deferred_initiators,
+    );
+    let release_reader = async move {
+        peer_add_started_rx
+            .recv()
+            .await
+            .expect("PeerUpdated did not enter the lifecycle transaction");
+        loop {
+            if timeline.snapshot().events.iter().any(|event| {
+                event.event == "peer_update_lock_wait_started"
+                    && event.reason_code.as_deref() == Some("connections_write")
+            }) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        drop(connection_reader);
+    };
+
+    let (update, ()) = timeout(Duration::from_secs(1), async {
+        tokio::join!(commit, release_reader)
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!("PeerUpdated parked behind an unpolled, granted {lane:?} connection writer")
+    });
+    assert!(update.last_seen_only);
+    let connection = peers
+        .get_connection(peer_id)
+        .await
+        .expect("peer lifecycle disappeared after the contended commit");
+    assert_eq!(connection.last_seen, 7);
+    assert_eq!(connection.state, ConnectionState::HolePunching);
+}
+
+#[tokio::test]
+async fn peer_lifecycle_wait_drives_granted_initiator_writer() {
+    assert_lifecycle_commit_drives_granted_lane(ContendedLifecycleLane::Initiator).await;
+}
+
+#[tokio::test]
+async fn peer_lifecycle_wait_drives_granted_responder_writer() {
+    assert_lifecycle_commit_drives_granted_lane(ContendedLifecycleLane::Responder).await;
+}
+
+#[tokio::test]
+async fn peer_answer_drives_candidate_target_writer_before_incarnation_commit() {
+    let mut config =
+        Config::generate_default("http://127.0.0.1:1", "answer-candidate-writer").unwrap();
+    config.node.node_id = "zz-local-answer-candidate-writer".to_string();
+    config.network.punch_attempts = 1;
+    let daemon = Daemon::new(config);
+    let peer_id = "peer-answer-candidate-writer";
+    let remote_identity = NodeIdentity::generate();
+    let public_key = hex::encode(remote_identity.public_key());
+    daemon
+        .peers
+        .add_peer(&control::PeerInfo {
+            node_id: peer_id.to_string(),
+            public_key: public_key.clone(),
+            virtual_ip: "10.20.0.2".to_string(),
+            online: true,
+            ..control::PeerInfo::default()
+        })
+        .await;
+    let udp = crate::udp::UdpTransport::bind("127.0.0.1:0".parse().unwrap(), daemon.peers.clone())
+        .await
+        .unwrap();
+    let local_candidate = udp.local_addr().unwrap().to_string();
+    *daemon.udp_transport.write().await = Some(udp);
+    daemon
+        .publish_candidate_snapshot(vec![local_candidate], HashMap::new(), Vec::new())
+        .await;
+
+    let mut initiator = HandshakeInitiator::new(
+        daemon.local_identity().unwrap(),
+        remote_identity.public_key(),
+        None,
+    );
+    let initiation = initiator.create_initiation().unwrap();
+    let mut responder = HandshakeResponder::new(remote_identity, None);
+    let (response, _) = responder
+        .consume_initiation_and_respond(&initiation)
+        .unwrap();
+    daemon
+        .pending_handshakes
+        .lock()
+        .insert(peer_id.to_string(), initiator, None, None);
+
+    let peers = daemon.peers.clone();
+    let transport = daemon.transport.clone();
+    let timeline = daemon.timeline.clone();
+    let pending = daemon.pending_handshakes.clone();
+    let attempts = daemon.punch_attempts.clone();
+    let control = daemon.control.clone();
+    let shutdown = daemon.shutdown_sender();
+    // Target preparation reads this independent snapshot immediately before
+    // queueing the connection writer. Keep it closed until the candidate lane
+    // has passed its non-queuing begin_hole_punch commit.
+    let interface_writer = peers.hold_local_interface_networks_writer_for_test().await;
+    let offer_generation = 0x4000_0000_0000_0000 | (411 << 21) | 1;
+    control
+        .event_sender()
+        .send(ControlEvent::PeerOffer {
+            from_node_id: peer_id.to_string(),
+            candidates: vec!["127.0.0.1:9".to_string()],
+            session_id: None,
+            probe_ephemeral_public_key: None,
+            candidate_sources: HashMap::new(),
+            candidate_generation: offer_generation,
+            candidates_expires_at_ms: None,
+            handshake_init: Vec::new(),
+            punch_at_ms: None,
+            punch_at_server_ms: None,
+            sender_public_key: Some(public_key.clone()),
+        })
+        .unwrap();
+    let (network_tx, _network_rx) = mpsc::channel(8);
+    let mut relay_started = false;
+    let mut daemon_task = daemon;
+    let loop_task = tokio::spawn(async move {
+        daemon_task
+            .run_control_event_loop(&mut relay_started, network_tx)
+            .await;
+    });
+    timeout(Duration::from_secs(1), async {
+        loop {
+            if peers
+                .get_connection(peer_id)
+                .await
+                .is_some_and(|connection| {
+                    connection.state == ConnectionState::HolePunching
+                        && connection.last_candidate_generation() == offer_generation
+                })
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the real candidate owner never passed its non-queuing punch commit");
+
+    let connection_map = peers.connection_map_for_test();
+    let connection_reader = connection_map.clone().read_owned().await;
+    drop(interface_writer);
+    timeout(Duration::from_secs(1), async {
+        while connection_map.try_read().is_ok() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("candidate target preparation did not enqueue its fair connection writer");
+    assert!(pending.lock().has_candidate_offer_work_for_test(peer_id));
+
+    let receipt = control::SignalDeliveryReceipt::pending();
+    control
+        .event_sender()
+        .send(ControlEvent::DeliveredSignal {
+            signal_id: "answer-behind-candidate-target-writer".to_string(),
+            signal_seq: Some(2),
+            signal_type: "peer_answer".to_string(),
+            event: Box::new(ControlEvent::PeerAnswer {
+                from_node_id: peer_id.to_string(),
+                candidates: Vec::new(),
+                session_id: None,
+                probe_ephemeral_public_key: None,
+                candidate_sources: HashMap::new(),
+                candidate_generation: offer_generation + 1,
+                candidates_expires_at_ms: None,
+                handshake_response: response.to_bytes(),
+                punch_at_ms: None,
+                punch_at_server_ms: None,
+                sender_public_key: Some(public_key),
+            }),
+            receipt: receipt.clone(),
+        })
+        .unwrap();
+    timeout(Duration::from_secs(1), async {
+        while !timeline
+            .snapshot()
+            .events
+            .iter()
+            .any(|event| event.event == "peer_answer_received")
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the real Answer branch did not enter its serial commit");
+    assert_eq!(receipt.current(), control::SignalApplyOutcome::Pending);
+    // The first writer is now granted, but only this actor can poll it. A
+    // bare await in PeerAnswer would park the actor behind its own candidate
+    // future forever, including after the external reader is released.
+    drop(connection_reader);
+    let result = timeout(Duration::from_secs(1), receipt.wait()).await;
+    if result.is_err() {
+        loop_task.abort();
+        let _ = loop_task.await;
+        panic!("PeerAnswer stopped polling its granted candidate target writer");
+    }
+    assert_eq!(result.unwrap(), control::SignalApplyOutcome::Applied);
+    assert!(
+        transport.has_session(peer_id).await,
+        "the authenticated Answer must install its session"
+    );
+    timeout(Duration::from_secs(1), async {
+        while pending.lock().has_candidate_offer_work_for_test(peer_id) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("candidate owner was not released after its queued writer completed");
+    drop(
+        timeout(Duration::from_secs(1), connection_map.write())
+            .await
+            .expect("the actor left the connection writer permanently unavailable"),
+    );
+    attempts.cancel(peer_id);
+    let _ = shutdown.send(true);
+    timeout(Duration::from_secs(1), loop_task)
+        .await
+        .expect("control event loop did not stop")
+        .expect("control event loop task panicked");
+}
+
 #[tokio::test]
 async fn control_event_loop_processes_critical_event_while_candidate_refresh_is_blocked() {
     let config = Config::generate_default("http://127.0.0.1:1", "net1").unwrap();
@@ -14,6 +325,8 @@ async fn control_event_loop_processes_critical_event_while_candidate_refresh_is_
         }
     };
     let peer_info = control::PeerInfo {
+        capabilities: crate::control::PeerCapabilities::default(),
+        registration_seq: 0,
         node_id: "peer-slow-candidate-refresh".to_string(),
         device_name: String::new(),
         app_version: String::new(),
@@ -88,6 +401,8 @@ async fn last_seen_only_peer_update_refreshes_diagnostics_without_handshake_rese
     };
     let peer_id = "peer-last-seen-heartbeat";
     let peer_info = control::PeerInfo {
+        capabilities: crate::control::PeerCapabilities::default(),
+        registration_seq: 0,
         node_id: peer_id.to_string(),
         device_name: "Heartbeat Peer".to_string(),
         app_version: "1.2.3".to_string(),
@@ -170,6 +485,8 @@ async fn control_event_loop_processes_peer_answer_while_peer_reflexive_work_wait
     daemon
         .peers
         .add_peer(&control::PeerInfo {
+            capabilities: crate::control::PeerCapabilities::default(),
+            registration_seq: 0,
             node_id: peer_id.to_string(),
             device_name: String::new(),
             app_version: String::new(),
@@ -266,6 +583,8 @@ async fn control_event_loop_processes_peer_offer_while_peer_reflexive_work_waits
     daemon
         .peers
         .add_peer(&control::PeerInfo {
+            capabilities: crate::control::PeerCapabilities::default(),
+            registration_seq: 0,
             node_id: peer_id.to_string(),
             device_name: String::new(),
             app_version: String::new(),
@@ -351,6 +670,8 @@ async fn control_event_loop_queues_candidate_offer_while_connection_writer_is_bl
     daemon
         .peers
         .add_peer(&control::PeerInfo {
+            capabilities: crate::control::PeerCapabilities::default(),
+            registration_seq: 0,
             node_id: peer_id.to_string(),
             device_name: String::new(),
             app_version: String::new(),
@@ -424,6 +745,8 @@ async fn control_event_loop_queues_candidate_offer_while_connection_writer_is_bl
     .await
     .expect("ordinary candidate worker did not exercise the non-queuing contention path");
     let heartbeat = control::PeerInfo {
+        capabilities: crate::control::PeerCapabilities::default(),
+        registration_seq: 0,
         node_id: peer_id.to_string(),
         device_name: String::new(),
         app_version: String::new(),
@@ -514,6 +837,8 @@ async fn fresh_candidate_lock_wait_does_not_stall_peer_update_or_queued_answer()
         }
     };
     let peer_info = control::PeerInfo {
+        capabilities: crate::control::PeerCapabilities::default(),
+        registration_seq: 0,
         node_id: peer_id.to_string(),
         public_key: hex::encode(peer_identity.public_key()),
         virtual_ip: "10.20.0.2".to_string(),
@@ -952,6 +1277,8 @@ async fn blocking_candidate_apply_releases_epoch_before_waiting_for_writer_turn(
     daemon
         .peers
         .add_peer(&control::PeerInfo {
+            capabilities: crate::control::PeerCapabilities::default(),
+            registration_seq: 0,
             node_id: peer_id.to_string(),
             public_key: hex::encode(peer_identity.public_key()),
             virtual_ip: "10.20.0.2".to_string(),
@@ -1020,6 +1347,8 @@ async fn remote_incarnation_claim_and_finish_never_queue_writer_with_epoch() {
     daemon
         .peers
         .add_peer(&control::PeerInfo {
+            capabilities: crate::control::PeerCapabilities::default(),
+            registration_seq: 0,
             node_id: peer_id.to_string(),
             public_key: sender_public_key.clone(),
             virtual_ip: "10.20.0.2".to_string(),
@@ -1139,6 +1468,8 @@ async fn remote_incarnation_rotation_cancels_retry_and_kicks_replacement() {
     daemon
         .peers
         .add_peer(&control::PeerInfo {
+            capabilities: crate::control::PeerCapabilities::default(),
+            registration_seq: 0,
             node_id: peer_id.to_string(),
             public_key: hex::encode(peer_identity.public_key()),
             virtual_ip: "10.20.0.2".to_string(),
@@ -1241,6 +1572,8 @@ async fn candidate_receipt_and_slow_work_do_not_head_of_line_block_responder_off
     };
     let peer_id = "peer-candidate-hol-responder";
     let peer_info = control::PeerInfo {
+        capabilities: crate::control::PeerCapabilities::default(),
+        registration_seq: 0,
         node_id: peer_id.to_string(),
         public_key: hex::encode(remote_identity.public_key()),
         virtual_ip: "10.20.0.2".to_string(),
@@ -1503,6 +1836,8 @@ async fn remote_incarnation_cleanup_fence_prevents_no_reset_race() {
     let remote_identity = NodeIdentity::generate();
     let peer_id = "peer-reset-fence";
     let peer_info = control::PeerInfo {
+        capabilities: crate::control::PeerCapabilities::default(),
+        registration_seq: 0,
         node_id: peer_id.to_string(),
         public_key: hex::encode(remote_identity.public_key()),
         virtual_ip: "10.20.0.2".to_string(),

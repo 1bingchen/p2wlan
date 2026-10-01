@@ -229,10 +229,13 @@ DaemonStartupFailure? classifyDaemonStartupLog(String contents) {
 DaemonStartupWaitResult classifyDaemonStartupProbe({
   required bool healthReady,
   required bool? childAlive,
+  bool requireChildIdentity = false,
   DaemonStartupFailure? logFailure,
   required bool deadlineReached,
 }) {
-  if (healthReady && childAlive != false) {
+  final identityReady =
+      childAlive == true || (!requireChildIdentity && childAlive == null);
+  if (healthReady && identityReady) {
     return const DaemonStartupWaitResult.ready();
   }
   if (logFailure != null) {
@@ -265,16 +268,18 @@ extension DaemonControllerDiagnosticsPaths on DaemonController {
     int? expectedPid,
   ) async {
     final deadline = DateTime.now().add(timeout);
-    // Start-Process returns the child PID before WMI/Get-Process is always
-    // able to observe the new process. Give that identity probe one poll
-    // interval of grace; a real early exit still fails in roughly 1–2 s.
+    // Windows already verified the child through Win32 at handoff. Only
+    // other platforms need grace for their command-line process discovery.
     final processProbeGrace = DateTime.now().add(const Duration(seconds: 1));
     while (DateTime.now().isBefore(deadline)) {
       final childAlive = await _startupChildAlive(expectedPid);
       final result = classifyDaemonStartupProbe(
         healthReady: await _diagnosticsApi.fetchHealth(diagnosticsUrl),
+        requireChildIdentity: Platform.isWindows && expectedPid != null,
         childAlive:
-            childAlive == false && DateTime.now().isBefore(processProbeGrace)
+            !Platform.isWindows &&
+                childAlive == false &&
+                DateTime.now().isBefore(processProbeGrace)
             ? null
             : childAlive,
         logFailure: await _startupLogFailure(logPath),
@@ -286,6 +291,7 @@ extension DaemonControllerDiagnosticsPaths on DaemonController {
     final childAlive = await _startupChildAlive(expectedPid);
     final result = classifyDaemonStartupProbe(
       healthReady: await _diagnosticsApi.fetchHealth(diagnosticsUrl),
+      requireChildIdentity: Platform.isWindows && expectedPid != null,
       childAlive: childAlive,
       logFailure: await _startupLogFailure(logPath),
       deadlineReached: true,
@@ -315,7 +321,21 @@ extension DaemonControllerDiagnosticsPaths on DaemonController {
             const Duration(milliseconds: 600)) {
       return lastProbeResult;
     }
-    final alive = await _processLooksLikeDaemon(pid);
+    final bool? alive;
+    if (Platform.isWindows &&
+        (pid == _launchedProcessId || pid == _authenticatedProcessId)) {
+      final process = queryWindowsProcess(pid);
+      alive = process.state == WindowsProcessState.unavailable
+          ? null
+          : trustedWindowsDaemonIdentityMatches(
+              pid: pid,
+              launchedProcessId: _launchedProcessId,
+              authenticatedProcessId: _authenticatedProcessId,
+              processName: process.processName,
+            );
+    } else {
+      alive = await _processLooksLikeDaemon(pid);
+    }
     _lastLaunchExitProbeAt = DateTime.now();
     _lastLaunchExitProbeResult = alive;
     return alive;

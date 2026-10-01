@@ -15,6 +15,24 @@ use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 #[test]
+fn birthday_stride_cannot_collapse_to_three_or_five_ports() {
+    // The former odd-stride rule admitted these short cycles modulo 65535.
+    for seed in [21_844, 13_106, 65_533, 0] {
+        let stride = super::birthday::birthday_permutation_stride(seed);
+        let ports = (0..512)
+            .map(|n| n * stride % 65_535)
+            .collect::<HashSet<_>>();
+        assert_eq!(ports.len(), 512);
+    }
+    let ip = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 10));
+    assert!(hard_hard_birthday_candidates(ip, &[40_000], 0, "zero").is_empty());
+    assert_eq!(
+        hard_hard_birthday_candidates(ip, &[0, 40_000, 40_000], usize::MAX, "capped").len(),
+        256
+    );
+}
+
+#[test]
 fn birthday_levels_are_exact_and_never_scan_the_full_port_ring() {
     let public_ip = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 10));
     for (level, token) in [(64, "android"), (128, "android-2"), (256, "desktop")] {
@@ -97,7 +115,7 @@ fn probe_failure_kinds_keep_precise_terminal_stop_reasons() {
 }
 
 #[test]
-fn birthday_two_waves_rotate_targets_without_socket_cartesian_product() {
+fn birthday_two_waves_retransmit_identical_pairs_without_socket_cartesian_product() {
     for (socket_count, level) in [(2, 64), (4, 128), (8, 256)] {
         let targets = (1..=level)
             .map(|port| SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port as u16))
@@ -125,13 +143,74 @@ fn birthday_two_waves_rotate_targets_without_socket_cartesian_product() {
             .collect::<HashMap<_, _>>();
         assert!(targets
             .iter()
-            .all(|target| first_socket[target] != second_socket[target]));
+            .all(|target| first_socket[target] == second_socket[target]));
+        assert_eq!(first, second);
     }
     assert_eq!(hard_hard_birthday_wave_count(1), 1);
     assert_eq!(hard_hard_birthday_wave_count(0), 0);
     assert_eq!(hard_hard_birthday_packets_planned(2, 64), 128);
     assert_eq!(hard_hard_birthday_packets_planned(4, 96), 192);
     assert_eq!(hard_hard_birthday_packets_planned(1, 96), 96);
+}
+
+#[test]
+fn fixed_anchor_two_waves_keep_every_socket_on_the_one_remote_anchor() {
+    let anchor: SocketAddr = "198.51.100.20:40004".parse().unwrap();
+    for count in [2, 4, 8] {
+        let first = super::birthday::hard_hard_fixed_anchor_wave_assignments(count, anchor);
+        let second = super::birthday::hard_hard_fixed_anchor_wave_assignments(count, anchor);
+        let pairs = first
+            .iter()
+            .enumerate()
+            .flat_map(|(socket, targets)| targets.iter().map(move |target| (socket, *target)))
+            .collect::<HashSet<_>>();
+        assert_eq!(pairs.len(), count);
+        assert!(pairs.iter().all(|(_, target)| *target == anchor));
+        assert_eq!(first, second);
+        assert_eq!(
+            first.iter().flatten().count() + second.iter().flatten().count(),
+            2 * count
+        );
+    }
+    assert!(super::birthday::hard_hard_fixed_anchor_wave_assignments(3, anchor).is_empty());
+    assert!(super::birthday::hard_hard_fixed_anchor_wave_assignments(
+        4,
+        SocketAddr::new(anchor.ip(), 0)
+    )
+    .is_empty());
+}
+
+#[test]
+fn last_accepted_stun_send_must_be_observed_before_predicting_its_successor() {
+    use p2pnet_nat::{AllocationAttempt, AllocationAttemptOutcome as Outcome};
+    let make = |sequence, outcome| AllocationAttempt {
+        sequence,
+        local_endpoint: "192.0.2.1:5000".parse().unwrap(),
+        destination: "203.0.113.1:3478".parse().unwrap(),
+        sent_at_ms: 100 + u64::from(sequence),
+        datagram_bytes: 40,
+        outcome,
+    };
+    let mut attempts = vec![
+        make(0, Outcome::Observed),
+        make(1, Outcome::Observed),
+        make(2, Outcome::Observed),
+        make(3, Outcome::SentUnobserved),
+    ];
+    assert!(super::dynamic_punch::last_mapping_send_is_unobserved(
+        &attempts
+    ));
+    // A later local syscall failure cannot conceal the earlier unknown send.
+    attempts.push(make(4, Outcome::SendFailed));
+    assert!(super::dynamic_punch::last_mapping_send_is_unobserved(
+        &attempts
+    ));
+    // A later measured new mapping establishes a new base; the old model's
+    // separate sequence-gap policy still decides whether its stride is usable.
+    attempts.push(make(5, Outcome::Observed));
+    assert!(!super::dynamic_punch::last_mapping_send_is_unobserved(
+        &attempts
+    ));
 }
 
 #[test]

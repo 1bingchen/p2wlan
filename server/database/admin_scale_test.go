@@ -1,6 +1,7 @@
 package database
 
 import (
+	"context"
 	"errors"
 	"testing"
 	"time"
@@ -14,7 +15,7 @@ func TestAdminAccountCursorFreezesInsertionHorizon(t *testing.T) {
 	defer db.Close()
 	seedAdminTestData(t, db)
 
-	first, err := db.AdminAccountsCursor("", "", 1)
+	first, err := db.AdminAccountsSnapshot(context.Background(), "", "", 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -28,7 +29,7 @@ func TestAdminAccountCursorFreezesInsertionHorizon(t *testing.T) {
 	if _, err := db.Exec(`INSERT INTO users (id, email, password_hash, created_at, username) VALUES ('u-new', 'new@example.test', 'x', ?, 'new')`, time.Now().Unix()); err != nil {
 		t.Fatal(err)
 	}
-	second, err := db.AdminAccountsCursor("", first.NextCursor, 1)
+	second, err := db.AdminAccountsSnapshot(context.Background(), "", first.NextCursor, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -48,24 +49,24 @@ func TestAdminCursorRejectsFilterReuse(t *testing.T) {
 	defer db.Close()
 	seedAdminTestData(t, db)
 
-	page, err := db.AdminAccountsCursor("", "", 1)
+	page, err := db.AdminAccountsSnapshot(context.Background(), "", "", 1)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if page.NextCursor == "" {
 		t.Fatal("expected another account page")
 	}
-	if _, err := db.AdminAccountsCursor("alice", page.NextCursor, 1); !errors.Is(err, ErrInvalidAdminCursor) {
+	if _, err := db.AdminAccountsSnapshot(context.Background(), "alice", page.NextCursor, 1); !errors.Is(err, ErrInvalidAdminCursor) {
 		t.Fatalf("cursor must be bound to its filter, got %v", err)
 	}
 }
 
-func collectTopologyPages(t *testing.T, db *DB, accountID, view string, limit int, afterFirst func()) *AdminTopologyPage {
+func collectTopologyPages(t *testing.T, db *DB, accountID, view string, limit int, afterFirst func()) *AdminTopologySnapshotPage {
 	t.Helper()
 	cursor := ""
-	merged := &AdminTopologyPage{Nodes: []AdminTopologyNode{}, Edges: []AdminTopologyEdge{}}
+	merged := &AdminTopologySnapshotPage{Nodes: []AdminTopologyNode{}, Edges: []AdminTopologyEdge{}}
 	for pageNumber := 0; pageNumber < 100; pageNumber++ {
-		page, err := db.AdminTopologyPage(accountID, view, cursor, limit)
+		page, err := db.AdminTopologySnapshotPage(context.Background(), accountID, view, cursor, limit)
 		if err != nil {
 			t.Fatalf("topology page %d: %v", pageNumber, err)
 		}
@@ -198,14 +199,14 @@ func TestAdminTopologyCursorRejectsViewReuse(t *testing.T) {
 	defer db.Close()
 	seedAdminTestData(t, db)
 
-	page, err := db.AdminTopologyPage("", topologyViewSummary, "", 1)
+	page, err := db.AdminTopologySnapshotPage(context.Background(), "", topologyViewSummary, "", 1)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if page.NextCursor == "" {
 		t.Fatal("expected topology continuation")
 	}
-	if _, err := db.AdminTopologyPage("", topologyViewFull, page.NextCursor, 1); !errors.Is(err, ErrInvalidAdminCursor) {
+	if _, err := db.AdminTopologySnapshotPage(context.Background(), "", topologyViewFull, page.NextCursor, 1); !errors.Is(err, ErrInvalidAdminCursor) {
 		t.Fatalf("topology cursor must be bound to its view, got %v", err)
 	}
 }

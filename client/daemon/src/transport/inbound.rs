@@ -1,4 +1,6 @@
 use super::*;
+use crate::connection_timeline::HotPathObservation;
+use crate::transport::wire::wire_receiver_index;
 
 impl WireGuardTransport {
     /// Consume encrypted network packets, decrypt them, and emit raw inbound IP packets.
@@ -125,6 +127,7 @@ impl WireGuardTransport {
             debug!(
                 event = "wireguard_inbound_envelope_received",
                 bytes = packet.wire_bytes.len(),
+                receiver_index = ?wire_receiver_index(&packet.wire_bytes),
                 counter = ?wire_counter(&packet.wire_bytes),
                 wire_fp = format_args!("{:016x}", wire_fingerprint(&packet.wire_bytes)),
                 source = ?source,
@@ -168,6 +171,7 @@ impl WireGuardTransport {
                     debug!(
                         event = "wireguard_inbound_decrypt_succeeded",
                         peer_id = %inbound.peer_id,
+                        receiver_index = ?wire_receiver_index(&packet.wire_bytes),
                         counter = ?wire_counter(&packet.wire_bytes),
                         wire_fp = format_args!("{:016x}", wire_fingerprint(&packet.wire_bytes)),
                         session_instance = ?inbound.session_instance,
@@ -422,6 +426,23 @@ impl WireGuardTransport {
                     // delivery.
                     let internal_rekey_confirmation = is_rekey_confirmation_packet(&inbound.packet);
                     let direct_validation = parse_direct_validation_token(&inbound.packet);
+                    if relay_endpoint.is_none() {
+                        if let (Some(udp), Some(index), Some(remote)) =
+                            (udp.as_ref(), socket_index, source)
+                        {
+                            if !udp
+                                .permits_hh2_encrypted_ingress(
+                                    &inbound.peer_id,
+                                    index,
+                                    remote,
+                                    direct_validation.is_some(),
+                                )
+                                .await
+                            {
+                                continue;
+                            }
+                        }
+                    }
                     let direct_validation_dplpmtud_capability = direct_validation.is_some()
                         && crate::dplpmtud::direct_validation_supports_dplpmtud(&inbound.packet);
                     let dplpmtud = crate::dplpmtud::parse_control_packet(&inbound.packet);
@@ -612,12 +633,21 @@ impl WireGuardTransport {
                                     );
                                 }
                             }
-                            let binding_guard = self
-                                .acquire_current_session_evidence_guard(
+                            let binding_outcome = self
+                                .acquire_current_session_evidence_guard_outcome(
                                     &inbound.peer_id,
                                     inbound.session_instance,
                                 )
                                 .await;
+                            let binding_contended = matches!(
+                                binding_outcome,
+                                CurrentSessionEvidenceGuardOutcome::Contended
+                            );
+                            let binding_guard = match binding_outcome {
+                                CurrentSessionEvidenceGuardOutcome::Current(guard) => Some(guard),
+                                CurrentSessionEvidenceGuardOutcome::Contended
+                                | CurrentSessionEvidenceGuardOutcome::Stale => None,
+                            };
                             let binding_session_current =
                                 inbound.session_instance.is_none() || binding_guard.is_some();
                             if binding_session_current {
@@ -665,14 +695,30 @@ impl WireGuardTransport {
                                     }
                                 }
                             } else {
-                                peers.emit_timeline(
-                                    "stale_session_evidence",
-                                    Some("relay"),
-                                    Some("session_replaced_or_removed"),
-                                    Some(format!(
-                                        "peer={} session_instance={:?} responder_binding=stale",
-                                        inbound.peer_id, inbound.session_instance,
-                                    )),
+                                peers.observe_hot_path(
+                                    if binding_contended {
+                                        HotPathObservation::ResponderBindingContended
+                                    } else {
+                                        HotPathObservation::ResponderBindingStale
+                                    },
+                                    relay_endpoint.as_ref().map(|_| "relay").or(Some("direct")),
+                                    Some(if binding_contended {
+                                        "session_evidence_fence_contended"
+                                    } else {
+                                        "session_replaced_or_removed"
+                                    }),
+                                    || {
+                                        format!(
+                                            "peer={} session_instance={:?} responder_binding={}",
+                                            inbound.peer_id,
+                                            inbound.session_instance,
+                                            if binding_contended {
+                                                "contended"
+                                            } else {
+                                                "stale"
+                                            },
+                                        )
+                                    },
                                 );
                             }
                             drop(binding_guard);
@@ -765,31 +811,31 @@ impl WireGuardTransport {
                                     // peer incarnation.
                                     let peer_session_generation =
                                         peers.peer_session_generation_sync(&inbound.peer_id);
-                                    let session_guard = if token_kind == DirectValidationKind::Ack {
-                                        self.acquire_current_session_evidence_guard(
+                                    // Only this internal validation path waits:
+                                    // a simultaneous local send is contention,
+                                    // not evidence that the decrypted instance
+                                    // was replaced. The earlier optional binding
+                                    // check remains try-only, so there is one
+                                    // bounded wait budget per validation frame.
+                                    let session_outcome = self
+                                        .acquire_direct_validation_session_guard(
                                             &inbound.peer_id,
                                             inbound.session_instance,
                                         )
-                                        .await
-                                    } else {
-                                        None
+                                        .await;
+                                    let session_contended = matches!(
+                                        session_outcome,
+                                        CurrentSessionEvidenceGuardOutcome::Contended
+                                    );
+                                    let session_guard = match session_outcome {
+                                        CurrentSessionEvidenceGuardOutcome::Current(guard) => {
+                                            Some(guard)
+                                        }
+                                        CurrentSessionEvidenceGuardOutcome::Contended
+                                        | CurrentSessionEvidenceGuardOutcome::Stale => None,
                                     };
-                                    let session_current = if inbound.session_instance.is_none() {
-                                        true
-                                    } else if token_kind == DirectValidationKind::Ack {
-                                        session_guard.is_some()
-                                    } else {
-                                        self.session_instance_is_current(
-                                            &inbound.peer_id,
-                                            inbound.session_instance,
-                                        )
-                                        .await
-                                    };
-                                    // Direct validation revalidates the exact
-                                    // peer lifecycle and owned request token.
-                                    // Release the inbound evidence fence before
-                                    // any of its async manager/UDP transactions.
-                                    drop(session_guard);
+                                    let session_current = inbound.session_instance.is_none()
+                                        || session_guard.is_some();
                                     if let (true, Some(peer_session_generation)) =
                                         (session_current, peer_session_generation)
                                     {
@@ -811,6 +857,7 @@ impl WireGuardTransport {
                                             socket_index,
                                             direct_socket.clone(),
                                             peer_session_generation,
+                                            session_guard,
                                             token,
                                         )
                                         .await;
@@ -821,9 +868,9 @@ impl WireGuardTransport {
                                         }
                                     } else {
                                         peers.emit_timeline(
-                                            "stale_session_evidence",
+                                            if session_contended { "session_evidence_contended" } else { "stale_session_evidence" },
                                             Some("direct"),
-                                            Some("session_replaced_or_removed"),
+                                            Some(if session_contended { "direct_validation_session_fence_timeout" } else { "session_replaced_or_removed" }),
                                             Some(format!(
                                                 "peer={} session_instance={:?} direct_validation={:?}",
                                                 inbound.peer_id,
@@ -853,12 +900,23 @@ impl WireGuardTransport {
                                         direct_validation,
                                     )
                                 {
-                                    let session_guard = self
-                                        .acquire_current_session_evidence_guard(
+                                    let session_guard_outcome = self
+                                        .acquire_current_session_evidence_guard_outcome(
                                             &inbound.peer_id,
                                             inbound.session_instance,
                                         )
                                         .await;
+                                    let session_contended = matches!(
+                                        session_guard_outcome,
+                                        CurrentSessionEvidenceGuardOutcome::Contended
+                                    );
+                                    let session_guard = match session_guard_outcome {
+                                        CurrentSessionEvidenceGuardOutcome::Current(guard) => {
+                                            Some(guard)
+                                        }
+                                        CurrentSessionEvidenceGuardOutcome::Contended
+                                        | CurrentSessionEvidenceGuardOutcome::Stale => None,
+                                    };
                                     let session_current = inbound.session_instance.is_none()
                                         || session_guard.is_some();
                                     // Endpoint learning is not a Relay/current-
@@ -867,14 +925,30 @@ impl WireGuardTransport {
                                     // those while retaining the emit guard.
                                     drop(session_guard);
                                     if !session_current {
-                                        peers.emit_timeline(
-                                            "stale_session_evidence",
+                                        peers.observe_hot_path(
+                                            if session_contended {
+                                                HotPathObservation::DirectIngressContended
+                                            } else {
+                                                HotPathObservation::DirectIngressStale
+                                            },
                                             Some("direct"),
-                                            Some("session_replaced_or_removed"),
-                                            Some(format!(
-                                                "peer={} session_instance={:?} direct_ingress=stale",
-                                                inbound.peer_id, inbound.session_instance,
-                                            )),
+                                            Some(if session_contended {
+                                                "session_evidence_fence_contended"
+                                            } else {
+                                                "session_replaced_or_removed"
+                                            }),
+                                            || {
+                                                format!(
+                                                "peer={} session_instance={:?} direct_ingress={}",
+                                                inbound.peer_id,
+                                                inbound.session_instance,
+                                                if session_contended {
+                                                    "contended"
+                                                } else {
+                                                    "stale"
+                                                },
+                                            )
+                                            },
                                         );
                                     } else {
                                         peers
@@ -1134,15 +1208,33 @@ impl WireGuardTransport {
                                             packet_identity,
                                             wire_fingerprint(&inbound.packet),
                                         );
-                                        timeline.emit_first_scoped_with_key(
+                                        let business_attribution_identity = if path
+                                            == crate::peer::NetworkPath::Direct
+                                            && owns_direct_packet
+                                        {
+                                            udp.as_ref().and_then(|udp| {
+                                                    udp.hard_hard_business_attribution_identity_for_ingress(
+                                                        &inbound.peer_id,
+                                                        source,
+                                                        local_endpoint,
+                                                        socket_index,
+                                                        udp_transport_owner,
+                                                        packet_network_generation,
+                                                    )
+                                                })
+                                        } else {
+                                            None
+                                        };
+                                        timeline.emit_first_scoped_with_business_attribution_identity(
                                             &scope,
                                             &format!(
-                                                "path={path_label} relay_connection_id={relay_transport_key} usable={first_usable_recorded}"
+                                                "path={path_label} relay_connection_id={relay_transport_key} business_identity={business_attribution_identity:?} usable={first_usable_recorded}"
                                             ),
                                             "business_ingress_observed",
                                             Some(path_label),
                                             Some(first_usable_result),
                                             Some(detail.clone()),
+                                            business_attribution_identity,
                                         );
                                         timeline.emit_first_scoped(
                                             &scope,
@@ -1178,11 +1270,11 @@ impl WireGuardTransport {
                                                     )
                                             });
                                     if let Some(timeline) = feed.timeline.as_ref() {
-                                        timeline.emit(
+                                        timeline.observe_hot_path(
                                             if session_guard_contended {
-                                                "business_ingress_evidence_deferred"
+                                                HotPathObservation::BusinessIngressDeferred
                                             } else {
-                                                "stale_session_evidence"
+                                                HotPathObservation::BusinessIngressStale
                                             },
                                             Some(match path {
                                                 crate::peer::NetworkPath::Relay => "relay",
@@ -1193,7 +1285,7 @@ impl WireGuardTransport {
                                             } else {
                                                 "session_replaced_or_removed"
                                             }),
-                                            Some(format!(
+                                            || format!(
                                                 "peer={} session_instance={:?} business_ingress={} evidence_retained={retained} queued_writer=false",
                                                 inbound.peer_id,
                                                 inbound.session_instance,
@@ -1202,7 +1294,7 @@ impl WireGuardTransport {
                                                 } else {
                                                     "stale"
                                                 },
-                                            )),
+                                            ),
                                         );
                                     }
                                 }

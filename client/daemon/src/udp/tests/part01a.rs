@@ -18,6 +18,8 @@ use crate::transport::WireGuardTransport;
 
 fn peer(node_id: &str, virtual_ip: &str, endpoint: Option<SocketAddr>) -> PeerInfo {
     PeerInfo {
+        capabilities: crate::control::PeerCapabilities::default(),
+        registration_seq: 0,
         node_id: node_id.to_string(),
         device_name: String::new(),
         app_version: String::new(),
@@ -38,6 +40,8 @@ fn peer_with_public_key(
     endpoint: Option<SocketAddr>,
 ) -> PeerInfo {
     PeerInfo {
+        capabilities: crate::control::PeerCapabilities::default(),
+        registration_seq: 0,
         node_id: node_id.to_string(),
         device_name: String::new(),
         app_version: String::new(),
@@ -52,9 +56,11 @@ fn peer_with_public_key(
 }
 
 fn peer_manager() -> Arc<PeerManager> {
-    Arc::new(PeerManager::new(
-        Config::generate_default("http://ctrl.test", "default").unwrap(),
-    ))
+    // Socket ownership and heartbeat tests seed already-active Relay state.
+    // Their legacy Auto fixture is independent of DirectFirst admission tests.
+    let mut config = Config::generate_default("http://ctrl.test", "default").unwrap();
+    config.relay.path_policy = crate::config::PathPolicy::Auto;
+    Arc::new(PeerManager::new(config))
 }
 
 fn config_for_identity(identity: &NodeIdentity, node_id: &str) -> Config {
@@ -73,6 +79,7 @@ async fn drain_udp_quiet(socket: &UdpSocket, quiet: Duration) {
 #[test]
 fn legacy_ack_matching_accepts_port_drift_but_rejects_ip_drift() {
     let pending = PendingProbe {
+        validation_preflight: None,
         sent_at: Instant::now(),
         expires_at: Instant::now() + DIRECT_KEEPALIVE_ACK_TIMEOUT,
         endpoint: "203.0.113.10:40000".parse().unwrap(),
@@ -159,6 +166,7 @@ fn probe_rx_snapshot_delta_is_saturating() {
         legacy_probe_acks_observed: 4,
         legacy_probe_acks_unmatched: 1,
         probe_acks_received: 3,
+        ..UdpProbeRxSnapshot::default()
     };
     let older = UdpProbeRxSnapshot {
         known_peer_ip_datagrams_received: 9,
@@ -168,6 +176,7 @@ fn probe_rx_snapshot_delta_is_saturating() {
         legacy_probe_acks_observed: 2,
         legacy_probe_acks_unmatched: 5,
         probe_acks_received: 9,
+        ..UdpProbeRxSnapshot::default()
     };
 
     assert_eq!(
@@ -180,6 +189,7 @@ fn probe_rx_snapshot_delta_is_saturating() {
             legacy_probe_acks_observed: 2,
             legacy_probe_acks_unmatched: 0,
             probe_acks_received: 0,
+            ..UdpProbeRxSnapshot::default()
         }
     );
 }
@@ -671,8 +681,45 @@ fn pool_stun_evidence_promotes_a_primary_blocked_profile_before_pool_gate() {
         Some("198.51.100.20:41000")
     );
     assert!(primary.nat_profile.birthday_candidate);
-    assert_eq!(primary.nat_profile.observations.len(), 2);
+    // The profile's observation sequence belongs to its primary local_addr.
+    // The pool-backed public candidate is retained separately and must not
+    // become a fake second port-allocation sample on that primary socket.
+    assert_eq!(primary.nat_profile.observations.len(), 1);
     assert!(socket_pool_is_eligible(&primary));
+}
+
+#[test]
+fn pool_socket_samples_do_not_change_primary_allocation_model() {
+    let mut primary = hard_nat_candidate_report(p2pnet_nat::FilteringBehavior::Unknown);
+    primary.nat_profile.observations = [40001, 40005, 40009]
+        .into_iter()
+        .enumerate()
+        .map(|(index, port)| p2pnet_nat::StunObservation {
+            server: format!("198.51.100.{}:3478", index + 1),
+            mapped_address: Some(format!("203.0.113.10:{port}")),
+            rtt_ms: Some(8),
+            error: None,
+        })
+        .collect();
+    let expected = p2pnet_nat::NatCapabilities::from_profile(&primary.nat_profile);
+    let mut pool = hard_nat_candidate_report(p2pnet_nat::FilteringBehavior::Unknown);
+    pool.candidates = vec![p2pnet_nat::IceCandidate::server_reflexive(
+        "203.0.113.10",
+        52017,
+    )];
+    pool.nat_profile.observations = vec![p2pnet_nat::StunObservation {
+        server: "198.51.100.9:3478".to_string(),
+        mapped_address: Some("203.0.113.10:52017".to_string()),
+        rtt_ms: Some(12),
+        error: None,
+    }];
+
+    assert!(!merge_pool_nat_profile(&mut primary, &pool));
+    assert_eq!(primary.nat_profile.observations.len(), 3);
+    assert_eq!(
+        p2pnet_nat::NatCapabilities::from_profile(&primary.nat_profile).allocation_model,
+        expected.allocation_model
+    );
 }
 
 #[tokio::test]

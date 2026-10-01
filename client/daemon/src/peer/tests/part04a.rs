@@ -100,6 +100,8 @@ async fn probe_target_sort_uses_single_time_snapshot_for_freshness() {
         .map(|candidate| (candidate.clone(), "stun_observed".to_string()))
         .collect::<HashMap<_, _>>();
     let peer = PeerInfo {
+        capabilities: crate::control::PeerCapabilities::default(),
+        registration_seq: 0,
         node_id: "peer1".to_string(),
         device_name: String::new(),
         app_version: String::new(),
@@ -281,6 +283,8 @@ async fn failed_stable_public_candidate_gets_short_background_retry() {
     let manager = PeerManager::new(test_config());
     let stable_endpoint: SocketAddr = "8.8.4.4:40000".parse().unwrap();
     let peer = PeerInfo {
+        capabilities: crate::control::PeerCapabilities::default(),
+        registration_seq: 0,
         node_id: "peer1".to_string(),
         device_name: String::new(),
         app_version: String::new(),
@@ -330,6 +334,8 @@ async fn failed_speculative_candidate_keeps_exponential_background_cooldown() {
     let manager = PeerManager::new(test_config());
     let predicted_endpoint: SocketAddr = "8.8.4.4:41000".parse().unwrap();
     let peer = PeerInfo {
+        capabilities: crate::control::PeerCapabilities::default(),
+        registration_seq: 0,
         node_id: "peer1".to_string(),
         device_name: String::new(),
         app_version: String::new(),
@@ -427,6 +433,8 @@ async fn candidate_pair_probe_targets_prioritize_non_failed_pairs() {
 
     manager
         .add_peer(&PeerInfo {
+            capabilities: crate::control::PeerCapabilities::default(),
+            registration_seq: 0,
             node_id: "peer1".to_string(),
             device_name: String::new(),
             app_version: String::new(),

@@ -103,13 +103,16 @@ pub struct AndroidNetworkChangeHint {
 /// duplicating the Kotlin callback state.
 pub type AndroidNetworkChangeReceiver = Arc<Mutex<broadcast::Receiver<AndroidNetworkChangeHint>>>;
 
+mod android_network_change;
+
 use acl::AclEngine;
 use candidate_refresh::{
     add_peer_reflexive_candidate_to_set, advertised_udp_endpoint, candidate_endpoints_from_report,
     candidate_refresh_requires_commit, candidate_set_change_reason, candidate_set_hash,
-    control_udp_endpoint_from_candidates, maybe_add_port_mapping_udp_candidate,
-    network_identity_changed, prepare_signal_candidates_and_network_identity,
-    publish_local_candidates_to_known_peers, run_udp_candidate_refresh, UdpCandidateRefreshContext,
+    control_udp_endpoint_from_candidates, control_udp_endpoint_from_candidates_with_loopback,
+    maybe_add_port_mapping_udp_candidate, network_identity_changed,
+    prepare_signal_candidates_and_network_identity, publish_local_candidates_to_known_peers,
+    run_udp_candidate_refresh, UdpCandidateRefreshContext,
 };
 #[cfg(test)]
 use candidate_refresh::{
@@ -130,7 +133,7 @@ use diagnostics::{
 };
 use dns::DnsResolver;
 use gateway_mapping::{record_method_result, GatewayMappingDiagnostics, GatewayMappingRuntime};
-use network_outbound::{run_network_outbound, RelayStartupWait};
+use network_outbound::{run_direct_first_deadline_loop, run_network_outbound, RelayStartupWait};
 #[cfg(target_os = "android")]
 use p2pnet_tun::AndroidTunMode;
 use p2pnet_tun::{InterfaceConfig, Ipv4Packet, TunDevice, VirtualInterface};
@@ -142,8 +145,8 @@ use peer::{
     CandidateSetApplyResult, ConnectionState, DirectProbeTargetSet, HardHardSessionRecord,
     HardHardSessionState, HolePunchStartOutcome, PeerManager, PeerSessionGeneration,
     PendingProbeBindingCommitOutcome, PendingRecoveryTarget, ProbeBindingStage, RecoveryAdmission,
-    DIRECT_RETRY_BASE_INTERVAL, REASON_DIRECT_PROBE_FAILED, REASON_HANDSHAKE_TIMEOUT,
-    RECOVERY_EPOCH_ACK_FEEDBACK_WINDOW,
+    RemoteNatProfileBindFailure, RemoteNatProfileBindResult, DIRECT_RETRY_BASE_INTERVAL,
+    REASON_DIRECT_PROBE_FAILED, REASON_HANDSHAKE_TIMEOUT, RECOVERY_EPOCH_ACK_FEEDBACK_WINDOW,
 };
 use port_mapping::PortMappingManager;
 #[cfg(test)]

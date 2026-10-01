@@ -29,6 +29,12 @@ impl Daemon {
             self.config.control.proxy_mode.as_label(),
             crate::control::proxy_http_behavior_label(self.config.control.proxy_mode)
         );
+        if self.config.network.hard_hard_experiment_only {
+            info!(
+                event = "hard_hard_experiment_lane_enabled",
+                "Hard↔Hard experiment lane enabled: ordinary candidate offers and punch workers are isolated"
+            );
+        }
         self.timeline.emit(
             "daemon_started",
             None,
@@ -164,6 +170,8 @@ impl Daemon {
         resolved_config.network.udp_observers =
             udp_observers_from_sources(&relay_catalog, &resolved_config.network.udp_observers);
         self.config = Arc::new(resolved_config);
+        self.peers
+            .set_local_node_id_for_traversal(&assigned_node_id);
 
         info!(
             "[startup] initializing TUN: interface={} address={} netmask={} mtu={}",
@@ -334,17 +342,12 @@ impl Daemon {
         let punch_interval = Duration::from_millis(self.config.network.punch_interval_ms);
         let punch_attempts = self.config.network.punch_attempts;
 
-        let relay_startup_wait = if relay_candidates_present {
-            RelayStartupWait {
-                timeout: Some(Duration::from_millis(
-                    self.config.relay.relay_startup_timeout_ms.max(1),
-                )),
-            }
-        } else {
-            // No relay candidates are configured or expected: the first packet
-            // degrades to direct-only immediately with a stable reason code
-            // instead of waiting for a relay that will never start.
-            RelayStartupWait { timeout: None }
+        let relay_startup_wait = RelayStartupWait {
+            relay_expected: relay_candidates_present,
+            timeout: self
+                .config
+                .relay
+                .startup_wait_timeout(relay_candidates_present),
         };
         let relay_available_rx = self.relay_available_tx.subscribe();
         // Kick signal for the forced-relay probe loop: bumped by the outbound
@@ -373,6 +376,13 @@ impl Daemon {
                     relay_probe_kick_tx,
                     self.timeline.clone(),
                 ),
+            )
+            .await;
+        self.task_manager
+            .spawn(
+                "direct-first-deadline",
+                false,
+                run_direct_first_deadline_loop(self.peers.clone(), self.shutdown_rx.clone()),
             )
             .await;
         self.task_manager

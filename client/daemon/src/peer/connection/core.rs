@@ -22,6 +22,47 @@ struct PendingProbeSessionBinding {
     promote_on_match: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RemoteNatProfileBindFailure {
+    PeerMissing,
+    ProfileMissing,
+    ProfileExpired,
+    ProfileGenerationMissing,
+    ProfileGenerationMismatch,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RemoteNatProfileBindSnapshot {
+    pub(crate) candidate_epoch: Option<u64>,
+    pub(crate) profile_candidate_epoch: Option<u64>,
+    pub(crate) profile_present: bool,
+    pub(crate) profile_generation: Option<u64>,
+    pub(crate) profile_fresh: bool,
+    pub(crate) declared_generation: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RemoteNatProfileBindResult {
+    Bound(RemoteNatProfileBindSnapshot),
+    Rejected {
+        reason: RemoteNatProfileBindFailure,
+        snapshot: RemoteNatProfileBindSnapshot,
+    },
+}
+
+impl RemoteNatProfileBindSnapshot {
+    pub(crate) fn missing_peer(declared_generation: u64) -> Self {
+        Self {
+            candidate_epoch: None,
+            profile_candidate_epoch: None,
+            profile_present: false,
+            profile_generation: None,
+            profile_fresh: false,
+            declared_generation,
+        }
+    }
+}
+
 /// The relay-first business gate state for one peer connection.
 ///
 /// This is the set of fields that describe relay-first startup/fallback
@@ -106,6 +147,9 @@ pub struct PeerConnection {
     pub device_name: String,
     /// Peer application/daemon version reported by the control plane.
     pub app_version: String,
+    /// Authenticated registration-scoped wire capabilities; absent means legacy.
+    pub capabilities: crate::control::PeerCapabilities,
+    pub registration_seq: u64,
     /// Peer's static WireGuard/X25519 public key as hex.
     pub public_key: String,
     /// Symmetric MAC key for authenticated UDP Probe v2.
@@ -273,9 +317,52 @@ pub struct PeerConnection {
     /// after the reducer commit and its infallible side effects have completed
     /// under the connection writer.
     committed_business_path_change_tx: Option<tokio::sync::watch::Sender<u64>>,
+    /// Authoritative active-path telemetry hub.
+    telemetry_hub: Option<Arc<path_telemetry::PathTelemetryHub>>,
 }
 
 impl PeerConnection {
+    fn start_direct_first(&mut self, epoch: PathEpoch, policy: crate::config::PathPolicy) -> bool {
+        if policy == crate::config::PathPolicy::DirectFirst
+            && !self.path_state_machine.direct_first_configured()
+        {
+            return self
+                .commit_path_transition(
+                    PathEvent::DirectFirstStarted {
+                        epoch,
+                        now: Instant::now(),
+                    },
+                    |_| {},
+                )
+                .applies_side_effects();
+        }
+        false
+    }
+
+    fn advance_direct_first_deadline(&mut self, generation: u64) {
+        self.advance_direct_first_deadline_at(generation, Instant::now());
+    }
+
+    fn advance_direct_first_deadline_at(&mut self, generation: u64, now: Instant) -> bool {
+        if !self.path_state_machine.direct_first_deadline_due(now) {
+            return false;
+        }
+        if let Some(epoch) = self
+            .path_state_machine
+            .current_epoch()
+            .filter(|epoch| epoch.network_generation == generation)
+        {
+            return self
+                .commit_path_transition(PathEvent::DirectFirstDeadline { epoch, now }, |_| {})
+                .applies_side_effects();
+        }
+        false
+    }
+
+    fn direct_first_pending(&self) -> bool {
+        self.path_state_machine.direct_first_pending()
+    }
+
     pub(crate) fn remote_candidate_epoch(&self) -> u64 {
         self.remote_candidate_epoch
     }
@@ -288,21 +375,53 @@ impl PeerConnection {
         self.remote_nat_profile_candidate_epoch == Some(self.remote_candidate_epoch)
     }
 
+    #[cfg(test)]
     pub(crate) fn bind_remote_nat_profile_to_candidate_epoch(
         &mut self,
         profile_generation: u64,
     ) -> bool {
-        if !self.remote_nat_profile_is_fresh()
-            || self
-                .remote_nat_profile
-                .as_ref()
-                .and_then(|profile| profile.generation)
-                != Some(profile_generation)
-        {
-            return false;
+        matches!(
+            self.bind_remote_nat_profile_to_candidate_epoch_with_snapshot(profile_generation),
+            RemoteNatProfileBindResult::Bound(_)
+        )
+    }
+
+    pub(crate) fn bind_remote_nat_profile_to_candidate_epoch_with_snapshot(
+        &mut self,
+        profile_generation: u64,
+    ) -> RemoteNatProfileBindResult {
+        let profile_present = self.remote_nat_profile.is_some();
+        let profile_generation_seen = self
+            .remote_nat_profile
+            .as_ref()
+            .and_then(|profile| profile.generation);
+        let profile_fresh = self.remote_nat_profile_is_fresh();
+        let snapshot = RemoteNatProfileBindSnapshot {
+            candidate_epoch: Some(self.remote_candidate_epoch),
+            profile_candidate_epoch: self.remote_nat_profile_candidate_epoch,
+            profile_present,
+            profile_generation: profile_generation_seen,
+            profile_fresh,
+            declared_generation: profile_generation,
+        };
+
+        let rejection = if !profile_present {
+            Some(RemoteNatProfileBindFailure::ProfileMissing)
+        } else if profile_generation_seen.is_none() {
+            Some(RemoteNatProfileBindFailure::ProfileGenerationMissing)
+        } else if !profile_fresh {
+            Some(RemoteNatProfileBindFailure::ProfileExpired)
+        } else if profile_generation_seen != Some(profile_generation) {
+            Some(RemoteNatProfileBindFailure::ProfileGenerationMismatch)
+        } else {
+            None
+        };
+        if let Some(reason) = rejection {
+            return RemoteNatProfileBindResult::Rejected { reason, snapshot };
         }
+
         self.remote_nat_profile_candidate_epoch = Some(self.remote_candidate_epoch);
-        true
+        RemoteNatProfileBindResult::Bound(snapshot)
     }
 
     pub(crate) fn set_local_interface_networks(&mut self, networks: Vec<LocalNetwork>) {
@@ -494,6 +613,8 @@ impl PeerConnection {
             node_id: node_id.to_string(),
             device_name: String::new(),
             app_version: String::new(),
+            capabilities: crate::control::PeerCapabilities::default(),
+            registration_seq: 0,
             public_key: String::new(),
             probe_mac_key: None,
             probe_session_id: None,
@@ -552,6 +673,7 @@ impl PeerConnection {
             direct_pair_cache: None,
             committed_business_path_cache: None,
             committed_business_path_change_tx: None,
+            telemetry_hub: None,
         }
     }
 
@@ -708,6 +830,8 @@ impl PeerConnection {
         }
         self.sync_direct_cache();
         self.sync_committed_business_path_cache();
+        self.sync_direct_pair_cache();
+        self.sync_path_telemetry();
 
         if previous_state != new_state || previous_active != current_active {
             info!(target: "p2pnet_daemon::peer::connection",
@@ -756,12 +880,40 @@ impl PeerConnection {
                 cache.remove(&self.node_id);
             }
         }
-        if self.state != ConnectionState::Direct {
-            if let Some(cache) = &self.direct_pair_cache {
-                cache
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .remove(&self.node_id);
+    }
+
+    /// Final exact-pair projection of the same authoritative transition. A
+    /// pending Direct commit has no active revision until the other path
+    /// mirrors above are published; invalidation removes the entire tuple.
+    fn sync_direct_pair_cache(&self) {
+        if let Some(cache) = &self.direct_pair_cache {
+            let mut cache = cache
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let path = self.path_state_machine.snapshot();
+            let current = cache.get_mut(&self.node_id).filter(|pair| {
+                self.online
+                    && self.state == ConnectionState::Direct
+                    && self.direct_generation == pair.generation
+                    && self.remote_candidate_epoch() == pair.remote_candidate_epoch
+                    && path.state.lifecycle == PeerPathLifecycle::Online
+                    && path.state.epoch
+                        == Some(PathEpoch::new(
+                            pair.generation,
+                            pair.peer_session_generation,
+                            pair.remote_candidate_epoch,
+                        ))
+                    && matches!(&path.state.active, ActiveBusinessPath::Direct(validation)
+                        if validation.epoch == path.state.epoch.expect("matched epoch")
+                            && validation.commit_endpoint() == Some(pair.remote_endpoint))
+                    && self.endpoint == Some(pair.remote_endpoint)
+            });
+            if let Some(pair) = current {
+                // Keep the exact commit projection in step with every typed
+                // path transition, including Direct-preserving observations.
+                pair.path_revision = Some(path.revision);
+            } else {
+                cache.remove(&self.node_id);
             }
         }
     }
@@ -772,13 +924,13 @@ impl PeerConnection {
         self.sync_direct_cache();
     }
 
-    /// Attach the manager's lock-free exact Direct-pair mirror.
+    /// Attach the manager's synchronous exact Direct-pair mirror.
     pub(crate) fn attach_direct_pair_cache(
         &mut self,
         cache: Arc<std::sync::Mutex<HashMap<String, DirectCommitPairSnapshot>>>,
     ) {
         self.direct_pair_cache = Some(cache);
-        self.sync_direct_cache();
+        self.sync_direct_pair_cache();
     }
 
     fn sync_committed_business_path_cache(&self) {
@@ -819,6 +971,20 @@ impl PeerConnection {
         self.committed_business_path_cache = Some(cache);
         self.committed_business_path_change_tx = Some(changes);
         self.sync_committed_business_path_cache();
+    }
+
+    /// Attach the active-path telemetry hub.
+    pub(crate) fn attach_telemetry_hub(&mut self, hub: Arc<path_telemetry::PathTelemetryHub>) {
+        self.telemetry_hub = Some(hub);
+        self.sync_path_telemetry();
+    }
+
+    /// Synchronize authoritative active-path state to the telemetry hub.
+    pub(crate) fn sync_path_telemetry(&self) {
+        if let Some(hub) = &self.telemetry_hub {
+            let snapshot = self.path_observability.snapshot(self);
+            hub.enqueue(&self.node_id, &snapshot);
+        }
     }
 
     /// Current selected traffic path, if active.

@@ -48,6 +48,7 @@ impl UdpTransport {
             None,
             None,
             None,
+            None,
         )
         .await
     }
@@ -121,6 +122,7 @@ impl UdpTransport {
                 profile_fence,
                 hard_hard_session_token,
                 None,
+                hard_hard_session_token.map(|_| Arc::new(HardHardProbePacer::new())),
             )
             .await?;
         finalize_physical_send_failure(&mut report);
@@ -138,6 +140,7 @@ impl UdpTransport {
         profile_fence: Option<(u64, u64)>,
         hard_hard_session_token: Option<&str>,
         live: Option<Arc<StdMutex<LiveBirthdayProgress>>>,
+        pacing: Option<Arc<HardHardProbePacer>>,
     ) -> Result<PunchSendReport> {
         let Some((index, socket, _lease)) = self
             .resolve_dynamic_socket_index_for_send(peer_id, socket_index)
@@ -164,6 +167,7 @@ impl UdpTransport {
             profile_fence,
             hard_hard_session_token,
             live,
+            pacing,
         )
         .await
     }
@@ -180,6 +184,7 @@ impl UdpTransport {
         profile_fence: Option<(u64, u64)>,
         hard_hard_session_token: Option<&str>,
         live: Option<Arc<StdMutex<LiveBirthdayProgress>>>,
+        pacing: Option<Arc<HardHardProbePacer>>,
     ) -> Result<PunchSendReport> {
         let schedule = build_probe_schedule(&candidates, probe_interval, attempts);
         let mut packets_sent = 0u32;
@@ -187,7 +192,9 @@ impl UdpTransport {
         let mut logical_probes_sent = 0u32;
         let mut logical_probe_send_failures = 0u32;
         let mut physical_datagrams_sent = 0u32;
+        let mut physical_bytes_sent = 0u64;
         let mut physical_send_errors = 0u32;
+        let mut physical_send_error_bytes = 0u64;
         let mut partial_physical_send_errors = 0u32;
         let mut probe_path_errors = 0u32;
         let mut budget_skipped = 0u32;
@@ -202,6 +209,9 @@ impl UdpTransport {
         let mut targets_attempted = 0u32;
         let mut target_processing_completed = true;
         let mut failure_kind = None;
+        let mut pacing_deadline_reached = false;
+        let mut epoch_budget_exhausted = false;
+        let mut sweep_budget_stop = None;
         let live_recorder = live.clone().map(BirthdayLiveRecorder::new);
         let commit_seq_at_start = self.peers.direct_commit_seq_sync(peer_id);
         let network_generation_at_start = self.peers.current_network_generation_sync();
@@ -225,11 +235,35 @@ impl UdpTransport {
             if !round.delay_before.is_zero() {
                 sleep(round.delay_before).await;
             }
-            for candidate in round.endpoints {
-                targets_examined = targets_examined.saturating_add(1);
-                update_live_birthday_counters(&live, |counters| {
-                    counters.targets_examined = counters.targets_examined.saturating_add(1);
-                });
+            let mut endpoints = round.endpoints.into_iter().peekable();
+            let mut retrying_target = false;
+            while let Some(&candidate) = endpoints.peek() {
+                if let Some(pacer) = pacing.as_ref() {
+                    if !pacer.wait_turn().await {
+                        sweep_budget_stop = pacer.stop_reason();
+                        epoch_budget_exhausted |= sweep_budget_stop
+                            == Some(probe_budget::OutboundProbeSweepStop::EpochCreditExhausted);
+                        pacing_deadline_reached = sweep_budget_stop.is_none();
+                        target_processing_completed = false;
+                        if retrying_target {
+                            budget_skipped = budget_skipped.saturating_add(1);
+                            last_budget_reason = Some(sweep_budget_stop.map_or(
+                                "probe_budget_deadline",
+                                probe_budget::OutboundProbeSweepStop::reason,
+                            ));
+                            update_live_birthday_counters(&live, |counters| {
+                                counters.budget_skipped = counters.budget_skipped.saturating_add(1);
+                            });
+                        }
+                        break 'schedule;
+                    }
+                }
+                if !retrying_target {
+                    targets_examined = targets_examined.saturating_add(1);
+                    update_live_birthday_counters(&live, |counters| {
+                        counters.targets_examined = counters.targets_examined.saturating_add(1);
+                    });
+                }
                 if let Some(token) = hard_hard_session_token {
                     if self
                         .peers
@@ -340,10 +374,12 @@ impl UdpTransport {
                 // fences passed. A budget rejection below is still an
                 // attempted target: it entered this worker's admission path,
                 // but it is not a logical Probe construction/send attempt.
-                targets_attempted = targets_attempted.saturating_add(1);
-                update_live_birthday_counters(&live, |counters| {
-                    counters.targets_attempted = counters.targets_attempted.saturating_add(1);
-                });
+                if !retrying_target {
+                    targets_attempted = targets_attempted.saturating_add(1);
+                    update_live_birthday_counters(&live, |counters| {
+                        counters.targets_attempted = counters.targets_attempted.saturating_add(1);
+                    });
+                }
                 if self
                     .peers
                     .direct_probe_endpoint_quarantined(
@@ -361,14 +397,41 @@ impl UdpTransport {
                     trace!(
                         "Skipped dynamic-socket punch for peer {peer_id} candidate {candidate}: recent slow ACK quarantine"
                     );
+                    endpoints.next();
+                    retrying_target = false;
                     continue;
                 }
-                match self
-                    .admit_outbound_connectivity_probe(peer_id, candidate, index)
-                    .await
-                {
+                let admission = if let Some(token) = hard_hard_session_token {
+                    match self.peers.hard_hard_session_by_token(peer_id, token).await {
+                        Some(record) if record.pair_nomination.is_some() => {
+                            self.admit_hard_hard_connectivity_probe(
+                                peer_id,
+                                candidate,
+                                index,
+                                token,
+                                crate::peer::RecoveryProbePurpose::HardHardExploration,
+                            )
+                            .await
+                        }
+                        Some(_) => {
+                            self.admit_outbound_connectivity_probe(peer_id, candidate, index)
+                                .await
+                        }
+                        None => OutboundProbeAdmission::RecoveryIdentityStale,
+                    }
+                } else {
+                    self.admit_outbound_connectivity_probe(peer_id, candidate, index)
+                        .await
+                };
+                match admission {
                     OutboundProbeAdmission::Accepted => {}
                     limited => {
+                        if pacing.is_some() && limited.retryable_in_sweep() {
+                            retrying_target = true;
+                            continue;
+                        }
+                        epoch_budget_exhausted |=
+                            limited == OutboundProbeAdmission::EpochCreditExhausted;
                         // The dedicated-socket sweep now shares the same
                         // admission as the pool sweeps: per-second windows,
                         // the persistent budgets AND the recovery-epoch probe
@@ -378,9 +441,21 @@ impl UdpTransport {
                         update_live_birthday_counters(&live, |counters| {
                             counters.budget_skipped = counters.budget_skipped.saturating_add(1);
                         });
+                        if let Some(stop) = limited.sweep_stop() {
+                            sweep_budget_stop = Some(stop);
+                            target_processing_completed = false;
+                            if let Some(pacer) = pacing.as_ref() {
+                                pacer.stop(stop);
+                            }
+                            break 'schedule;
+                        }
+                        endpoints.next();
+                        retrying_target = false;
                         continue;
                     }
                 }
+                endpoints.next();
+                retrying_target = false;
                 logical_probes_attempted = logical_probes_attempted.saturating_add(1);
                 update_live_birthday_counters(&live, |counters| {
                     counters.logical_probes_attempted =
@@ -408,8 +483,12 @@ impl UdpTransport {
                         per_socket_sent_index = sent.socket_index;
                         physical_datagrams_sent =
                             physical_datagrams_sent.saturating_add(successful_datagrams);
+                        physical_bytes_sent =
+                            physical_bytes_sent.saturating_add(sent.physical_bytes_sent);
                         physical_send_errors =
                             physical_send_errors.saturating_add(failed_datagrams);
+                        physical_send_error_bytes = physical_send_error_bytes
+                            .saturating_add(sent.physical_send_error_bytes);
                         if failed_datagrams > 0 {
                             partial_physical_send_errors =
                                 partial_physical_send_errors.saturating_add(failed_datagrams);
@@ -438,6 +517,8 @@ impl UdpTransport {
                     }
                     Err(failure) => {
                         let failed_datagrams = u32::from(failure.physical_send_errors);
+                        physical_send_error_bytes = physical_send_error_bytes
+                            .saturating_add(failure.physical_send_error_bytes);
                         if failure.kind == ProbeSendFailureKind::PhysicalSend
                             && failed_datagrams > 0
                         {
@@ -491,7 +572,9 @@ impl UdpTransport {
             logical_probes_sent,
             logical_probe_send_failures,
             physical_datagrams_sent,
+            physical_bytes_sent,
             physical_send_errors,
+            physical_send_error_bytes,
             partial_physical_send_errors,
             probe_path_errors,
             unique_target_endpoints: u32::try_from(sent_endpoints.len()).unwrap_or(u32::MAX),
@@ -500,7 +583,9 @@ impl UdpTransport {
                 .then_some(vec![(per_socket_sent_index, per_socket_sent)])
                 .unwrap_or_default(),
             budget_skipped,
-            epoch_budget_exhausted: false,
+            epoch_budget_exhausted,
+            sweep_budget_stop,
+            pacing_deadline_reached,
             candidate_iteration_capped: false,
             sent_target_endpoints: sent_endpoints.into_iter().collect(),
             last_send_at_ms,

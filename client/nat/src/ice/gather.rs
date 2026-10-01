@@ -198,3 +198,20 @@ pub fn candidate_report_from_observations(
         nat_profile,
     }
 }
+
+/// Build a coarse discovery hint from concurrently issued STUN requests.
+/// The input order is not proof of NAT allocation order, even when every
+/// response succeeded. Preserve bounded hypotheses for strategy admission,
+/// but do not give them the high confidence of an ordered measurement. The
+/// dedicated fresh-socket measurement remains the execution authority.
+pub fn candidate_report_from_unordered_observations(
+    local_addr: SocketAddr,
+    gather_host: bool,
+    observations: Vec<StunObservation>,
+) -> CandidateGatherReport {
+    let mut report = candidate_report_from_observations(local_addr, gather_host, observations);
+    if report.nat_profile.mapping_behavior == MappingBehavior::AddressOrPortDependent {
+        report.nat_profile.confidence = report.nat_profile.confidence.min(60);
+    }
+    report
+}

@@ -120,7 +120,7 @@ jobs:
           docker compose --env-file deploy/selfhost/config/compose.env -f deploy/selfhost/compose.yml config --quiet
           docker compose --env-file deploy/selfhost/config/compose.env -f deploy/selfhost/compose.yml up -d --build --wait --wait-timeout 90
           docker compose --env-file deploy/selfhost/config/compose.env -f deploy/selfhost/compose.yml exec -T relay curl -fsS --max-time 5 http://127.0.0.1:18082/readyz
-      - name: SQLite volume survives a container restart
+      - name: Non-root private support logs and SQLite survive a container restart
         run: python3 scripts/selfhost/test_compose_persistence.py
       - name: Verify static ELF and Ubuntu 20.04 server loader compatibility
         working-directory: server

@@ -63,6 +63,8 @@ impl ControlClient {
                 virtual_ip,
             } => {
                 let peer = PeerInfo {
+                    capabilities: crate::control::PeerCapabilities::default(),
+                    registration_seq: 0,
                     node_id: node_id.clone(),
                     device_name: String::new(),
                     app_version: String::new(),

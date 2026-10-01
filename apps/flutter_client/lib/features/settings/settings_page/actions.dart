@@ -246,6 +246,45 @@ extension _SettingsPageActions on _SettingsPageState {
     await _saveCategory(SettingsCategory.developer);
   }
 
+  Future<void> _checkForUpdates() async {
+    if (_checkingForUpdates) return;
+    _updateState(() {
+      _checkingForUpdates = true;
+      _updateCheckResult = null;
+    });
+    try {
+      final result = await _updateService.check();
+      if (mounted) _updateState(() => _updateCheckResult = result);
+    } catch (_) {
+      if (mounted) {
+        _updateState(
+          () => _updateCheckResult = UpdateCheckResult(
+            status: UpdateCheckStatus.networkError,
+            currentAppVersion: ClientBuildInfo.current.appVersion,
+            error: const UpdateCheckError(
+              UpdateCheckErrorCode.transport,
+              'The release request failed.',
+            ),
+          ),
+        );
+      }
+    } finally {
+      if (mounted) _updateState(() => _checkingForUpdates = false);
+    }
+  }
+
+  Future<void> _openUpdateRelease(UpdateCheckResult result) async {
+    final update = result.update;
+    if (update == null) return;
+    final opened = await _updateService.openRelease(update);
+    if (!opened && mounted) {
+      final strings = AppStrings.fromCode(
+        widget.settingsStore.settings.languageCode,
+      );
+      showAppNotice(context, content: Text(strings.updateOpenFailed));
+    }
+  }
+
   Future<void> _uploadCurrentSessionLogs() async {
     if (_uploadingLogs) return;
     final strings = AppStrings.fromCode(
@@ -286,11 +325,39 @@ extension _SettingsPageActions on _SettingsPageState {
     try {
       final parallel = widget.statusStore.parallelRooms;
       final activeRoomProfileIds = parallel.supportLogProfileCandidates;
-      final dynamicSummaries = parallel.exportStatusSummaries();
+      final uploadSessionRevision = widget.statusStore.sessionRevision;
+      final observedBuild =
+          widget.statusStore.daemonController.lastDaemonBuildInfo;
+      final dynamicSummaries = parallel.exportStatusSummaries(
+        supportSafe: true,
+      );
+      final mainStatusSummary = await captureMainSupportStatus(
+        diagnosticsUrl: settings.diagnosticsUrl,
+        cachedSnapshot: widget.statusStore.snapshot?.raw,
+        cachedAt: widget.statusStore.lastSuccessfulStatusAt,
+        observedDaemonBuild: observedBuild == null
+            ? null
+            : {
+                'app_version': observedBuild.appVersion,
+                'daemon_version': observedBuild.daemonVersion,
+                'git_commit': observedBuild.gitCommit,
+                'build_id': observedBuild.buildId,
+              },
+      );
+      if (!mounted ||
+          uploadSessionRevision != widget.statusStore.sessionRevision ||
+          widget.settingsStore.settings.authToken != settings.authToken) {
+        return;
+      }
       final bundle = await CurrentSessionLogBundle.collectCurrentStartup(
         activeRoomProfileIds: activeRoomProfileIds,
         dynamicSummaries: dynamicSummaries,
       );
+      if (!mounted ||
+          uploadSessionRevision != widget.statusStore.sessionRevision ||
+          widget.settingsStore.settings.authToken != settings.authToken) {
+        return;
+      }
       final result = await _controlApi.uploadSupportLogs(
         controlServer: settings.controlServer,
         authToken: authToken,
@@ -298,6 +365,7 @@ extension _SettingsPageActions on _SettingsPageState {
         clientBuild: ClientBuildInfo.current,
         daemonBuild: widget.statusStore.daemonController.lastDaemonBuildInfo,
         files: bundle.files,
+        mainStatusSummary: mainStatusSummary,
         omittedRoomProfileIds: bundle.omittedRoomProfileIds,
       );
       if (mounted) {

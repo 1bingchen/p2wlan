@@ -187,6 +187,7 @@ func registerDeviceControlRoutes(mux *http.ServeMux, authService *auth.Service, 
 	mux.HandleFunc("POST /api/v1/signals", anySessionAuth(apiServer.CreateSignal))
 	mux.HandleFunc("GET /api/v1/signals", anySessionAuth(apiServer.ListSignals))
 	mux.HandleFunc("POST /api/v1/signals/ack", anySessionAuth(apiServer.AckSignals))
+	mux.HandleFunc("POST /api/v1/signals/release", anySessionAuth(apiServer.ReleaseSignals))
 	mux.HandleFunc("POST /api/v1/tunnels", anySessionAuth(apiServer.CreateTunnel))
 	mux.HandleFunc("GET /api/v1/tunnels", anySessionAuth(apiServer.ListTunnels))
 	mux.HandleFunc("DELETE /api/v1/tunnels/{id}", anySessionAuth(apiServer.DeleteTunnel))
@@ -208,6 +209,9 @@ func registerDeviceControlRoutes(mux *http.ServeMux, authService *auth.Service, 
 
 	// Backward-compat: endpoint update accepts user JWT (anyAuth).
 	mux.HandleFunc("PATCH /api/v1/devices/{id}/endpoint", anySessionAuth(apiServer.UpdateDeviceEndpoint))
+
+	// Authoritative daemon path telemetry route.
+	mux.HandleFunc("POST /api/v1/telemetry/paths", anySessionAuth(apiServer.SubmitPathTelemetry))
 
 	// Device-authenticated WebSocket wake-up channel. Signal payloads remain
 	// durable in the database and are consumed through GET /api/v1/signals.

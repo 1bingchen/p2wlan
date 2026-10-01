@@ -83,16 +83,18 @@ P2WLAN 是一个开源、P2P 优先、可自托管的虚拟局域网工具。它
 
 ## 适用场景
 
-P2WLAN 的目标不是替你定义业务，而是提供一张跨地域的虚拟三层网络。只要应用本身能通过 IP 通信，就可以把它放到这张网络上。
+P2WLAN 提供一张跨地域的虚拟三层网络。应用通过对端的虚拟 IP 和业务端口通信；目标服务需要监听可访问的地址，并允许对应的防火墙流量。
 
 | 场景 | 可以怎么用 |
 | --- | --- |
-| **NAS / HomeLab** | 在外网访问 NAS 管理页、家庭服务器、虚拟机和其他内部服务，不必逐个暴露公网端口。 |
+| **NAS / HomeLab** | 在外网访问运行 P2WLAN 的 NAS、家庭服务器或虚拟机上的服务，不必逐个暴露公网端口。 |
 | **Minecraft 联机** | 把朋友的电脑加入同一房间，直接使用虚拟 IP 访问自建 Minecraft 服务器。 |
 | **Terraria 联机** | 将不同网络中的玩家组织到同一虚拟网络，进行多人联机。 |
 | **自建服务器** | 访问 Web 应用、API、数据库、面板、游戏服以及仅希望在私网开放的服务。 |
 | **远程开发** | SSH、RDP、数据库连接、开发测试机互联，以及跨地区设备调试。 |
 | **跨地域组网** | 家庭宽带、移动热点、校园网、云主机和不同云厂商之间互联。 |
+
+安装 P2WLAN 不会自动把所在家庭或办公网络中的其他设备接入虚拟网络。上面的访问示例以目标设备也运行 P2WLAN 为前提。
 
 ### 房间：把“我要和谁互联”单独组织起来
 
@@ -100,23 +102,33 @@ P2WLAN 的目标不是替你定义业务，而是提供一张跨地域的虚拟�
 
 ## 快速开始
 
+**先准备 Control 地址。** 新安装不预填项目运营的 Control 或 Relay，也不会自动注册账号。请向管理员获取可信的 Control 地址，或先完成[自托管部署](docs/guides/self-hosting.md)。需要互联的设备应使用同一个 Control；不同账号之间通过同一房间互联。
+
 ### 1. 下载
 
-前往 [GitHub Releases](https://github.com/yhan-sun/p2wlan/releases) 下载对应平台的最新版本。
+前往 [GitHub Releases](https://github.com/yhan-sun/p2wlan/releases)，选择客户端 **`vX.Y.Z`** 发布中的对应平台文件。服务端 **`server-vX.Y.Z`** 是独立发布，不是客户端安装包。
 
 | 平台 | Release 文件 | 状态 |
 | --- | --- | --- |
 | macOS 12+ Apple Silicon | `p2wlan-macos-arm64.dmg` | 支持 |
 | macOS 12+ Intel | `p2wlan-macos-x64.dmg` | 支持 |
 | Windows x64 | `p2wlan-windows-x64-setup.exe` | 支持 |
-| Linux x64 | Flutter `.tar.gz` / CLI `.tar.gz` | 支持 |
-| Linux arm64 | CLI `.tar.gz` | 支持 |
+| Linux x64 | `p2wlan-linux-x64.tar.gz`（GUI） / `p2wlan-linux-x64-cli.tar.gz`（CLI + daemon） | 支持 |
+| Linux arm64 | `p2wlan-linux-arm64-cli.tar.gz`（CLI + daemon） | 支持 |
 | Android 7.0+ (API 24+) arm64 | `p2wlan-android-arm64-release.apk` | 支持 |
 | iOS 15+ arm64 | `p2wlan-ios-arm64-unsigned.ipa` | 实验性，需签名 |
 
+Linux 无桌面环境选择 CLI 包，也可使用固定版本安装脚本。把 `vX.Y.Z` 替换为实际客户端 Release 标签：
+
+```bash
+P2WLAN_VERSION=vX.Y.Z
+curl -fsSL "https://raw.githubusercontent.com/yhan-sun/p2wlan/$P2WLAN_VERSION/scripts/install-linux-cli.sh" -o /tmp/p2wlan-install.sh
+sudo sh /tmp/p2wlan-install.sh --version "$P2WLAN_VERSION"
+```
+
 ### 2. 配置 Control
 
-打开客户端并登录；服务器或无桌面环境可使用 CLI：
+在客户端登录页的“高级选项 → 自托管服务器”中填写 Control 地址。`https://control.example.com` 仅是占位示例，需要替换为实际服务器地址。CLI 使用：
 
 ```bash
 p2wlan config set control https://control.example.com
@@ -124,80 +136,62 @@ p2wlan config set control https://control.example.com
 
 ### 3. 注册／登录
 
-打开客户端并登录；服务器或无桌面环境可使用 CLI：
+在客户端注册账号或登录已有账号。CLI 登录已有账号：
 
 ```bash
 p2wlan login -u your-name
 p2wlan account show
 ```
 
-### 4. 启动虚拟网络
+没有账号时，使用 `p2wlan register -u you@example.com` 注册并保存登录状态；注册需要邮箱，登录可使用邮箱或已设置的用户名。密码由终端提示输入。配置和登录命令使用普通用户执行，不要加 `sudo`。
 
-在客户端启动网络，或在 CLI 中执行：
+### 4. 连接设备
+
+**自己的设备互联：** 在各设备上登录同一账号，完成首次设置并启动个人网络。CLI 使用：
 
 ```bash
 p2wlan up
 p2wlan status
 ```
 
-### 5. 使用虚拟 IP
+**与朋友或其他账号互联：** 各设备使用同一个 Control，在客户端创建房间或通过房间号／邀请加入，再点击房间中的“连接本机”。加入房间只建立成员关系，不会自动启动本机网络。
 
-连接建立后，直接像访问普通局域网地址一样使用对端的 P2WLAN 虚拟 IP：
+CLI 房主先用 `p2wlan room create --name my-room` 创建房间，按提示设置房间密码，并将房间号交给其他成员。其他成员加入后，房主和成员都需要连接该房间：
 
 ```bash
-ping 10.20.0.5
-ssh user@10.20.0.5
+# 成员加入：将 12345678 替换为实际的 8 位房间号，按提示输入房间密码
+p2wlan room join --code 12345678
+# 房主和成员：查看房间，并连接本机
+p2wlan room list
+p2wlan room connect 12345678
+p2wlan room show 12345678
 ```
 
-游戏服务器、NAS、Web 面板或数据库同理：应用只需要连接对端虚拟 IP 和对应业务端口。
+房间使用独立的网络和虚拟 IP。`p2wlan up` 启动个人网络，不能代替 `p2wlan room connect`。设备可能需要房主批准后才能通信；详细操作见[房间指南](docs/guides/rooms.md)。
+
+### 5. 使用虚拟 IP
+
+等待对端连接后，从设备列表或房间详情获取对端在当前网络中的虚拟 IP。下面以房间内的演示地址 `10.21.0.5` 为例，请替换为实际地址：
+
+```bash
+ping 10.21.0.5
+ssh user@10.21.0.5
+```
+
+游戏服务器、NAS、Web 面板或数据库同理：连接对端虚拟 IP 和对应业务端口。登录成功、设备在线或出现 Direct/Relay 标签都不能单独证明业务可达，应实际验证目标服务。
 
 ### 6. 查看连接路径
 
-客户端会显示 Peer 当前使用的路径。遇到问题时，可先运行：
+客户端会显示对端当前使用的路径。遇到问题时，可先运行：
 
 ```bash
+p2wlan status --json
 p2wlan doctor
+p2wlan route verify
 p2wlan logs -f
 ```
 
-Linux CLI 也提供安装脚本：
-
-```bash
-VERSION=vX.Y.Z
-curl -fsSL https://raw.githubusercontent.com/yhan-sun/p2wlan/$VERSION/scripts/install-linux-cli.sh -o /tmp/p2wlan-install.sh
-sudo sh /tmp/p2wlan-install.sh --version "$VERSION"
-```
-
-Linux CLI 的房间管理、Direct/Relay 路径策略、路由修复、支持包和 systemd 部署说明见[客户端指南](docs/guides/client.md)与[CLI 参考](docs/reference/cli.md)。常用命令还包括：
-
-```bash
-p2wlan room list
-p2wlan room connect <房间号或房间 ID>
-p2wlan route verify
-p2wlan support-bundle --upload
-```
-
-自托管 Control/Relay 的安装、校验、systemd 启停、备份和升级见[自托管指南](docs/guides/self-hosting.md)与[升级与恢复](docs/guides/upgrade-and-recovery.md)。服务端使用 `server-vX.Y.Z` 标签，客户端使用 `vX.Y.Z` 标签。
-
-```bash
-sudo ./scripts/install-server.sh --version server-vX.Y.Z --role all
-sudo p2wlan-server status
-sudo p2wlan-server doctor --service all
-sudo p2wlan-server update --version server-vX.Y.Z
-sudo p2wlan-server backup
-sudo p2wlan-server rollback
-```
-
-发布后的服务端可以由本机上传，或让已安装 manager 的服务器自行拉取：
-
-```bash
-./scripts/deploy-server.sh --host <服务器地址> --user <SSH用户> \
-  --version server-vX.Y.Z --start
-./scripts/deploy-server.sh --mode fetch --host <服务器地址> \
-  --user <SSH用户> --version server-vX.Y.Z --start
-```
-
-省略 `--identity` 时 SSH 会在终端提示服务器密码，远端 `sudo` 会提示管理员密码；密码不会出现在命令行。部署入口和 staging 变量由[自托管指南](docs/guides/self-hosting.md)与发布 workflow 共同定义，不把具体主机或私钥写入仓库。
+`p2wlan support-bundle` 可生成本地诊断包；只有确认接收方、内容和保存期限后，才显式添加 `--upload` 上传。更多操作见[客户端指南](docs/guides/client.md)、[CLI 参考](docs/reference/cli.md)和[排障指南](docs/guides/troubleshooting.md)。
 
 ## 工作方式
 
@@ -246,23 +240,13 @@ P2WLAN 使用自包含的 **WireGuard-like Noise** 数据面，并使用 X25519�
 
 ## 自托管
 
-新机器的完整配置、Windows 原生与 Docker Compose 示例见[自托管指南](docs/guides/self-hosting.md)。
+Control Plane 和 Relay 位于 [`server/`](server/)。固定服务端发布包使用 **`server-vX.Y.Z`** 标签，公开安装与升级路径为 **Linux + systemd**；普通部署不需要在服务器上安装 Go 或 Node.js。
 
-Control Plane 和 Relay 位于 [`server/`](server/)；Linux CLI / daemon 位于 Rust workspace。最小构建可以从仓库根目录执行：
+部署需要可信的 Control HTTPS/WSS 入口、Relay TLS 入口、持久化数据库和匹配的认证配置。仅启动服务端不会使服务器自动成为虚拟网络节点；需要作为节点时，还应安装并连接客户端。
 
-```bash
-cd server
-go build -o p2wlan-control .
-go build -o p2wlan-relay ./relay
-```
-
-CLI 和 daemon 可在仓库根目录构建：
-
-```bash
-cargo build --release -p p2wlan-cli -p p2wlan-daemon
-```
-
-生产部署还需要根据当前代码配置 HTTPS/WSS、数据库、认证密钥和 Relay 地址。README 首页只保留入口信息，具体配置请以 [`server/`](server/) 中的实现为准。
+- [自托管指南](docs/guides/self-hosting.md)：固定版本安装、配置、TLS、管理台与 Docker Compose 边界。
+- [升级与恢复](docs/guides/upgrade-and-recovery.md)：备份、升级、恢复与回滚。
+- [运维指南](docs/guides/operations.md)：服务管理、健康检查、日志与证书。
 
 ## 安全边界
 
@@ -289,7 +273,7 @@ Flutter 开发和发布统一使用 **Flutter 3.47.2 / Dart 3.13.2**，仓库根
 - [`server/`](server/) — Go Control Plane
 - [`server/relay/`](server/relay/) — Go Relay
 
-实现细节请优先以源码、测试和 CI 为准。
+构建、检查与贡献约定见 [CONTRIBUTING.md](CONTRIBUTING.md)，完整文档入口见 [docs/README.md](docs/README.md)。实现细节请优先以源码、测试和 CI 为准。
 
 ## License
 

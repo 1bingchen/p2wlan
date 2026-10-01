@@ -59,6 +59,17 @@ async fn run_direct_probe_loop(
             let stable_remote_scatter = target.stable_remote_scatter;
             let birthday_plan = target.birthday_plan;
             let reclaim_active = peers.direct_reclaim_active(&peer_id).await;
+            let signal = {
+                let stun_servers = stun_servers.read().await.clone();
+                let stun_timeout = *stun_timeout.read().await;
+                HolePunchSignalContext {
+                    control: control.clone(),
+                    candidate_snapshot: candidate_snapshot.clone(),
+                    stun_servers,
+                    stun_timeout,
+                    boot_epoch_ms,
+                }
+            };
             if peers.hard_hard_experiment_only() {
                 // The experiment lane observes one bounded authoritative
                 // session. Do not fill the diagnostics ring with ordinary
@@ -66,17 +77,6 @@ async fn run_direct_probe_loop(
                 if peers.hard_hard_session_is_active(&peer_id).await {
                     continue;
                 }
-                let signal = {
-                    let stun_servers = stun_servers.read().await.clone();
-                    let stun_timeout = *stun_timeout.read().await;
-                    HolePunchSignalContext {
-                        control: control.clone(),
-                        candidate_snapshot: candidate_snapshot.clone(),
-                        stun_servers,
-                        stun_timeout,
-                        boot_epoch_ms,
-                    }
-                };
                 peers
                     .record_direct_event(
                         &peer_id,
@@ -101,6 +101,35 @@ async fn run_direct_probe_loop(
                 )
                 .await;
                 continue;
+            }
+            // An initial HH claim can be deferred behind a protected ordinary
+            // owner. Reconsider its unused lane on the existing bounded retry
+            // tick; otherwise normal operation may spend every plan on legacy
+            // scans while only the explicit experiment ever retries HH.
+            if peers.local_node_id_for_traversal() < peer_id
+                && peers.hard_hard_plan_for_peer(&peer_id).await.is_some()
+                && peers
+                    .recovery_hard_hard_available(&peer_id, target.recovery_epoch)
+                    .await
+            {
+                let Some(peer_session) = peers.peer_session_generation_sync(&peer_id) else {
+                    continue;
+                };
+                let lifecycle = (peers.current_network_generation_sync(), peer_session);
+                if spawn_hard_hard_initiator(
+                    udp.clone(),
+                    peers.clone(),
+                    punch_deduplicator.clone(),
+                    peer_id.clone(),
+                    signal.clone(),
+                    None,
+                    Some(lifecycle),
+                )
+                .await
+                .is_handled()
+                {
+                    continue;
+                }
             }
             // Every retry trigger enters the authoritative recovery-epoch
             // scheduler: one plan per (peer_id, generation, epoch), shared
@@ -155,17 +184,6 @@ async fn run_direct_probe_loop(
             };
             let udp = udp.clone();
             let peers = peers.clone();
-            let signal = {
-                let stun_servers = stun_servers.read().await.clone();
-                let stun_timeout = *stun_timeout.read().await;
-                HolePunchSignalContext {
-                    control: control.clone(),
-                    candidate_snapshot: candidate_snapshot.clone(),
-                    stun_servers,
-                    stun_timeout,
-                    boot_epoch_ms,
-                }
-            };
             // A multi-socket peer may probe ANY of our advertised socket-pool
             // mappings: temporarily activate the pool so every socket sends
             // peer-directed probes and every advertised mapping stays alive

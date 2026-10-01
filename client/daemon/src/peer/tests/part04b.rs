@@ -220,6 +220,8 @@ async fn candidate_pair_probe_targets_promote_authenticated_peer_reflexive() {
 
     manager
         .add_peer(&PeerInfo {
+            capabilities: crate::control::PeerCapabilities::default(),
+            registration_seq: 0,
             node_id: "peer1".to_string(),
             device_name: String::new(),
             app_version: String::new(),
@@ -307,6 +309,8 @@ async fn test_peer_manager_selects_endpoint_from_candidates() {
     let manager = PeerManager::new(config);
 
     let peer_info = PeerInfo {
+        capabilities: crate::control::PeerCapabilities::default(),
+        registration_seq: 0,
         node_id: "peer1".to_string(),
         device_name: String::new(),
         app_version: String::new(),
@@ -341,6 +345,8 @@ async fn test_peer_manager_learns_endpoint_from_probe_source_without_confirming_
     let manager = PeerManager::new(config);
 
     let peer_info = PeerInfo {
+        capabilities: crate::control::PeerCapabilities::default(),
+        registration_seq: 0,
         node_id: "peer1".to_string(),
         device_name: String::new(),
         app_version: String::new(),

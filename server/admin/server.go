@@ -1,6 +1,7 @@
 package admin
 
 import (
+	"context"
 	"crypto/sha256"
 	"crypto/subtle"
 	"embed"
@@ -26,11 +27,17 @@ type Store interface {
 	AdminAccounts(query string, limit, offset int) (*database.AdminAccountPage, error)
 	AdminAccountsCursor(query, afterID string, limit int) (*database.AdminAccountCursorPage, error)
 	AdminAccount(accountID string) (*database.AdminAccountDetail, error)
+	AdminAccountSummary(context.Context, string) (*database.AdminAccountSummaryResponse, error)
 	AdminTopology(accountID string) (*database.AdminTopology, error)
 	AdminTopologyPage(afterAccountID string, accountLimit, nodeBudget int) (*database.AdminTopologyPage, error)
+	AdminTopologyNetwork(context.Context, string, int) (*database.AdminTopologyPage, error)
 	AdminDevices(query, status string, limit, offset int) (*database.AdminDevicePage, error)
+	AdminDevicesCursor(query, status, cursor string, limit int) (*database.AdminDeviceCursorPage, error)
+	AdminDevicesCursorScoped(context.Context, string, string, string, int, string) (*database.AdminDeviceCursorPage, error)
 	AdminNetworks(limit, offset int) (*database.AdminNetworkPage, error)
 	AdminRooms(limit, offset int) (*database.AdminRoomPage, error)
+	AdminNetworksFiltered(context.Context, database.AdminResourceFilter, int, int) (*database.AdminNetworkPage, error)
+	AdminRoomsFiltered(context.Context, database.AdminResourceFilter, int, int) (*database.AdminRoomPage, error)
 	AdminConnections(filter database.AdminConnectionFilter, limit, offset int) (*database.AdminConnectionPage, error)
 	AdminConnectionTransitions(filter database.AdminConnectionTransitionFilter, limit int, cursor string) (*database.AdminConnectionTransitionPage, error)
 	AdminConnectionHealth(filter database.AdminConnectionHealthFilter) (*database.AdminConnectionHealth, error)
@@ -104,6 +111,7 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /admin/api/v1/accounts/{id}", s.requireAdmin(s.account))
 	mux.HandleFunc("GET /admin/api/v1/topology", s.requireAdmin(s.topology))
 	mux.HandleFunc("GET /admin/api/v1/devices", s.requireAdmin(s.devices))
+	mux.HandleFunc("GET /admin/api/v1/devices/cursor", s.requireAdmin(s.devicesCursor))
 	mux.HandleFunc("GET /admin/api/v1/networks", s.requireAdmin(s.networks))
 	mux.HandleFunc("GET /admin/api/v1/rooms", s.requireAdmin(s.rooms))
 	mux.HandleFunc("GET /admin/api/v1/connections", s.requireAdmin(s.connections))
@@ -133,17 +141,24 @@ func (s *Server) serveConsole(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
 
 	asset := strings.TrimPrefix(r.URL.Path, "/admin/")
-	switch asset {
-	case "", "index.html":
+	if asset == "" {
 		asset = "index.html"
-	case "app.css", "app.js":
-		// Static build artifacts are served as-is.
-	default:
+	} else if !fs.ValidPath(asset) {
+		http.NotFound(w, r)
+		return
+	} else if info, err := fs.Stat(embeddedWeb, "web/"+asset); err == nil {
+		// Serve every real build artifact, including lazy-loaded chunks. Never
+		// expose a directory listing or invent an asset from an SPA fallback.
+		if info.IsDir() {
+			http.NotFound(w, r)
+			return
+		}
+	} else {
 		// BrowserRouter uses clean paths such as /admin/accounts/:id. Any path
 		// without a file extension is an SPA route and must receive index.html so
 		// refresh/deep-link navigation works. Unknown asset-looking paths remain
 		// 404 instead of accidentally serving HTML as JavaScript or CSS.
-		if strings.Contains(asset, ".") {
+		if !errors.Is(err, fs.ErrNotExist) || strings.Contains(asset, ".") {
 			http.NotFound(w, r)
 			return
 		}
@@ -198,6 +213,10 @@ func (s *Server) overview(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (s *Server) accounts(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Query().Get("pagination") == "cursor" {
+		s.snapshot(w, r, "accounts", "")
+		return
+	}
 	limit, offset, ok := parsePage(w, r)
 	if !ok {
 		return
@@ -229,20 +248,15 @@ func (s *Server) accountsCursor(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, value)
 }
 
-func (s *Server) account(w http.ResponseWriter, r *http.Request) {
-	value, err := s.store.AdminAccount(r.PathValue("id"))
-	if errors.Is(err, database.ErrAdminAccountNotFound) {
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": "account not found"})
-		return
-	}
-	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "unable to load account"})
-		return
-	}
-	writeJSON(w, http.StatusOK, value)
-}
-
 func (s *Server) topology(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Query().Get("view") != "" {
+		s.snapshot(w, r, "topology", "")
+		return
+	}
+	if strings.TrimSpace(r.URL.Query().Get("network_id")) != "" {
+		s.networkTopology(w, r)
+		return
+	}
 	accountLimit, err := parseBoundedInt(r.URL.Query().Get("limit"), 12, 1, 50)
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "limit must be between 1 and 50"})
@@ -271,6 +285,10 @@ func (s *Server) topology(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) accountTopology(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Query().Get("view") != "" {
+		s.snapshot(w, r, "topology", r.PathValue("id"))
+		return
+	}
 	value, err := s.store.AdminTopology(r.PathValue("id"))
 	if errors.Is(err, database.ErrAdminAccountNotFound) {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "account not found"})
@@ -284,6 +302,10 @@ func (s *Server) accountTopology(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) devices(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Query().Get("pagination") == "cursor" {
+		s.snapshot(w, r, "devices", "")
+		return
+	}
 	limit, offset, ok := parsePage(w, r)
 	if !ok {
 		return
@@ -295,32 +317,6 @@ func (s *Server) devices(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "unable to load devices"})
-		return
-	}
-	writeJSON(w, http.StatusOK, value)
-}
-
-func (s *Server) networks(w http.ResponseWriter, r *http.Request) {
-	limit, offset, ok := parsePage(w, r)
-	if !ok {
-		return
-	}
-	value, err := s.store.AdminNetworks(limit, offset)
-	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "unable to load networks"})
-		return
-	}
-	writeJSON(w, http.StatusOK, value)
-}
-
-func (s *Server) rooms(w http.ResponseWriter, r *http.Request) {
-	limit, offset, ok := parsePage(w, r)
-	if !ok {
-		return
-	}
-	value, err := s.store.AdminRooms(limit, offset)
-	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "unable to load rooms"})
 		return
 	}
 	writeJSON(w, http.StatusOK, value)

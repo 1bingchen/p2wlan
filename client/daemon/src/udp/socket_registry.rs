@@ -1,6 +1,16 @@
 use super::*;
 
 impl UdpTransport {
+    /// Immutable hh2 classification survives detach and its ACK drain grace.
+    /// A legacy PNCH must never generate a reply from that retained socket.
+    pub(super) async fn permits_legacy_punch_on_socket(&self, socket_index: usize) -> bool {
+        let state = self.socket_state.lock().await;
+        !state.hard_hard_pair_modes.contains_key(&socket_index)
+            && state
+                .dynamic
+                .get(&socket_index)
+                .is_none_or(|entry| entry.permits_ordinary_traffic())
+    }
     pub(crate) async fn socket_index_for_peer(&self, peer_id: Option<&str>) -> usize {
         let socket_count = self.socket_count();
         let Some(peer_id) = peer_id else {
@@ -67,6 +77,7 @@ impl UdpTransport {
                     .await
                     .dynamic
                     .get(&index)
+                    .filter(|dynamic| dynamic.permits_ordinary_traffic())
                     .map(|dynamic| dynamic.socket.clone())
                 {
                     return Some((index, socket));
@@ -93,6 +104,34 @@ impl UdpTransport {
             return self.ipv6_socket.clone().map(|s| (IPV6_SOCKET_INDEX, s));
         }
         self.socket_for_peer(peer_id).await
+    }
+
+    /// Exact encrypted sends must not consume an unproven rendezvous mapping.
+    /// Isolation is established while provisional and never re-enabled after
+    /// authentication, so a successful check cannot race a later reservation.
+    /// An already detached entry leaves admission to the caller's exact Arc
+    /// handoff: authenticated validation requests retain their receiving socket
+    /// specifically so their ACK can still use that mapping after detach.
+    pub(super) async fn permits_ordinary_send_on_socket(
+        &self,
+        peer_id: &str,
+        socket_index: usize,
+        socket: &Arc<UdpSocket>,
+    ) -> bool {
+        if socket_index < DYNAMIC_SOCKET_INDEX_BASE || socket_index == IPV6_SOCKET_INDEX {
+            return true;
+        }
+        let state = self.socket_state.lock().await;
+        state.dynamic.get(&socket_index).map_or_else(
+            || !state.hard_hard_pair_modes.contains_key(&socket_index),
+            |entry| {
+                entry.peer_id == peer_id
+                    && entry.phase.is_usable()
+                    && entry.network_generation == self.peers.current_network_generation_sync()
+                    && Arc::ptr_eq(&entry.socket, socket)
+                    && entry.permits_ordinary_traffic()
+            },
+        )
     }
 
     /// Resolve the exact socket that received an authenticated direct packet.
@@ -194,6 +233,7 @@ impl UdpTransport {
         let dynamic = state.dynamic.get(&pin.socket_index)?;
         if dynamic.peer_id != peer_id
             || !dynamic.phase.is_usable()
+            || !dynamic.permits_ordinary_traffic()
             || dynamic.network_generation != self.peers.current_network_generation_sync()
         {
             return None;
@@ -319,6 +359,11 @@ impl UdpTransport {
                 || !entry.phase.is_usable()
                 || entry.network_generation != generation
             {
+                return false;
+            }
+            if entry.hard_hard_pair_required && entry.hard_hard_committed_remote.is_none() {
+                // Decryption/authentication is observation, not authority
+                // to bypass the negotiated pair's validation transaction.
                 return false;
             }
             // The evidence belongs to THIS entry: peer identity, network
@@ -493,6 +538,11 @@ impl UdpTransport {
                         && dynamic.network_generation
                             == self.peers.current_network_generation_sync()
                     {
+                        // Keep the reservation and affinity intact; substituting
+                        // another socket would also invalidate the expectation.
+                        if !dynamic.permits_ordinary_traffic() {
+                            return None;
+                        }
                         let leases = dynamic.send_leases.clone();
                         let socket = dynamic.socket.clone();
                         let index = pin.socket_index;

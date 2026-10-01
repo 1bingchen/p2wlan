@@ -425,6 +425,84 @@ pub struct HardHardAttemptTimeline {
     pub business_evidence_attribution: Option<String>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HardHardDatagramCost {
+    pub datagrams: u64,
+    pub bytes: u64,
+}
+
+/// Additional HH2 confirmation traffic, separate from the unchanged sweep
+/// counters. Only successful kernel handoffs spend datagrams/bytes here.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HardHardConfirmationCosts {
+    pub triggered_check: HardHardDatagramCost,
+    pub nomination: HardHardDatagramCost,
+    pub probe_ack: HardHardDatagramCost,
+    pub validation_request: HardHardDatagramCost,
+    pub validation_ack: HardHardDatagramCost,
+    pub retryable_not_sent: u64,
+    pub budget_deferred: u64,
+    pub delivery_unknown: u64,
+    pub stopped: u64,
+}
+
+/// Endpoint-free terminal snapshot of the bounded Birthday/fixed-anchor
+/// scheduler and its physical-send ledger. These are observations, not a new
+/// send authority. Counts retain the scheduler's existing dimensions and
+/// compatibility aliases; zero is a measured value only when this snapshot
+/// is present in the enclosing report.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HardHardBirthdaySweepDiagnostics {
+    pub requested_level: usize,
+    pub generated_candidate_count: usize,
+    pub signaled_candidate_count: usize,
+    pub effective_target_count: usize,
+    pub requested_socket_count: usize,
+    pub attached_socket_count: usize,
+    pub usable_socket_count: usize,
+    pub unavailable_socket_count: usize,
+    pub socket_count: usize,
+    pub degraded_reason: Option<String>,
+    pub waves_planned: usize,
+    pub waves_started: usize,
+    pub waves_fully_completed: usize,
+    pub waves_completed: usize,
+    pub packets_planned: usize,
+    pub targets_assigned: usize,
+    pub targets_examined: usize,
+    pub targets_attempted: usize,
+    pub logical_probes_attempted: usize,
+    pub logical_probes_sent: usize,
+    pub logical_probe_send_failures: usize,
+    pub physical_datagrams_sent: usize,
+    pub physical_send_errors: usize,
+    pub partial_physical_send_errors: usize,
+    pub targets_budget_skipped: usize,
+    pub targets_cancelled: usize,
+    pub stop_reason: Option<String>,
+    pub packets_sent: u32,
+    pub unique_target_endpoints: u32,
+    pub budget_skipped: u32,
+    pub physical_bytes_sent: u64,
+    pub physical_send_error_bytes: u64,
+    pub probe_path_errors: u32,
+    /// Stable reason code from the sender's typed failure, not Debug output.
+    pub failure_kind: Option<String>,
+    /// Exact successful physical datagrams by local socket index, sorted by
+    /// index. No remote address or port is included.
+    pub per_socket_sent: Vec<(usize, u32)>,
+    /// Original PunchSendReport wall-clock UNIX milliseconds. The enclosing
+    /// report's `timeline` retains its separate daemon-monotonic semantics.
+    pub first_send_at_ms: Option<u64>,
+    pub last_send_at_ms: Option<u64>,
+    pub epoch_budget_exhausted: bool,
+    pub candidate_iteration_capped: bool,
+    pub pacing_deadline_reached: bool,
+    pub worker_failed: bool,
+    pub target_processing_completed: bool,
+    pub sweep_budget_stop: Option<String>,
+}
+
 /// Endpoint-free report emitted once when a Hard↔Hard sweep reaches a
 /// terminal result. Build identity is embedded so a copied peer record still
 /// proves which binary produced it; scenario/seed/attempt identity remains in
@@ -461,6 +539,13 @@ pub struct HardHardAttemptReport {
     pub socket_index: Option<usize>,
     pub attempt: u8,
     pub counts: HardHardAttemptCounts,
+    /// None means confirmation instrumentation was unavailable (legacy/pre-session).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confirmation: Option<HardHardConfirmationCosts>,
+    /// Absent for older schema-2 reports or attempts without a Birthday
+    /// terminal ledger. Missing evidence must not be presented as zero sends.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub birthday_sweep: Option<Box<HardHardBirthdaySweepDiagnostics>>,
     pub candidate_cap: u32,
     pub truncation_reason: String,
     pub target_order_tags: Vec<String>,

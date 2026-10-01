@@ -32,6 +32,9 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+pub mod allocation;
+pub mod rendezvous;
+
 /// One STUN mapping observation on a dedicated punch socket.
 ///
 /// `sequence` is the request send order (0-based).  Responses may arrive in
@@ -543,6 +546,9 @@ pub enum PredictionReason {
     LowConfidenceWindow { distance: u8 },
     /// A bounded secondary hypothesis from cross-batch learning.
     LearnedSuccessor { distance: u8 },
+    /// A shorter stride compatible with competing allocations in this batch.
+    /// This is a candidate hypothesis, never fixed-step or allocator-scope evidence.
+    ContentionHypothesis { step: i16, distance: u8 },
     /// Same port again (endpoint-independent mapping).
     StablePort,
     /// Next port of the periodic pattern.

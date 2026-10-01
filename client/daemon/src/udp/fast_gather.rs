@@ -32,6 +32,7 @@ impl UdpTransport {
             stun_servers,
             stun_timeout.min(crate::DIRECT_STARTUP_STUN_TIMEOUT),
             false,
+            true,
         )
         .await
     }
@@ -40,14 +41,21 @@ impl UdpTransport {
     ///
     /// This is used after the bounded startup window to obtain the full NAT
     /// profile without serializing observers or stealing encrypted datagrams
-    /// from the inbound reader.
+    /// from the inbound reader. The caller must apply the returned socket-pool
+    /// policy only after accepting this report against its candidate snapshot;
+    /// gateway discovery can otherwise let an older report finish last.
     pub async fn gather_candidate_report_live_parallel_full(
         &self,
         stun_servers: Vec<SocketAddr>,
         stun_timeout: Duration,
     ) -> Result<CandidateGatherReport> {
-        self.gather_candidate_report_live_parallel_with_timeout(stun_servers, stun_timeout, true)
-            .await
+        self.gather_candidate_report_live_parallel_with_timeout(
+            stun_servers,
+            stun_timeout,
+            true,
+            false,
+        )
+        .await
     }
 
     async fn gather_candidate_report_live_parallel_with_timeout(
@@ -55,6 +63,7 @@ impl UdpTransport {
         stun_servers: Vec<SocketAddr>,
         stun_timeout: Duration,
         probe_filtering: bool,
+        apply_socket_pool_policy: bool,
     ) -> Result<CandidateGatherReport> {
         let local_addr = self.local_addr()?;
         let primary_servers = stun_servers
@@ -68,7 +77,7 @@ impl UdpTransport {
         }))
         .await;
 
-        let mut report = candidate_report_from_observations(
+        let mut report = p2pnet_nat::candidate_report_from_unordered_observations(
             local_addr,
             self.peers.gather_host_candidates().await,
             observations,
@@ -94,8 +103,11 @@ impl UdpTransport {
                     }))
                     .await;
                     let local_addr = socket.local_addr().ok()?;
-                    let pool_report =
-                        candidate_report_from_observations(local_addr, false, observations);
+                    let pool_report = p2pnet_nat::candidate_report_from_unordered_observations(
+                        local_addr,
+                        false,
+                        observations,
+                    );
                     Some((socket_index, pool_report))
                 }
             }))
@@ -106,11 +118,11 @@ impl UdpTransport {
                 // while another bound socket has a live public mapping.  The
                 // old code discarded that distinction: it classified the
                 // whole daemon as UDP-blocked and left the pool inactive,
-                // even though it had just gathered the 96 real pool targets
-                // later offered to the peer.  Keep the observations and
-                // promote the profile before deciding whether the pool is
-                // usable, so startup Direct and recovery use the same
-                // evidence that candidate signaling uses.
+                // even though it had just gathered real pool targets later
+                // offered to the peer. Promote the pool-backed capability
+                // without mixing its port samples into the primary socket's
+                // allocation sequence; the socket-indexed candidates retain
+                // the pool evidence used by signaling.
                 merge_pool_nat_profile(&mut report, &pool_report);
                 self.append_pool_candidates(&mut report, pool_report.candidates, socket_index)
                     .await;
@@ -132,7 +144,7 @@ impl UdpTransport {
                     }
                 }))
                 .await;
-                let ipv6_report = candidate_report_from_observations(
+                let ipv6_report = p2pnet_nat::candidate_report_from_unordered_observations(
                     ipv6_local_addr,
                     self.peers.gather_host_candidates().await,
                     v6_observations,
@@ -157,7 +169,9 @@ impl UdpTransport {
         // not proof that UDP is blocked when a secondary bound socket has a
         // real server-reflexive mapping.  In that case the pool is the
         // available direct path and must remain active for punch/retry.
-        self.set_socket_pool_active(socket_pool_is_eligible(&report));
+        if apply_socket_pool_policy {
+            self.apply_candidate_report_socket_pool_policy(&report);
+        }
 
         if !self.peers.predicted_candidates_enabled_for_gather() {
             report
@@ -167,6 +181,10 @@ impl UdpTransport {
         Ok(report)
     }
 
+    pub(crate) fn apply_candidate_report_socket_pool_policy(&self, report: &CandidateGatherReport) {
+        self.set_socket_pool_active(socket_pool_is_eligible(report));
+    }
+
     async fn probe_live_filtering_behavior(
         &self,
         report: &mut CandidateGatherReport,
@@ -174,7 +192,6 @@ impl UdpTransport {
         stun_timeout: Duration,
     ) {
         if report.nat_profile.udp_blocked
-            || report.nat_profile.mapping_behavior != MappingBehavior::EndpointIndependent
             || report.nat_profile.filtering_behavior != FilteringBehavior::Unknown
         {
             return;
@@ -200,20 +217,16 @@ impl UdpTransport {
             .query_stun_live_response(&self.socket, server, timeout, true, true)
             .await
         {
-            if let Some(filtering) = classify_live_filtering_response(server, response.source) {
+            if let Some(filtering) = p2pnet_nat::ice::classify_filtering_probe_response(
+                server,
+                response.source,
+                stun_servers,
+            ) {
                 report.nat_profile.filtering_behavior = filtering;
-                return;
             }
         }
-
-        if let Ok(response) = self
-            .query_stun_live_response(&self.socket, server, timeout, false, true)
-            .await
-        {
-            if response.source.ip() == server.ip() && response.source != server {
-                report.nat_profile.filtering_behavior = FilteringBehavior::AddressDependent;
-            }
-        }
+        // Port-only success cannot separate EIF from ADF without a verified
+        // uncontacted alternate-IP experiment. Keep the filtering axis unknown.
     }
 }
 
@@ -223,24 +236,19 @@ fn stun_timeout_for_live_filtering_probe(timeout: Duration) -> Duration {
         .max(Duration::from_millis(50))
 }
 
+#[cfg(test)]
 fn classify_live_filtering_response(
     server: SocketAddr,
     response_source: SocketAddr,
 ) -> Option<FilteringBehavior> {
-    if response_source.ip() != server.ip() {
-        Some(FilteringBehavior::EndpointIndependent)
-    } else if response_source != server {
-        Some(FilteringBehavior::AddressDependent)
-    } else {
-        None
-    }
+    p2pnet_nat::ice::classify_filtering_probe_response(server, response_source, &[server])
 }
 
-/// Fold evidence from one socket-pool member into the daemon-level NAT
-/// profile.  The primary socket's profile is still authoritative whenever it
-/// has evidence of its own.  When it says `UdpBlocked` but a pool member has a
-/// real STUN mapping, the correct diagnosis is instead "primary mapping
-/// unavailable; pool-backed mapping-dependent Direct is available".
+/// Promote pool-backed reachability without treating independent UDP sockets
+/// as one sequential port-allocation experiment. `NatProfile.observations`
+/// belongs to `local_addr` and is consumed by the allocation-model inference;
+/// appending pool observations there can falsely label a predictable primary
+/// socket as random, or invent an ordering that was never measured.
 ///
 /// This is deliberately conservative: it does not invent a port delta or a
 /// predicted window from a single pool member.  It only changes the gates
@@ -259,11 +267,6 @@ fn merge_pool_nat_profile(
     if observed_endpoints.is_empty() {
         return false;
     }
-
-    report
-        .nat_profile
-        .observations
-        .extend(pool_report.nat_profile.observations.iter().cloned());
 
     if !report.nat_profile.udp_blocked {
         return false;

@@ -215,12 +215,15 @@ ssh_exec() {
 
 ssh_script() {
   local command="bash -s --"
-  local value quoted
+  local value quoted tty_mode=-tt
   for value in "$@"; do
     quoted=$(shell_quote "$value")
     command+=" $quoted"
   done
-  ssh -tt "${SSH_COMMON[@]}" "$TARGET" "$command"
+  # A forced terminal keeps bash -s waiting for terminal EOF after the heredoc.
+  # Batch deployments use a pipe so the remote script receives EOF normally.
+  [ "$NON_INTERACTIVE" -eq 0 ] || tty_mode=-T
+  ssh "$tty_mode" "${SSH_COMMON[@]}" "$TARGET" "$command"
 }
 
 if [ "$MODE" = fetch ]; then

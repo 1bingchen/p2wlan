@@ -174,22 +174,72 @@ class MobileLifecycleCoordinatorTest {
         val captive = validated.copy(validated = false, captive = true)
 
         assertEquals(MobileLifecycleOutcome.APPLIED, reducer.onAvailable(validated).outcome)
-        assertEquals(MobileLifecycleOutcome.APPLIED, reducer.onAvailable(captive).outcome)
+        assertEquals(MobileLifecycleOutcome.APPLIED, reducer.onPropertiesChanged(captive).outcome)
         assertEquals(2L, reducer.generation())
-        assertEquals(MobileLifecycleOutcome.DUPLICATE, reducer.onAvailable(captive).outcome)
+        assertEquals(MobileLifecycleOutcome.DUPLICATE, reducer.onPropertiesChanged(captive).outcome)
     }
 
     @Test
-    fun lateLostAndAvailableCallbacksForOldNetworkAreRejected() {
+    fun lateLostAndPropertyCallbacksForOldNetworkAreRejected() {
         val reducer = PhysicalNetworkIdentityReducer()
         val wifi = PhysicalNetworkIdentity(10, setOf("wifi"), true, false, "wlan0")
         val cellular = PhysicalNetworkIdentity(20, setOf("cellular"), true, false, "rmnet0")
         reducer.onAvailable(wifi)
         assertEquals(MobileLifecycleOutcome.APPLIED, reducer.onLost(10).outcome)
-        assertEquals(MobileLifecycleOutcome.STALE_REJECTED, reducer.onAvailable(wifi).outcome)
+        assertEquals(MobileLifecycleOutcome.STALE_REJECTED, reducer.onPropertiesChanged(wifi).outcome)
         assertEquals(MobileLifecycleOutcome.APPLIED, reducer.onAvailable(cellular).outcome)
         assertEquals(MobileLifecycleOutcome.STALE_REJECTED, reducer.onLost(10).outcome)
         assertEquals(2L, reducer.generation())
+    }
+
+    @Test
+    fun previouslyBestNetworkCanBecomeDefaultAgainWithoutLosingItsHandle() {
+        val calls = mutableListOf<Pair<Long, String>>()
+        val forwarder = forwarder(40, 4, { 40 }, { 4 }, calls)
+        val wifi = identity(10, "wifi", "wlan0")
+        val cellular = identity(20, "cellular", "rmnet0")
+
+        assertEquals(MobileLifecycleOutcome.APPLIED, forwarder.onAvailable(wifi).outcome)
+        assertEquals(MobileLifecycleOutcome.APPLIED, forwarder.onAvailable(cellular).outcome)
+        assertEquals(MobileLifecycleOutcome.STALE_REJECTED, forwarder.onPropertiesChanged(wifi).outcome)
+        assertEquals(MobileLifecycleOutcome.STALE_REJECTED, forwarder.onLost(wifi.networkHandle).outcome)
+        assertEquals(MobileLifecycleOutcome.APPLIED, forwarder.onAvailable(wifi).outcome)
+        assertEquals(MobileLifecycleOutcome.DUPLICATE, forwarder.onPropertiesChanged(wifi).outcome)
+        assertEquals(MobileLifecycleOutcome.STALE_REJECTED, forwarder.onPropertiesChanged(cellular).outcome)
+        assertEquals(MobileLifecycleOutcome.STALE_REJECTED, forwarder.onLost(cellular.networkHandle).outcome)
+        assertEquals(listOf(1L to wifi.identityHash(), 2L to cellular.identityHash(), 3L to wifi.identityHash()), calls)
+    }
+
+    @Test
+    fun availableAnnouncementWaitsForPropertiesAndDoesNotAdoptLateOldAttributes() {
+        val calls = mutableListOf<Pair<Long, String>>()
+        val forwarder = forwarder(40, 4, { 40 }, { 4 }, calls)
+        val wifi = identity(10, "wifi", "wlan0")
+        val cellular = identity(20, "cellular", "rmnet0")
+        assertEquals(MobileLifecycleOutcome.APPLIED, forwarder.onAvailable(wifi).outcome)
+        assertTrue(forwarder.announceAvailable(cellular.networkHandle))
+        assertEquals(MobileLifecycleOutcome.STALE_REJECTED, forwarder.onPropertiesChanged(wifi.copy(validated = false)).outcome)
+        assertEquals(1, calls.size)
+        assertEquals(MobileLifecycleOutcome.APPLIED, forwarder.onPropertiesChanged(cellular).outcome)
+        assertEquals(listOf(1L to wifi.identityHash(), 2L to cellular.identityHash()), calls)
+
+        assertTrue(forwarder.announceAvailable(wifi.networkHandle))
+        forwarder.onLost(wifi.networkHandle)
+        assertEquals(MobileLifecycleOutcome.STALE_REJECTED, forwarder.onPropertiesChanged(wifi).outcome)
+        assertEquals(2, calls.size)
+    }
+
+    @Test
+    fun replacementServiceCannotCompleteAnOldAvailableAnnouncement() {
+        val calls = mutableListOf<Pair<Long, String>>()
+        var serviceOwner = 40L
+        val forwarder = forwarder(40, 4, { serviceOwner }, { 4 }, calls)
+        val wifi = identity(10, "wifi", "wlan0")
+        assertTrue(forwarder.announceAvailable(wifi.networkHandle))
+        serviceOwner = 41L
+        assertEquals(MobileLifecycleOutcome.STALE_REJECTED, forwarder.onPropertiesChanged(wifi).outcome)
+        assertEquals(MobileLifecycleOutcome.STALE_REJECTED, forwarder.onAvailable(wifi).outcome)
+        assertTrue(calls.isEmpty())
     }
 
     @Test
@@ -314,7 +364,7 @@ class MobileLifecycleCoordinatorTest {
 
         forwarder.onAvailable(oldWifi)
         forwarder.onLost(oldWifi.networkHandle)
-        assertEquals(MobileLifecycleOutcome.STALE_REJECTED, forwarder.onAvailable(oldWifi).outcome)
+        assertEquals(MobileLifecycleOutcome.STALE_REJECTED, forwarder.onPropertiesChanged(oldWifi).outcome)
         assertEquals(MobileLifecycleOutcome.APPLIED, forwarder.onAvailable(cellular).outcome)
         assertEquals(listOf(1L, 2L), calls)
     }

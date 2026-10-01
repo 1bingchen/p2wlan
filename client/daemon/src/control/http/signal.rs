@@ -190,7 +190,16 @@ pub(super) async fn poll_signals(
     wait_ms: u64,
     delivery_tracker: &Arc<tokio::sync::Mutex<SignalDeliveryTracker>>,
     server_clock: &ServerClockEstimate,
+    registration_rx: tokio::sync::watch::Receiver<Option<super::CriticalControlAuth>>,
+    release_http: &RouteAwareControlHttpClient,
 ) -> Result<()> {
+    let ack_registration = SignalAckRegistration::capture(
+        base_url,
+        token,
+        self_node_id,
+        registration_seq,
+        registration_rx,
+    )?;
     // ACK mode (`ack=1`): the server hands out delivery LEASES instead of
     // deleting rows at GET time, so a connection that breaks mid-body or a
     // client that dies mid-processing can never lose a signal — the lease
@@ -213,6 +222,7 @@ pub(super) async fn poll_signals(
     // decoding and executor contention must not extend a synchronized punch
     // deadline or candidate lifetime after the bytes have already arrived.
     let received_at_ms = unix_time_millis();
+    let received_at = tokio::time::Instant::now();
 
     if !res.status().is_success() {
         let status = res.status();
@@ -241,11 +251,29 @@ pub(super) async fn poll_signals(
             );
         }
     }
+    if let Err(error) = ack_registration.ensure_current() {
+        if body.delivery.is_some() {
+            let leased: Vec<_> = body
+                .signals
+                .iter()
+                .take(SIGNAL_ACK_PIPELINE_CAPACITY)
+                .filter(|signal| signal.to_node_id.as_deref() == Some(self_node_id))
+                .filter_map(|signal| {
+                    Some(SignalAckRequest {
+                        id: signal.id.clone()?,
+                        delivery_token: signal.delivery_token.clone()?,
+                    })
+                })
+                .collect();
+            release_revoked_signal_leases(release_http, ack_registration, &leased).await;
+        }
+        return Err(error);
+    }
     let ack_mode = body.delivery.is_some();
     if let Some(delivery) = body.delivery.as_ref() {
         debug!(
-            "Control server granted an ACK-mode delivery lease (batch_token={} lease_expires_at_ms={:?}); acknowledging each row only after state-machine application",
-            delivery.batch_token, delivery.lease_expires_at_ms
+            "Control signal phase=lease_batch rows={} lease_expires_at_ms={:?}; acknowledging each row only after state-machine application",
+            body.signals.len(), delivery.lease_expires_at_ms
         );
     }
 
@@ -340,6 +368,7 @@ pub(super) async fn poll_signals(
                         signal_type: signal.signal_type,
                         from_node_id: signal.from_node_id,
                         ack,
+                        ack_timing: SignalAckTiming::Ordinary,
                         prepared: PreparedSignalDelivery::TerminalRejected,
                     });
             }
@@ -348,6 +377,12 @@ pub(super) async fn poll_signals(
         let punch_at_ms =
             normalize_signal_punch_at(signal.punch_at_ms, server_time_ms, received_at_ms);
         let punch_at_server_ms = signal.punch_at_ms.filter(|_| server_time_ms.is_some());
+        let ack_timing = SignalAckTiming::for_signal(
+            signal.session_id.as_deref(),
+            punch_at_ms,
+            received_at_ms,
+            received_at,
+        );
         let candidates_expires_at_ms = normalize_signal_candidate_expiry(
             signal.candidates_expires_at_ms,
             server_time_ms,
@@ -456,6 +491,7 @@ pub(super) async fn poll_signals(
                     signal_type,
                     from_node_id,
                     ack,
+                    ack_timing,
                     prepared,
                 });
             continue;
@@ -479,10 +515,11 @@ pub(super) async fn poll_signals(
     for deliveries in leased_deliveries.into_values() {
         spawn_signal_application_lane(
             http.clone(),
+            release_http.clone(),
             base_url.to_string(),
             token.to_string(),
             self_node_id.to_string(),
-            registration_seq,
+            ack_registration.clone(),
             event_tx.clone(),
             delivery_tracker.clone(),
             deliveries,
@@ -626,6 +663,7 @@ struct LeasedSignalDelivery {
     signal_type: String,
     from_node_id: String,
     ack: SignalAckRequest,
+    ack_timing: SignalAckTiming,
     prepared: PreparedSignalDelivery,
 }
 
@@ -765,209 +803,7 @@ mod signal_application_timeout_tests {
     }
 }
 
-/// Apply one leased server batch in response order without blocking the
-/// heartbeat/roster polling loop.  ACKs are deliberately emitted one row at a
-/// time: if an ACK is ambiguous, later rows stay unacknowledged and the
-/// server's per-pair head-of-line lease will replay from the first uncertain
-/// commit instead of allowing a newer handshake to overtake it.
-#[allow(clippy::too_many_arguments)]
-fn spawn_signal_application_lane(
-    http: reqwest::Client,
-    base_url: String,
-    token: String,
-    self_node_id: String,
-    registration_seq: Option<u64>,
-    event_tx: mpsc::UnboundedSender<ControlEvent>,
-    delivery_tracker: Arc<tokio::sync::Mutex<SignalDeliveryTracker>>,
-    deliveries: Vec<LeasedSignalDelivery>,
-) {
-    tokio::spawn(async move {
-        for delivery in deliveries {
-            let log_signal_id = bounded_signal_log_value(&delivery.signal_id);
-            let log_from_node_id = bounded_signal_log_value(&delivery.from_node_id);
-            let log_signal_type = bounded_signal_log_value(&delivery.signal_type);
-            let mut application_waiter = None;
-            let mut application_wait_result = None;
-            let mut already_applied = false;
-            let outcome = match delivery.prepared {
-                PreparedSignalDelivery::TerminalRejected => {
-                    already_applied = delivery_tracker.lock().await.already_applied(
-                        &delivery.signal_id,
-                        &delivery.from_node_id,
-                        delivery.signal_seq,
-                    );
-                    if already_applied {
-                        SignalApplyOutcome::Applied
-                    } else {
-                        SignalApplyOutcome::TerminalRejected
-                    }
-                }
-                PreparedSignalDelivery::Apply(event) => {
-                    let tracked = delivery_tracker.lock().await.begin_application(
-                        &delivery.signal_id,
-                        &delivery.from_node_id,
-                        delivery.signal_seq,
-                        &delivery.signal_type,
-                    );
-                    match tracked {
-                        TrackedSignalApplication::AlreadyApplied => {
-                            already_applied = true;
-                            SignalApplyOutcome::Applied
-                        }
-                        TrackedSignalApplication::Join(waiter) => {
-                            info!(
-                                "Control signal phase=join_in_flight id={} from={} type={} seq={:?}",
-                                log_signal_id, log_from_node_id, log_signal_type, delivery.signal_seq
-                            );
-                            application_waiter = Some(waiter.clone());
-                            let wait_result = wait_for_signal_application(
-                                waiter,
-                                &delivery.signal_id,
-                                &delivery.from_node_id,
-                                delivery.signal_seq,
-                                &delivery.signal_type,
-                            )
-                            .await;
-                            application_wait_result = Some(wait_result);
-                            match wait_result {
-                                SignalApplicationWait::Completed(outcome) => outcome,
-                                SignalApplicationWait::TimedOut => SignalApplyOutcome::Retry,
-                            }
-                        }
-                        TrackedSignalApplication::Start { receipt, waiter } => {
-                            application_waiter = Some(waiter.clone());
-                            let delivered = ControlEvent::DeliveredSignal {
-                                signal_id: delivery.signal_id.clone(),
-                                signal_seq: delivery.signal_seq,
-                                signal_type: delivery.signal_type.clone(),
-                                event,
-                                receipt: receipt.clone(),
-                            };
-                            if event_tx.send(delivered).is_err() {
-                                warn!(
-                                    "Control signal {} could not enter the daemon state machine; leaving its server lease unacknowledged",
-                                    log_signal_id
-                                );
-                                delivery_tracker.lock().await.finish_application(
-                                    delivery.signal_id.clone(),
-                                    &delivery.from_node_id,
-                                    delivery.signal_seq,
-                                    application_waiter.as_ref(),
-                                    SignalApplyOutcome::Retry,
-                                );
-                                break;
-                            }
-                            receipt.record_phase("queued", "daemon_event_channel");
-                            info!(
-                                "Control signal phase=queued id={} from={} type={} seq={:?}",
-                                log_signal_id,
-                                log_from_node_id,
-                                log_signal_type,
-                                delivery.signal_seq
-                            );
-                            let wait_result = wait_for_signal_application(
-                                waiter,
-                                &delivery.signal_id,
-                                &delivery.from_node_id,
-                                delivery.signal_seq,
-                                &delivery.signal_type,
-                            )
-                            .await;
-                            application_wait_result = Some(wait_result);
-                            match wait_result {
-                                SignalApplicationWait::Completed(outcome) => outcome,
-                                SignalApplicationWait::TimedOut => SignalApplyOutcome::Retry,
-                            }
-                        }
-                    }
-                }
-            };
-
-            let application_timed_out = matches!(
-                application_wait_result,
-                Some(SignalApplicationWait::TimedOut)
-            );
-            if !already_applied && !application_timed_out {
-                info!(
-                    "Control signal phase=application_completed id={} from={} type={} seq={:?} outcome={:?}",
-                    log_signal_id,
-                    log_from_node_id,
-                    log_signal_type,
-                    delivery.signal_seq,
-                    outcome
-                );
-            }
-
-            if already_applied {
-                debug!(
-                    "Skipping redelivered signal {} from {} at seq {:?}; state-machine application already committed",
-                    log_signal_id, log_from_node_id, delivery.signal_seq
-                );
-            } else if let Some(waiter) = application_waiter.as_ref() {
-                let wait_result =
-                    application_wait_result.unwrap_or(SignalApplicationWait::Completed(outcome));
-                delivery_tracker.lock().await.finish_application_wait(
-                    delivery.signal_id.clone(),
-                    &delivery.from_node_id,
-                    delivery.signal_seq,
-                    waiter,
-                    wait_result,
-                );
-            } else if !application_timed_out {
-                delivery_tracker.lock().await.finish_application(
-                    delivery.signal_id.clone(),
-                    &delivery.from_node_id,
-                    delivery.signal_seq,
-                    None,
-                    outcome,
-                );
-            }
-
-            if application_timed_out {
-                warn!(
-                    "Control signal phase=retry_pending_application id={} from={} type={} seq={:?}; the original state-machine event remains in flight",
-                    log_signal_id,
-                    log_from_node_id,
-                    log_signal_type,
-                    delivery.signal_seq
-                );
-                break;
-            }
-
-            if !matches!(
-                outcome,
-                SignalApplyOutcome::Applied | SignalApplyOutcome::TerminalRejected
-            ) {
-                warn!(
-                    "Control signal phase=application_retry id={} from={} type={} seq={:?} outcome={:?}; leaving it and all later rows unacknowledged for ordered redelivery",
-                    log_signal_id, log_from_node_id, log_signal_type, delivery.signal_seq, outcome
-                );
-                break;
-            }
-
-            if let Err(error) = ack_signals(
-                &http,
-                &base_url,
-                &token,
-                &self_node_id,
-                registration_seq,
-                std::slice::from_ref(&delivery.ack),
-            )
-            .await
-            {
-                warn!(
-                    "Signal {} applied but ACK failed; later rows remain unprocessed until ordered redelivery: {error}",
-                    log_signal_id
-                );
-                break;
-            }
-            info!(
-                "Control signal phase=acked id={} from={} type={} seq={:?}",
-                log_signal_id, log_from_node_id, log_signal_type, delivery.signal_seq
-            );
-        }
-    });
-}
+include!("signal_delivery.rs");
 
 /// One per-row delivery acknowledgement.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -976,39 +812,8 @@ struct SignalAckRequest {
     delivery_token: String,
 }
 
-/// Acknowledge a delivered signal batch (idempotent server-side).
-async fn ack_signals(
-    http: &reqwest::Client,
-    base_url: &str,
-    token: &str,
-    self_node_id: &str,
-    registration_seq: Option<u64>,
-    acks: &[SignalAckRequest],
-) -> Result<()> {
-    let res = with_registration_sequence(
-        http.post(format!(
-            "{base_url}/api/v1/signals/ack?node_id={self_node_id}"
-        ))
-        .timeout(SIGNAL_SEND_TIMEOUT)
-        .bearer_auth(token)
-        .json(&serde_json::json!({ "signals": acks })),
-        registration_seq,
-    )
-    .send()
-    .await
-    .map_err(|e| DaemonError::ControlPlane(format!("signal ack request failed: {e}")))?;
-    if !res.status().is_success() {
-        let status = res.status();
-        let (detail, error_code, current_seq) = control_error_detail(res).await;
-        if let Some(error) = registration_conflict_error(status, error_code, current_seq, &detail) {
-            return Err(error);
-        }
-        return Err(DaemonError::ControlPlane(format!(
-            "signal ack returned HTTP {status}: {detail}",
-        )));
-    }
-    Ok(())
-}
+include!("signal_ack.rs");
+include!("signal_release.rs");
 
 pub(super) fn normalize_signal_punch_at(
     punch_at_ms: Option<u64>,

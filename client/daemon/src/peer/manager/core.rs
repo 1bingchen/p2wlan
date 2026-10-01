@@ -78,6 +78,9 @@ impl PeerManager {
             punch_generations: Arc::new(RwLock::new(HashMap::new())),
             local_fresh_mappings: Arc::new(RwLock::new(HashMap::new())),
             hard_hard_sessions: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            hard_hard_strategy_learning: Arc::new(std::sync::Mutex::new(
+                HardHardStrategyLearning::default(),
+            )),
             hard_hard_cleanup_owners: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
             hard_hard_winners: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             fresh_mapping_history: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -292,6 +295,39 @@ impl PeerManager {
             .clone();
         if let Some(timeline) = timeline {
             timeline.emit(event, path, reason_code, detail);
+        }
+    }
+
+    pub(crate) fn observe_hot_path<F>(
+        &self,
+        observation: crate::connection_timeline::HotPathObservation,
+        path: Option<&str>,
+        reason_code: Option<&str>,
+        detail: F,
+    ) where
+        F: FnOnce() -> String,
+    {
+        let timeline = self
+            .timeline
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        if let Some(timeline) = timeline {
+            timeline.observe_hot_path(observation, path, reason_code, detail);
+        }
+    }
+
+    pub(crate) fn count_hot_path(
+        &self,
+        observation: crate::connection_timeline::HotPathObservation,
+    ) {
+        let timeline = self
+            .timeline
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        if let Some(timeline) = timeline {
+            timeline.count_hot_path(observation);
         }
     }
 
@@ -993,6 +1029,14 @@ impl PeerManager {
         &self,
     ) -> tokio::sync::RwLockWriteGuard<'_, HashMap<String, PeerConnection>> {
         self.connections.write().await
+    }
+
+    /// Pause target snapshot preparation before its connection writer is queued.
+    #[cfg(test)]
+    pub(crate) async fn hold_local_interface_networks_writer_for_test(
+        &self,
+    ) -> tokio::sync::RwLockWriteGuard<'_, Vec<LocalNetwork>> {
+        self.local_interface_networks.write().await
     }
 
     #[cfg(test)]

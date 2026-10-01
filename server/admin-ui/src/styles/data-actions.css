@@ -1,0 +1,20 @@
+.snapshot-export, .copy-value { display: inline-flex; align-items: center; flex-wrap: wrap; gap: 6px; }
+.copy-value-button { display: inline-flex; align-items: center; justify-content: center; gap: 5px; min-height: 30px; padding: 3px 6px; border: 1px solid var(--border); border-radius: 6px; color: var(--text-2); background: var(--surface); font-size: var(--font-caption); }
+.copy-value-button:hover { color: var(--accent); border-color: var(--accent); }
+.data-action-feedback, .data-action-error { font-size: var(--font-caption); overflow-wrap: anywhere; }
+.data-action-error { color: var(--red); }
+
+.resource-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
+.resource-filter-bar { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; }
+.resource-filter-bar .search-field { flex: 1 1 260px; }
+@media (pointer: coarse) { .copy-value-button { min-width: 44px; min-height: 44px; } }
+
+.value-with-action { display: inline-flex; align-items: center; flex-wrap: wrap; gap: 6px; max-width: 100%; }
+.value-with-action code { overflow-wrap: anywhere; white-space: normal; }
+.detail-navigation { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 12px; }
+.identity-link { color: var(--text); font-size: var(--font-table); font-weight: 600; }
+
+.copy-value-button.compact-copy { width: 30px; padding: 4px; border-color: transparent; background: transparent; }
+.copy-value-button.compact-copy:hover { background: var(--accent-soft); }
+.copy-fallback-value { display: block; flex-basis: 100%; max-width: 360px; padding: 6px 8px; border: 1px solid var(--border); border-radius: 4px; color: var(--text); background: var(--surface-subtle); overflow-wrap: anywhere; white-space: pre-wrap; user-select: all; }
+@media (pointer: coarse) { .copy-value-button.compact-copy { min-width: 44px; min-height: 44px; } }

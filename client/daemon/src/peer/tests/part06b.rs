@@ -321,6 +321,8 @@ async fn test_peer_manager_path_health_drives_data_path() {
 
     manager
         .add_peer(&PeerInfo {
+            capabilities: crate::control::PeerCapabilities::default(),
+            registration_seq: 0,
             node_id: "peer1".to_string(),
             device_name: String::new(),
             app_version: String::new(),
@@ -420,6 +422,8 @@ async fn network_generation_invalidates_direct_and_ignores_stale_results() {
 
     manager
         .add_peer(&PeerInfo {
+            capabilities: crate::control::PeerCapabilities::default(),
+            registration_seq: 0,
             node_id: "peer1".to_string(),
             device_name: String::new(),
             app_version: String::new(),
@@ -531,6 +535,8 @@ async fn test_peer_manager_direct_probe_targets_exclude_direct_peers() {
 
     manager
         .add_peer(&PeerInfo {
+            capabilities: crate::control::PeerCapabilities::default(),
+            registration_seq: 0,
             node_id: "peer1".to_string(),
             device_name: String::new(),
             app_version: String::new(),
@@ -616,6 +622,8 @@ async fn test_peer_manager_stats() {
     // Add two peers
     for (id, ip) in [("p1", "10.20.0.2"), ("p2", "10.20.0.3")] {
         let peer_info = PeerInfo {
+            capabilities: crate::control::PeerCapabilities::default(),
+            registration_seq: 0,
             node_id: id.to_string(),
             device_name: String::new(),
             app_version: String::new(),

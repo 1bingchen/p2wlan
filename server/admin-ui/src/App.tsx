@@ -1,23 +1,23 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useState, lazy } from 'react'
 import { useQueryClient } from '@tanstack/react-query'
-import {
-  BrowserRouter,
-  Navigate,
-  Route,
-  Routes,
-} from 'react-router-dom'
-import { clearAdminToken, getAdminToken } from './api'
-import { ConnectionHealthPage } from './features/health/ConnectionHealthPage'
-import { ConnectionsPage } from './features/connections/ConnectionsPage'
-import { AccountDetailPage } from './features/accounts/AccountDetailPage'
+import { BrowserRouter, Navigate, Route, Routes, useLocation } from 'react-router-dom'
+import { getAdminToken } from './api'
+import { useLocale } from './i18n'
+import { Shell } from './layout/AppShell'
+import { LoginPage } from './features/auth/LoginPage'
+import { Dashboard } from './features/overview/OverviewPage'
 import { AccountsPage } from './features/accounts/AccountsPage'
-import { Login } from './features/auth/LoginPage'
+import { AccountDetailPage } from './features/accounts/AccountDetailPage'
 import { DevicesPage } from './features/devices/DevicesPage'
 import { NetworksPage } from './features/networks/NetworksPage'
-import { Dashboard } from './features/overview/OverviewPage'
 import { RelationshipsPage } from './features/relationships/RelationshipsPage'
 import { SystemPage } from './features/system/SystemPage'
-import { Shell } from './layout/AppShell'
+const ConnectionWorkspace = lazy(() => import('./features/connections/ConnectionWorkspace').then((module) => ({ default: module.ConnectionWorkspace })))
+
+function RelationshipAlias() {
+  const location = useLocation()
+  return <Navigate to={{ pathname: '/relationships', search: location.search }} state={location.state} replace />
+}
 
 function AuthenticatedApp({ onLogout }: { onLogout: () => void }) {
   return <BrowserRouter basename="/admin"><Routes>
@@ -26,11 +26,11 @@ function AuthenticatedApp({ onLogout }: { onLogout: () => void }) {
       <Route path="accounts" element={<AccountsPage />} />
       <Route path="accounts/:id" element={<AccountDetailPage />} />
       <Route path="relationships" element={<RelationshipsPage />} />
-      <Route path="topology" element={<Navigate to="/relationships" replace />} />
-      <Route path="connections" element={<ConnectionsPage />} />
+      <Route path="topology" element={<RelationshipAlias />} />
+      <Route path="connections" element={<ConnectionWorkspace />} />
       <Route path="devices" element={<DevicesPage />} />
       <Route path="networks" element={<NetworksPage />} />
-      <Route path="health" element={<ConnectionHealthPage />} />
+      <Route path="health" element={<ConnectionWorkspace />} />
       <Route path="system" element={<SystemPage />} />
       <Route path="*" element={<Navigate to="/" replace />} />
     </Route>
@@ -38,20 +38,21 @@ function AuthenticatedApp({ onLogout }: { onLogout: () => void }) {
 }
 
 export default function App() {
-  const [authenticated, setAuthenticated] = useState(Boolean(getAdminToken()))
+  const locale = useLocale()
+  const [authenticated, setAuthenticated] = useState(() => Boolean(getAdminToken()))
   const queryClient = useQueryClient()
-
+  useEffect(() => {
+    document.documentElement.lang = locale
+  }, [locale])
   useEffect(() => {
     const unauthorized = () => {
-      clearAdminToken()
+      // A rejected token must not leave the previous session's pages in the
+      // cache, or the next login would briefly render the old session's data.
       queryClient.clear()
       setAuthenticated(false)
     }
     window.addEventListener('p2wlan:unauthorized', unauthorized)
     return () => window.removeEventListener('p2wlan:unauthorized', unauthorized)
   }, [queryClient])
-
-  return authenticated
-    ? <AuthenticatedApp onLogout={() => setAuthenticated(false)} />
-    : <Login onSuccess={() => setAuthenticated(true)} />
+  return authenticated ? <AuthenticatedApp onLogout={() => setAuthenticated(false)} /> : <LoginPage onSuccess={() => setAuthenticated(true)} />
 }

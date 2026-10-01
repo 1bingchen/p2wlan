@@ -73,10 +73,222 @@ enum HardHardOfferHandling {
     /// ordinary fresh-punch path instead of swallowing the offer.
     Fallback,
     Rejected,
+    /// A repeated token failed transcript/identity validation. Consume this
+    /// signal without letting the generic candidate cleanup retire its owner.
+    RejectedPreservingSession,
     Started,
 }
 
+impl HardHardOfferHandling {
+    fn diagnostic_label(self) -> &'static str {
+        match self {
+            Self::NotHardHard => "not_hard_hard",
+            Self::Fallback => "fallback_to_generic_punch",
+            Self::Rejected => "hard_hard_rejected",
+            Self::RejectedPreservingSession => "repeat_rejected_owner_preserved",
+            Self::Started => "hard_hard_started_or_already_owned",
+        }
+    }
+}
+
 impl Daemon {
+    /// Runs under the existing per-peer candidate owner, before candidate
+    /// mutation. Same-token delivery can acknowledge the existing work, but
+    /// cannot reset its measurement, extend time, or change its transcript.
+    async fn handle_hard_hard_repeated_signal(
+        &self,
+        offer: &PendingPeerOffer,
+    ) -> Option<HardHardOfferHandling> {
+        let coordination = offer
+            .session_id
+            .as_deref()
+            .and_then(HardHardCoordination::parse)?;
+        let meta = coordination.v2.as_ref()?;
+        if !matches!(meta.stage, HardHardV2Stage::Offer | HardHardV2Stage::Answer) {
+            return None;
+        }
+        let record = self
+            .peers
+            .hard_hard_session_by_token(&offer.from_node_id, &coordination.token)
+            .await?;
+        let plan = record.coordinated_plan.as_ref()?;
+        // This is the expected first reciprocal ANSWER, not a repeated
+        // publication. Its candidate transaction and agreement must still run.
+        if record.initiator && meta.stage == HardHardV2Stage::Answer && plan.agreement.is_none() {
+            return None;
+        }
+        let identity_current = offer.network_generation == record.local_network_generation
+            && offer.peer_session_generation.is_none_or(|generation| {
+                self.peers
+                    .peer_session_is_current_sync(&offer.from_node_id, generation)
+            })
+            && self.peers.signal_sender_identity_matches_peer_sync(
+                &offer.from_node_id,
+                offer.sender_public_key.as_deref(),
+            )
+            && hard_hard_plan_registration_is_current(
+                &self.peers,
+                &self.control,
+                &offer.from_node_id,
+                plan,
+            )
+            .await
+            && self
+                .peers
+                .hard_hard_session_identity_is_current(&record.fresh_socket)
+                .await;
+        let fresh_matches = if let FreshPredictionSources::Valid(id) =
+            fresh_prediction_from_sources(&offer.candidate_sources)
+        {
+            self.peers
+                .prepare_remote_fresh_prediction(
+                    &offer.from_node_id,
+                    id,
+                    &offer.candidates,
+                    &offer.candidate_sources,
+                    offer.candidates_expires_at_ms,
+                )
+                .await
+                == crate::peer::RemoteFreshAdmission::AlreadyRecorded
+        } else {
+            false
+        };
+        let matches = identity_current
+            && fresh_matches
+            && hard_hard_repeated_transcript_matches(
+                &record,
+                &coordination,
+                &offer.candidates,
+                offer.punch_at_server_ms,
+            );
+        tracing::info!(event = "hard_hard_signal_repeat",
+            session_tag = %hard_hard_anonymized_tag(&coordination.token, "session"),
+            identity_current, fresh_matches, accepted = matches,
+            outcome = if matches { "already_owned" } else { "rejected_owner_preserved" },
+            "Hard-Hard repeated signal checked before candidate mutation");
+        self.peers.record_direct_event(
+            &offer.from_node_id,
+            if matches { "hard_hard_signal_duplicate" } else { "hard_hard_signal_repeat_rejected" },
+            None, Some(offer.candidates.len()), None,
+            if matches { "same token and immutable transcript already owned; no candidate mutation or measurement restart" }
+            else { "same-token signal failed current identity or immutable transcript; existing session preserved" },
+        ).await;
+        Some(if matches {
+            HardHardOfferHandling::Started
+        } else {
+            HardHardOfferHandling::RejectedPreservingSession
+        })
+    }
+
+    /// Signal delivery and roster polling are independent. Keep this exact
+    /// offer in its existing bounded owner while one requested roster refresh
+    /// supplies the producer's real profile identity. Never extend rendezvous
+    /// time or synthesize a generation from the signal's declaration.
+    async fn wait_for_hard_hard_profile_publication(
+        &self,
+        offer: &PendingPeerOffer,
+        reservation: &mut CandidateOfferWorkReservation,
+    ) -> bool {
+        let Some(coordination) = offer
+            .session_id
+            .as_deref()
+            .and_then(HardHardCoordination::parse)
+        else {
+            return true;
+        };
+        let Some(punch_at_ms) = offer.punch_at_ms else {
+            return true;
+        };
+        let peer_id = &offer.from_node_id;
+        let expected_session = offer
+            .peer_session_generation
+            .or_else(|| self.peers.peer_session_generation_sync(peer_id));
+        let wait_ms = punch_at_ms.saturating_sub(
+            hard_hard_now_ms().saturating_add(HARD_HARD_MIN_RESPONSE_LEAD.as_millis() as u64),
+        );
+        let deadline = tokio::time::Instant::now()
+            + Duration::from_millis(wait_ms)
+                .min(HARD_HARD_PUNCH_LEAD - HARD_HARD_MIN_RESPONSE_LEAD);
+        let mut refresh_requested = false;
+        loop {
+            let current = || {
+                !*reservation.cancellation.borrow()
+                    && self
+                        .pending_handshakes
+                        .lock()
+                        .candidate_offer_work_is_current(peer_id, reservation.owner)
+                    && self.peers.current_network_generation_sync() == offer.network_generation
+                    && self.peers.peer_session_generation_sync(peer_id) == expected_session
+                    && self.peers.signal_sender_identity_matches_peer_sync(
+                        peer_id,
+                        offer.sender_public_key.as_deref(),
+                    )
+            };
+            if !current() {
+                return false;
+            }
+            // Yield immediately to the one newest-wins successor. The caller
+            // takes it before any incarnation/candidate mutation.
+            if self
+                .pending_handshakes
+                .lock()
+                .candidate_offer_work_has_priority_successor(peer_id, reservation.owner, offer)
+            {
+                return true;
+            }
+            let Some(connection) = self.peers.get_connection(peer_id).await else {
+                return false;
+            };
+            if !current() {
+                return false;
+            }
+            let observed = connection
+                .remote_nat_profile
+                .as_ref()
+                .and_then(|profile| profile.generation);
+            if observed.is_some_and(|generation| {
+                generation > coordination.local_profile_generation
+                    || (generation == coordination.local_profile_generation
+                        && connection.remote_nat_profile_is_fresh())
+            }) {
+                // A newer generation must reach the original strict binding
+                // check and be rejected, rather than waiting for a downgrade.
+                return true;
+            }
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero()
+                || !hard_hard_punch_window_is_usable(hard_hard_now_ms(), punch_at_ms)
+                || offer
+                    .candidates_expires_at_ms
+                    .is_some_and(|expires| expires <= hard_hard_now_ms())
+            {
+                return true;
+            }
+            if !refresh_requested {
+                refresh_requested = true;
+                self.control.refresh_peers_now();
+                self.timeline.emit(
+                    "hard_hard_profile_publication_wait",
+                    None,
+                    Some("profile_metadata_pending"),
+                    Some(format!(
+                        "session_tag={} declared_generation={} observed_generation={observed:?}",
+                        hard_hard_anonymized_tag(&coordination.token, "session"),
+                        coordination.local_profile_generation,
+                    )),
+                );
+            }
+            tokio::select! {
+                changed = reservation.cancellation.changed() => {
+                    if changed.is_err() || *reservation.cancellation.borrow() {
+                        return false;
+                    }
+                }
+                _ = sleep(UNKNOWN_PEER_OFFER_POLL.min(remaining)) => {}
+            }
+        }
+    }
+
     /// Repair the local peer-manager roster when a signal races a lifecycle
     /// event.  The control client keeps an authoritative snapshot separately
     /// from the event consumer; a PeerLeft/PeerJoined boundary can therefore
@@ -387,18 +599,25 @@ impl Daemon {
         candidate_apply_result: CandidateSetApplyResult,
         fresh_punch: FreshPunchDecision,
         reservation: &mut CandidateOfferWorkReservation,
-    ) {
-        let hard_hard_handling = self
-            .handle_hard_hard_fresh_offer(
-                &offer.from_node_id,
-                offer.session_id.as_deref(),
-                offer.punch_at_ms,
-                offer.punch_at_server_ms,
-                fresh_punch.clone(),
-            )
-            .await;
+    ) -> HardHardOfferHandling {
+        let hard_hard_handling =
+            if let Some(repeated) = self.handle_hard_hard_repeated_signal(offer).await {
+                repeated
+            } else {
+                self.handle_hard_hard_fresh_offer(
+                    &offer.from_node_id,
+                    offer.session_id.as_deref(),
+                    offer.punch_at_ms,
+                    offer.punch_at_server_ms,
+                    fresh_punch.clone(),
+                )
+                .await
+            };
         if candidate_apply_result == CandidateSetApplyResult::Applied
-            && hard_hard_handling != HardHardOfferHandling::Started
+            && !matches!(
+                hard_hard_handling,
+                HardHardOfferHandling::Started | HardHardOfferHandling::RejectedPreservingSession
+            )
         {
             self.peers
                 .clear_hard_hard_sessions(Some(&offer.from_node_id))
@@ -407,13 +626,15 @@ impl Daemon {
         if self.peers.hard_hard_experiment_only()
             && hard_hard_handling != HardHardOfferHandling::NotHardHard
         {
-            return;
+            return hard_hard_handling;
         }
         if matches!(
             hard_hard_handling,
-            HardHardOfferHandling::Rejected | HardHardOfferHandling::Started
+            HardHardOfferHandling::Rejected
+                | HardHardOfferHandling::RejectedPreservingSession
+                | HardHardOfferHandling::Started
         ) {
-            return;
+            return hard_hard_handling;
         }
         match fresh_punch {
             FreshPunchDecision::Fresh(id, frozen_targets) => {
@@ -427,7 +648,7 @@ impl Daemon {
                     )
                     .await
                 {
-                    return;
+                    return hard_hard_handling;
                 }
                 // C=0 (mutual-APD): when we also hold a fresh local mapping,
                 // knock back from OUR fresh source at the SAME canonical
@@ -468,6 +689,7 @@ impl Daemon {
                 }
             }
         }
+        hard_hard_handling
     }
 
     #[cfg(test)]
@@ -477,17 +699,24 @@ impl Daemon {
         candidate_apply_result: CandidateSetApplyResult,
         fresh_punch: FreshPunchDecision,
     ) {
-        let hard_hard_handling = self
-            .handle_hard_hard_fresh_offer(
-                &offer.from_node_id,
-                offer.session_id.as_deref(),
-                offer.punch_at_ms,
-                offer.punch_at_server_ms,
-                fresh_punch.clone(),
-            )
-            .await;
+        let hard_hard_handling =
+            if let Some(repeated) = self.handle_hard_hard_repeated_signal(offer).await {
+                repeated
+            } else {
+                self.handle_hard_hard_fresh_offer(
+                    &offer.from_node_id,
+                    offer.session_id.as_deref(),
+                    offer.punch_at_ms,
+                    offer.punch_at_server_ms,
+                    fresh_punch.clone(),
+                )
+                .await
+            };
         if candidate_apply_result == CandidateSetApplyResult::Applied
-            && hard_hard_handling != HardHardOfferHandling::Started
+            && !matches!(
+                hard_hard_handling,
+                HardHardOfferHandling::Started | HardHardOfferHandling::RejectedPreservingSession
+            )
         {
             self.peers
                 .clear_hard_hard_sessions(Some(&offer.from_node_id))
@@ -500,7 +729,9 @@ impl Daemon {
         }
         if matches!(
             hard_hard_handling,
-            HardHardOfferHandling::Rejected | HardHardOfferHandling::Started
+            HardHardOfferHandling::Rejected
+                | HardHardOfferHandling::RejectedPreservingSession
+                | HardHardOfferHandling::Started
         ) {
             return;
         }
@@ -539,6 +770,94 @@ impl Daemon {
     /// not a cryptographic authenticator: malformed or mismatched metadata is
     /// consumed and rejected rather than silently degrading into an ordinary
     /// one-sided Hard↔Hard punch.
+    /// A READY message cannot enter the newest-candidate queue: that worker
+    /// may be waiting for this very acknowledgement under the punch owner.
+    async fn accept_hard_hard_ready_signal(
+        &self,
+        peer_id: &str,
+        coordination: &HardHardCoordination,
+        candidates: &[String],
+        punch_at_server_ms: Option<u64>,
+    ) -> bool {
+        let Some(meta) = coordination.v2.as_ref() else {
+            return false;
+        };
+        let acknowledgement = matches!(
+            meta.stage,
+            HardHardV2Stage::ReadyAck | HardHardV2Stage::SyncAck
+        );
+        let starting = matches!(meta.stage, HardHardV2Stage::Sync | HardHardV2Stage::SyncAck);
+        if !meta.stage.is_barrier() {
+            return false;
+        }
+        let Some(record) = self
+            .peers
+            .hard_hard_session_by_token(peer_id, &coordination.token)
+            .await
+        else {
+            return false;
+        };
+        let Some(plan) = record.coordinated_plan.as_ref() else {
+            return false;
+        };
+        let Some(agreement) = meta.agreement else {
+            return false;
+        };
+        if record.initiator != acknowledgement
+            || meta.phase != plan.phase
+            || meta.strategy_order != plan.strategy_order
+            || meta.remote != plan.local_offer
+            || Some(meta.local) != plan.remote_offer
+            || coordination.local_network_generation != record.remote_network_generation
+            || coordination.remote_network_generation != record.local_network_generation
+            || coordination.local_profile_generation != record.remote_profile_generation
+            || coordination.remote_profile_generation != record.local_profile_generation
+            || candidates.len() != record.remote_prediction.len()
+            || hard_hard_prediction_targets(candidates, crate::MAX_SIGNAL_CANDIDATES)
+                != record.remote_prediction
+            || !hard_hard_plan_registration_is_current(&self.peers, &self.control, peer_id, plan)
+                .await
+            || !self
+                .peers
+                .hard_hard_session_identity_is_current(&record.fresh_socket)
+                .await
+        {
+            return false;
+        }
+        if starting {
+            let Some(server_time_ms) = punch_at_server_ms else {
+                return false;
+            };
+            let Some(base) = plan.agreement else {
+                return false;
+            };
+            if agreement != crate::peer::hard_hard_start_agreement(base, server_time_ms) {
+                return false;
+            }
+            let start = crate::peer::HardHardAgreedStart {
+                server_time_ms,
+                agreement,
+            };
+            return if acknowledgement {
+                self.peers
+                    .hard_hard_confirm_start(peer_id, &coordination.token, start, true, None)
+                    .await
+            } else {
+                self.peers
+                    .hard_hard_activate_start(peer_id, &coordination.token, start)
+                    .await
+            };
+        }
+        if plan.agreement != Some(agreement)
+            || punch_at_server_ms != Some(plan.canonical_server_deadline)
+        {
+            return false;
+        }
+        self.peers
+            .hard_hard_accept_ready(peer_id, &coordination.token, agreement, acknowledgement)
+            .await
+    }
+
     async fn handle_hard_hard_fresh_offer(
         &self,
         peer_id: &str,
@@ -790,7 +1109,7 @@ impl Daemon {
                         );
                     }
                 }
-                match spawn_hard_hard_initiator_response(
+                match spawn_hard_hard_initiator_response_with_signal(
                     udp,
                     self.peers.clone(),
                     self.punch_attempts.clone(),
@@ -798,6 +1117,7 @@ impl Daemon {
                     coordination,
                     frozen_targets,
                     punch_at_ms,
+                    Some(signal),
                 )
                 .await
                 {

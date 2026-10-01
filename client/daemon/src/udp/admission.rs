@@ -160,6 +160,84 @@ impl UdpTransport {
         peer_addr: SocketAddr,
         socket_index: usize,
     ) -> OutboundProbeAdmission {
+        self.admit_connectivity_probe_for_purpose(
+            peer_id,
+            peer_addr,
+            socket_index,
+            crate::peer::RecoveryProbePurpose::Ordinary,
+            None,
+        )
+        .await
+    }
+
+    async fn admit_hard_hard_connectivity_probe(
+        &self,
+        peer_id: &str,
+        peer_addr: SocketAddr,
+        socket_index: usize,
+        token: &str,
+        purpose: crate::peer::RecoveryProbePurpose,
+    ) -> OutboundProbeAdmission {
+        let Some(record) = self.peers.hard_hard_session_by_token(peer_id, token).await else {
+            return OutboundProbeAdmission::RecoveryIdentityStale;
+        };
+        if purpose == crate::peer::RecoveryProbePurpose::Ordinary
+            || record.pair_nomination.is_none()
+            || record.local_network_generation != self.peers.current_network_generation_sync()
+            || !record.requested_socket_indices.contains(&socket_index)
+        {
+            return OutboundProbeAdmission::RecoveryIdentityStale;
+        }
+        let Some(identity) = record
+            .coordinated_plan
+            .and_then(|plan| plan.recovery_identity)
+        else {
+            return OutboundProbeAdmission::RecoveryIdentityStale;
+        };
+        self.admit_connectivity_probe_for_purpose(
+            peer_id,
+            peer_addr,
+            socket_index,
+            purpose,
+            Some(identity),
+        )
+        .await
+    }
+
+    async fn admit_connectivity_probe_for_purpose(
+        &self,
+        peer_id: &str,
+        peer_addr: SocketAddr,
+        socket_index: usize,
+        purpose: crate::peer::RecoveryProbePurpose,
+        recovery_identity: Option<crate::peer::RecoveryEpochIdentity>,
+    ) -> OutboundProbeAdmission {
+        // One deadline covers local -> global -> recovery acquisition. None
+        // of these owners acquires the preceding budget lock in reverse. The
+        // recovery gate and both UDP debits commit without a subsequent await,
+        // so timeout/cancellation before that point leaves all credits intact.
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            self.admit_connectivity_probe_transaction(
+                peer_id,
+                peer_addr,
+                socket_index,
+                purpose,
+                recovery_identity,
+            ),
+        )
+        .await
+        .unwrap_or(OutboundProbeAdmission::AdmissionDeferred)
+    }
+
+    async fn admit_connectivity_probe_transaction(
+        &self,
+        peer_id: &str,
+        peer_addr: SocketAddr,
+        socket_index: usize,
+        purpose: crate::peer::RecoveryProbePurpose,
+        recovery_identity: Option<crate::peer::RecoveryEpochIdentity>,
+    ) -> OutboundProbeAdmission {
         let now = Instant::now();
         let network_key = OutboundProbeBudgetKey::Network;
         let peer_key = OutboundProbeBudgetKey::Peer(peer_id.to_string());
@@ -180,21 +258,69 @@ impl UdpTransport {
             return OutboundProbeAdmission::RemoteIpRateLimited;
         }
 
-        if let Some(global_budget) = self.global_outbound_probe_budget.as_ref() {
-            match global_budget.admit(peer_id, peer_addr, socket_index).await {
-                OutboundProbeAdmission::Accepted => {}
-                limited => return limited,
-            }
+        let reserve = purpose.confirmation_short_window_reserve();
+        if reserve > 0
+            && [
+                (&network_key, OUTBOUND_PROBE_BUDGET_PER_NETWORK),
+                (&peer_key, OUTBOUND_PROBE_BUDGET_PER_PEER),
+                (&remote_ip_key, OUTBOUND_PROBE_BUDGET_PER_PEER_REMOTE_IP),
+            ]
+            .into_iter()
+            .any(|(key, ceiling)| {
+                budget.get(key).map_or(0, VecDeque::len) >= ceiling.saturating_sub(reserve)
+            })
+        {
+            return OutboundProbeAdmission::HardHardConfirmationRateReserved;
         }
 
         // The recovery-epoch credit is the hard per-epoch TOTAL: it cannot be
         // refilled by per-second windows or new candidate offers, so a failing
         // peer's whole recovery episode stays bounded regardless of how many
         // punch sessions or fresh-mapping generations start.
-        if !self.peers.try_consume_recovery_probe_credit(peer_id).await {
-            return OutboundProbeAdmission::EpochCreditExhausted;
+        let recovery_credit = async {
+            if let Some(identity) = recovery_identity {
+                use crate::peer::RecoveryProbeCreditAdmission;
+                match self
+                    .peers
+                    .consume_recovery_probe_credit_for_purpose(peer_id, identity, purpose)
+                    .await
+                {
+                    RecoveryProbeCreditAdmission::Accepted => {}
+                    RecoveryProbeCreditAdmission::Exhausted => {
+                        return OutboundProbeAdmission::EpochCreditExhausted
+                    }
+                    RecoveryProbeCreditAdmission::ConfirmationReserved => {
+                        return OutboundProbeAdmission::HardHardRecoveryConfirmationReserved
+                    }
+                    RecoveryProbeCreditAdmission::IdentityStale => {
+                        return OutboundProbeAdmission::RecoveryIdentityStale
+                    }
+                }
+            } else if !self.peers.try_consume_recovery_probe_credit(peer_id).await {
+                return OutboundProbeAdmission::EpochCreditExhausted;
+            }
+            OutboundProbeAdmission::Accepted
+        };
+
+        let admission = if let Some(global_budget) = self.global_outbound_probe_budget.as_ref() {
+            global_budget
+                .admit_with_purpose_after(
+                    peer_id,
+                    peer_addr,
+                    socket_index,
+                    purpose,
+                    recovery_credit,
+                )
+                .await
+        } else {
+            recovery_credit.await
+        };
+        if admission != OutboundProbeAdmission::Accepted {
+            return admission;
         }
 
+        // No await after the exact recovery gate or global commit.
+        let now = Instant::now();
         budget.entry(network_key).or_default().push_back(now);
         budget.entry(peer_key).or_default().push_back(now);
         budget.entry(remote_ip_key).or_default().push_back(now);
@@ -245,7 +371,10 @@ impl UdpTransport {
         RelayBackoffHeartbeatReservationRejection,
     > {
         let local_busy = {
-            let budget = self.outbound_probe_budget.lock().await;
+            let mut budget = self.outbound_probe_budget.lock().await;
+            // Heartbeats must age this window themselves: ordinary traversal
+            // may remain frozen throughout the relay-backoff period.
+            retain_live_budget_entries(&mut budget, Instant::now());
             budget
                 .get(&OutboundProbeBudgetKey::Network)
                 .map_or(0, VecDeque::len)
@@ -733,6 +862,55 @@ impl UdpTransport {
         require_exact_dynamic_owner: bool,
         live_recorder: Option<BirthdayLiveRecorder>,
     ) -> std::result::Result<ProbeSendResult, ProbeSendFailure> {
+        let mode = self.hard_hard_socket_mode(socket_index).await;
+        let committed_ordinary = hard_hard_session_token.is_none()
+            && mode
+                .as_ref()
+                .is_some_and(|mode| Some(mode.peer.as_str()) == peer_id)
+            && self
+                .hard_hard_committed_socket_matches(
+                    peer_id.unwrap_or_default(),
+                    socket_index,
+                    peer_addr,
+                )
+                .await;
+        let hh2 = mode.is_some() && !committed_ordinary;
+        if hh2
+            && mode.as_ref().is_some_and(|mode| {
+                Some(mode.peer.as_str()) != peer_id
+                    || Some(mode.token.as_str()) != hard_hard_session_token
+            })
+        {
+            return Err(ProbeSendFailure::new(
+                ProbeSendFailureKind::SocketRevoked,
+                DaemonError::Network("hh2 socket requires its exact session token".into()),
+            ));
+        }
+        if !hh2 {
+            if let (Some(peer), Some(token)) = (peer_id, hard_hard_session_token) {
+                if self.peers.hard_hard_pair_is_enabled(peer, token).await {
+                    return Err(ProbeSendFailure::new(
+                        ProbeSendFailureKind::SocketRevoked,
+                        DaemonError::Network("hh2 socket mode was not enabled before send".into()),
+                    ));
+                }
+            }
+        }
+        if hh2
+            && self
+                .peers
+                .hard_hard_pair_scope(
+                    peer_id.unwrap_or_default(),
+                    hard_hard_session_token.unwrap_or_default(),
+                )
+                .await
+                .is_none()
+        {
+            return Err(ProbeSendFailure::new(
+                ProbeSendFailureKind::SocketRevoked,
+                DaemonError::Network("hh2 session fence rejected probe".into()),
+            ));
+        }
         let remote_candidate_epoch = match peer_id {
             Some(peer_id) => self
                 .peers
@@ -759,11 +937,13 @@ impl UdpTransport {
                 .unwrap_or(0);
             (generation, socket_epoch, cleanup_epoch)
         };
-        let requires_legacy_probe = match peer_id {
-            Some(peer_id) => self.peers.peer_requires_legacy_probe(peer_id).await,
-            None => true,
-        };
-        let should_retransmit = use_candidate || purpose == PendingProbePurpose::ConsentCheck;
+        let requires_legacy_probe = !hh2
+            && match peer_id {
+                Some(peer_id) => self.peers.peer_requires_legacy_probe(peer_id).await,
+                None => true,
+            };
+        let should_retransmit =
+            !hh2 && (use_candidate || purpose == PendingProbePurpose::ConsentCheck);
         let heartbeat_probe = purpose == PendingProbePurpose::RelayBackoffHeartbeat;
         let authenticated_probe = match (peer_id, self.local_node_id.as_deref()) {
             (Some(peer_id), Some(local_node_id))
@@ -773,6 +953,14 @@ impl UdpTransport {
                     .probe_key_and_session_for_peer(peer_id)
                     .await
                     .map(|(key, probe_session_id)| {
+                        let key = if hh2 {
+                            crate::peer::hard_hard_scoped_probe_key(
+                                &key,
+                                hard_hard_session_token.unwrap_or_default(),
+                            )
+                        } else {
+                            key
+                        };
                         let (bytes, nonce) = build_authenticated_punch_packet_with_nomination(
                             local_node_id,
                             peer_id,
@@ -836,6 +1024,21 @@ impl UdpTransport {
         // probe can never be registered once the generation moved on.
         let send_lease = {
             let _epoch_gate = self.network_epoch_gate.lock().await;
+            if hh2
+                && self
+                    .peers
+                    .hard_hard_pair_scope(
+                        peer_id.unwrap_or_default(),
+                        hard_hard_session_token.unwrap_or_default(),
+                    )
+                    .await
+                    .is_none()
+            {
+                return Err(ProbeSendFailure::new(
+                    ProbeSendFailureKind::SocketRevoked,
+                    DaemonError::Network("hh2 owner revoked before probe handoff".into()),
+                ));
+            }
             let current_remote_candidate_epoch = match peer_id {
                 Some(peer_id) => self
                     .peers
@@ -914,6 +1117,28 @@ impl UdpTransport {
                     ));
                 }
             }
+            if let Some(dynamic) = state.dynamic.get(&socket_index) {
+                if !dynamic.permits_ordinary_traffic()
+                    && !(accepts_authenticated_ack
+                        && matches!(
+                            purpose,
+                            PendingProbePurpose::ConnectivityCheck
+                                | PendingProbePurpose::HardHardNomination
+                                | PendingProbePurpose::HardHardTriggeredCheck
+                        )
+                        && hard_hard_session_token.is_some()
+                        && hard_hard_session_token == dynamic.hard_hard_session_token.as_deref()
+                        && peer_id == Some(dynamic.peer_id.as_str())
+                        && Arc::ptr_eq(&dynamic.socket, &socket))
+                {
+                    return Err(ProbeSendFailure::new(
+                        ProbeSendFailureKind::SocketRevoked,
+                        DaemonError::Network(
+                            "probe rejected: socket reserved for authenticated rendezvous".into(),
+                        ),
+                    ));
+                }
+            }
             let send_lease = if socket_index >= DYNAMIC_SOCKET_INDEX_BASE {
                 state.dynamic.get(&socket_index).map(|entry| {
                     entry.send_leases.acquire();
@@ -934,6 +1159,7 @@ impl UdpTransport {
             pending.insert(
                 nonce,
                 PendingProbe {
+                    validation_preflight: None,
                     sent_at,
                     // A punch/heartbeat ACK that arrives after this bound is
                     // terminally stale.  The old 60-second map-retention
@@ -969,7 +1195,22 @@ impl UdpTransport {
             send_lease
         };
 
-        let first_send_at_ms = match self.send_probe_datagram(&socket, &bytes, peer_addr).await {
+        let send_result = if hh2 {
+            self.send_hh2_probe_datagram(
+                socket_index,
+                &socket,
+                &bytes,
+                peer_id.unwrap_or_default(),
+                peer_addr,
+                hard_hard_session_token.unwrap_or_default(),
+                purpose,
+                use_candidate,
+            )
+            .await
+        } else {
+            self.send_probe_datagram(&socket, &bytes, peer_addr).await
+        };
+        let first_send_at_ms = match send_result {
             Ok(_) => {
                 let sent_at_ms = monotonic_millis();
                 // This is the physical send commit point.  It must precede
@@ -989,6 +1230,14 @@ impl UdpTransport {
                 Some(sent_at_ms)
             }
             Err(error) => {
+                if hh2 && error.kind() == std::io::ErrorKind::PermissionDenied {
+                    self.pending_probes.lock().await.remove(&nonce);
+                    self.clear_hard_hard_pending_probe_token(nonce).await;
+                    return Err(ProbeSendFailure::new(
+                        ProbeSendFailureKind::SocketRevoked,
+                        DaemonError::Network(error.to_string()),
+                    ));
+                }
                 // The primary send failed, but the physical error must still
                 // survive a cancellation racing the pending-probe cleanup.
                 if let Some(recorder) = live_recorder.as_ref() {

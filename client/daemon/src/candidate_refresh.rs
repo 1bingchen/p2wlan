@@ -2,11 +2,14 @@ use super::*;
 
 include!("candidate_refresh/signals.rs");
 include!("candidate_refresh/port_mapping.rs");
+include!("candidate_refresh/gather_fence.rs");
 include!("candidate_refresh/runtime.rs");
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    include!("candidate_refresh/gather_fence_tests.rs");
 
     #[test]
     fn volatile_candidate_churn_is_coalesced_and_not_fanned_out() {
@@ -50,6 +53,36 @@ mod tests {
         );
         // And no pending publication remains for it.
         assert_eq!(coalescer.take_due(now + Duration::from_secs(80)), None);
+    }
+
+    #[test]
+    fn volatile_candidate_return_to_published_set_retracts_pending_change() {
+        let now = Instant::now();
+        let mut coalescer = VolatilePublishCoalescer::default();
+        coalescer.record_published(1);
+        assert_eq!(
+            coalescer.on_churn(2, now),
+            VolatileChurnAction::SchedulePublish
+        );
+        assert_eq!(
+            coalescer.on_churn(1, now + Duration::from_millis(100)),
+            VolatileChurnAction::SuppressIdentical
+        );
+        assert_eq!(coalescer.pending_deadline(), None);
+        assert_eq!(coalescer.take_due(now + Duration::from_millis(500)), None);
+
+        // A later real change receives a fresh, bounded debounce window.
+        let next = now + Duration::from_millis(600);
+        assert_eq!(
+            coalescer.on_churn(3, next),
+            VolatileChurnAction::SchedulePublish
+        );
+        assert_eq!(coalescer.take_due(next + Duration::from_millis(499)), None);
+        assert_eq!(
+            coalescer.take_due(next + Duration::from_millis(500)),
+            Some(3)
+        );
+        assert_eq!(coalescer.take_due(next + Duration::from_secs(1)), None);
     }
 
     #[test]

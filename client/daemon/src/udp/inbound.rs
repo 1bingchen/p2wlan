@@ -1,3 +1,17 @@
+fn matched_ack_validation_observation(
+    admission: DirectValidationAdmission,
+) -> crate::connection_timeline::HotPathObservation {
+    use crate::connection_timeline::HotPathObservation;
+    match admission {
+        DirectValidationAdmission::Queued => HotPathObservation::MatchedAckValidationQueued,
+        DirectValidationAdmission::Coalesced => HotPathObservation::MatchedAckValidationCoalesced,
+        DirectValidationAdmission::Backpressured => {
+            HotPathObservation::MatchedAckValidationBackpressured
+        }
+        DirectValidationAdmission::Inactive => HotPathObservation::MatchedAckValidationInactive,
+    }
+}
+
 impl UdpTransport {
     /// Commit a modern responder handshake transaction from an authenticated
     /// pending Probe-v2 packet. WireGuard is promoted first; Probe is only
@@ -308,6 +322,18 @@ impl UdpTransport {
             };
             let udp_received = Instant::now();
 
+            // A loopback birthday target can equal another private fixture
+            // socket. Enforce the simulated NAT boundary before STUN or any
+            // probe/validation side effect, including on dynamic readers.
+            #[cfg(test)]
+            if self
+                .test_ingress_gate
+                .as_ref()
+                .is_some_and(|gate| !gate.admit(source))
+            {
+                continue;
+            }
+
             if n == 0 {
                 continue;
             }
@@ -320,7 +346,7 @@ impl UdpTransport {
             // slow peer/diagnostic lock must not make a healthy observer look
             // like `UdpBlocked` after the bounded startup deadline.
             if let Some(transaction_id) = stun_transaction_id(data) {
-                let waiter = self.stun_waiters.lock().await.remove(&transaction_id);
+                let waiter = self.stun_waiters.take(&transaction_id);
                 if let Some(waiter) = waiter {
                     let _ = waiter.send(StunResponse {
                         data: data.to_vec(),
@@ -385,6 +411,55 @@ impl UdpTransport {
                     );
                     continue;
                 }
+                let socket_mode = self.hard_hard_socket_mode(socket_index).await;
+                let committed_ordinary = socket_mode
+                    .as_ref()
+                    .is_some_and(|mode| mode.peer == identity.source_node_id)
+                    && self
+                        .hard_hard_committed_socket_matches(
+                            &identity.source_node_id,
+                            socket_index,
+                            source,
+                        )
+                        .await;
+                let socket_token = self.hard_hard_socket_token(socket_index).await;
+                let hh2_token = if let Some(mode) = socket_mode {
+                    if mode.peer != identity.source_node_id {
+                        continue;
+                    }
+                    if self
+                        .peers
+                        .hard_hard_pair_is_enabled(&identity.source_node_id, &mode.token)
+                        .await
+                    {
+                        Some(mode.token)
+                    } else if committed_ordinary {
+                        None
+                    } else {
+                        continue;
+                    }
+                } else if let Some(token) = socket_token.as_deref() {
+                    match self
+                        .peers
+                        .hard_hard_session_by_token(&identity.source_node_id, token)
+                        .await
+                    {
+                        Some(record) if record.pair_nomination.is_some() => continue,
+                        None if self
+                            .socket_state
+                            .lock()
+                            .await
+                            .dynamic
+                            .get(&socket_index)
+                            .is_some_and(|entry| !entry.permits_ordinary_traffic()) =>
+                        {
+                            continue
+                        }
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
                 let key_candidates = self
                     .peers
                     .probe_key_candidates_for_peer(&identity.source_node_id)
@@ -401,10 +476,28 @@ impl UdpTransport {
                     );
                     continue;
                 }
-                let Some((packet, key_candidate)) =
-                    key_candidates.into_iter().find_map(|candidate| {
+                let Some((packet, key_candidate, scoped_hh2)) =
+                    key_candidates.into_iter().find_map(|mut candidate| {
+                        if let Some(token) = hh2_token.as_deref() {
+                            // HH cannot commit a pending WireGuard rekey by
+                            // bypassing its existing adoption transaction.
+                            if candidate.role != ProbeKeyRole::Active {
+                                return None;
+                            }
+                            let scoped_key =
+                                crate::peer::hard_hard_scoped_probe_key(&candidate.key, token);
+                            if let Some(packet) =
+                                decode_authenticated_punch_packet(data, &scoped_key)
+                            {
+                                candidate.key = scoped_key;
+                                return Some((packet, candidate, true));
+                            }
+                            if !committed_ordinary {
+                                return None;
+                            }
+                        }
                         decode_authenticated_punch_packet(data, &candidate.key)
-                            .map(|packet| (packet, candidate))
+                            .map(|packet| (packet, candidate, false))
                     })
                 else {
                     self.update_socket_diagnostics(socket_index, |metrics| {
@@ -425,6 +518,54 @@ impl UdpTransport {
                 let matched_probe_session_id = key_candidate.session_id.clone();
                 let peer_session_generation = key_candidate.session_generation;
                 let key = key_candidate.key;
+                // Attempt evidence belongs to the authenticated token and
+                // receiving pair, never to the peer's shared Probe counters.
+                let observation_token = if scoped_hh2 {
+                    hh2_token.as_deref()
+                } else if hh2_token.is_none() {
+                    socket_token.as_deref()
+                } else {
+                    None
+                };
+                if let (Some(token), Ok(local_endpoint)) = (observation_token, socket.local_addr())
+                {
+                    self.peers
+                        .record_hard_hard_receive(
+                            &identity.source_node_id,
+                            token,
+                            peer_session_generation,
+                            crate::peer::HardHardPairKey {
+                                socket_index,
+                                local_endpoint,
+                                remote_endpoint: source,
+                            },
+                            match packet.kind {
+                                PunchPacketKind::Punch => {
+                                    crate::peer::HardHardReceiveObservation::AuthenticatedPunch
+                                }
+                                PunchPacketKind::Ack => {
+                                    crate::peer::HardHardReceiveObservation::AuthenticatedAck
+                                }
+                            },
+                            monotonic_millis(),
+                        )
+                        .await;
+                }
+                if let Some(token) = hh2_token.as_deref().filter(|_| scoped_hh2) {
+                    self.handle_hard_hard_pair_packet(
+                        &identity.source_node_id,
+                        token,
+                        &packet,
+                        &key,
+                        peer_session_generation,
+                        matched_probe_session_id.as_deref(),
+                        socket_index,
+                        &socket,
+                        source,
+                    )
+                    .await;
+                    continue;
+                }
                 #[cfg(test)]
                 let authenticated_probe_verify_gate = self
                     .peers
@@ -963,6 +1104,24 @@ impl UdpTransport {
                                 metrics.probe_acks_received += 1
                             })
                             .await;
+                            if let (Some(token), Some(local_endpoint)) =
+                                (hard_hard_token.as_deref(), local_endpoint)
+                            {
+                                self.peers
+                                    .record_hard_hard_receive(
+                                        &identity.source_node_id,
+                                        token,
+                                        peer_session_generation,
+                                        crate::peer::HardHardPairKey {
+                                            socket_index,
+                                            local_endpoint,
+                                            remote_endpoint: source,
+                                        },
+                                        crate::peer::HardHardReceiveObservation::MatchedAck,
+                                        monotonic_millis(),
+                                    )
+                                    .await;
+                            }
                             self.update_peer_probe_rx_diagnostics(
                                 &identity.source_node_id,
                                 generation,
@@ -995,13 +1154,21 @@ impl UdpTransport {
                                     )
                                     .await;
                             }
-                            self.peers
+                            let endpoint_learned = self
+                                .peers
                                 .learn_authenticated_endpoint_in_epoch(
                                     &epoch_guard,
                                     &identity.source_node_id,
                                     source,
                                 )
                                 .await;
+                            if endpoint_learned {
+                                self.complete_validation_preflight_in_epoch(
+                                    &identity.source_node_id,
+                                    &pending,
+                                )
+                                .await;
+                            }
                             let accepted = self
                                 .peers
                                 .record_direct_probe_success_with_latency_for_generation_and_local_endpoint_for_remote_epoch(
@@ -1025,15 +1192,22 @@ impl UdpTransport {
                                 // the ACK's source so both sides converge to
                                 // Direct without user traffic.
                                 //
-                                // This is evidence ingress only. It is
-                                // deliberately recorded before handing off to
-                                // the bounded validation scheduler and never
-                                // promotes Direct on its own. The explicit
-                                // pending-probe generation/session prevents a
-                                // later rekey or another peer's ACK from being
-                                // presented as this validation request.
+                                // Only admitted work is a validation request.
+                                // Healthy Direct consent ACKs are expected to
+                                // be inactive and must not look like a fresh
+                                // encrypted validation attempt in diagnostics.
+                                let admission = self
+                                    .trigger_encrypted_validation(&identity.source_node_id, source)
+                                    .await;
                                 self.peers
-                                    .record_direct_event_for_generation_with_socket(
+                                    .count_hot_path(matched_ack_validation_observation(admission));
+                                if matches!(
+                                    admission,
+                                    DirectValidationAdmission::Queued
+                                        | DirectValidationAdmission::Coalesced
+                                ) {
+                                    self.peers
+                                        .record_direct_event_for_generation_with_socket(
                                         &identity.source_node_id,
                                         generation,
                                         "direct_validation_ingress_requested",
@@ -1048,10 +1222,9 @@ impl UdpTransport {
                                             format_optional_endpoint(local_endpoint),
                                             latency.as_millis(),
                                         ),
-                                    )
-                                    .await;
-                                self.trigger_encrypted_validation(&identity.source_node_id, source)
-                                    .await;
+                                        )
+                                        .await;
+                                }
                                 if purpose == PendingProbePurpose::ConsentCheck {
                                     self.peers
                                         .record_direct_event(
@@ -1119,6 +1292,15 @@ impl UdpTransport {
             }
 
             if let Some(packet) = legacy_punch {
+                // Mode outlives registry detach while a reader/lease still
+                // retains the Arc. Negotiated hh2 never needs PNCH-v1; even
+                // during ACK grace it must not answer or learn from one.
+                // A legacy datagram supplies no authenticated evidence and
+                // must neither consume a reserved mapping with an ACK nor
+                // unlock it through the legacy affinity-adoption path.
+                if !self.permits_legacy_punch_on_socket(socket_index).await {
+                    continue;
+                }
                 self.update_socket_diagnostics(socket_index, |metrics| {
                     metrics.datagrams_received = metrics.datagrams_received.saturating_add(1)
                 })
@@ -1422,8 +1604,19 @@ impl UdpTransport {
                                     // per-pending-probe attribution. The ACK
                                     // remains only an ingress signal for the
                                     // encrypted validation worker.
+                                    let admission =
+                                        self.trigger_encrypted_validation(&peer_id, source).await;
                                     self.peers
-                                        .record_direct_event_for_generation_with_socket(
+                                        .count_hot_path(matched_ack_validation_observation(
+                                            admission,
+                                        ));
+                                    if matches!(
+                                        admission,
+                                        DirectValidationAdmission::Queued
+                                            | DirectValidationAdmission::Coalesced
+                                    ) {
+                                        self.peers
+                                            .record_direct_event_for_generation_with_socket(
                                             &peer_id,
                                             generation,
                                             "direct_validation_ingress_requested",
@@ -1438,9 +1631,9 @@ impl UdpTransport {
                                                 format_optional_endpoint(local_endpoint),
                                                 latency.as_millis(),
                                             ),
-                                        )
-                                        .await;
-                                    self.trigger_encrypted_validation(&peer_id, source).await;
+                                            )
+                                            .await;
+                                    }
                                     if purpose == PendingProbePurpose::ConsentCheck {
                                         self.peers
                                             .record_direct_event(
@@ -1486,6 +1679,16 @@ impl UdpTransport {
                 continue;
             }
 
+            // A reserved hh2 reader cannot forward traffic from an unrelated
+            // tuple or an unprepared pair into WireGuard endpoint learning.
+            if let Some(mode) = self.hard_hard_socket_mode(socket_index).await {
+                if !self
+                    .hh2_validation_pair_matches(&mode.peer, socket_index, source)
+                    .await
+                {
+                    continue;
+                }
+            }
             // Raw encrypted UDP is NOT fresh affinity evidence. It is handed
             // to the transport queue without candidate scans, PeerManager
             // locks, or awaited diagnostics. Endpoint learning occurs only

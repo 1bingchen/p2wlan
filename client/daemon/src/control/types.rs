@@ -151,6 +151,29 @@ pub enum ControlMessage {
 // Peer Info
 // ============================================================
 
+/// Explicit wire capabilities, scoped to the authenticated registration lifecycle.
+/// Missing fields identify legacy clients; application versions are not capabilities.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct PeerCapabilities {
+    #[serde(default)]
+    pub hh2_pair_nomination: bool,
+    #[serde(default)]
+    pub hh2_plan_v2: bool,
+}
+
+impl PeerCapabilities {
+    pub const fn current() -> Self {
+        Self {
+            hh2_pair_nomination: true,
+            hh2_plan_v2: true,
+        }
+    }
+
+    pub const fn supports_hh2(self) -> bool {
+        self.hh2_pair_nomination && self.hh2_plan_v2
+    }
+}
+
 /// Information about a known peer.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct PeerInfo {
@@ -162,6 +185,11 @@ pub struct PeerInfo {
     /// Peer application/daemon version reported by the control plane.
     #[serde(default)]
     pub app_version: String,
+    #[serde(default)]
+    pub capabilities: PeerCapabilities,
+    /// Server-issued lifecycle for this capability snapshot; zero is legacy.
+    #[serde(default)]
+    pub registration_seq: u64,
     /// Peer public key (hex).
     pub public_key: String,
     /// Peer public endpoint (ip:port).
@@ -445,6 +473,7 @@ pub enum ControlEvent {
 /// Control plane client state.
 #[derive(Debug)]
 struct ClientState {
+    server_clock: Arc<ServerClockEstimate>,
     room_authorization: Arc<crate::rooms::RoomAuthorization>,
     /// Whether we are registered.
     registered: bool,
@@ -454,42 +483,6 @@ struct ClientState {
     virtual_ip: Option<String>,
     /// Available relay servers.
     _relay_servers: Vec<String>,
-}
-
-/// Latest bounded translation between this process' wall clock and the
-/// control server clock. Signal polling refreshes it from a timestamp written
-/// into the same response as the durable signal batch. Hard<->Hard uses the
-/// estimate only to express its existing 3500ms local deadline on the server
-/// clock before queueing an initiating offer; the server remains authoritative
-/// and the receiver independently translates that one absolute deadline.
-#[derive(Debug, Default)]
-struct ServerClockEstimate {
-    offset_ms: AtomicI64,
-    observed_at_local_ms: AtomicU64,
-}
-
-impl ServerClockEstimate {
-    const MAX_AGE_MS: u64 = 30_000;
-
-    fn observe(&self, server_time_ms: u64, local_time_ms: u64) {
-        let offset = i128::from(server_time_ms) - i128::from(local_time_ms);
-        let Ok(offset) = i64::try_from(offset) else {
-            return;
-        };
-        self.offset_ms.store(offset, Ordering::Relaxed);
-        self.observed_at_local_ms
-            .store(local_time_ms, Ordering::Release);
-    }
-
-    fn server_deadline_for_local(&self, local_deadline_ms: u64, local_now_ms: u64) -> Option<u64> {
-        let observed_at = self.observed_at_local_ms.load(Ordering::Acquire);
-        if observed_at == 0 || local_now_ms.abs_diff(observed_at) > Self::MAX_AGE_MS {
-            return None;
-        }
-        let translated = i128::from(local_deadline_ms)
-            .checked_add(i128::from(self.offset_ms.load(Ordering::Relaxed)))?;
-        u64::try_from(translated).ok()
-    }
 }
 
 /// Relay catalog entry from control plane.
@@ -506,6 +499,9 @@ pub struct RelayCatalogEntry {
 
 #[derive(Debug, Deserialize)]
 struct RegisterDeviceResponse {
+    /// Echo of this daemon registration, independent of server feature flags.
+    #[serde(default)]
+    accepted_peer_capabilities: PeerCapabilities,
     success: bool,
     node_id: Option<String>,
     virtual_ip: Option<String>,
@@ -538,6 +534,8 @@ struct ControlErrorResponse {
 #[derive(Debug, Deserialize)]
 struct ListNodesResponse {
     #[serde(default)]
+    server_time_ms: Option<u64>,
+    #[serde(default)]
     authorization_lease_seconds: u64,
     #[serde(default)]
     nodes: Vec<DeviceResponse>,
@@ -545,6 +543,10 @@ struct ListNodesResponse {
 
 #[derive(Debug, Deserialize)]
 struct DeviceResponse {
+    #[serde(default)]
+    registration_seq: u64,
+    #[serde(default)]
+    capabilities: PeerCapabilities,
     id: String,
     #[serde(default)]
     device_name: String,
@@ -621,8 +623,6 @@ struct ListSignalsResponse {
 #[derive(Debug, Deserialize)]
 struct SignalDelivery {
     #[serde(default)]
-    batch_token: String,
-    #[serde(default)]
     lease_expires_at_ms: Option<u64>,
 }
 
@@ -675,6 +675,10 @@ struct SignalResponse {
 /// signaling, peer discovery, and configuration updates.
 #[derive(Clone)]
 pub struct ControlClient {
+    /// Existing registration owner; new-mode eligibility is never inferred locally.
+    registration_rx: watch::Receiver<Option<CriticalControlAuth>>,
+    #[cfg(test)]
+    test_registration_tx: Option<watch::Sender<Option<CriticalControlAuth>>>,
     shutdown_lifecycle: Option<Arc<ControlShutdown>>,
     /// Set by the daemon after its main control-event consumer is ready.
     ///
@@ -689,6 +693,7 @@ pub struct ControlClient {
     event_tx: mpsc::UnboundedSender<ControlEvent>,
     /// Channel to send commands to the background task.
     cmd_tx: mpsc::UnboundedSender<ControlCommand>,
+    network_changes: Arc<ControlNetworkChanges>,
     /// Bounded lane for initiator offers that carry real WireGuard handshake
     /// bytes.  It is serviced by a separate worker so a slow
     /// candidate-only/peer-reflexive POST can never hold an offer behind the
@@ -753,6 +758,11 @@ const CRITICAL_OFFER_QUEUE_CAPACITY: usize = 32;
 const CRITICAL_ANSWER_QUEUE_CAPACITY: usize = 32;
 const CRITICAL_CTRL_QUEUE_CAPACITY: usize = 8;
 const CANDIDATE_OFFER_QUEUE_CAPACITY: usize = 32;
+/// One serial HTTP request per lane also caps candidate HTTP concurrency at 32.
+const CANDIDATE_OFFER_MAX_LANES: usize = 32;
+const CANDIDATE_OFFER_IDLE_TIMEOUT: Duration = Duration::from_secs(1);
+/// Final HH2 ACK retries are prepaid from the existing recovery HTTP quota.
+pub(crate) const HARD_HARD_START_ACK_MAX_ATTEMPTS: u8 = 3;
 /// In-flight ceilings per lane.  The answer lane gets a dedicated budget so
 /// it is never blocked behind offer traffic; the two lane ceilings together
 /// are the global handshake hard cap.
@@ -780,6 +790,7 @@ const CRITICAL_SIGNAL_OVERALL_DEADLINE: std::time::Duration = std::time::Duratio
 /// the configured local id is deliberately not used for signal sends.
 #[derive(Clone)]
 struct CriticalControlAuth {
+    accepted_peer_capabilities: PeerCapabilities,
     base_url: String,
     token: String,
     self_node_id: String,
@@ -798,6 +809,7 @@ impl CriticalControlAuth {
             && self.token == other.token
             && self.self_node_id == other.self_node_id
             && self.registration_seq == other.registration_seq
+            && self.accepted_peer_capabilities == other.accepted_peer_capabilities
     }
 }
 
@@ -875,6 +887,13 @@ pub(crate) enum PeerOfferSendOutcome {
 /// context; this value contains only the immutable request data and the
 /// caller's completion channel.
 struct CandidateOfferCommand {
+    /// HH2 transcript registration, captured before bounded queue admission.
+    expected_registration_seq: Option<u64>,
+    not_after: Option<Instant>,
+    /// Starts only when the worker is ready to execute HTTP, never in either
+    /// candidate queue. The immutable `not_after` still caps the whole phase.
+    attempt_timeout: Option<Duration>,
+    prepaid_attempts: u8,
     to_node_id: String,
     candidates: Vec<String>,
     session_id: Option<String>,
@@ -886,7 +905,77 @@ struct CandidateOfferCommand {
     /// candidate-only response. Initial offers leave this empty.
     punch_at_server_ms: Option<u64>,
     fresh_ownership: Option<Arc<crate::PunchSessionCancellation>>,
+    /// Candidate refreshes re-check their source network, peer lifecycle and
+    /// committed candidate set in the per-peer worker immediately before HTTP.
+    /// HH transcript commands use their separate registration/owner fences.
+    publication_fence: Option<Arc<CandidatePublicationFence>>,
     response_tx: oneshot::Sender<PeerOfferSendOutcome>,
+}
+
+pub(crate) struct CandidatePublicationFence {
+    peers: Arc<crate::peer::PeerManager>,
+    candidate_snapshot: Option<Arc<RwLock<Option<crate::CandidateSnapshotLease>>>>,
+    peer_id: String,
+    network_generation: u64,
+    peer_session_generation: crate::peer::PeerSessionGeneration,
+    candidate_hash: u64,
+}
+
+impl CandidatePublicationFence {
+    pub(crate) fn lifecycle(&self) -> (u64, crate::peer::PeerSessionGeneration) {
+        (self.network_generation, self.peer_session_generation)
+    }
+
+    pub(crate) fn new(
+        peers: Arc<crate::peer::PeerManager>,
+        candidate_snapshot: Option<Arc<RwLock<Option<crate::CandidateSnapshotLease>>>>,
+        peer_id: String,
+        network_generation: u64,
+        peer_session_generation: crate::peer::PeerSessionGeneration,
+        candidate_hash: u64,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            peers,
+            candidate_snapshot,
+            peer_id,
+            network_generation,
+            peer_session_generation,
+            candidate_hash,
+        })
+    }
+
+    pub(crate) async fn is_current(&self) -> bool {
+        if self.peers.current_network_generation_sync() != self.network_generation
+            || self.peers.peer_session_generation_sync(&self.peer_id)
+                != Some(self.peer_session_generation)
+        {
+            return false;
+        }
+        if !self.peers.peer_online(&self.peer_id).await
+            || self
+                .peers
+                .should_defer_relay_assisted_punch(&self.peer_id)
+                .await
+        {
+            return false;
+        }
+        // Read the coherent candidate lease after the peer-state awaits, so
+        // a refresh that commits while those checks are blocked cannot leave
+        // an old hash looking current at the final HTTP admission boundary.
+        if let Some(candidate_snapshot) = self.candidate_snapshot.as_ref() {
+            if !candidate_snapshot
+                .read()
+                .await
+                .as_ref()
+                .is_some_and(|lease| lease.hash == self.candidate_hash)
+            {
+                return false;
+            }
+        }
+        self.peers.current_network_generation_sync() == self.network_generation
+            && self.peers.peer_session_generation_sync(&self.peer_id)
+                == Some(self.peer_session_generation)
+    }
 }
 
 /// Why a peer-offer send did not obtain authoritative server acceptance.
@@ -935,7 +1024,7 @@ enum ControlCommand {
     /// Rebind the existing control HTTP/WebSocket lifecycle after an Android
     /// physical-network handoff.
     #[cfg_attr(not(target_os = "android"), allow(dead_code))]
-    NetworkChanged,
+    NetworkChanged(Arc<ControlNetworkChanges>),
     /// Create a tunnel.
     CreateTunnel {
         protocol: String,

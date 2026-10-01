@@ -792,6 +792,8 @@ async fn hard_hard_measurement_sweeps_from_the_same_exact_socket() {
             &nat.observers,
             Duration::from_millis(500),
             None,
+            Duration::from_millis(500),
+            Duration::from_millis(3_500),
         )
         .await;
     let result = match outcome {
@@ -804,15 +806,77 @@ async fn hard_hard_measurement_sweeps_from_the_same_exact_socket() {
         }
     };
 
+    let token = "exact-measurement-rendezvous";
+    assert!(
+        transport
+            .tag_hard_hard_socket("peer-b", result.socket_index, token)
+            .await
+    );
+    assert!(transport.socket_for_peer(Some("peer-b")).await.is_none());
+    let remote_candidate_epoch = peers
+        .current_remote_candidate_epoch("peer-b")
+        .await
+        .unwrap();
+    let local_profile_generation = peers.current_local_profile_generation_sync();
+    let now = crate::peer::hard_hard_now_ms();
+    assert!(
+        peers
+            .hard_hard_register_session(crate::peer::HardHardSessionRecord {
+                pair_nomination: None,
+                coordinated_plan: None,
+                session_id: "exact-measurement-session".into(),
+                probe_session_id: None,
+                session_token: token.into(),
+                peer_id: "peer-b".into(),
+                initiator: true,
+                remote_network_generation: generation,
+                local_network_generation: generation,
+                remote_candidate_epoch,
+                local_profile_generation,
+                remote_profile_generation: 0,
+                local_prediction_confidence: result.model.confidence,
+                remote_prediction_confidence: 90,
+                requested_birthday_level: 0,
+                generated_candidate_count: result.predicted_ports.len(),
+                signaled_candidate_count: result.predicted_ports.len(),
+                birthday: false,
+                requested_socket_indices: vec![result.socket_index],
+                requested_socket_count: 1,
+                prediction_window: vec![nat.peer_public],
+                remote_prediction: vec![nat.peer_public],
+                fresh_socket: crate::peer::HardHardFreshSocketIdentity {
+                    peer_id: "peer-b".into(),
+                    session_token: token.into(),
+                    network_generation: generation,
+                    remote_candidate_epoch,
+                    local_profile_generation,
+                    remote_profile_generation: 0,
+                    punch_generation: result.punch_generation,
+                    socket_index: result.socket_index,
+                    socket_local_endpoint: result.socket_local_endpoint,
+                },
+                punch_at_ms: now,
+                expires_at_ms: now.saturating_add(30_000),
+                state: crate::peer::HardHardSessionState::Sweeping,
+                attempt_count: 1,
+                measurement: crate::peer::HardHardMeasurementObservation::default(),
+                created_at: Instant::now(),
+                cancellation: Arc::new(crate::PunchSessionCancellation::default()),
+            })
+            .await
+    );
+
     // The measurement phase has no peer-directed send; the first mapping for
     // the peer is created only by the exact-index synchronized sweep below.
     let report = transport
-        .punch_candidates_from_dynamic_socket_index(
+        .punch_candidates_from_dynamic_socket_index_with_profile_fence_and_session(
             "peer-b",
             result.socket_index,
             vec![nat.peer_public],
             Duration::ZERO,
             1,
+            None,
+            Some(token),
         )
         .await
         .unwrap();
@@ -830,6 +894,15 @@ async fn hard_hard_measurement_sweeps_from_the_same_exact_socket() {
     assert_eq!(
         nat.assigned_punch_port(result.socket_local_endpoint).await,
         result.predicted_ports[0]
+    );
+
+    assert_eq!(
+        peers.hard_hard_winner_for_token("peer-b", token).await,
+        Some(result.socket_index)
+    );
+    assert_eq!(
+        transport.socket_for_peer(Some("peer-b")).await.unwrap().0,
+        result.socket_index
     );
 
     listener.abort();
@@ -917,6 +990,7 @@ async fn exact_dynamic_socket_live_recorder_counts_compatibility_success_once() 
             None,
             None,
             Some(live.clone()),
+            None,
         )
         .await
         .unwrap();
@@ -957,6 +1031,7 @@ async fn exact_dynamic_socket_live_recorder_counts_compatibility_failure_as_part
             None,
             None,
             Some(live.clone()),
+            None,
         )
         .await
         .unwrap();
@@ -1602,7 +1677,7 @@ async fn direct_promotion_cancels_in_flight_fresh_mapping() {
     );
     // Waiter, provisional socket and reader task cleanup.
     assert_eq!(
-        transport.stun_waiters.lock().await.len(),
+        transport.stun_waiters.len(),
         0,
         "no STUN waiter may remain after the cancelled generation"
     );
@@ -2992,6 +3067,7 @@ async fn public_key_change_detaches_every_dynamic_socket_and_clears_probes() {
     transport.pending_probes.lock().await.insert(
         nonce,
         PendingProbe {
+            validation_preflight: None,
             sent_at: Instant::now(),
             expires_at: Instant::now() + DIRECT_KEEPALIVE_ACK_TIMEOUT,
             endpoint: nat.peer_public,

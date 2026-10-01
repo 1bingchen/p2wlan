@@ -1,3 +1,12 @@
+fn network_change_test_command() -> ControlCommand {
+    let changes = Arc::new(ControlNetworkChanges::default());
+    changes.observe(crate::AndroidNetworkChangeHint {
+        kotlin_network_generation: 1,
+        network_identity_hash: "test-network".into(),
+    });
+    ControlCommand::NetworkChanged(changes)
+}
+
 // Regression coverage for `control/runtime/commands.rs`.
 //
 // The command arms used to be spliced straight into the polling loop's
@@ -113,13 +122,14 @@ impl CommandHarness {
     fn new(base_url: &str) -> Self {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         Self {
-            http: route_aware_control_http_clients(ControlProxyMode::Direct, base_url).0,
+            http: route_aware_control_http_clients(ControlProxyMode::Direct, base_url, None).0,
             base_url: base_url.to_string(),
             token: "dc-test-device".to_string(),
             config: test_config(),
             self_node_id: "node-a".to_string(),
             registration_seq: Some(4),
             state: Arc::new(RwLock::new(ClientState {
+                server_clock: Arc::new(ServerClockEstimate::default()),
                 room_authorization: Arc::new(crate::rooms::RoomAuthorization::new("net1")),
                 registered: true,
                 peers: HashMap::new(),
@@ -280,7 +290,7 @@ async fn network_changed_aborts_signaling_and_re_registers() {
     );
 
     let disposition = harness
-        .invoke(ControlCommand::NetworkChanged, Some(&signal_ws_task))
+        .invoke(network_change_test_command(), Some(&signal_ws_task))
         .await;
 
     assert_eq!(
@@ -291,6 +301,39 @@ async fn network_changed_aborts_signaling_and_re_registers() {
     assert!(
         !connected.load(Ordering::Acquire),
         "the signaling WebSocket task must be aborted"
+    );
+}
+
+#[tokio::test]
+async fn absorbed_network_wakeup_does_not_revoke_a_fresh_registration() {
+    let stub = ControlStub::start(|_| (200, r#"{"nodes":[]}"#.to_string())).await;
+    let mut harness = CommandHarness::new(&stub.base_url);
+    let changes = Arc::new(ControlNetworkChanges::default());
+    for generation in [1, 2] {
+        changes.observe(crate::AndroidNetworkChangeHint {
+            kotlin_network_generation: generation,
+            network_identity_hash: format!("network-{generation}"),
+        });
+    }
+    let (current, changed) = changes.begin_registration();
+    assert!(changed);
+    assert!(changes.commit_if_current(&current, || {}));
+    assert_eq!(
+        harness
+            .invoke(ControlCommand::NetworkChanged(changes.clone()), None)
+            .await,
+        ControlCommandDisposition::Continue,
+    );
+    changes.observe(crate::AndroidNetworkChangeHint {
+        kotlin_network_generation: 1,
+        network_identity_hash: "replacement-service".into(),
+    });
+    assert_eq!(
+        harness
+            .invoke(ControlCommand::NetworkChanged(changes), None)
+            .await,
+        ControlCommandDisposition::Reregister,
+        "a real new authorized edge remains effective even after a service counter reset",
     );
 }
 

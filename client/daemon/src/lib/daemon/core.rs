@@ -255,7 +255,9 @@ impl Daemon {
         {
             let pending_handshakes = pending_handshakes.clone();
             let timeline = timeline.clone();
+            let timing_control = control.clone();
             peers.set_network_generation_handshake_cancel_hook(Arc::new(move |generation| {
+                timing_control.invalidate_network_timing();
                 let (cancelled_reservations, cancelled_pending, stale_probe_bindings) =
                     pending_handshakes
                     .lock()
@@ -416,8 +418,8 @@ impl Daemon {
                         }
                         hint = recv_android_network_change(network_change_rx.clone()) => hint,
                     };
-                    if hint.is_some() {
-                        control.network_changed();
+                    if let Some(hint) = hint {
+                        control.network_changed(hint);
                     } else {
                         break;
                     }
@@ -442,12 +444,5 @@ impl Daemon {
 async fn recv_android_network_change(
     network_change_rx: AndroidNetworkChangeReceiver,
 ) -> Option<AndroidNetworkChangeHint> {
-    let mut receiver = network_change_rx.lock().await;
-    loop {
-        match receiver.recv().await {
-            Ok(hint) => return Some(hint),
-            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-            Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
-        }
-    }
+    crate::android_network_change::recv_latest(&network_change_rx).await
 }

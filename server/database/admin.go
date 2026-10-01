@@ -1,10 +1,10 @@
 package database
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
-	"strings"
 	"time"
 )
 
@@ -32,6 +32,7 @@ type AdminOverview struct {
 
 type AdminDeviceSummary struct {
 	ID          string `json:"id"`
+	OwnerID     string `json:"owner_id"`
 	Username    string `json:"username"`
 	DeviceName  string `json:"device_name"`
 	Platform    string `json:"platform"`
@@ -49,6 +50,7 @@ type AdminNetworkSummary struct {
 	ID            string `json:"id"`
 	Name          string `json:"name"`
 	CIDR          string `json:"cidr"`
+	OwnerID       string `json:"owner_id"`
 	OwnerUsername string `json:"owner_username"`
 	MemberCount   int    `json:"member_count"`
 	DeviceCount   int    `json:"device_count"`
@@ -62,6 +64,7 @@ type AdminRoomSummary struct {
 	Code          string `json:"code"`
 	Name          string `json:"name"`
 	CIDR          string `json:"cidr"`
+	OwnerID       string `json:"owner_id"`
 	OwnerUsername string `json:"owner_username"`
 	MemberCount   int    `json:"member_count"`
 	DeviceCount   int    `json:"device_count"`
@@ -78,17 +81,19 @@ type AdminDevicePage struct {
 }
 
 type AdminNetworkPage struct {
-	Total  int                   `json:"total"`
-	Limit  int                   `json:"limit"`
-	Offset int                   `json:"offset"`
-	Items  []AdminNetworkSummary `json:"items"`
+	GeneratedAt int64                 `json:"generated_at"`
+	Total       int                   `json:"total"`
+	Limit       int                   `json:"limit"`
+	Offset      int                   `json:"offset"`
+	Items       []AdminNetworkSummary `json:"items"`
 }
 
 type AdminRoomPage struct {
-	Total  int                `json:"total"`
-	Limit  int                `json:"limit"`
-	Offset int                `json:"offset"`
-	Items  []AdminRoomSummary `json:"items"`
+	GeneratedAt int64              `json:"generated_at"`
+	Total       int                `json:"total"`
+	Limit       int                `json:"limit"`
+	Offset      int                `json:"offset"`
+	Items       []AdminRoomSummary `json:"items"`
 }
 
 func normalizeAdminPage(limit, offset int) (int, int) {
@@ -126,6 +131,7 @@ func adminDeviceOnline(online, lastSeen int64, cutoff int64) bool {
 
 func adminDeviceColumns() string {
 	return `d.id,
+		d.user_id,
 		COALESCE(NULLIF(u.username, ''), u.email),
 		d.device_name,
 		d.platform,
@@ -145,6 +151,7 @@ func scanAdminDevice(row interface{ Scan(...any) error }, cutoff int64) (AdminDe
 	var relayRTT sql.NullInt64
 	err := row.Scan(
 		&item.ID,
+		&item.OwnerID,
 		&item.Username,
 		&item.DeviceName,
 		&item.Platform,
@@ -230,30 +237,12 @@ func (db *DB) AdminOverviewSnapshot() (*AdminOverview, error) {
 // metadata.
 func (db *DB) AdminDevices(query, status string, limit, offset int) (*AdminDevicePage, error) {
 	limit, offset = normalizeAdminPage(limit, offset)
-	query = strings.TrimSpace(query)
-	status = strings.ToLower(strings.TrimSpace(status))
-
-	where := []string{"1 = 1"}
-	args := make([]any, 0, 8)
+	query, status, err := normalizeAdminDeviceFilter(query, status)
+	if err != nil {
+		return nil, err
+	}
 	cutoff := adminOnlineCutoff()
-	if query != "" {
-		where = append(where, `(d.device_name LIKE ? ESCAPE '!' OR COALESCE(NULLIF(u.username, ''), u.email) LIKE ? ESCAPE '!' OR d.virtual_ip LIKE ? ESCAPE '!' OR COALESCE(n.name, '') LIKE ? ESCAPE '!')`)
-		escaped := strings.NewReplacer("!", "!!", "%", "!%", "_", "!_").Replace(query)
-		pattern := "%" + escaped + "%"
-		args = append(args, pattern, pattern, pattern, pattern)
-	}
-	switch status {
-	case "online":
-		where = append(where, adminOnlineLeaseSQL("d"))
-		args = append(args, cutoff)
-	case "offline":
-		where = append(where, "NOT "+adminOnlineLeaseSQL("d"))
-		args = append(args, cutoff)
-	case "", "all":
-	default:
-		return nil, ErrInvalidAdminDeviceStatus
-	}
-	clause := strings.Join(where, " AND ")
+	clause, args := adminDeviceFilterSQL(query, status, cutoff)
 
 	var total int
 	countArgs := append([]any(nil), args...)
@@ -293,86 +282,9 @@ func (db *DB) AdminDevices(query, status string, limit, offset int) (*AdminDevic
 }
 
 func (db *DB) AdminNetworks(limit, offset int) (*AdminNetworkPage, error) {
-	limit, offset = normalizeAdminPage(limit, offset)
-	var total int
-	if err := db.QueryRow(`SELECT COUNT(*) FROM networks WHERE id <> 'default'`).Scan(&total); err != nil {
-		return nil, fmt.Errorf("count admin networks: %w", err)
-	}
-	cutoff := adminOnlineCutoff()
-	rows, err := db.Query(`SELECT
-		n.id,
-		n.name,
-		n.cidr,
-		COALESCE(NULLIF(u.username, ''), u.email),
-		(SELECT COUNT(*) FROM network_memberships m WHERE m.network_id = n.id),
-		(SELECT COUNT(*) FROM devices d WHERE d.network_id = n.id),
-		(SELECT COUNT(*) FROM devices d WHERE d.network_id = n.id AND `+adminOnlineLeaseSQL("d")+`),
-		EXISTS(SELECT 1 FROM rooms r WHERE r.network_id = n.id),
-		n.created_at
-		FROM networks n
-		JOIN users u ON u.id = n.owner_id
-		WHERE n.id <> 'default'
-		ORDER BY n.created_at DESC, n.name COLLATE NOCASE ASC, n.id ASC
-		LIMIT ? OFFSET ?`, cutoff, limit, offset)
-	if err != nil {
-		return nil, fmt.Errorf("list admin networks: %w", err)
-	}
-	defer rows.Close()
-	items := make([]AdminNetworkSummary, 0, min(limit, total))
-	for rows.Next() {
-		var item AdminNetworkSummary
-		var isRoom int
-		if err := rows.Scan(&item.ID, &item.Name, &item.CIDR, &item.OwnerUsername, &item.MemberCount, &item.DeviceCount, &item.OnlineDevices, &isRoom, &item.CreatedAt); err != nil {
-			return nil, fmt.Errorf("scan admin network: %w", err)
-		}
-		item.IsRoom = isRoom == 1
-		items = append(items, item)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return &AdminNetworkPage{Total: total, Limit: limit, Offset: offset, Items: items}, nil
+	return db.AdminNetworksFiltered(context.Background(), AdminResourceFilter{}, limit, offset)
 }
 
 func (db *DB) AdminRooms(limit, offset int) (*AdminRoomPage, error) {
-	limit, offset = normalizeAdminPage(limit, offset)
-	var total int
-	if err := db.QueryRow(`SELECT COUNT(*) FROM rooms`).Scan(&total); err != nil {
-		return nil, fmt.Errorf("count admin rooms: %w", err)
-	}
-	cutoff := adminOnlineCutoff()
-	rows, err := db.Query(`SELECT
-		r.network_id,
-		r.room_code,
-		n.name,
-		n.cidr,
-		COALESCE(NULLIF(u.username, ''), u.email),
-		(SELECT COUNT(*) FROM network_memberships m WHERE m.network_id = r.network_id),
-		(SELECT COUNT(*) FROM devices d WHERE d.network_id = r.network_id),
-		(SELECT COUNT(*) FROM devices d WHERE d.network_id = r.network_id AND `+adminOnlineLeaseSQL("d")+`),
-		r.join_locked,
-		r.created_at
-		FROM rooms r
-		JOIN networks n ON n.id = r.network_id
-		JOIN users u ON u.id = r.owner_id
-		ORDER BY r.created_at DESC, n.name COLLATE NOCASE ASC, r.network_id ASC
-		LIMIT ? OFFSET ?`, cutoff, limit, offset)
-	if err != nil {
-		return nil, fmt.Errorf("list admin rooms: %w", err)
-	}
-	defer rows.Close()
-	items := make([]AdminRoomSummary, 0, min(limit, total))
-	for rows.Next() {
-		var item AdminRoomSummary
-		var joinLocked int
-		if err := rows.Scan(&item.ID, &item.Code, &item.Name, &item.CIDR, &item.OwnerUsername, &item.MemberCount, &item.DeviceCount, &item.OnlineDevices, &joinLocked, &item.CreatedAt); err != nil {
-			return nil, fmt.Errorf("scan admin room: %w", err)
-		}
-		item.JoinLocked = joinLocked == 1
-		items = append(items, item)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return &AdminRoomPage{Total: total, Limit: limit, Offset: offset, Items: items}, nil
+	return db.AdminRoomsFiltered(context.Background(), AdminResourceFilter{}, limit, offset)
 }

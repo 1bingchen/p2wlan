@@ -17,6 +17,7 @@ async fn poll_peers_preserves_offline_devices_from_control_plane() {
 
     let config = test_config();
     let state = Arc::new(RwLock::new(ClientState {
+        server_clock: Arc::new(ServerClockEstimate::default()),
         room_authorization: Arc::new(crate::rooms::RoomAuthorization::new("default")),
         registered: true,
         peers: HashMap::new(),
@@ -27,6 +28,7 @@ async fn poll_peers_preserves_offline_devices_from_control_plane() {
 
     poll_peers(
         &test_no_proxy_client(),
+        0,
         &format!("http://{address}"),
         "test-token",
         &config,
@@ -81,6 +83,7 @@ async fn poll_peers_admits_online_peer_before_historical_offline_rows() {
 
     let config = test_config();
     let state = Arc::new(RwLock::new(ClientState {
+        server_clock: Arc::new(ServerClockEstimate::default()),
         room_authorization: Arc::new(crate::rooms::RoomAuthorization::new("default")),
         registered: true,
         peers: HashMap::new(),
@@ -91,6 +94,7 @@ async fn poll_peers_admits_online_peer_before_historical_offline_rows() {
 
     poll_peers(
         &test_no_proxy_client(),
+        0,
         &format!("http://{address}"),
         "test-token",
         &config,
@@ -117,6 +121,8 @@ async fn poll_peers_admits_online_peer_before_historical_offline_rows() {
 #[test]
 fn peer_endpoint_change_is_reported_as_metadata_update() {
     let known = PeerInfo {
+        capabilities: crate::control::PeerCapabilities::default(),
+        registration_seq: 0,
         node_id: "peer-a".to_string(),
         device_name: "peer".to_string(),
         app_version: String::new(),

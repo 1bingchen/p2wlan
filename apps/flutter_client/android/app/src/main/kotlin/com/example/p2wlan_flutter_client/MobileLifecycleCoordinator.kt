@@ -449,16 +449,12 @@ internal data class PhysicalNetworkTransition(
 /** Debounces Android callback bursts and fences callbacks for old Networks. */
 internal class PhysicalNetworkIdentityReducer {
     private var current: PhysicalNetworkIdentity? = null
-    private val retiredHandles = mutableSetOf<Long>()
     private var replacementPending = false
     private var generation = 0L
 
     fun onAvailable(identity: PhysicalNetworkIdentity): PhysicalNetworkTransition {
         if (current == identity) {
             return PhysicalNetworkTransition(MobileLifecycleOutcome.DUPLICATE, generation, current, current)
-        }
-        if (retiredHandles.contains(identity.networkHandle)) {
-            return PhysicalNetworkTransition(MobileLifecycleOutcome.STALE_REJECTED, generation, null, null)
         }
         val old = current
         if (old != null && old.networkHandle == identity.networkHandle) {
@@ -468,10 +464,18 @@ internal class PhysicalNetworkIdentityReducer {
             return PhysicalNetworkTransition(MobileLifecycleOutcome.APPLIED, generation, old, identity)
         }
         if (!replacementPending) generation += 1
-        old?.let { retiredHandles += it.networkHandle }
         current = identity
         replacementPending = false
         return PhysicalNetworkTransition(MobileLifecycleOutcome.APPLIED, generation, old, identity)
+    }
+
+    /** Attribute updates cannot select a different default network. Only the
+     * framework's onAvailable edge may reactivate a previously-best handle. */
+    fun onPropertiesChanged(identity: PhysicalNetworkIdentity): PhysicalNetworkTransition {
+        if (current?.networkHandle != identity.networkHandle) {
+            return PhysicalNetworkTransition(MobileLifecycleOutcome.STALE_REJECTED, generation, current, current)
+        }
+        return onAvailable(identity)
     }
 
     fun onLost(networkHandle: Long): PhysicalNetworkTransition {
@@ -481,7 +485,6 @@ internal class PhysicalNetworkIdentityReducer {
         }
         generation += 1
         current = null
-        retiredHandles += networkHandle
         replacementPending = true
         return PhysicalNetworkTransition(MobileLifecycleOutcome.APPLIED, generation, old, null)
     }
@@ -510,8 +513,9 @@ internal data class PhysicalNetworkCallbackResult(
 
 /**
  * Captures the service/bridge owner at callback registration and forwards only
- * reducer-authorized `onAvailable` edges to Rust. The Kotlin reducer remains a
- * debounce/fencing boundary; Rust owns the dataplane generation and rebind.
+ * reducer-authorized identity changes to Rust. A real onAvailable can return
+ * to a previously-best Network; late capability/link callbacks cannot. The
+ * Kotlin reducer remains an input fence; Rust owns generation and rebind.
  */
 internal class PhysicalNetworkCallbackForwarder(
     private val callbackServiceIncarnation: Long,
@@ -521,19 +525,44 @@ internal class PhysicalNetworkCallbackForwarder(
     private val notifier: PhysicalNetworkChangeNotifier,
     private val reducer: PhysicalNetworkIdentityReducer = PhysicalNetworkIdentityReducer(),
 ) {
+    // One callback-scoped announcement survives temporarily unavailable
+    // capabilities/link properties. No historical handle set is retained.
+    private var announcedNetworkHandle: Long? = null
+
+    /** Only the framework's actual onAvailable callback may call this. */
+    fun announceAvailable(networkHandle: Long): Boolean {
+        if (!ownerAccepted()) return false
+        announcedNetworkHandle = networkHandle
+        return true
+    }
+
+    /** Complete-identity entry used by the JVM production-boundary fixtures. */
     fun onAvailable(identity: PhysicalNetworkIdentity): PhysicalNetworkCallbackResult {
-        val ownerAccepted = callbackServiceIncarnation > 0L &&
-            callbackBridgeIncarnation > 0L &&
-            currentServiceIncarnation() == callbackServiceIncarnation &&
-            currentBridgeIncarnation() == callbackBridgeIncarnation
-        if (!ownerAccepted) {
+        if (!announceAvailable(identity.networkHandle)) {
+            return result(MobileLifecycleOutcome.STALE_REJECTED, reducer.generation(), false)
+        }
+        return onPropertiesChanged(identity)
+    }
+
+    fun onPropertiesChanged(identity: PhysicalNetworkIdentity): PhysicalNetworkCallbackResult {
+        if (!ownerAccepted()) {
             return result(
                 MobileLifecycleOutcome.STALE_REJECTED,
                 reducer.generation(),
                 forwardedToRust = false,
             )
         }
-        val transition = reducer.onAvailable(identity)
+        val announced = announcedNetworkHandle
+        val transition = if (announced == identity.networkHandle) {
+            announcedNetworkHandle = null
+            reducer.onAvailable(identity)
+        } else if (announced != null) {
+            // A new default was announced but its properties are not ready;
+            // attributes of the old default must not delay or undo that edge.
+            return result(MobileLifecycleOutcome.STALE_REJECTED, reducer.generation(), false)
+        } else {
+            reducer.onPropertiesChanged(identity)
+        }
         if (transition.outcome != MobileLifecycleOutcome.APPLIED) {
             return PhysicalNetworkCallbackResult(
                 transition.outcome,
@@ -561,17 +590,14 @@ internal class PhysicalNetworkCallbackForwarder(
     /** Loss is retained as reducer state; the replacement `onAvailable` edge
      * carries the single Rust generation advance for the handoff. */
     fun onLost(networkHandle: Long): PhysicalNetworkCallbackResult {
-        val ownerAccepted = callbackServiceIncarnation > 0L &&
-            callbackBridgeIncarnation > 0L &&
-            currentServiceIncarnation() == callbackServiceIncarnation &&
-            currentBridgeIncarnation() == callbackBridgeIncarnation
-        if (!ownerAccepted) {
+        if (!ownerAccepted()) {
             return result(
                 MobileLifecycleOutcome.STALE_REJECTED,
                 reducer.generation(),
                 forwardedToRust = false,
             )
         }
+        if (announcedNetworkHandle == networkHandle) announcedNetworkHandle = null
         val transition = reducer.onLost(networkHandle)
         return PhysicalNetworkCallbackResult(
             transition.outcome,
@@ -581,6 +607,11 @@ internal class PhysicalNetworkCallbackForwarder(
             forwardedToRust = false,
         )
     }
+
+    private fun ownerAccepted(): Boolean = callbackServiceIncarnation > 0L &&
+        callbackBridgeIncarnation > 0L &&
+        currentServiceIncarnation() == callbackServiceIncarnation &&
+        currentBridgeIncarnation() == callbackBridgeIncarnation
 
     private fun result(
         outcome: MobileLifecycleOutcome,

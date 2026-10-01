@@ -6,7 +6,6 @@ struct StunResponse {
     data: Vec<u8>,
     source: SocketAddr,
 }
-type StunWaiters = Arc<Mutex<HashMap<StunTransactionId, oneshot::Sender<StunResponse>>>>;
 /// Bounded, per-peer newest-wins ingress for peer-reflexive observations.
 ///
 /// The UDP reader cannot await a downstream worker or enqueue one task per
@@ -585,6 +584,7 @@ pub(crate) struct DirectValidationTarget {
 /// completed or cancelled session.
 pub(crate) struct DirectValidationSession {
     pub(crate) target_tx: watch::Sender<DirectValidationTarget>,
+    pub(crate) hard_hard: Option<HardHardValidationWork>,
 }
 
 /// Ownership lease returned exactly once when the scheduler must spawn a
@@ -594,6 +594,22 @@ pub(crate) struct DirectValidationSessionLease {
     pub(crate) peer_id: String,
     pub(crate) owner_token: u64,
     pub(crate) target_rx: watch::Receiver<DirectValidationTarget>,
+    pub(crate) hard_hard: Option<HardHardValidationWork>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DirectValidationAdmission {
+    Queued,
+    Coalesced,
+    Backpressured,
+    Inactive,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DirectValidationCompletion {
+    OwnerFinished,
+    Backpressured,
+    DeadlineExpired,
 }
 
 pub(crate) enum DirectValidationSessionStart {
@@ -674,6 +690,11 @@ impl DirectValidationAckRejectReason {
 /// with the single acquire inside the prepare path.
 #[derive(Debug)]
 pub(crate) struct DirectValidationExpectation {
+    /// At most one ordinary Probe-v2 preflight may consume this request.
+    pub(crate) preflight_attempted: bool,
+    /// Immutable rendezvous identity: absence of its live owner is terminal,
+    /// never permission to reinterpret this request as a legacy validation.
+    pub(crate) hard_hard_pair: Option<HardHardValidationScope>,
     pub(crate) request_id: u16,
     pub(crate) generation: u64,
     pub(crate) peer_session_generation: PeerSessionGeneration,
@@ -710,6 +731,10 @@ pub(crate) struct DirectValidationExpectation {
 /// `dynamic_sockets` and `peer_socket_affinity` maps and ABBA deadlocks are
 /// impossible by construction.
 pub(crate) struct SocketState {
+    /// Immutable mode stamps survive detach while an exact Arc is in flight.
+    /// Weak references do not retain sockets; enabling fails closed at 256
+    /// live stamps instead of evicting a stamp still used by an old sender.
+    pub(crate) hard_hard_pair_modes: HashMap<usize, HardHardSocketMode>,
     pub(crate) dynamic: HashMap<usize, DynamicPunchSocket>,
     pub(crate) affinity: HashMap<String, PeerSocketPin>,
     /// Monotonic evidence counter. Every affinity adoption and every
@@ -772,8 +797,12 @@ const AUTH_PUNCH_RATE_LIMIT_PER_SOURCE: usize = 16;
 /// Pace connectivity checks below the per-peer/public-IP admission ceiling.
 /// A large symmetric-NAT sweep must cover the full candidate window instead
 /// of consuming its one-second budget in one burst and dropping the tail.
+// Protocol scheduling retains the real production spacing even when test
+// execution removes sleeps to keep existing fixtures deterministic.
+const OUTBOUND_CONNECTIVITY_PROBE_PRODUCTION_SPACING: Duration = Duration::from_millis(6);
 #[cfg(not(test))]
-const OUTBOUND_CONNECTIVITY_PROBE_SPACING: Duration = Duration::from_millis(6);
+const OUTBOUND_CONNECTIVITY_PROBE_SPACING: Duration =
+    OUTBOUND_CONNECTIVITY_PROBE_PRODUCTION_SPACING;
 #[cfg(test)]
 const OUTBOUND_CONNECTIVITY_PROBE_SPACING: Duration = Duration::ZERO;
 /// Hard bound on primary connectivity-check datagrams emitted by one punch
@@ -874,6 +903,8 @@ pub(crate) const DYNAMIC_SOCKET_LEASE_DRAIN_TIMEOUT: Duration = Duration::from_s
 /// abandoned for a different socket.
 #[derive(Debug)]
 pub(crate) struct DynamicPunchSocket {
+    pub(crate) hard_hard_pair_required: bool,
+    pub(crate) hard_hard_committed_remote: Option<SocketAddr>,
     pub(crate) socket_index: usize,
     pub(crate) socket: Arc<UdpSocket>,
     pub(crate) peer_id: String,
@@ -883,6 +914,9 @@ pub(crate) struct DynamicPunchSocket {
     /// binds an authenticated packet received on this socket to the exact
     /// bounded rendezvous that owns the socket.
     pub(crate) hard_hard_session_token: Option<String>,
+    /// Reserve a measured mapping before its token handoff. Ordinary traffic
+    /// may use it only after authenticated evidence on this exact socket.
+    pub(crate) hard_hard_exclusive: bool,
     pub(crate) created_at: Instant,
     /// Monotonic counter of AUTHENTICATED post-attach evidence observed on
     /// this socket: a matched Probe-v2 ACK, an accepted authenticated punch,
@@ -1051,6 +1085,11 @@ impl DynamicSocketPhase {
 }
 
 impl DynamicPunchSocket {
+    pub(crate) fn permits_ordinary_traffic(&self) -> bool {
+        (!self.hard_hard_exclusive || self.authenticated_evidence > 0)
+            && (!self.hard_hard_pair_required || self.hard_hard_committed_remote.is_some())
+    }
+
     pub(crate) fn local_endpoint(&self) -> Option<SocketAddr> {
         self.socket.local_addr().ok()
     }
@@ -1184,6 +1223,8 @@ pub(crate) enum FreshMappingRejection {
     PublicIpChanged,
     /// The port sequence had no consistent linear behavior.
     UnpredictableSequence,
+    /// A physical allocation-changing send had no final observed response.
+    UnobservedAllocation,
     /// The dedicated socket could not be bound.
     BindFailed,
     /// The dynamic socket cap had no safely evictable entry, so the new
@@ -1209,6 +1250,7 @@ impl FreshMappingRejection {
             Self::BatchStale => "batch_stale",
             Self::PublicIpChanged => "public_ip_changed",
             Self::UnpredictableSequence => "unpredictable_sequence",
+            Self::UnobservedAllocation => "allocation_unobserved_send",
             Self::BindFailed => "bind_failed",
             Self::CapacityRejected => "capacity_rejected",
             Self::MissingProbeKey => "missing_probe_key",
@@ -1473,6 +1515,9 @@ impl Default for PeerReflexiveIngress {
 
 #[derive(Debug, Clone)]
 struct PendingProbe {
+    /// Optional completion for the existing owned validation request. It is
+    /// fulfilled only after independent authenticated endpoint learning.
+    validation_preflight: Option<Arc<direct_validation_preflight::PreflightReceipt>>,
     sent_at: Instant,
     /// Monotonic terminal deadline for this probe's ACK.  Keeping the nonce
     /// in the bounded map for cleanup is not permission to accept an ACK
@@ -1515,6 +1560,8 @@ impl PendingProbe {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PendingProbePurpose {
     ConnectivityCheck,
+    HardHardNomination,
+    HardHardTriggeredCheck,
     ConsentCheck,
     RelayBackoffHeartbeat,
 }
@@ -1912,9 +1959,14 @@ pub(crate) struct PunchSendReport {
     /// must treat a zero-send session as a budget-exhausted verdict instead
     /// of an empty success.
     pub epoch_budget_exhausted: bool,
+    /// Exact allocation verdict shared across all Hard-Hard socket workers.
+    /// It does not describe target-scoped rate limits or the sweep deadline.
+    pub(crate) sweep_budget_stop: Option<probe_budget::OutboundProbeSweepStop>,
     /// The session stopped enumerating candidates because the epoch's hard
     /// candidate-iteration budget was reached.
     pub candidate_iteration_capped: bool,
+    /// The shared Hard-Hard send clock reached its bounded sweep deadline.
+    pub pacing_deadline_reached: bool,
     /// Exact endpoints that accepted at least one logical probe. This is an
     /// internal aggregation aid for multi-wave Hard↔Hard diagnostics; callers
     /// must use `unique_target_endpoints` for the bounded count.

@@ -5,22 +5,18 @@ The simulator uses two address/port-dependent NATs on loopback.  Each mapping
 owns one public UDP socket, so packets delivered to a daemon are sourced from
 the mapping port that a remote peer would actually observe.
 
-``asyncio`` cannot transparently interpose on another process's UDP sends on
-macOS.  ``NatFabric`` is the deliberate loopback substitute for that missing
-kernel hook: when a public forwarder receives a datagram directly from a
-registered private daemon socket, it does *not* deliver that packet.  Instead
-it asks the sender's NAT to allocate/reuse the (private source, public
-destination) mapping and re-emits the datagram from that mapping's public
-socket.  The receiving forwarder then handles the translated packet normally.
-Consequently the receiver observes the sender NAT's public endpoint, rather
-than its own public endpoint or the sender's private socket.
+Hard<->Hard uses a test-only libc sendto/sendmsg shim: every loopback UDP
+send, from the original daemon socket, carries its destination to a per-NAT
+gateway. The gateway allocates the source mapping even when the destination
+has no mapping/listener. It then routes only through existing public mappings,
+so a guessed host port cannot bypass the simulated NAT. Per-process successful
+send counters are reconciled with gateway receipts; a lost gateway datagram
+invalidates the experiment instead of silently skipping a NAT allocation.
 
-The Hard<->Hard experiment may additionally pre-bind a bounded window of the
-allocator's next public ports.  Those sockets are *egress listeners*, not NAT
-mappings: they can observe a registered private daemon's first packet so the
-sender NAT can translate it, but they never admit public inbound traffic until
-the corresponding port is consumed by a real mapping.  This models the kernel
-interposition that loopback lacks without inventing a peer-visible mapping.
+The legacy listener route is retained for existing Direct/Relay gates. It can
+only observe registered private sends to bound public/preview ports and is not
+a complete outbound-capture oracle. Optional preview sockets never admit public
+inbound traffic before a real mapping exists.
 
 STUN observers are the NAT's measurement face.  They return RFC 5389 Binding
 responses with the allocated mapping encoded as XOR-MAPPED-ADDRESS.  They are
@@ -37,9 +33,13 @@ import dataclasses
 import errno
 import json
 import os
+from pathlib import Path
 import random
+import socket
 import struct
 import time
+from background_traffic import run_background
+from network_conditions import Impairments, NetworkProfile, load_profiles
 from typing import Deque, Dict, List, Optional, Set, Tuple
 
 
@@ -135,9 +135,11 @@ class Mapping:
     destination: Address
     port: int
     transport: Optional[asyncio.DatagramTransport] = None
+    bound_reported: bool = False
     bind_task: Optional[asyncio.Task] = None
     send_task: Optional[asyncio.Task] = None
     pending: Deque[Tuple[bytes, Address]] = dataclasses.field(default_factory=collections.deque)
+    last_outbound_at: float = 0.0
 
 
 class StunObserverProtocol(asyncio.DatagramProtocol):
@@ -176,12 +178,42 @@ class PublicForwarderProtocol(asyncio.DatagramProtocol):
         self.nat.handle_public_datagram(self.port, data, addr)
 
 
+class EgressGatewayProtocol(asyncio.DatagramProtocol):
+    """A per-NAT shim ingress; every destination is observed before routing."""
+
+    def __init__(self, nat: "Nat") -> None:
+        self.nat = nat
+
+    def datagram_received(self, data: bytes, client: Address) -> None:
+        if (client[0] != "127.0.0.1" or len(data) < 16 or data[:8] != b"P2NAT001"
+                or int.from_bytes(data[14:16], "big") != len(data) - 16):
+            self.nat.record("egress_rejected", reason="invalid_envelope")
+            return
+        destination = (socket.inet_ntoa(data[8:12]), int.from_bytes(data[12:14], "big"))
+        if not destination[0].startswith("127.") or destination[1] == 0:
+            self.nat.record("egress_rejected", reason="destination_outside_loopback")
+            return
+        self.nat.record_client(client)
+        self.nat.record("egress_captured", client=format_address(client),
+                        destination=format_address(destination), bytes=len(data) - 16)
+        self.nat.egress_activity.set()
+        self.nat.activate_network()
+        for transport, observer in self.nat.observers:
+            if destination == observer:
+                transaction = parse_binding_request(data[16:])
+                if transaction is not None:
+                    self.nat.handle_stun_request(transport, client, observer, transaction)
+                return
+        self.nat.translate_outbound(client, destination, data[16:])
+
+
 class NatFabric:
     """Coordinates source translation between the two loopback NATs."""
 
     def __init__(self, trace: Optional[NatTrace] = None) -> None:
         self.nats: List["Nat"] = []
         self.trace = trace
+        self.reciprocal_pairs: Set[Tuple[Address, Address]] = set()
 
     def record(self, event: str, **fields: object) -> None:
         if self.trace is not None:
@@ -190,6 +222,47 @@ class NatFabric:
     def add_nat(self, nat: "Nat") -> None:
         if nat not in self.nats:
             self.nats.append(nat)
+
+    def route_translated(self, sender: "Nat", mapping: Mapping, data: bytes, destination: Address) -> None:
+        # Source mapping already exists even when the destination is unbound.
+        # Never send raw packets to arbitrary host sockets/private daemon ports.
+        if sender.network_outage:
+            sender.record("packet_dropped_outage", direction="outbound", bytes=len(data))
+            return
+        if sender.block_direct or (
+            sender.direct_gate_file is not None and not os.path.exists(sender.direct_gate_file)
+        ):
+            self.record("direct_blocked", nat=sender.name,
+                        reason="permanent_blackhole" if sender.block_direct else "startup_gate_closed")
+            return
+        for receiver in self.nats:
+            if receiver is not sender and receiver.owns_public_endpoint(destination):
+                if receiver.block_direct or (
+                    receiver.direct_gate_file is not None and not os.path.exists(receiver.direct_gate_file)
+                ):
+                    self.record("direct_blocked", nat=receiver.name, reason="receiver_gate_closed")
+                    return
+                receiver.handle_public_datagram(destination[1], data, (sender.public_ip, mapping.port))
+                return
+        self.record("outbound_destination_unmapped", nat=sender.name,
+                    public_endpoint=f"{sender.public_ip}:{mapping.port}",
+                    destination=format_address(destination), bytes=len(data))
+
+    def mapping_bound(self, nat: "Nat", mapping: Mapping) -> None:
+        if mapping.bound_reported:
+            return
+        mapping.bound_reported = True
+        endpoint = (nat.public_ip, mapping.port)
+        self.record("mapping_bound", nat=nat.name, client=format_address(mapping.client),
+                    public_endpoint=format_address(endpoint), destination=format_address(mapping.destination))
+        peer = self.mapping_for_public_endpoint(nat, mapping.destination)
+        if peer is None or peer[1].destination != endpoint:
+            return
+        pair = tuple(sorted((endpoint, mapping.destination)))
+        if pair not in self.reciprocal_pairs:
+            self.reciprocal_pairs.add(pair)
+            self.record("reciprocal_mapping_pair", public_endpoint_a=format_address(pair[0]),
+                        public_endpoint_b=format_address(pair[1]), pair_count=len(self.reciprocal_pairs))
 
     def owner_for_private_client(self, addr: Address) -> Optional["Nat"]:
         for nat in self.nats:
@@ -234,6 +307,10 @@ class Nat:
         duplicate_rate: float = 0.0,
         direct_gate_file: Optional[str] = None,
         unassigned_egress_listeners: int = 0,
+        sweep_noise_every: int = 0,
+        sweep_noise_count: int = 0,
+        sweep_noise_limit: int = 64,
+        network_profile: Optional[NetworkProfile] = None,
     ) -> None:
         if mapping_mode not in {"step", "random"}:
             raise ValueError("mapping_mode must be 'step' or 'random'")
@@ -247,6 +324,20 @@ class Nat:
             raise ValueError("duplicate_rate must be between 0 and 1")
         if not 0 <= unassigned_egress_listeners <= 32:
             raise ValueError("unassigned_egress_listeners must be between 0 and 32")
+        if not 0 <= consume_before_punch <= 64:
+            raise ValueError("consume_before_punch must be in 0..64 per measured socket")
+        if not 0 <= sweep_noise_every <= 1024 or not 0 <= sweep_noise_count <= 64:
+            raise ValueError("sweep noise interval/count is outside bounds")
+        if not 0 <= sweep_noise_limit <= 4096:
+            raise ValueError("sweep noise limit must be in 0..4096")
+        self.sweep_noise_every = sweep_noise_every
+        self.sweep_noise_count = sweep_noise_count
+        self.sweep_noise_remaining = sweep_noise_limit
+        self.initial_noise_remaining = 4096
+        self.noise_ports: Set[int] = set()
+        self.measurements: Dict[Address, int] = {}
+        self.peer_mapping_counts: Dict[Address, int] = {}
+        self.egress_gateway: Optional[asyncio.DatagramTransport] = None
         self.name = name
         self.public_ip = public_ip
         self.step = step
@@ -288,9 +379,20 @@ class Nat:
         self.observed_sequence: List[int] = []
         self._egress_refresh_task: Optional[asyncio.Task] = None
         self._egress_refresh_needed = False
+        self.egress_activity = None
+        self.network_profile = network_profile or NetworkProfile()
+        self.impairments = Impairments(self.network_profile, seed)
+        self.network_outage = False
+        self._network_started_at = None
+        self._network_task = None
+        self._network_rebound = False
+        self._packet_tasks: Set[asyncio.Task] = set()
+        self._retired_tasks: Set[asyncio.Task] = set()
+        self._closed = False
 
     async def start(self, fabric: Optional[NatFabric] = None) -> "Nat":
         self.loop = asyncio.get_running_loop()
+        self.egress_activity = asyncio.Event()
         self.fabric = fabric
         if fabric is not None:
             fabric.add_nat(self)
@@ -298,7 +400,12 @@ class Nat:
         return self
 
     async def close(self) -> None:
-        tasks = []
+        self._closed = True
+        tasks = list(self._packet_tasks | self._retired_tasks)
+        if self._network_task is not None:
+            tasks.append(self._network_task)
+        for task in tasks:
+            task.cancel()
         if self._egress_refresh_task is not None and not self._egress_refresh_task.done():
             self._egress_refresh_task.cancel()
             tasks.append(self._egress_refresh_task)
@@ -309,6 +416,9 @@ class Nat:
                     tasks.append(task)
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+        if self.egress_gateway is not None:
+            self.egress_gateway.close()
+            self.egress_gateway = None
         for transport, _ in self.observers:
             transport.close()
         for transport in self.forwarders.values():
@@ -318,6 +428,77 @@ class Nat:
         self.observers.clear()
         self.forwarders.clear()
         self.provisional_forwarders.clear()
+
+    def activate_network(self) -> None:
+        if self._network_started_at is not None or self.loop is None or self._closed:
+            return
+        self._network_started_at = self.loop.time()
+        self.record("network_conditions_started", profile=self.network_profile.to_dict())
+        profile = self.network_profile
+        if profile.outage_after_ms or profile.rebind_after_ms or profile.mapping_idle_ms:
+            self._network_task = self.loop.create_task(self._run_network_events())
+
+    async def _run_network_events(self) -> None:
+        while not self._closed:
+            self.advance_network(self.loop.time())
+            await asyncio.sleep(0.05)
+
+    def advance_network(self, now: float) -> None:
+        if self._network_started_at is None:
+            return
+        profile = self.network_profile
+        elapsed = (now - self._network_started_at) * 1000
+        outage = (profile.outage_after_ms > 0
+                  and profile.outage_after_ms <= elapsed < profile.outage_after_ms + profile.outage_duration_ms)
+        if outage != self.network_outage:
+            self.network_outage = outage
+            self.record("network_outage_started" if outage else "network_outage_ended")
+        if profile.rebind_after_ms and elapsed >= profile.rebind_after_ms and not self._network_rebound:
+            self._network_rebound = True
+            count = len(self.mappings)
+            for mapping in list(self.mappings.values()):
+                self.retire_mapping(mapping, "network_rebind")
+            self.record("network_rebound", retired_mappings=count)
+        if profile.mapping_idle_ms:
+            for mapping in list(self.mappings.values()):
+                if (now - mapping.last_outbound_at) * 1000 >= profile.mapping_idle_ms:
+                    self.retire_mapping(mapping, "idle_timeout")
+
+    def mapping_is_current(self, mapping: Mapping) -> bool:
+        return not self._closed and self.mappings.get((mapping.client, mapping.destination)) is mapping
+
+    def retire_mapping(self, mapping: Mapping, reason: str) -> None:
+        if not self.mapping_is_current(mapping):
+            return
+        del self.mappings[(mapping.client, mapping.destination)]
+        self.mapping_by_port.pop(mapping.port, None)
+        transport = self.forwarders.pop(mapping.port, None)
+        if transport is not None:
+            transport.close()
+        mapping.transport = None
+        mapping.pending.clear()
+        for task in (mapping.bind_task, mapping.send_task):
+            if task is not None and not task.done():
+                self._retired_tasks.add(task)
+                task.add_done_callback(self._retired_tasks.discard)
+                task.cancel()
+        self.record("mapping_retired", public_endpoint=f"{self.public_ip}:{mapping.port}",
+                    client=format_address(mapping.client), destination=format_address(mapping.destination),
+                    reason=reason)
+
+    def spawn_packet_task(self, coroutine, packet_kind: str) -> None:
+        if self._closed or self.loop is None or len(self._packet_tasks) >= self.network_profile.queue_limit:
+            coroutine.close()
+            self.record("packet_dropped_queue", packet_kind=packet_kind, reason="pending_packet_limit")
+            return
+        task = self.loop.create_task(coroutine)
+        self._packet_tasks.add(task)
+        def completed(done):
+            self._packet_tasks.discard(done)
+            if not done.cancelled() and done.exception() is not None:
+                self.record("network_packet_task_failed", packet_kind=packet_kind,
+                            error_type=type(done.exception()).__name__)
+        task.add_done_callback(completed)
 
     def alloc_port(self) -> int:
         if self.mapping_mode == "random":
@@ -336,7 +517,7 @@ class Nat:
         # preserved unless it cycles onto a live mapping or an occupied port.
         for _ in range(64512):
             port = self.alloc_port()
-            if port not in self.mapping_by_port:
+            if port not in self.mapping_by_port and port not in self.noise_ports:
                 return port
         raise RuntimeError(f"NAT {self.name} exhausted public UDP ports")
 
@@ -348,7 +529,7 @@ class Nat:
         preview_rng.setstate(self.rng.getstate())
         next_port = self.next_port
         ports: List[int] = []
-        reserved: Set[int] = set(self.mapping_by_port)
+        reserved: Set[int] = set(self.mapping_by_port) | self.noise_ports
         for _ in range(64512):
             if self.mapping_mode == "random":
                 port = preview_rng.randrange(1024, 65536)
@@ -419,8 +600,10 @@ class Nat:
         key = (client, destination)
         mapping = self.mappings.get(key)
         if mapping is not None:
+            mapping.last_outbound_at = self.loop.time() if self.loop else time.monotonic()
             return mapping
         mapping = Mapping(client=client, destination=destination, port=self._allocate_unused_port())
+        mapping.last_outbound_at = self.loop.time() if self.loop else time.monotonic()
         self.mappings[key] = mapping
         self.mapping_by_port[mapping.port] = mapping
         provisional = self.provisional_forwarders.pop(mapping.port, None)
@@ -432,6 +615,7 @@ class Nat:
             self.fabric.record(
                 "mapping_created",
                 nat=self.name,
+                client=format_address(client),
                 public_endpoint=f"{self.public_ip}:{mapping.port}",
                 destination=format_address(destination),
             )
@@ -450,19 +634,52 @@ class Nat:
         self.observers.append((transport, observer_addr))
         return observer_addr
 
+    def record(self, event: str, **fields: object) -> None:
+        if self.fabric is not None:
+            self.fabric.record(event, nat=self.name, **fields)
+
+    async def add_egress_gateway(self) -> Address:
+        if self.loop is None:
+            raise RuntimeError("start the NAT before its egress gateway")
+        if self.egress_gateway is not None:
+            raise RuntimeError("egress gateway already exists")
+        self.egress_gateway, _ = await self.loop.create_datagram_endpoint(
+            lambda: EgressGatewayProtocol(self), local_addr=("127.0.0.1", 0))
+        # Bounded buffering reduces local harness loss under birthday bursts.
+        # The receipt/counter reconciliation remains authoritative regardless
+        # of the OS's actual SO_RCVBUF cap.
+        gateway_socket = self.egress_gateway.get_extra_info("socket")
+        try:
+            gateway_socket.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1024 * 1024)
+        except OSError:
+            pass
+        self.record("egress_gateway_ready", schema_version=1, capture="libc_sendto_sendmsg",
+                    gateway_port=self.egress_gateway.get_extra_info("sockname")[1])
+        return self.egress_gateway.get_extra_info("sockname")
+
+    def _report_bound(self, mapping: Mapping) -> None:
+        if self.fabric is not None:
+            self.fabric.mapping_bound(self, mapping)
+
     async def ensure_bound(self, mapping: Mapping) -> None:
+        if not self.mapping_is_current(mapping):
+            return
         if mapping.transport is not None:
+            self._report_bound(mapping)
             return
         provisional = self.provisional_forwarders.pop(mapping.port, None)
         if provisional is not None:
             mapping.transport = provisional
             self.forwarders[mapping.port] = provisional
+            self._report_bound(mapping)
             return
         if mapping.bind_task is None:
             if self.loop is None:
                 raise RuntimeError("start the NAT before allocating mappings")
             mapping.bind_task = self.loop.create_task(self._bind_mapping(mapping))
         await asyncio.shield(mapping.bind_task)
+        if self.mapping_is_current(mapping):
+            self._report_bound(mapping)
 
     async def _bind_mapping(self, mapping: Mapping) -> None:
         if self.loop is None:
@@ -486,6 +703,9 @@ class Nat:
                 # Reallocate before either STUN or peer traffic observes it.
                 self._reassign_mapping_port(mapping)
                 continue
+            if not self.mapping_is_current(mapping):
+                transport.close()
+                return
             mapping.transport = transport
             self.forwarders[port] = transport
 
@@ -497,16 +717,16 @@ class Nat:
         transaction: bytes,
     ) -> None:
         self.record_client(client)
-        if self.consume_before_punch > 0:
-            for _ in range(self.consume_before_punch):
-                self._allocate_unused_port()
-            self.consume_before_punch = 0
+        self.activate_network()
+        self.measurements[client] = self.measurements.get(client, 0) + 1
         mapping = self.mapping_for(client, observer)
+        self.record("stun_mapping_observed", client=format_address(client),
+                    observer=format_address(observer), sample=self.measurements[client],
+                    public_endpoint=f"{self.public_ip}:{mapping.port}")
         if self.loop is None:
             return
-        self.loop.create_task(
-            self._reply_to_stun_after_bind(observer_transport, client, transaction, mapping)
-        )
+        self.spawn_packet_task(
+            self._reply_to_stun_after_bind(observer_transport, client, transaction, mapping), "stun")
 
     async def _reply_to_stun_after_bind(
         self,
@@ -519,30 +739,85 @@ class Nat:
             await self.ensure_bound(mapping)
         except OSError:
             return
+        if not self.mapping_is_current(mapping):
+            return
+        if self.network_outage:
+            self.record("packet_dropped_outage", packet_kind="stun", bytes=20)
+            return
         response = binding_response(transaction, self.public_ip, mapping.port)
-        if self.stun_delay_ms > 0:
-            await asyncio.sleep(self.stun_delay_ms / 1000.0)
+        delay = self.stun_delay_ms / 1000
+        if self.network_profile.impair_stun:
+            reason = self.impairments.loss(self.loss_rate)
+            if reason:
+                self.record(reason, packet_kind="stun", bytes=len(response))
+                return
+            delay = self.impairments.delay(self.loop.time(), self.stun_delay_ms, len(response))
+            if delay is None:
+                self.record("packet_dropped_queue", packet_kind="stun", reason="queue_deadline")
+                return
+            self.record("packet_conditioned", packet_kind="stun", delay_ms=round(delay * 1000, 3))
+        if delay > 0:
+            await asyncio.sleep(delay)
+        if not self.mapping_is_current(mapping):
+            self.record("packet_dropped_stale_mapping", packet_kind="stun")
+            return
+        if self.network_outage:
+            self.record("packet_dropped_outage", packet_kind="stun", bytes=len(response))
+            return
         observer_transport.sendto(response, client)
 
     def translate_outbound(self, client: Address, destination: Address, data: bytes) -> None:
         """Source-NAT a daemon datagram then send it to the public destination."""
+        if (client, destination) not in self.mappings:
+            count = self.peer_mapping_counts.get(client, 0)
+            measured = self.measurements.get(client, 0)
+            if count == 0 and measured:
+                noise = min(self.consume_before_punch, self.initial_noise_remaining)
+                self._consume_noise(client, noise, "post_measurement_before_first_peer", count)
+                self.initial_noise_remaining -= noise
+            elif count and self.sweep_noise_every and count % self.sweep_noise_every == 0:
+                noise = min(self.sweep_noise_count, self.sweep_noise_remaining)
+                self._consume_noise(client, noise, "during_sweep", count)
+                self.sweep_noise_remaining -= noise
+            self.record("peer_mapping_started", client=format_address(client),
+                        destination=format_address(destination), prior_peer_mappings=count,
+                        measurement_samples=measured)
+            self.peer_mapping_counts[client] = count + 1
         mapping = self.mapping_for(client, destination)
+        if len(mapping.pending) >= 256:
+            self.record("outbound_queue_rejected", reason="mapping_queue_capacity", bytes=len(data))
+            return
         mapping.pending.append((data, destination))
         if mapping.send_task is None or mapping.send_task.done():
             if self.loop is None:
                 return
             mapping.send_task = self.loop.create_task(self._flush_outbound(mapping))
 
+    def _consume_noise(self, client: Address, count: int, stage: str, peer_count: int) -> None:
+        for _ in range(count):
+            port = self._allocate_unused_port()
+            self.noise_ports.add(port)
+            self.record("mapping_consumed", client=format_address(client), stage=stage,
+                        public_endpoint=f"{self.public_ip}:{port}",
+                        measurement_samples=self.measurements.get(client, 0),
+                        prior_peer_mappings=peer_count)
+
     async def _flush_outbound(self, mapping: Mapping) -> None:
         try:
             await self.ensure_bound(mapping)
+            if not self.mapping_is_current(mapping):
+                return
             while mapping.pending:
                 data, destination = mapping.pending.popleft()
                 if mapping.transport is not None:
-                    mapping.transport.sendto(data, destination)
-        except OSError:
+                    if self.egress_gateway is not None and self.fabric is not None:
+                        self.fabric.route_translated(self, mapping, data, destination)
+                    else:
+                        mapping.transport.sendto(data, destination)
+        except OSError as error:
             # A non-recoverable bind error must not leave an unobserved task
             # exception or replay stale packets on a later mapping attempt.
+            self.record("outbound_mapping_error", reason="public_socket_bind_or_send_failed", errno=error.errno)
             mapping.pending.clear()
         finally:
             mapping.send_task = None
@@ -608,6 +883,9 @@ class Nat:
         # cannot create or impersonate a NAT mapping.
         if mapping is None:
             return
+        if self.network_outage:
+            self.record("packet_dropped_outage", direction="inbound", bytes=len(data))
+            return
         if not self.inbound_allowed(mapping, addr):
             if self.fabric is not None:
                 self.fabric.record(
@@ -618,33 +896,38 @@ class Nat:
                     actual_source=format_address(addr),
                 )
             return
-        if self.loss_rate > 0 and self.rng.random() < self.loss_rate:
+        loss_reason = self.impairments.loss(self.loss_rate)
+        if loss_reason:
             if self.fabric is not None:
                 self.fabric.record(
-                    "packet_dropped_loss",
+                    loss_reason,
                     nat=self.name,
                     receiver_endpoint=f"{self.public_ip}:{mapping.port}",
                     bytes=len(data),
                     **wireguard_transport_trace_fields(data),
                 )
             return
-        delay_seconds = self.delivery_delay_ms / 1000.0
-        reorder_delay_injected = self.reorder and self.rng.random() < 0.25
+        delay_seconds = self.impairments.delay(self.loop.time(), self.delivery_delay_ms, len(data))
+        if delay_seconds is None:
+            self.record("packet_dropped_queue", packet_kind="peer", reason="queue_deadline")
+            return
+        reorder_delay_injected = self.reorder and self.impairments.rng.random() < 0.25
         if reorder_delay_injected:
             delay_seconds += 0.02
-        duplicate = self.duplicate_rate > 0 and self.rng.random() < self.duplicate_rate
+        duplicate = self.duplicate_rate > 0 and self.impairments.rng.random() < self.duplicate_rate
         if delay_seconds > 0:
+            source_mapping = self.fabric.mapping_for_public_endpoint(self, addr) if self.fabric else None
             if self.loop is not None:
-                self.loop.create_task(
+                self.spawn_packet_task(
                     self._delayed_delivery(
-                        mapping, data, addr, delay_seconds, duplicate_copy=0
-                    )
+                        mapping, data, addr, delay_seconds, duplicate_copy=0, source_mapping=source_mapping
+                    ), "peer"
                 )
                 if duplicate:
-                    self.loop.create_task(
+                    self.spawn_packet_task(
                         self._delayed_delivery(
-                            mapping, data, addr, delay_seconds + 0.001, duplicate_copy=1
-                        )
+                            mapping, data, addr, delay_seconds + 0.001, duplicate_copy=1, source_mapping=source_mapping
+                        ), "peer"
                     )
             if self.fabric is not None:
                 self.fabric.record(
@@ -696,6 +979,12 @@ class Nat:
         source: Address,
         duplicate_copy: int = 0,
     ) -> None:
+        if not self.mapping_is_current(mapping):
+            self.record("packet_dropped_stale_mapping", packet_kind="peer")
+            return
+        if self.network_outage:
+            self.record("packet_dropped_outage", direction="inbound", bytes=len(data))
+            return
         if self.fabric is not None:
             self.fabric.record(
                 "simulator_delivery",
@@ -735,8 +1024,12 @@ class Nat:
         source: Address,
         delay: float,
         duplicate_copy: int = 0,
+        source_mapping=None,
     ) -> None:
         await asyncio.sleep(delay)
+        if source_mapping is not None and not source_mapping[0].mapping_is_current(source_mapping[1]):
+            self.record("packet_dropped_stale_mapping", packet_kind="peer_source")
+            return
         self._deliver(mapping, data, source, duplicate_copy=duplicate_copy)
 
 
@@ -746,6 +1039,10 @@ def main() -> None:
     parser.add_argument("--step-b", type=int, default=1)
     parser.add_argument("--consume-a", type=int, default=0)
     parser.add_argument("--consume-b", type=int, default=0)
+    parser.add_argument("--egress-capture", choices=("listeners", "shim"), default="listeners")
+    parser.add_argument("--sweep-noise-every", type=int, default=0)
+    parser.add_argument("--sweep-noise-count", type=int, default=0)
+    parser.add_argument("--sweep-noise-limit", type=int, default=64)
     parser.add_argument("--loss", type=float, default=0.0)
     parser.add_argument("--reorder", action="store_true")
     parser.add_argument("--strict-filtering", action="store_true")
@@ -774,11 +1071,26 @@ def main() -> None:
     parser.add_argument("--base-a", type=int, default=16000)
     parser.add_argument("--base-b", type=int, default=26000)
     parser.add_argument("--trace-file", type=str)
+    parser.add_argument("--background-devices", type=int, default=0)
+    parser.add_argument("--background-flows", type=int, default=32)
+    parser.add_argument("--background-interval-ms", type=int, default=250)
+    parser.add_argument("--network-profile", type=Path)
     args = parser.parse_args()
+    try:
+        profiles = load_profiles(args.network_profile)
+    except (OSError, ValueError, TypeError) as error:
+        parser.error(str(error))
+    if args.network_profile and args.egress_capture != "shim":
+        parser.error("network profiles require complete shim capture")
+    if not 0 <= args.background_devices <= 16 or not 1 <= args.background_flows <= 64 or not 10 <= args.background_interval_ms <= 5000:
+        parser.error("background limits: devices 0..16, flows 1..64, interval 10..5000 ms")
+    if args.background_devices and args.egress_capture != "shim":
+        parser.error("background traffic requires complete shim capture")
 
     async def run() -> None:
         trace = NatTrace(args.trace_file) if args.trace_file else None
         fabric = NatFabric(trace)
+        background_tasks = []
         nat_a = Nat(
             "A",
             "127.0.0.1",
@@ -796,6 +1108,10 @@ def main() -> None:
             args.duplicate_rate,
             args.direct_gate_file,
             args.unassigned_egress_listeners,
+            args.sweep_noise_every,
+            args.sweep_noise_count,
+            args.sweep_noise_limit,
+            profiles["A"],
         )
         nat_b = Nat(
             "B",
@@ -814,12 +1130,32 @@ def main() -> None:
             args.duplicate_rate,
             args.direct_gate_file,
             args.unassigned_egress_listeners,
+            args.sweep_noise_every,
+            args.sweep_noise_count,
+            args.sweep_noise_limit,
+            profiles["B"],
         )
         try:
             await nat_a.start(fabric)
             await nat_b.start(fabric)
             observer_a = [await nat_a.add_observer() for _ in range(args.observers)]
             observer_b = [await nat_b.add_observer() for _ in range(args.observers)]
+            if args.background_devices:
+                async def background_after_join(nat, seed):
+                    # Start the other clients when this subscriber first joins;
+                    # their independent schedule does not observe measurements
+                    # or target candidates. Slow peer startup cannot silently
+                    # move all interference outside the tested traffic window.
+                    await nat.egress_activity.wait()
+                    await run_background(nat, args.background_devices, args.background_flows,
+                                         args.background_interval_ms, seed)
+                background_tasks = [asyncio.create_task(background_after_join(nat, args.seed + offset))
+                    for offset, nat in enumerate((nat_a, nat_b))]
+            if args.egress_capture == "shim":
+                gateway_a = await nat_a.add_egress_gateway()
+                gateway_b = await nat_b.add_egress_gateway()
+                print(f"EGRESS_A_PORT={gateway_a[1]}", flush=True)
+                print(f"EGRESS_B_PORT={gateway_b[1]}", flush=True)
             print("STUN_A=" + ",".join(f"{host}:{port}" for host, port in observer_a), flush=True)
             print("STUN_B=" + ",".join(f"{host}:{port}" for host, port in observer_b), flush=True)
             print("BASE_A=%d" % args.base_a, flush=True)
@@ -832,6 +1168,16 @@ def main() -> None:
                 "NAT_FEATURES="
                 + json.dumps(
                     {
+                        "egress_capture": args.egress_capture,
+                        "background_devices": args.background_devices,
+                        "background_flows": args.background_flows,
+                        "background_interval_ms": args.background_interval_ms,
+                        "network_profiles": {name: profile.to_dict() for name, profile in profiles.items()},
+                        "consume_a": args.consume_a,
+                        "consume_b": args.consume_b,
+                        "sweep_noise_every": args.sweep_noise_every,
+                        "sweep_noise_count": args.sweep_noise_count,
+                        "sweep_noise_limit": args.sweep_noise_limit,
                         "mapping_mode_a": args.mapping_mode_a,
                         "mapping_mode_b": args.mapping_mode_b,
                         "strict_filtering_a": args.strict_filtering or args.strict_filtering_a,
@@ -842,6 +1188,7 @@ def main() -> None:
                         "stun_delay_b_ms": args.stun_delay_b_ms,
                         "duplicate_rate": args.duplicate_rate,
                         "direct_gate": bool(args.direct_gate_file),
+                        "direct_gate_preserves_source_allocations": args.egress_capture == "shim",
                         "unassigned_egress_listeners": args.unassigned_egress_listeners,
                     },
                     sort_keys=True,
@@ -851,6 +1198,9 @@ def main() -> None:
             )
             await asyncio.Event().wait()
         finally:
+            for task in background_tasks:
+                task.cancel()
+            await asyncio.gather(*background_tasks, return_exceptions=True)
             await nat_a.close()
             await nat_b.close()
             if trace is not None:

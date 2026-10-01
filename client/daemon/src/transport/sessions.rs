@@ -347,6 +347,31 @@ impl WireGuardTransport {
         }
     }
 
+    /// A validation frame cannot be replayed after decryption consumed its
+    /// WireGuard counter. Give simultaneous local control sends one bounded
+    /// chance to release the emit fence instead of discarding the only ACK
+    /// opportunity. Every retry checks the original instance, and no emit or
+    /// session-map lock is held while waiting.
+    pub(in crate::transport) async fn acquire_direct_validation_session_guard(
+        &self,
+        peer_id: &str,
+        session_instance: Option<u64>,
+    ) -> CurrentSessionEvidenceGuardOutcome {
+        tokio::time::timeout(DIRECT_VALIDATION_EMIT_LOCK_TIMEOUT, async {
+            loop {
+                let outcome = self
+                    .acquire_current_session_evidence_guard_outcome(peer_id, session_instance)
+                    .await;
+                if !matches!(outcome, CurrentSessionEvidenceGuardOutcome::Contended) {
+                    return outcome;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .unwrap_or(CurrentSessionEvidenceGuardOutcome::Contended)
+    }
+
     /// Install or replace an established transport session for a peer.
     pub async fn add_session(&self, peer_id: impl Into<String>, session: TransportSession) -> bool {
         self.install_active_session(peer_id, None, session).await

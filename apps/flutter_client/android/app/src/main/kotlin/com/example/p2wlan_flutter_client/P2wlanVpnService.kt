@@ -726,7 +726,11 @@ class P2wlanVpnService : VpnService() {
         )
         val callback = object : ConnectivityManager.NetworkCallback() {
             override fun onAvailable(network: Network) {
-                observePhysicalNetwork(network, forwarder)
+                // Returning to a still-connected former default is a fresh
+                // selection edge, even when Android reuses its Network handle.
+                if (forwarder.announceAvailable(network.networkHandle)) {
+                    observePhysicalNetwork(network, forwarder)
+                }
             }
 
             override fun onCapabilitiesChanged(
@@ -790,7 +794,7 @@ class P2wlanVpnService : VpnService() {
             captive = capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_CAPTIVE_PORTAL),
             interfaceIdentity = manager.getLinkProperties(network)?.interfaceName,
         )
-        val transition = forwarder.onAvailable(identity)
+        val transition = forwarder.onPropertiesChanged(identity)
         if (transition.outcome != MobileLifecycleOutcome.APPLIED) {
             Log.i(
                 TAG,

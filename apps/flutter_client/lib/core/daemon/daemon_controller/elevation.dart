@@ -1,6 +1,18 @@
 part of '../daemon_controller.dart';
 
 const _windowsChildPidMarker = '__P2WLAN_CHILD_PID__=';
+const _posixChildPidMarker = '__P2WLAN_POSIX_CHILD_PID__=';
+
+/// The elevated shell returns only the launched PID. Log rotation and PID
+/// file writes belong to the interactive user; the daemon owns its fd-safe
+/// log writer and config persistence.
+String buildPosixDaemonLaunchShell(String binaryPath, List<String> args) {
+  String quote(String value) => "'${value.replaceAll("'", "'\\''")}'";
+  return '(P2WLAN_DAEMON_BIN=${quote(binaryPath)} '
+      '${quote(binaryPath)} ${args.map(quote).join(' ')} '
+      '> /dev/null 2>&1 < /dev/null & '
+      'printf \'$_posixChildPidMarker%s\\n\' "\$!")';
+}
 
 /// Parse the marker emitted by the single elevated `Start-Process -PassThru`
 /// launch. Keeping this pure makes PID supervision testable without running
@@ -68,67 +80,14 @@ extension DaemonControllerElevation on DaemonController {
   String _buildElevatedShell({
     required File binary,
     required List<String> args,
-    required Directory configDir,
-    required Directory logDir,
-    required String logPath,
-    required String pidPath,
   }) {
-    final repairOwnership = _macosRepairOwnershipShell(configDir, logDir);
-    final repairBefore = repairOwnership.isEmpty ? '' : '$repairOwnership; ';
-    final repairAfter = repairOwnership.isEmpty
-        ? ''
-        : '; /bin/sleep 1; $repairOwnership';
-    final rotateLog = _macosRotateLogShell(logPath);
-    return 'mkdir -p ${_shellQuote(configDir.path)} ${_shellQuote(logDir.path)}; '
-        '$repairBefore'
-        '$rotateLog'
-        ': > ${_shellQuote(logPath)}; chmod 600 ${_shellQuote(logPath)}; '
-        '$repairBefore'
-        '(P2WLAN_DAEMON_BIN=${_shellQuote(binary.path)} '
-        '${_shellQuote(binary.path)} ${args.map(_shellQuote).join(' ')} '
-        '>> ${_shellQuote(logPath)} 2>&1 < /dev/null & echo \$! > ${_shellQuote(pidPath)})'
-        '$repairAfter';
+    return buildPosixDaemonLaunchShell(binary.path, args);
   }
 
-  String _macosRotateLogShell(String logPath) {
-    if (!Platform.isMacOS) return '';
-    final current = _shellQuote(logPath);
-    final previous = _shellQuote('$logPath.1');
-    return 'if [ -f $current ]; then '
-        '/bin/rm -f $previous || exit 72; '
-        '/bin/mv $current $previous || exit 73; '
-        'fi; ';
-  }
-
-  String _macosRepairOwnershipShell(Directory configDir, Directory logDir) {
-    if (!Platform.isMacOS) return '';
-    final owner = _macosUserOwnerForUserPaths();
-    if (owner == null || owner.isEmpty || owner == 'root') return '';
-    final quotedOwner = _shellQuote(owner);
-    final quotedConfigDir = _shellQuote(configDir.path);
-    final quotedLogDir = _shellQuote(logDir.path);
-    return 'owner=$quotedOwner; '
-        'group="\$(/usr/bin/id -gn "\$owner" 2>/dev/null || /bin/echo staff)"; '
-        '/usr/sbin/chown -R "\$owner:\$group" $quotedConfigDir $quotedLogDir >/dev/null 2>&1 || true';
-  }
-
-  String? _macosUserOwnerForUserPaths() {
-    for (final key in const ['SUDO_USER', 'USER', 'LOGNAME']) {
-      final value = Platform.environment[key]?.trim();
-      if (value != null && value.isNotEmpty && value != 'root') {
-        return value;
-      }
-    }
-    final home = Platform.environment['HOME']?.trim();
-    if (home == null || home.isEmpty || home == '/var/root') return null;
-    final parts = home.split('/').where((part) => part.isNotEmpty).toList();
-    if (parts.isEmpty) return null;
-    final user = parts.last.trim();
-    if (user.isEmpty || user == 'root') return null;
-    return user;
-  }
-
-  Future<void> _startMacosElevated(String command, {String? password}) async {
+  Future<_MacosElevatedCommandResult> _startMacosElevated(
+    String command, {
+    String? password,
+  }) async {
     final credentials = _MacosElevationCredentials();
     try {
       var activePassword = password;
@@ -157,11 +116,25 @@ extension DaemonControllerElevation on DaemonController {
         run = await credentials.runWithPassword(command, freshPassword);
       }
       if (!run.ok) {
-        throw run.error ?? '管理员权限启动失败。';
+        throw _MacosElevationException(
+          run.error ?? '管理员权限启动失败。',
+          childPid: run.childPid,
+        );
       }
       if (shouldPersistPassword) {
-        await saveMacosAdminPassword?.call(activePassword);
+        try {
+          await saveMacosAdminPassword?.call(activePassword);
+        } catch (_) {
+          throw _MacosElevationException(
+            '无法保存本地管理员凭据。',
+            childPid: run.childPid,
+          );
+        }
       }
+      return _MacosElevatedCommandResult(
+        password: activePassword,
+        childPid: run.childPid,
+      );
     } on MissingPluginException {
       throw '当前 macOS 构建不支持本地管理员凭据存储，请重新安装 P2WLAN。';
     } on PlatformException catch (error) {
@@ -231,23 +204,26 @@ extension DaemonControllerElevation on DaemonController {
       throw StateError(stderr.isEmpty ? 'Windows UAC 启动失败。' : stderr);
     }
     final pid = parseWindowsChildPidMarker(result.stdout.toString());
-    if (pid != null) {
-      _launchedProcessId = pid;
-      if (await _waitForWindowsChildIdentity(pid)) return pid;
-      _launchedProcessId = null;
-    }
+    if (pid != null) return pid;
     throw StateError(
       'PID_MARKER_FAILED: Windows UAC did not return the elevated child PID.',
     );
   }
 
-  Future<bool> _waitForWindowsChildIdentity(int pid) async {
-    final deadline = DateTime.now().add(const Duration(seconds: 3));
-    while (DateTime.now().isBefore(deadline)) {
-      if (await _processLooksLikeDaemon(pid)) return true;
-      await Future<void>.delayed(const Duration(milliseconds: 100));
-    }
-    return await _processLooksLikeDaemon(pid);
+  Future<void> _verifyWindowsChildIdentity(int pid) async {
+    final process = await waitForWindowsProcess(pid);
+    await _startupTrace?.detail(
+      '10 child_identity state=${process.state.name} '
+      'pid=$pid operation=${process.operation ?? 'none'} '
+      'win32_error=${process.win32Error ?? 0} '
+      'exit_code=${process.exitCode ?? 'unknown'}',
+    );
+    final failure = classifyWindowsChildIdentity(
+      process: process,
+      pid: pid,
+      launchedProcessId: _launchedProcessId,
+    );
+    if (failure != null) throw _WindowsChildIdentityException(failure);
   }
 
   Future<String?> _windowsCurrentUserSid() async {
@@ -288,6 +264,40 @@ extension DaemonControllerElevation on DaemonController {
   }
 }
 
+DaemonStartupFailure? classifyWindowsChildIdentity({
+  required WindowsProcessProbe process,
+  required int pid,
+  required int? launchedProcessId,
+}) {
+  if (process.state == WindowsProcessState.exited) {
+    return const DaemonStartupFailure(
+      DaemonStartupFailureCode.daemonExitedDuringStartup,
+      'p2wlan-daemon 在启动身份校验前已退出，请查看启动日志。',
+    );
+  }
+  if (trustedWindowsDaemonIdentityMatches(
+    pid: pid,
+    launchedProcessId: launchedProcessId,
+    authenticatedProcessId: null,
+    processName: process.processName,
+  )) {
+    return null;
+  }
+  return const DaemonStartupFailure(
+    DaemonStartupFailureCode.pidMarkerFailed,
+    '无法确认 Windows 后台网络服务的进程身份，请查看启动日志。',
+  );
+}
+
+class _WindowsChildIdentityException implements Exception {
+  const _WindowsChildIdentityException(this.failure);
+
+  final DaemonStartupFailure failure;
+
+  @override
+  String toString() => failure.codeValue;
+}
+
 /// The native bridge only displays the secure input field and pipes the
 /// password to sudo. Persistence is owned by [SettingsStore], which writes
 /// authenticated ciphertext to the local settings file; no Keychain API is
@@ -317,6 +327,10 @@ class _MacosElevationCredentials {
       ok: result['ok'] == true,
       missingCredential: result['missingCredential'] == true,
       authenticationFailed: result['authenticationFailed'] == true,
+      childPid: switch (result['childPid']) {
+        int pid when pid > 0 => pid,
+        _ => null,
+      },
       error: (result['error'] as String?)?.trim(),
     );
   }
@@ -327,11 +341,32 @@ class _MacosElevationRunResult {
     required this.ok,
     this.missingCredential = false,
     this.authenticationFailed = false,
+    this.childPid,
     this.error,
   });
 
   final bool ok;
   final bool missingCredential;
   final bool authenticationFailed;
+  final int? childPid;
   final String? error;
+}
+
+/// The credential remains local to one launch and is never rendered in
+/// debug output. Preparation and launch can share a newly entered password.
+class _MacosElevatedCommandResult {
+  const _MacosElevatedCommandResult({required this.password, this.childPid});
+
+  final String password;
+  final int? childPid;
+}
+
+class _MacosElevationException implements Exception {
+  const _MacosElevationException(this.message, {this.childPid});
+
+  final String message;
+  final int? childPid;
+
+  @override
+  String toString() => message;
 }

@@ -4,6 +4,8 @@ fn business_budget_peer(
     endpoint: SocketAddr,
 ) -> control::PeerInfo {
     control::PeerInfo {
+        capabilities: crate::control::PeerCapabilities::default(),
+        registration_seq: 0,
         node_id: node_id.to_string(),
         device_name: String::new(),
         app_version: String::new(),

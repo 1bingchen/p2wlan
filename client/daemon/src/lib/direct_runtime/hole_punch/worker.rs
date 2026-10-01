@@ -23,6 +23,7 @@ async fn spawn_hole_punch_task(
         fresh_prediction,
         frozen_targets,
         None,
+        None,
     )
     .await;
 }
@@ -74,6 +75,7 @@ async fn spawn_hole_punch_task_with_lifecycle(
     fresh_prediction: Option<FreshPredictionId>,
     frozen_targets: Option<Vec<SocketAddr>>,
     invocation_shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>,
+    publication_fence: Option<Arc<crate::control::CandidatePublicationFence>>,
 ) {
     if punch_invocation_is_cancelled(invocation_shutdown_rx.as_ref()) {
         return;
@@ -83,8 +85,22 @@ async fn spawn_hole_punch_task_with_lifecycle(
     // lifecycle that admitted it.  Peer IDs are reusable after PeerLeft, so a
     // worker which merely re-reads `online=true` at completion can otherwise
     // publish an old send error into a same-node replacement (ABA).
-    let Some(peer_session_generation) = peers.peer_session_generation_sync(&peer_id) else {
-        return;
+    let (network_generation, peer_session_generation) = match publication_fence.as_ref() {
+        Some(fence) => {
+            // The control worker's oneshot can be delivered after a handover.
+            // Carry the offer's identity through admission instead of adopting
+            // the replacement network/session when this receiver is polled.
+            if !fence.is_current().await {
+                return;
+            }
+            fence.lifecycle()
+        }
+        None => {
+            let Some(session) = peers.peer_session_generation_sync(&peer_id) else {
+                return;
+            };
+            (peers.current_network_generation_sync(), session)
+        }
     };
     // A peer that is already Direct must not schedule a synchronized punch
     // session at all: the fresh-mapping measurement, the candidate sweep and
@@ -105,7 +121,10 @@ async fn spawn_hole_punch_task_with_lifecycle(
         debug!("Skipping UDP punch for {peer_id}; Direct path is already confirmed");
         return;
     }
-    if punch_invocation_is_cancelled(invocation_shutdown_rx.as_ref()) {
+    if punch_invocation_is_cancelled(invocation_shutdown_rx.as_ref())
+        || peers.current_network_generation_sync() != network_generation
+        || !peers.peer_session_is_current_sync(&peer_id, peer_session_generation)
+    {
         return;
     }
     // Hard↔Hard is a planner-gated replacement for the ordinary first punch
@@ -140,6 +159,7 @@ async fn spawn_hole_punch_task_with_lifecycle(
                     peer_id.clone(),
                     signal,
                     invocation_shutdown_rx.clone(),
+                    Some((network_generation, peer_session_generation)),
                 )
                 .await;
                 if hard_hard_start.is_handled() {
@@ -216,6 +236,11 @@ async fn spawn_hole_punch_task_with_lifecycle(
     // traversal plan per (peer_id, generation, epoch) with shared hard
     // budgets.  A trigger inside the current epoch can never spawn a parallel
     // session; it only updates the newest-wins pending target.
+    if peers.current_network_generation_sync() != network_generation
+        || !peers.peer_session_is_current_sync(&peer_id, peer_session_generation)
+    {
+        return;
+    }
     let RecoveryAdmission::Accepted { epoch } = peers.recovery_epoch_admit(&peer_id).await else {
         peers
             .record_direct_event(
@@ -253,7 +278,11 @@ async fn spawn_hole_punch_task_with_lifecycle(
     if punch_invocation_is_cancelled(invocation_shutdown_rx.as_ref()) {
         return;
     }
-    let network_generation = peers.current_network_generation().await;
+    if let Some(fence) = publication_fence.as_ref() {
+        if !fence.is_current().await {
+            return;
+        }
+    }
     let Some(claimed) = punch_deduplicator
         .claim_for_epoch_with_rendezvous_for_peer_session(
             &peers,
@@ -340,7 +369,9 @@ async fn spawn_hole_punch_task_with_lifecycle(
     let invocation_cancellation = session.cancellation_handle();
     tokio::spawn(async move {
         let worker = async move {
-            if !peers.peer_session_is_current_sync(&peer_id, peer_session_generation) {
+            if peers.current_network_generation_sync() != network_generation
+                || !peers.peer_session_is_current_sync(&peer_id, peer_session_generation)
+            {
                 return;
             }
             peers

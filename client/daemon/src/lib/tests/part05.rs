@@ -27,6 +27,8 @@ async fn dual_end_direct_validation_converges_without_tun_or_user_traffic() {
     ));
     peers_a
         .add_peer(&control::PeerInfo {
+            capabilities: crate::control::PeerCapabilities::default(),
+            registration_seq: 0,
             node_id: "node-b".to_string(),
             device_name: String::new(),
             app_version: String::new(),
@@ -41,6 +43,8 @@ async fn dual_end_direct_validation_converges_without_tun_or_user_traffic() {
         .await;
     peers_b
         .add_peer(&control::PeerInfo {
+            capabilities: crate::control::PeerCapabilities::default(),
+            registration_seq: 0,
             node_id: "node-a".to_string(),
             device_name: String::new(),
             app_version: String::new(),
@@ -218,6 +222,8 @@ async fn same_class_endpoint_churn_preserves_delayed_validation_ack() {
     ));
     peers_a
         .add_peer(&control::PeerInfo {
+            capabilities: crate::control::PeerCapabilities::default(),
+            registration_seq: 0,
             node_id: "node-b".to_string(),
             device_name: String::new(),
             app_version: String::new(),
@@ -232,6 +238,8 @@ async fn same_class_endpoint_churn_preserves_delayed_validation_ack() {
         .await;
     peers_b
         .add_peer(&control::PeerInfo {
+            capabilities: crate::control::PeerCapabilities::default(),
+            registration_seq: 0,
             node_id: "node-a".to_string(),
             device_name: String::new(),
             app_version: String::new(),
@@ -413,6 +421,8 @@ async fn matched_ack_fires_validation_trigger_and_both_sides_converge() {
     ));
     peers_a
         .add_peer(&control::PeerInfo {
+            capabilities: crate::control::PeerCapabilities::default(),
+            registration_seq: 0,
             node_id: "node-b".to_string(),
             device_name: String::new(),
             app_version: String::new(),
@@ -427,6 +437,8 @@ async fn matched_ack_fires_validation_trigger_and_both_sides_converge() {
         .await;
     peers_b
         .add_peer(&control::PeerInfo {
+            capabilities: crate::control::PeerCapabilities::default(),
+            registration_seq: 0,
             node_id: "node-a".to_string(),
             device_name: String::new(),
             app_version: String::new(),
@@ -596,6 +608,8 @@ async fn responder_promotes_on_request_with_different_local_generation() {
     ));
     peers_a
         .add_peer(&control::PeerInfo {
+            capabilities: crate::control::PeerCapabilities::default(),
+            registration_seq: 0,
             node_id: "node-b".to_string(),
             device_name: String::new(),
             app_version: String::new(),
@@ -610,6 +624,8 @@ async fn responder_promotes_on_request_with_different_local_generation() {
         .await;
     peers_b
         .add_peer(&control::PeerInfo {
+            capabilities: crate::control::PeerCapabilities::default(),
+            registration_seq: 0,
             node_id: "node-a".to_string(),
             device_name: String::new(),
             app_version: String::new(),
@@ -726,6 +742,8 @@ async fn peer_reflexive_ingress_drops_observation_for_direct_peer() {
     ));
     peers
         .add_peer(&control::PeerInfo {
+            capabilities: crate::control::PeerCapabilities::default(),
+            registration_seq: 0,
             node_id: "node-b".to_string(),
             device_name: String::new(),
             app_version: String::new(),
@@ -806,6 +824,8 @@ async fn peer_reflexive_worker_rechecks_direct_before_http_and_fast_punch() {
     ));
     peers
         .add_peer(&control::PeerInfo {
+            capabilities: crate::control::PeerCapabilities::default(),
+            registration_seq: 0,
             node_id: "node-b".to_string(),
             device_name: String::new(),
             app_version: String::new(),
@@ -880,6 +900,8 @@ async fn peer_reflexive_signal_worker_fast_punches_a_non_direct_peer() {
     ));
     peers
         .add_peer(&control::PeerInfo {
+            capabilities: crate::control::PeerCapabilities::default(),
+            registration_seq: 0,
             node_id: "node-b".to_string(),
             device_name: String::new(),
             app_version: String::new(),
@@ -933,6 +955,8 @@ async fn peer_reflexive_fast_punch_does_not_block_endpoint_signal_on_ack_grace()
     ));
     peers
         .add_peer(&control::PeerInfo {
+            capabilities: crate::control::PeerCapabilities::default(),
+            registration_seq: 0,
             node_id: "node-b".to_string(),
             device_name: String::new(),
             app_version: String::new(),
@@ -984,6 +1008,8 @@ async fn peer_reflexive_micro_window_is_deduplicated_bounded_and_records_actual_
     let endpoint = receiver.local_addr().unwrap();
     peers
         .add_peer(&control::PeerInfo {
+            capabilities: crate::control::PeerCapabilities::default(),
+            registration_seq: 0,
             node_id: "node-b".to_string(),
             device_name: String::new(),
             // Avoid a legacy compatibility copy: this test's cap is the
@@ -1090,6 +1116,8 @@ async fn post_direct_inbound_punch_and_matched_ack_create_no_new_traversal_work(
     ));
     peers_a
         .add_peer(&control::PeerInfo {
+            capabilities: crate::control::PeerCapabilities::default(),
+            registration_seq: 0,
             node_id: "node-b".to_string(),
             device_name: String::new(),
             app_version: String::new(),
@@ -1104,6 +1132,8 @@ async fn post_direct_inbound_punch_and_matched_ack_create_no_new_traversal_work(
         .await;
     peers_b
         .add_peer(&control::PeerInfo {
+            capabilities: crate::control::PeerCapabilities::default(),
+            registration_seq: 0,
             node_id: "node-a".to_string(),
             device_name: String::new(),
             app_version: String::new(),
@@ -1317,6 +1347,8 @@ async fn stale_validation_ack_cannot_confirm_a_new_generation() {
     ));
     peers
         .add_peer(&control::PeerInfo {
+            capabilities: crate::control::PeerCapabilities::default(),
+            registration_seq: 0,
             node_id: "node-b".to_string(),
             device_name: String::new(),
             app_version: String::new(),
@@ -1373,6 +1405,8 @@ async fn stale_sender_identity_fresh_signal_never_enters_new_high_water() {
     daemon
         .peers
         .add_peer(&control::PeerInfo {
+            capabilities: crate::control::PeerCapabilities::default(),
+            registration_seq: 0,
             node_id: "node-b".to_string(),
             device_name: String::new(),
             app_version: String::new(),
@@ -1490,6 +1524,8 @@ async fn offline_peer_first_offer_deferred_and_not_rejected_as_stale_identity() 
     daemon
         .peers
         .add_peer(&control::PeerInfo {
+            capabilities: crate::control::PeerCapabilities::default(),
+            registration_seq: 0,
             node_id: "node-offline".to_string(),
             device_name: String::new(),
             app_version: String::new(),
@@ -1592,6 +1628,8 @@ async fn initiator_handshake_bounded_retransmission_fires_and_stops_on_answer() 
         }
     };
     let peer_info = control::PeerInfo {
+        capabilities: crate::control::PeerCapabilities::default(),
+        registration_seq: 0,
         node_id: "node-retransmit".to_string(),
         device_name: String::new(),
         app_version: String::new(),
@@ -1722,6 +1760,8 @@ async fn maintenance_rebuild_handshake_bounded_retransmission_fires_and_stops_on
         }
     };
     let peer_info = control::PeerInfo {
+        capabilities: crate::control::PeerCapabilities::default(),
+        registration_seq: 0,
         node_id: "node-rebuild".to_string(),
         device_name: String::new(),
         app_version: String::new(),
@@ -1864,6 +1904,8 @@ async fn maintenance_rekey_handshake_bounded_retransmission_survives_existing_se
         }
     };
     let peer_info = control::PeerInfo {
+        capabilities: crate::control::PeerCapabilities::default(),
+        registration_seq: 0,
         node_id: "node-rekey".to_string(),
         device_name: String::new(),
         app_version: String::new(),
@@ -1966,6 +2008,8 @@ async fn direct_validation_registry_single_flight_merges_newest_endpoint() {
     for (node_id, virtual_ip) in [("node-b", "10.20.0.2"), ("node-c", "10.20.0.3")] {
         peers
             .add_peer(&control::PeerInfo {
+                capabilities: crate::control::PeerCapabilities::default(),
+                registration_seq: 0,
                 node_id: node_id.to_string(),
                 device_name: String::new(),
                 app_version: String::new(),
@@ -2128,6 +2172,8 @@ async fn finishing_direct_validation_session_cancels_worker_receiver() {
     ));
     peers
         .add_peer(&control::PeerInfo {
+            capabilities: crate::control::PeerCapabilities::default(),
+            registration_seq: 0,
             node_id: "node-b".to_string(),
             device_name: String::new(),
             app_version: String::new(),
@@ -2183,6 +2229,8 @@ async fn slow_relay_validation_cooldown_blocks_replacement_until_generation_chan
     ));
     peers
         .add_peer(&control::PeerInfo {
+            capabilities: crate::control::PeerCapabilities::default(),
+            registration_seq: 0,
             node_id: "node-b".to_string(),
             device_name: String::new(),
             app_version: String::new(),
@@ -2254,6 +2302,8 @@ async fn direct_validation_owner_cleanup_cannot_remove_newer_expectation() {
     ));
     peers
         .add_peer(&control::PeerInfo {
+            capabilities: crate::control::PeerCapabilities::default(),
+            registration_seq: 0,
             node_id: "node-b".to_string(),
             device_name: String::new(),
             app_version: String::new(),
@@ -2338,6 +2388,8 @@ async fn network_generation_advance_cancels_old_validation_registry_owner() {
     ));
     peers
         .add_peer(&control::PeerInfo {
+            capabilities: crate::control::PeerCapabilities::default(),
+            registration_seq: 0,
             node_id: "node-b".to_string(),
             device_name: String::new(),
             app_version: String::new(),
@@ -2422,6 +2474,8 @@ async fn direct_validation_ingress_preserves_non_public_over_public_churn() {
     ));
     peers
         .add_peer(&control::PeerInfo {
+            capabilities: crate::control::PeerCapabilities::default(),
+            registration_seq: 0,
             node_id: "node-b".to_string(),
             device_name: String::new(),
             app_version: String::new(),
@@ -2465,12 +2519,53 @@ async fn direct_validation_ingress_preserves_non_public_over_public_churn() {
 }
 
 #[tokio::test]
+async fn direct_validation_ingress_reports_coalescing_and_backpressure_without_attempts() {
+    use crate::udp::DirectValidationAdmission;
+    let ingress = DirectValidationIngress::new();
+    let endpoint = "203.0.113.8:40123".parse().unwrap();
+    for peer in 0..MAX_PENDING_DIRECT_VALIDATION_PEERS {
+        assert_eq!(
+            ingress.submit(PeerReflexiveObservation {
+                peer_id: format!("peer-{peer}"),
+                observed_endpoint: endpoint,
+            }),
+            DirectValidationAdmission::Queued
+        );
+    }
+    assert_eq!(
+        ingress.submit(PeerReflexiveObservation {
+            peer_id: "peer-0".into(),
+            observed_endpoint: endpoint,
+        }),
+        DirectValidationAdmission::Coalesced
+    );
+    assert_eq!(
+        ingress.submit(PeerReflexiveObservation {
+            peer_id: "overflow".into(),
+            observed_endpoint: endpoint,
+        }),
+        DirectValidationAdmission::Backpressured
+    );
+    assert_eq!(ingress.pending_len(), MAX_PENDING_DIRECT_VALIDATION_PEERS);
+    ingress.next().await;
+    assert_eq!(
+        ingress.submit(PeerReflexiveObservation {
+            peer_id: "overflow".into(),
+            observed_endpoint: endpoint,
+        }),
+        DirectValidationAdmission::Queued
+    );
+}
+
+#[tokio::test]
 async fn direct_validation_ingress_does_not_prefer_off_link_private_over_public() {
     let peers = Arc::new(PeerManager::new(
         Config::generate_default("https://ctrl.test", "net1").unwrap(),
     ));
     peers
         .add_peer(&control::PeerInfo {
+            capabilities: crate::control::PeerCapabilities::default(),
+            registration_seq: 0,
             node_id: "node-b".to_string(),
             device_name: String::new(),
             app_version: String::new(),
@@ -2557,6 +2652,8 @@ async fn direct_validation_scheduler_enforces_global_worker_cap() {
     for (node_id, virtual_ip) in [("node-b", "10.20.0.2"), ("node-c", "10.20.0.3")] {
         peers
             .add_peer(&control::PeerInfo {
+                capabilities: crate::control::PeerCapabilities::default(),
+                registration_seq: 0,
                 node_id: node_id.to_string(),
                 device_name: String::new(),
                 app_version: String::new(),
@@ -2645,6 +2742,8 @@ async fn direct_validation_worker_cap_survives_udp_transport_replacement() {
     ));
     old_peers
         .add_peer(&control::PeerInfo {
+            capabilities: crate::control::PeerCapabilities::default(),
+            registration_seq: 0,
             node_id: "node-old".to_string(),
             device_name: String::new(),
             app_version: String::new(),
@@ -2662,6 +2761,8 @@ async fn direct_validation_worker_cap_survives_udp_transport_replacement() {
     ));
     replacement_peers
         .add_peer(&control::PeerInfo {
+            capabilities: crate::control::PeerCapabilities::default(),
+            registration_seq: 0,
             node_id: "node-new".to_string(),
             device_name: String::new(),
             app_version: String::new(),
@@ -2812,6 +2913,8 @@ async fn direct_validation_scheduler_merges_queued_endpoint_and_starts_after_per
     for (node_id, virtual_ip) in [("node-b", "10.20.0.2"), ("node-c", "10.20.0.3")] {
         peers
             .add_peer(&control::PeerInfo {
+                capabilities: crate::control::PeerCapabilities::default(),
+                registration_seq: 0,
                 node_id: node_id.to_string(),
                 device_name: String::new(),
                 app_version: String::new(),
@@ -3152,6 +3255,8 @@ async fn withdrawn_validation_registry_rejects_late_scheduler_observation() {
     ));
     peers
         .add_peer(&control::PeerInfo {
+            capabilities: crate::control::PeerCapabilities::default(),
+            registration_seq: 0,
             node_id: "node-b".to_string(),
             device_name: String::new(),
             app_version: String::new(),

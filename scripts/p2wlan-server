@@ -28,7 +28,8 @@ Usage:
   sudo p2wlan-server rollback [--version VERSION]
   sudo p2wlan-server logs [--service control|relay]
 
-The manager never overwrites CONFIG_DIR or DATA_DIR during an update.
+Updates preserve existing configuration and data. A missing log upload path
+is filled with the private managed data directory; custom paths are preserved.
 Set P2WLAN_SERVER_ROOT, P2WLAN_SERVER_CONFIG, or P2WLAN_SERVER_DATA to use
 an isolated staging installation.
 EOF
@@ -96,6 +97,252 @@ env_value() {
   local key=$2
   [ -f "$file" ] || return 0
   awk -F= -v key="$key" '$1 == key { value=$0; sub(/^[^=]*=/, "", value); print value; exit }' "$file"
+}
+
+# Keep this narrow filesystem transaction embedded in the released manager:
+# updates must not fetch an unversioned helper or follow links while root.
+support_log_storage() {
+  local action=$1
+  command -v python3 >/dev/null 2>&1 || { echo 'support_log_storage_python3_required' >&2; return 1; }
+  python3 - "$action" "$CONFIG_DIR" "$DATA_DIR" <<'PY_SUPPORT_LOG_STORAGE'
+import errno
+import fcntl
+import os
+import pwd
+import re
+import shlex
+import signal
+import stat
+import sys
+
+
+class StorageError(Exception):
+    pass
+
+
+def directory_fd(path, uid):
+    if not os.path.isabs(path) or any(c in path for c in '\r\n\x00'):
+        raise StorageError('absolute_path_required')
+    parts = path.split('/')[1:]
+    if any(part in ('.', '..') for part in parts):
+        raise StorageError('unsafe_path')
+    fd = os.open('/', os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    try:
+        for part in filter(None, parts):
+            child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=fd)
+            os.close(fd)
+            fd = child
+            info = os.fstat(fd)
+            if info.st_uid not in (0, uid):
+                raise StorageError('foreign_directory_owner')
+            if info.st_mode & 0o022 and not (info.st_uid == 0 and info.st_mode & stat.S_ISVTX):
+                raise StorageError('unsafe_parent_permissions')
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def environment_assignments(content):
+    # EnvironmentFile allows quoted multiline values and backslash continuation.
+    # This migration supports only complete, single-line assignments. Validate
+    # every variable before interpreting LOG_UPLOAD_DIR: an apparent assignment
+    # inside another variable's multiline value must never override a real one.
+    assignments = []
+    for physical_line in content.decode('utf-8').split('\n'):
+        line = physical_line.strip(' \t\r')
+        if not line:
+            continue
+        if line.startswith(('#', ';')):
+            # Older systemd versions continue comments after a backslash and
+            # can swallow an apparent assignment on the following line.
+            if (len(line) - len(line.rstrip('\\'))) % 2:
+                raise StorageError('unsupported_environment_syntax')
+            continue
+        assignment = re.fullmatch(r'([A-Za-z_][A-Za-z0-9_]*)[ \t]*=(.*)', line)
+        if assignment is None:
+            raise StorageError('unsupported_environment_syntax')
+        name, value = assignment.groups()
+        value = value.strip(' \t\r')
+        if value.startswith(('"', "'")):
+            quote, escaped, closing = value[0], False, None
+            for index, character in enumerate(value[1:], 1):
+                if escaped:
+                    escaped = False
+                elif quote == '"' and character == '\\':
+                    escaped = True
+                elif character == quote:
+                    closing = index
+                    break
+            if closing is None or value[closing + 1:].strip(' \t\r'):
+                raise StorageError('unsupported_environment_syntax')
+        elif (len(value) - len(value.rstrip('\\'))) % 2:
+            raise StorageError('unsupported_environment_syntax')
+        # Quotes within an unquoted value are literal EnvironmentFile content,
+        # including the JSON emitted by p2wlan-config; they do not open a block.
+        assignments.append((name, value))
+    return assignments
+
+
+def configured_path(content, strict=True):
+    # Last assignment wins, as with systemd EnvironmentFile. Never evaluate it.
+    values = [value for name, value in environment_assignments(content) if name == 'LOG_UPLOAD_DIR']
+    if not values:
+        return None
+    raw = values[-1]
+    if raw in ('', "''", '""'):
+        return None
+    if raw.startswith(('"', "'")):
+        try:
+            parsed = shlex.split(raw, comments=False)
+            if len(parsed) == 1:
+                return parsed[0].strip() or None
+        except ValueError:
+            pass
+        if strict:
+            raise StorageError('unsupported_path_syntax')
+        return raw
+    if '\\' in raw:
+        if strict:
+            raise StorageError('unsupported_path_syntax')
+        return raw
+    return raw
+
+
+def file_identity(info):
+    return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns,
+            info.st_ctime_ns, info.st_uid, info.st_gid, info.st_mode, info.st_nlink)
+
+
+def current_config(parent, fd, initial, content):
+    current = os.stat('control.env', dir_fd=parent, follow_symlinks=False)
+    if file_identity(current) != file_identity(initial) or file_identity(os.fstat(fd)) != file_identity(initial):
+        raise StorageError('configuration_changed')
+    if os.pread(fd, len(content) + 1, 0) != content:
+        raise StorageError('configuration_changed')
+
+
+def managed_directory(data_dir, uid, gid):
+    parent = directory_fd(data_dir, uid)
+    leaf = None
+    try:
+        try:
+            os.mkdir('log-uploads', 0o700, dir_fd=parent)
+        except FileExistsError:
+            pass
+        leaf = os.open('log-uploads', os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=parent)
+        info = os.fstat(leaf)
+        if info.st_uid not in (0, uid):
+            raise StorageError('foreign_storage_owner')
+        if (info.st_uid, info.st_gid) != (uid, gid):
+            os.fchown(leaf, uid, gid)
+        os.fchmod(leaf, 0o700)
+        named = os.stat('log-uploads', dir_fd=parent, follow_symlinks=False)
+        if (named.st_dev, named.st_ino) != (info.st_dev, info.st_ino):
+            raise StorageError('storage_directory_changed')
+        os.fsync(parent)
+    finally:
+        if leaf is not None:
+            os.close(leaf)
+        os.close(parent)
+
+
+def check_directory(path, uid, gid):
+    fd = directory_fd(path, uid)
+    try:
+        info = os.fstat(fd)
+        if info.st_uid != uid or stat.S_IMODE(info.st_mode) & 0o077:
+            raise StorageError('storage_not_private_service_directory')
+        if os.fstatvfs(fd).f_flag & os.ST_RDONLY:
+            raise StorageError('storage_read_only')
+    finally:
+        os.close(fd)
+    # This child process changes credentials, never the manager or the service.
+    if os.geteuid() == 0:
+        os.setgroups([])
+        os.setgid(gid)
+        os.setuid(uid)
+    elif (os.geteuid(), os.getegid()) != (uid, gid):
+        raise StorageError('service_identity_unavailable')
+    if not os.access(path, os.W_OK | os.X_OK):
+        raise StorageError('storage_not_writable')
+
+
+def maintain_storage(action, config_dir, data_dir, uid, gid):
+    if action not in ('prepare', 'check'):
+        raise StorageError('invalid_action')
+    parent = directory_fd(config_dir, uid)
+    fd = None
+    try:
+        flags = os.O_RDWR | os.O_APPEND if action == 'prepare' else os.O_RDONLY
+        fd = os.open('control.env', flags | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=parent)
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_uid not in (0, uid) or info.st_mode & 0o022:
+            raise StorageError('unsafe_configuration_file')
+        fcntl.flock(fd, (fcntl.LOCK_EX if action == 'prepare' else fcntl.LOCK_SH) | fcntl.LOCK_NB)
+        content = os.pread(fd, (1 << 20) + 1, 0)
+        if len(content) > 1 << 20:
+            raise StorageError('configuration_too_large')
+        configured = configured_path(content, strict=action == 'check')
+        default = os.path.join(data_dir, 'log-uploads')
+        if action == 'check':
+            if configured is None:
+                raise StorageError('configuration_missing')
+            current_config(parent, fd, info, content)
+        else:
+            if configured is not None and configured != default:
+                return 'custom_path_preserved'
+            managed_directory(data_dir, uid, gid)
+            current_config(parent, fd, info, content)
+            if configured is None:
+                escaped = default.replace('\\', '\\\\').replace('"', '\\"')
+                addition = (('' if not content or content.endswith(b'\n') else '\n') + 'LOG_UPLOAD_DIR="' + escaped + '"\n').encode('utf-8')
+                if os.write(fd, addition) != len(addition):
+                    os.ftruncate(fd, len(content))
+                    raise StorageError('configuration_short_write')
+                os.fsync(fd)
+            return 'managed_path_ready'
+    finally:
+        if fd is not None:
+            os.close(fd)
+        os.close(parent)
+    check_directory(configured, uid, gid)
+    return 'host_permissions_ready'
+
+
+def deadline_expired(*_):
+    raise StorageError('deadline_exceeded')
+
+
+def main():
+    signal.signal(signal.SIGALRM, deadline_expired)
+    signal.alarm(10)
+    try:
+        if os.geteuid() != 0:
+            raise StorageError('root_required')
+        account = pwd.getpwnam('p2wlan')
+        if account.pw_uid == 0:
+            raise StorageError('nonroot_service_identity_required')
+        result = maintain_storage(sys.argv[1], sys.argv[2], sys.argv[3], account.pw_uid, account.pw_gid)
+        print('support_log_storage_' + result)
+    except (StorageError, OSError, KeyError, UnicodeError, ValueError) as error:
+        reason = str(error) if isinstance(error, StorageError) else errno.errorcode.get(getattr(error, 'errno', None), 'invalid_configuration')
+        print('support_log_storage_' + reason, file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())
+PY_SUPPORT_LOG_STORAGE
+}
+
+prepare_managed_support_storage() {
+  local selected=${1:-all}
+  [ "$selected" != relay ] || return 0
+  # Relay-only installations may have no Control configuration at all.
+  if [ ! -e "$CONFIG_DIR/control.env" ] && [ ! -L "$CONFIG_DIR/control.env" ]; then return 0; fi
+  support_log_storage prepare || die "support log storage preparation failed; current release was not changed"
 }
 
 verify_server() {
@@ -222,6 +469,7 @@ init_server() {
     printf '%s\n' "# Configure TLS, keyring, audience, region and revocation feed before starting; see docs/guides/self-hosting.md" "RELAY_BIND=:18081" "RELAY_REQUIRE_AUTH=true" "RELAY_METRICS_BIND=127.0.0.1:18082" >> "$CONFIG_DIR/relay.env"
   fi
   chown -R p2wlan:p2wlan "$CONFIG_DIR" "$DATA_DIR"
+  prepare_managed_support_storage "$role"
   case "$role" in
     control) install_unit p2wlan-control.service p2wlan-control "$CONFIG_DIR/control.env" ;;
     relay) install_unit p2wlan-relay.service p2wlan-relay "$CONFIG_DIR/relay.env" ;;
@@ -339,6 +587,12 @@ doctor_server() {
   fi
 
   if [ "$check_control" -eq 1 ]; then
+    if support_log_storage check; then
+      doctor_line PASS "support log path is private and writable by p2wlan on the host"
+    else
+      doctor_line FAIL "support log storage configuration or host permissions failed; inspect LOG_UPLOAD_DIR without printing credentials"
+      failures=$((failures + 1))
+    fi
     local admin_token
     admin_token=$(env_value "$CONFIG_DIR/control.env" CONTROL_ADMIN_TOKEN)
     if [ -z "$admin_token" ]; then
@@ -440,6 +694,7 @@ archive_install() {
   for required in p2wlan-control p2wlan-relay p2wlan-config p2wlan-db p2wlan-server install-server.sh deploy-server.sh; do
     [ -x "$stage/$required" ] || die "archive is missing required member: $required"
   done
+  prepare_managed_support_storage "${selected:-all}"
   if [ -d "$RELEASE_DIR/$version" ]; then
     if cmp -s "$stage/p2wlan-control" "$RELEASE_DIR/$version/p2wlan-control" &&
       cmp -s "$stage/p2wlan-relay" "$RELEASE_DIR/$version/p2wlan-relay"; then

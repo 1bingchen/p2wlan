@@ -27,6 +27,8 @@ mod tests {
     use crate::udp::UdpTransport;
     use tokio::time::{sleep, timeout};
 
+    include!("tests/direct_validation_contention.rs");
+
     #[test]
     fn first_usable_evidence_requires_a_decrypted_overlay_ip_packet() {
         assert!(!is_real_overlay_business_packet(&[]));
@@ -286,6 +288,8 @@ mod tests {
             ));
             peers
                 .add_peer(&PeerInfo {
+                    capabilities: crate::control::PeerCapabilities::default(),
+                    registration_seq: 0,
                     node_id: peer_id.to_string(),
                     public_key: hex::encode(NodeIdentity::generate().public_key()),
                     virtual_ip: "10.20.0.2".to_string(),
@@ -1137,6 +1141,8 @@ mod tests {
         ));
         peers
             .add_peer(&PeerInfo {
+                capabilities: crate::control::PeerCapabilities::default(),
+                registration_seq: 0,
                 node_id: "peer-a".to_string(),
                 virtual_ip: "10.20.0.2".to_string(),
                 online: true,
@@ -2050,6 +2056,8 @@ mod tests {
         let probe_identity = NodeIdentity::generate();
         peers
             .add_peer(&PeerInfo {
+                capabilities: crate::control::PeerCapabilities::default(),
+                registration_seq: 0,
                 node_id: "peer-a".to_string(),
                 public_key: hex::encode(probe_identity.public_key()),
                 virtual_ip: "10.20.0.1".to_string(),
@@ -2161,6 +2169,8 @@ mod tests {
         }));
         local_peers
             .add_peer(&PeerInfo {
+                capabilities: crate::control::PeerCapabilities::default(),
+                registration_seq: 0,
                 node_id: peer_id.to_string(),
                 public_key: hex::encode(NodeIdentity::generate().public_key()),
                 virtual_ip: "10.20.0.2".to_string(),
@@ -2176,6 +2186,8 @@ mod tests {
         }));
         remote_peers
             .add_peer(&PeerInfo {
+                capabilities: crate::control::PeerCapabilities::default(),
+                registration_seq: 0,
                 node_id: local_node_id.to_string(),
                 public_key: hex::encode(NodeIdentity::generate().public_key()),
                 virtual_ip: "10.20.0.1".to_string(),
@@ -2789,6 +2801,8 @@ mod tests {
         }));
         peers
             .add_peer(&PeerInfo {
+                capabilities: crate::control::PeerCapabilities::default(),
+                registration_seq: 0,
                 node_id: "peer-a".to_string(),
                 virtual_ip: "10.20.0.1".to_string(),
                 online: true,
@@ -2863,6 +2877,8 @@ mod tests {
         ));
         peers
             .add_peer(&PeerInfo {
+                capabilities: crate::control::PeerCapabilities::default(),
+                registration_seq: 0,
                 node_id: "peer-a".to_string(),
                 virtual_ip: "10.20.0.1".to_string(),
                 online: true,
@@ -2978,6 +2994,8 @@ mod tests {
         ));
         peers
             .add_peer(&PeerInfo {
+                capabilities: crate::control::PeerCapabilities::default(),
+                registration_seq: 0,
                 node_id: "peer-a".to_string(),
                 virtual_ip: "10.20.0.1".to_string(),
                 online: true,
@@ -3138,6 +3156,8 @@ mod tests {
         ));
         peers
             .add_peer(&PeerInfo {
+                capabilities: crate::control::PeerCapabilities::default(),
+                registration_seq: 0,
                 node_id: "peer-a".to_string(),
                 virtual_ip: "10.20.0.1".to_string(),
                 online: true,
@@ -3214,6 +3234,8 @@ mod tests {
         ));
         peers
             .add_peer(&PeerInfo {
+                capabilities: crate::control::PeerCapabilities::default(),
+                registration_seq: 0,
                 node_id: "peer-a".to_string(),
                 virtual_ip: "10.20.0.1".to_string(),
                 online: true,
@@ -3305,6 +3327,8 @@ mod tests {
         ));
         peers
             .add_peer(&PeerInfo {
+                capabilities: crate::control::PeerCapabilities::default(),
+                registration_seq: 0,
                 node_id: "peer-a".to_string(),
                 device_name: String::new(),
                 app_version: String::new(),
@@ -3431,6 +3455,8 @@ mod tests {
         ));
         peers
             .add_peer(&PeerInfo {
+                capabilities: crate::control::PeerCapabilities::default(),
+                registration_seq: 0,
                 node_id: "peer-a".to_string(),
                 device_name: String::new(),
                 app_version: String::new(),
@@ -3526,6 +3552,8 @@ mod tests {
         ));
         peers
             .add_peer(&PeerInfo {
+                capabilities: crate::control::PeerCapabilities::default(),
+                registration_seq: 0,
                 node_id: "peer-a".to_string(),
                 device_name: String::new(),
                 app_version: String::new(),
@@ -3631,6 +3659,8 @@ mod tests {
         let source: std::net::SocketAddr = "198.51.100.73:51820".parse().unwrap();
         peers
             .add_peer(&PeerInfo {
+                capabilities: crate::control::PeerCapabilities::default(),
+                registration_seq: 0,
                 node_id: "peer-a".to_string(),
                 virtual_ip: "10.20.0.2".to_string(),
                 endpoint: "198.51.100.72:51820".to_string(),
@@ -3770,6 +3800,8 @@ mod tests {
         ));
         peers
             .add_peer(&PeerInfo {
+                capabilities: crate::control::PeerCapabilities::default(),
+                registration_seq: 0,
                 node_id: "peer-a".to_string(),
                 virtual_ip: "10.20.0.2".to_string(),
                 online: true,
@@ -3819,6 +3851,7 @@ mod tests {
                 peers
                     .peer_session_generation_sync("peer-a")
                     .expect("peer lifecycle must be online"),
+                None,
                 token,
             )
             .await;
@@ -3871,6 +3904,8 @@ mod tests {
             Config::generate_default("https://ctrl.test", "net1").unwrap(),
         ));
         let old_info = PeerInfo {
+            capabilities: crate::control::PeerCapabilities::default(),
+            registration_seq: 0,
             node_id: "peer-a".to_string(),
             virtual_ip: "10.20.0.2".to_string(),
             endpoint: "198.51.100.70:51820".to_string(),
@@ -3933,6 +3968,7 @@ mod tests {
                         Some(0),
                         None,
                         old_peer_session_generation,
+                        None,
                         token,
                     )
                     .await;
@@ -3999,6 +4035,8 @@ mod tests {
         ));
         peers
             .add_peer(&PeerInfo {
+                capabilities: crate::control::PeerCapabilities::default(),
+                registration_seq: 0,
                 node_id: "peer-a".to_string(),
                 virtual_ip: "10.20.0.2".to_string(),
                 online: true,
@@ -4063,6 +4101,7 @@ mod tests {
                 peers
                     .peer_session_generation_sync("peer-a")
                     .expect("peer lifecycle must be online"),
+                None,
                 token,
             )
             .await;
@@ -4094,6 +4133,8 @@ mod tests {
         ));
         peers
             .add_peer(&PeerInfo {
+                capabilities: crate::control::PeerCapabilities::default(),
+                registration_seq: 0,
                 node_id: "peer-a".to_string(),
                 virtual_ip: "10.20.0.2".to_string(),
                 endpoint: "198.51.100.72:51820".to_string(),
@@ -4147,6 +4188,7 @@ mod tests {
                 peers
                     .peer_session_generation_sync("peer-a")
                     .expect("peer lifecycle must be online"),
+                None,
                 token,
             )
             .await;
@@ -4180,6 +4222,8 @@ mod tests {
         let observed_endpoint: std::net::SocketAddr = "198.51.100.44:46005".parse().unwrap();
         peers
             .add_peer(&PeerInfo {
+                capabilities: crate::control::PeerCapabilities::default(),
+                registration_seq: 0,
                 node_id: "peer-a".to_string(),
                 virtual_ip: "10.20.0.2".to_string(),
                 endpoint: request_endpoint.to_string(),
@@ -4316,6 +4360,8 @@ mod tests {
         ));
         peers
             .add_peer(&PeerInfo {
+                capabilities: crate::control::PeerCapabilities::default(),
+                registration_seq: 0,
                 node_id: "peer-a".to_string(),
                 virtual_ip: "10.20.0.2".to_string(),
                 online: true,
@@ -4452,6 +4498,8 @@ mod tests {
         ));
         peers
             .add_peer(&PeerInfo {
+                capabilities: crate::control::PeerCapabilities::default(),
+                registration_seq: 0,
                 node_id: "peer-a".to_string(),
                 virtual_ip: "10.20.0.2".to_string(),
                 online: true,

@@ -129,6 +129,33 @@ impl PeerManager {
         expected_remote_candidate_epoch: Option<u64>,
         validation_identity: Option<DirectValidationIdentity>,
     ) -> bool {
+        self.record_direct_success_with_commit_hooks(
+            _epoch_guard,
+            node_id,
+            endpoint,
+            generation,
+            local_endpoint,
+            validation_latency,
+            expected_remote_candidate_epoch,
+            validation_identity,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn record_direct_success_with_commit_hooks(
+        &self,
+        _epoch_guard: &tokio::sync::MutexGuard<'_, ()>,
+        node_id: &str,
+        endpoint: Option<SocketAddr>,
+        generation: u64,
+        local_endpoint: Option<SocketAddr>,
+        validation_latency: Option<Duration>,
+        expected_remote_candidate_epoch: Option<u64>,
+        validation_identity: Option<DirectValidationIdentity>,
+        mut hooks: Option<&mut (dyn DirectCommitHooks + Send)>,
+    ) -> bool {
         // The lock-free mirror is written while this very gate is held by a
         // generation advance.  Reading it here therefore cannot race an
         // advance between validation and mutation.
@@ -213,7 +240,13 @@ impl PeerManager {
             let was_direct = conn.state == ConnectionState::Direct;
             let previous_endpoint = conn.endpoint;
             let previous_generation = conn.direct_generation;
+            let direct_confirmation_changed = !was_direct
+                || previous_endpoint != selected_endpoint
+                || previous_generation != generation;
             let mut pair_success = None;
+            if hooks.as_ref().is_some_and(|hooks| !hooks.is_current()) {
+                return false;
+            }
             let outcome = conn.commit_path_transition(
                 PathEvent::DirectCommitted {
                     validation: validation_identity,
@@ -262,9 +295,6 @@ impl PeerManager {
                             )
                         }
                     });
-                    let direct_confirmation_changed = !was_direct
-                        || previous_endpoint != selected_endpoint
-                        || previous_generation != generation;
                     conn.direct_generation = generation;
                     if let Some(latency) = validation_latency {
                         conn.direct_health
@@ -275,22 +305,12 @@ impl PeerManager {
                     conn.clear_direct_reclaim_window();
                     self.publish_direct_commit_pair(
                         node_id,
-                        generation,
-                        conn.remote_candidate_epoch(),
+                        validation_identity.epoch,
                         local_endpoint,
+                        selected_endpoint_value,
                     );
-                    // Publish the Direct-set mirror before waking confirmation
-                    // waiters. The pair snapshot and the active-state bit must be
-                    // visible together; otherwise a waiter can wake on the sequence
-                    // bump between these two writes, observe a non-Direct peer, and
-                    // miss the only notification for this commit.
                     if direct_confirmation_changed {
-                        // The direct-commit sequence is bumped inside the SAME
-                        // network-epoch critical section as the state transition, so
-                        // an outbound punch loop that gates every UDP send on this
-                        // sequence can never miss a promotion that already committed.
                         conn.direct_commit_seq = conn.direct_commit_seq.wrapping_add(1);
-                        self.bump_direct_commit_seq(node_id);
                         conn.record_direct_event(
                             generation,
                             "direct_confirmed",
@@ -419,8 +439,20 @@ impl PeerManager {
                             }
                         }
                     }
+                    if let Some(hooks) = hooks.as_mut() { hooks.committed(); }
                 },
             );
+            // commit_path_transition publishes Direct/business mirrors after
+            // the side-effect closure. The exact UDP guards must span that
+            // publication, but never the registry awaits below.
+            if outcome.applies_side_effects() && direct_confirmation_changed {
+                // Wake only after the active-state and pair mirrors are visible.
+                // Candidate handovers advance this sequence without Direct proof.
+                self.bump_direct_commit_seq(node_id);
+            }
+            if let Some(hooks) = hooks.as_mut() {
+                hooks.finish();
+            }
             if !outcome.accepted() {
                 return false;
             }

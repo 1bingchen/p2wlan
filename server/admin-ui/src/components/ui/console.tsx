@@ -1,5 +1,4 @@
-import { useEffect, useId, useRef, type ButtonHTMLAttributes, type ReactNode } from 'react'
-import { X } from 'lucide-react'
+import { type ButtonHTMLAttributes, type ReactNode } from 'react'
 
 type PanelProps = {
   title?: string
@@ -133,88 +132,4 @@ export function EmptyState({
     <div><strong>{title}</strong>{description && <p>{description}</p>}</div>
     {action}
   </div>
-}
-
-export function Sheet({
-  title,
-  description,
-  onClose,
-  children,
-  width = 'wide',
-}: {
-  title: ReactNode
-  description?: ReactNode
-  onClose: () => void
-  children: ReactNode
-  width?: 'normal' | 'wide'
-}) {
-  const sheetRef = useRef<HTMLElement>(null)
-  const titleId = useId()
-
-  useEffect(() => {
-    const previousOverflow = document.body.style.overflow
-    const previousFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null
-    document.body.style.overflow = 'hidden'
-
-    const focusable = () => [...(sheetRef.current?.querySelectorAll<HTMLElement>(
-      'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
-    ) ?? [])]
-
-    const frame = window.requestAnimationFrame(() => {
-      focusable()[0]?.focus()
-    })
-
-    const handleKeyDown = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') {
-        event.preventDefault()
-        onClose()
-        return
-      }
-      if (event.key !== 'Tab') return
-
-      const items = focusable()
-      if (items.length === 0) {
-        event.preventDefault()
-        return
-      }
-
-      const first = items[0]
-      const last = items[items.length - 1]
-      if (event.shiftKey && document.activeElement === first) {
-        event.preventDefault()
-        last.focus()
-      } else if (!event.shiftKey && document.activeElement === last) {
-        event.preventDefault()
-        first.focus()
-      }
-    }
-
-    window.addEventListener('keydown', handleKeyDown)
-    return () => {
-      window.cancelAnimationFrame(frame)
-      document.body.style.overflow = previousOverflow
-      window.removeEventListener('keydown', handleKeyDown)
-      previousFocus?.focus()
-    }
-  }, [onClose])
-
-  return <>
-    <div className="console-sheet-backdrop" aria-hidden="true" onClick={onClose} />
-    <aside
-      ref={sheetRef}
-      className={`console-sheet ${width}`}
-      role="dialog"
-      aria-modal="true"
-      aria-labelledby={titleId}
-    >
-      <header className="console-sheet-header">
-        <div>
-          <h2 id={titleId}>{title}</h2>
-          {description && <p>{description}</p>}
-        </div>
-        <IconButton label="关闭详情" icon={<X size={17} />} onClick={onClose} />
-      </header>
-      <div className="console-sheet-body">{children}</div>
-    </aside>
-  </>
 }

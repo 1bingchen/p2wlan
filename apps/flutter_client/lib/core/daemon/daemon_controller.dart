@@ -14,6 +14,7 @@ import '../platform/android_platform.dart';
 import '../security/redactor.dart';
 import 'diagnostics_auth.dart';
 import 'runtime_identity.dart';
+import 'windows_process.dart';
 import '../rooms/room_api.dart';
 import '../rooms/room_profiles.dart';
 import '../rooms/route_inventory.dart';
@@ -22,6 +23,7 @@ part 'daemon_controller/process_control.dart';
 part 'daemon_controller/elevation.dart';
 part 'daemon_controller/diagnostics_paths.dart';
 part 'daemon_controller/launch_token.dart';
+part 'daemon_controller/runtime_permissions.dart';
 part 'daemon_controller/pids.dart';
 part 'daemon_controller/android_vpn.dart';
 part 'daemon_controller/startup_trace.dart';
@@ -201,6 +203,9 @@ class DaemonController {
   DateTime? _lastLaunchExitProbeAt;
   bool? _lastLaunchExitProbeResult;
   DaemonBuildInfo? _lastDaemonBuildInfo;
+  WindowsStartupTrace? _startupTrace;
+
+  List<String> get lastStartupTrace => _startupTrace?.entries ?? const [];
 
   ClientBuildInfo get clientBuildInfo => ClientBuildInfo.current;
 
@@ -264,8 +269,11 @@ class DaemonController {
     }
     if (Platform.isAndroid) return _startAndroidVpn(settings);
     _lastDaemonBuildInfo = null;
-    final startupTrace = Platform.isWindows
-        ? WindowsStartupTrace(_defaultLogDir())
+    final startupTrace = _startupTrace = _supportsProcessControl
+        ? WindowsStartupTrace(
+            _defaultLogDir(),
+            platform: Platform.operatingSystem,
+          )
         : null;
     if (startupTrace != null) {
       await startupTrace.open();
@@ -398,8 +406,19 @@ class DaemonController {
     // identically, which prevents a second fallback process from being
     // started after UAC succeeds.
     await startupTrace?.stageStart(5, 'runtime_acl');
+    String? macosLaunchPassword = settings.macosAdminPassword;
     try {
-      if (Platform.isWindows) await protectRuntimeDirectory(logDir);
+      if (Platform.isWindows) {
+        await protectRuntimeDirectory(logDir);
+      } else {
+        macosLaunchPassword = await _preparePosixRuntimeDirectories(
+          binary: binary,
+          config: configPath,
+          runtime: logDir,
+          allowElevation: requiresElevation,
+          password: macosLaunchPassword,
+        );
+      }
       await startupTrace?.stageOk(5, 'runtime_acl');
     } catch (error) {
       await _recordWindowsStartupError(
@@ -410,7 +429,9 @@ class DaemonController {
       return _startupFailure(
         startupTrace,
         stage: 5,
-        code: DaemonStartupFailureCode.aclFailure,
+        code: Platform.isWindows
+            ? DaemonStartupFailureCode.aclFailure
+            : _failureCodeForError(error),
         message: _startFailureMessage(error),
       );
     }
@@ -540,11 +561,10 @@ class DaemonController {
           await _restrictLaunchPath(configPath.path);
         }
       }
-      // Keep the current log and one previous startup log. macOS elevated
-      // launches rotate inside the sudo shell below so a root-owned log can
-      // be repaired before it is moved; all other desktop paths can rotate as
-      // the interactive user here.
-      if (!(Platform.isMacOS && requiresElevation)) {
+      // Runtime ownership is prepared before token creation. Rotate and
+      // pre-create logs as the interactive user, including macOS: the root
+      // shell must never truncate or follow a replaceable user log path.
+      {
         await rotateP2wlanLogFiles(File(logPath));
         // Pre-create and truncate as the interactive user. Elevated launches
         // must append to this file rather than creating an admin-owned file or
@@ -590,14 +610,7 @@ class DaemonController {
       );
     }
 
-    final elevatedShell = _buildElevatedShell(
-      binary: binary,
-      args: args,
-      configDir: configPath.parent,
-      logDir: logDir,
-      logPath: logPath,
-      pidPath: pidPath,
-    );
+    final elevatedShell = _buildElevatedShell(binary: binary, args: args);
     // Managed launches include an auth token. Never expose a token-bearing
     // command in UI error messages or the clipboard.
     final manualCommand = useManualMode
@@ -612,15 +625,20 @@ class DaemonController {
     await startupTrace?.stageStart(8, 'uac');
     try {
       if (requiresElevation && Platform.isMacOS) {
-        await _startMacosElevated(
+        final launched = await _startMacosElevated(
           elevatedShell,
-          password: settings.macosAdminPassword,
+          password: macosLaunchPassword,
         );
+        launchPid = launched.childPid;
+        if (launchPid == null) {
+          throw StateError(
+            'PID marker was not returned by the macOS launcher.',
+          );
+        }
+        await _writePidMarker(pidPath, launchPid);
       } else if (requiresElevation && Platform.isWindows) {
         launchPid = await _startWindowsElevated(binary: binary, args: args);
-        await _writePidMarker(pidPath, launchPid);
         await startupTrace?.stageAccepted(8, 'uac');
-        await startupTrace?.childPid(launchPid);
       } else if (requiresElevation && Platform.isLinux) {
         await _startLinuxElevated(binary: binary, args: args);
         await startupTrace?.stageSkipped(8, 'uac');
@@ -632,23 +650,34 @@ class DaemonController {
         );
         launchPid = process.pid;
         if (Platform.isWindows) {
-          _launchedProcessId = launchPid;
-          if (!await _waitForWindowsChildIdentity(launchPid)) {
-            _launchedProcessId = null;
-            throw StateError(
-              'PID_MARKER_FAILED: Windows daemon PID did not resolve to p2wlan-daemon.',
-            );
-          }
-        }
-        await _writePidMarker(pidPath, launchPid);
-        if (Platform.isWindows) {
           await startupTrace?.stageSkipped(8, 'uac');
-          await startupTrace?.childPid(launchPid);
+        } else {
+          await _writePidMarker(pidPath, launchPid);
         }
+      }
+      if (Platform.isWindows && launchPid != null) {
+        // Capture the OS-returned PID before verification, including UAC
+        // launches. A failed handoff must retain it for verified cleanup.
+        _launchedProcessId = launchPid;
+        await startupTrace?.childPid(launchPid);
+        await _verifyWindowsChildIdentity(launchPid);
+        await _writePidMarker(pidPath, launchPid);
       }
     } catch (error) {
       // The launch itself failed: never leave the temporary credential file
       // behind.
+      if (error is _MacosElevationException) launchPid ??= error.childPid;
+      await _recordWindowsStartupError(startupTrace, 'launch ERROR', error);
+      final childFailure = error is _WindowsChildIdentityException
+          ? error.failure
+          : null;
+      // Exit is established by the OS. Existing startup-log classification
+      // may refine the explanation (for example Wintun or token access).
+      final logFailure =
+          childFailure?.code ==
+              DaemonStartupFailureCode.daemonExitedDuringStartup
+          ? await _startupLogFailure(logPath)
+          : null;
       try {
         await _cleanupFailedStartup(launchPid);
       } catch (_) {}
@@ -657,9 +686,15 @@ class DaemonController {
       } catch (_) {}
       return _startupFailure(
         startupTrace,
-        stage: Platform.isWindows ? 8 : 0,
-        code: _failureCodeForError(error),
-        message: _startFailureMessage(error),
+        stage: childFailure != null ? 10 : (Platform.isWindows ? 8 : 0),
+        code:
+            logFailure?.code ??
+            childFailure?.code ??
+            _failureCodeForError(error),
+        message:
+            logFailure?.message ??
+            childFailure?.message ??
+            _startFailureMessage(error),
         manualCommand: manualCommand,
       );
     }
@@ -871,7 +906,7 @@ class DaemonController {
     await trace?.failure(stage, code.value);
     return DaemonCommandResult(
       ok: false,
-      message: message,
+      message: '[startup] stage=$stage code=${code.value} $message',
       manualCommand: manualCommand,
       failureCode: code,
     );
@@ -901,14 +936,20 @@ class DaemonController {
     String prefix,
     Object error,
   ) async {
-    if (!Platform.isWindows) return;
+    if (trace == null) return;
     final detail = error is WindowsAclProtectionException
         ? error.diagnostic
         : 'error=${_sanitizeProbeOutput(error.toString())}';
-    await trace?.detail('$prefix $detail');
+    await trace.detail('$prefix $detail');
   }
 
   DaemonStartupFailureCode _failureCodeForError(Object error) {
+    if (error is PosixLaunchPathProtectionException ||
+        error is UnsafeLaunchPathException ||
+        error is RuntimeDirectoryRepairException ||
+        isPosixRuntimePermissionFailure(error)) {
+      return DaemonStartupFailureCode.aclFailure;
+    }
     if (Platform.isWindows) {
       return classifyWindowsLaunchFailure(error.toString()).code;
     }

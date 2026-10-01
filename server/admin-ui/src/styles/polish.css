@@ -1,0 +1,1100 @@
+/* Resource graph controls and spatial layout. Shared typography and density
+ * are owned by styles.css; theme.css owns appearance only. */
+
+:root {
+  --content-max: 1440px;
+}
+
+/* The first pass was visually too compressed for an operations console.
+ * Keep density, but do not make administrators read 8px table text. */
+.page-stack {
+  max-width: var(--content-max);
+}
+
+.data-table td {
+  height: var(--table-row-height);
+}
+
+/* Topology command bar. It deliberately stays small and neutral; account
+ * identity belongs to graph colors, not toolbar chrome. */
+.topology-canvas-actions {
+  position: absolute;
+  z-index: 9;
+  top: 12px;
+  right: 12px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  pointer-events: auto;
+}
+
+.topology-filter-button {
+  height: 32px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--text-3);
+  box-shadow: var(--shadow-overlay);
+  backdrop-filter: blur(8px);
+  font-weight: 650;
+  transition: border-color .14s ease, background .14s ease, color .14s ease, box-shadow .14s ease;
+}
+
+.topology-canvas-actions .topology-fullscreen-button {
+  position: static;
+  top: auto;
+  right: auto;
+  width: 32px;
+  height: 32px;
+  flex: 0 0 32px;
+  border-radius: 8px;
+}
+
+.topology-filter-button:hover {
+  border-color: var(--border-strong);
+  color: var(--text-2);
+  background: var(--surface);
+}
+
+.topology-filter-button.active {
+  border-color: var(--accent);
+  color: var(--accent);
+  background: var(--accent-soft);
+  box-shadow: var(--shadow-overlay);
+}
+
+/* A compact factual summary makes very large graphs readable before zooming. */
+.topology-summary {
+  position: absolute;
+  z-index: 7;
+  left: 12px;
+  bottom: 12px;
+  display: flex;
+  align-items: center;
+  gap: 0;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  background: var(--surface);
+  box-shadow: var(--shadow-overlay);
+  backdrop-filter: blur(8px);
+}
+
+.topology-summary span {
+  min-height: 32px;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 0 10px;
+  border-right: 1px solid var(--border);
+  color: var(--text-3);
+  white-space: nowrap;
+}
+
+.topology-summary span:last-child {
+  border-right: 0;
+}
+
+.topology-summary strong {
+  color: var(--text-2);
+}
+
+/* Hundreds of accounts should not turn the legend into a page-sized overlay. */
+.topology-account-legend-list {
+  max-height: min(230px, 32vh);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-width: thin;
+}
+
+.topology-account-legend-list .legend-row span:last-child {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.topology-legend {
+  max-height: min(390px, calc(100% - 96px));
+}
+
+/* React Flow controls live at bottom-left; move the summary far enough right
+ * so the two remain independently clickable. */
+.topology-canvas .react-flow__controls {
+  left: 12px !important;
+  bottom: 54px !important;
+}
+
+.topology-detail {
+  right: 12px;
+  top: 54px;
+  width: min(292px, calc(100% - 24px));
+}
+
+.topology-detail h3 {
+  max-width: 220px;
+}
+
+.topology-detail dl div {
+  min-height: 39px;
+}
+
+/* Make the selected graph object obvious without using status colors for
+ * identity. React Flow adds this class to selected nodes. */
+.react-flow__node.selected {
+  z-index: 3 !important;
+}
+
+.react-flow__node.selected > div {
+  outline: 2px solid rgba(47, 111, 236, .22);
+  outline-offset: 2px;
+}
+
+/* Long account/device tables need a stable header while operators scan. */
+.data-table thead th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+}
+
+.data-table tbody tr.clickable:focus-within td,
+.data-table tbody tr.clickable:hover td {
+  background: var(--surface-subtle);
+}
+
+/* Fullscreen topology is a real workspace rather than a modal-looking card. */
+.topology-canvas.fullscreen {
+  inset: 10px;
+  background: var(--surface-subtle);
+}
+
+.topology-canvas.fullscreen .topology-detail {
+  top: 54px;
+}
+
+@media (max-width: 900px) {
+  .topology-canvas-actions {
+    right: 50px;
+  }
+
+  .topology-filter-button {
+    padding: 0 8px;
+  }
+
+  .topology-summary {
+    left: 10px;
+    bottom: 10px;
+  }
+}
+
+@media (max-width: 650px) {
+
+  .topology-canvas .react-flow__minimap {
+    display: none !important;
+  }
+
+  .topology-canvas-actions {
+    left: 10px;
+    right: 48px;
+    justify-content: flex-end;
+  }
+
+  .topology-filter-button {
+    width: 32px;
+    padding: 0;
+    justify-content: center;
+  }
+
+  .topology-filter-button svg {
+    width: 15px;
+    height: 15px;
+  }
+
+  .topology-summary {
+    display: none;
+  }
+
+  .topology-canvas .react-flow__controls {
+    bottom: 12px !important;
+  }
+
+  .topology-detail {
+    left: 10px;
+    right: 10px;
+    top: auto;
+    bottom: 10px;
+    width: auto;
+    max-height: min(360px, 55vh);
+    overflow-y: auto;
+  }
+}
+
+/* The sidebar indicator reports the runtime query state; a permanently green
+   dot would claim the control plane is healthy even when it is unreachable. */
+.health-dot.down {
+  background: #d92d20;
+  box-shadow: 0 0 0 3px rgba(217, 45, 32, .14);
+}
+
+.health-dot.unknown {
+  background: #98a2b3;
+  box-shadow: 0 0 0 3px rgba(152, 162, 179, .16);
+}
+
+.account-identity-code {
+  flex: 0 0 auto;
+  min-width: 24px;
+  height: 18px;
+  display: inline-grid;
+  place-items: center;
+  padding: 0 5px;
+  border: 1px solid;
+  border-radius: 5px;
+  font-weight: 750;
+  letter-spacing: .04em;
+}
+
+.legend-code {
+  min-width: 22px;
+  color: var(--text-3);
+  font-family: "SFMono-Regular", Consolas, monospace;
+  font-weight: 700;
+}
+
+.topology-page-progress {
+  min-height: 42px;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text-3);
+}
+
+.topology-page-progress > .button,
+.topology-page-progress > .badge {
+  margin-left: auto;
+}
+
+.topology-partial-warning {
+  margin-left: auto;
+  color: var(--warning-text);
+  font-weight: 600;
+}
+
+@media (max-width: 650px) {
+  .topology-page-progress {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .topology-page-progress > .button,
+  .topology-page-progress > .badge,
+  .topology-partial-warning {
+    margin-left: 0;
+  }
+}
+
+/* Operations-first dashboard and relationship workspace refinements. */
+.operations-grid {
+  grid-template-columns: minmax(0, .9fr) minmax(0, 1.1fr);
+}
+
+.attention-list {
+  display: grid;
+  gap: 0;
+}
+
+.attention-item {
+  min-height: 74px;
+  display: grid;
+  grid-template-columns: 26px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  padding: 14px 16px;
+  border-bottom: 1px solid var(--border);
+}
+
+.attention-item:last-child {
+  border-bottom: 0;
+}
+
+.attention-item > svg {
+  color: var(--text-3);
+}
+
+.attention-item.warning > svg {
+  color: #b54708;
+}
+
+.attention-item.success > svg {
+  color: #16803d;
+}
+
+.attention-item div {
+  min-width: 0;
+  display: grid;
+  gap: 3px;
+}
+
+.attention-item strong {
+  color: var(--text);
+  line-height: 1.35;
+}
+
+.attention-item span {
+  color: var(--text-3);
+  line-height: 1.5;
+}
+
+.attention-item > a,
+.panel-footer-link {
+  color: var(--text-2);
+  font-weight: 700;
+  text-decoration: none;
+}
+
+.attention-item > a:hover,
+.panel-footer-link:hover {
+  color: var(--text);
+}
+
+.panel-footer-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  margin-top: 14px;
+}
+
+@media (max-width: 1200px) {
+  .operations-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (max-width: 650px) {
+  .attention-item {
+    grid-template-columns: 24px minmax(0, 1fr);
+  }
+
+  .attention-item > a {
+    grid-column: 2;
+    justify-self: start;
+  }
+}
+
+/* Network-first relationship explorer: keep the high-level view scannable and
+   open a bounded graph only after the operator chooses a network. */
+.topology-toolbar {
+  align-items: flex-end;
+  min-height: 78px;
+}
+
+.topology-toolbar h2 {
+  letter-spacing: -.035em;
+}
+
+.topology-toolbar p {
+  max-width: 560px;
+  color: var(--text-2);
+  line-height: 1.55;
+}
+
+.topology-toolbar-controls {
+  flex: 0 1 auto;
+  align-items: center;
+  justify-content: flex-end;
+}
+
+.topology-toolbar-controls .search-field {
+  width: min(300px, 30vw);
+}
+
+.topology-toolbar-controls .select-field {
+  min-width: 158px;
+  max-width: 210px;
+}
+
+.topology-page-stack > .topology-main-panel {
+  border-color: var(--border);
+  box-shadow: none;
+}
+
+.topology-truth {
+  padding: 16px 24px;
+  border-bottom-color: var(--border);
+  background: var(--surface-subtle);
+  color: var(--text-2);
+}
+
+.topology-page-progress {
+  min-height: 48px;
+  padding: 12px 24px;
+  background: var(--surface);
+  color: var(--text-3);
+}
+
+.network-overview {
+  padding: 28px 24px 32px;
+}
+
+.network-overview-heading {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 24px;
+}
+
+.network-overview-heading h3 {
+  margin: 3px 0 4px;
+  color: var(--text);
+  font-weight: 600;
+  letter-spacing: -.025em;
+}
+
+.network-overview-heading p {
+  margin: 0;
+  color: var(--text-2);
+}
+
+.section-kicker {
+  color: var(--text-3);
+  font-weight: 500;
+  letter-spacing: .08em;
+}
+
+.network-total {
+  display: inline-flex;
+  align-items: center;
+  min-height: 28px;
+  padding: 0;
+  color: var(--text-3);
+  white-space: nowrap;
+}
+
+.network-overview-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 20px;
+}
+
+.network-overview-card {
+  min-width: 0;
+  min-height: 150px;
+  display: grid;
+  grid-template-columns: 42px minmax(0, 1fr) auto;
+  grid-template-rows: minmax(0, 1fr) auto;
+  align-items: start;
+  gap: 12px;
+  padding: 22px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+  color: var(--text-2);
+  text-align: left;
+  box-shadow: none;
+  transition: border-color .16s ease, background .16s ease;
+}
+
+.network-overview-card:hover {
+  border-color: var(--border-strong);
+  background: var(--surface-subtle);
+}
+
+.network-overview-icon {
+  width: 42px;
+  height: 42px;
+  display: grid;
+  place-items: center;
+  border: 1px solid var(--border);
+  border-radius: 11px;
+  background: var(--surface-subtle);
+  color: var(--accent);
+}
+
+.network-overview-icon.room {
+  border-color: #e8dcff;
+  background: #f8f4ff;
+  color: #7a43d1;
+}
+
+.network-overview-copy {
+  min-width: 0;
+  display: grid;
+  align-content: start;
+  gap: 5px;
+}
+
+.network-kind-label {
+  color: var(--text-3);
+  font-weight: 500;
+}
+
+.network-overview-copy strong {
+  overflow: hidden;
+  color: var(--text);
+  font-weight: 600;
+  line-height: 1.35;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.network-cidr {
+  overflow: hidden;
+  color: var(--text-3);
+  font-family: "SFMono-Regular", Consolas, monospace;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.network-overview-stats {
+  display: grid;
+  justify-items: end;
+  gap: 3px;
+  padding-top: 1px;
+}
+
+.network-overview-stats strong {
+  color: #16803d;
+  line-height: 1;
+}
+
+.network-overview-stats i {
+  color: var(--text-3);
+  font-style: normal;
+  font-weight: 500;
+}
+
+.network-overview-stats > span {
+  color: var(--text-3);
+  white-space: nowrap;
+}
+
+.network-overview-footer {
+  grid-column: 1 / -1;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-width: 0;
+  padding-top: 16px;
+  color: var(--text-3);
+}
+
+.network-overview-footer > span:first-child {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.network-open-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  flex: 0 0 auto;
+  color: var(--accent);
+  font-weight: 500;
+}
+
+.network-overview-empty {
+  min-height: 220px;
+  display: grid;
+  place-content: center;
+  justify-items: center;
+  gap: 7px;
+  color: var(--text-3);
+  text-align: center;
+}
+
+.network-overview-empty strong {
+  color: var(--text-2);
+}
+
+.network-graph-heading {
+  min-height: 60px;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 18px 24px;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface);
+}
+
+.network-graph-heading > div:not(.network-view-tabs) {
+  min-width: 0;
+  display: grid;
+  gap: 3px;
+}
+
+.network-graph-heading strong {
+  color: var(--text);
+  font-weight: 600;
+}
+
+.network-graph-heading span {
+  color: var(--text-3);
+}
+
+.network-view-tabs {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  margin-left: auto;
+  padding: 0;
+}
+
+.network-view-tabs button {
+  min-height: 30px;
+  padding: 0 11px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-2);
+  font-weight: 500;
+}
+
+.network-view-tabs button:hover {
+  color: var(--text);
+}
+
+.network-view-tabs button.active {
+  background: var(--surface-subtle);
+  color: var(--accent); box-shadow: inset 0 -2px var(--accent);
+}
+
+.network-resource-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 28px;
+  padding: 24px;
+}
+
+.network-resource-panel {
+  min-width: 0;
+  overflow: hidden;
+  background: var(--surface);
+}
+
+.network-resource-panel > header {
+  min-height: 61px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 14px 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.network-resource-panel > header h3 {
+  margin: 0 0 3px;
+  color: var(--text);
+  font-weight: 600;
+}
+
+.network-resource-panel > header span {
+  color: var(--text-3);
+}
+
+.network-resource-panel > header b {
+  color: var(--text-2);
+  font-weight: 500;
+}
+
+.network-resource-list {
+  display: grid;
+  max-height: 610px;
+  overflow: auto;
+}
+
+.network-resource-row {
+  min-height: 72px;
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  padding: 12px 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.network-resource-row:last-child {
+  border-bottom: 0;
+}
+
+.network-resource-copy {
+  min-width: 0;
+  flex: 1;
+}
+
+.network-resource-copy > a,
+.network-resource-copy strong,
+.network-resource-copy span {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.network-resource-copy strong {
+  color: var(--text);
+  font-weight: 600;
+}
+
+.network-resource-copy > span {
+  margin-top: 3px;
+  color: var(--text-3);
+}
+
+.network-role {
+  flex: 0 0 auto;
+  color: var(--text-3);
+}
+
+.network-role.owner {
+  color: #175cd3;
+  font-weight: 650;
+}
+
+.network-device-icon {
+  width: 31px;
+  height: 31px;
+  display: grid;
+  flex: 0 0 auto;
+  place-items: center;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface-subtle);
+  color: var(--text-3);
+}
+
+.network-resource-row .status-label {
+  flex: 0 0 auto;
+}
+
+.network-resource-empty {
+  min-height: 110px;
+  display: grid;
+  place-items: center;
+  color: var(--text-3);
+}
+
+.topology-canvas {
+  height: min(720px, calc(100vh - 300px));
+  min-height: 510px;
+  background: var(--surface-subtle);
+}
+
+.topology-node-content {
+  gap: 11px;
+  padding: 12px 14px;
+}
+
+.topology-node-title-row strong {
+  min-width: 0;
+  flex: 1 1 auto;
+  color: var(--text);
+}
+
+.topology-node-copy > span {
+  color: var(--text-3);
+}
+
+.topology-node-icon {
+  width: 38px;
+  height: 38px;
+}
+
+.topology-canvas .react-flow__background {
+  background-color: var(--surface-subtle);
+}
+
+.topology-canvas .react-flow__controls-button {
+  color: var(--text-2);
+  background: var(--surface);
+}
+
+.topology-canvas .react-flow__controls-button:hover {
+  background: var(--surface-subtle);
+}
+
+.topology-canvas .react-flow__minimap {
+  background: var(--surface) !important;
+}
+
+@media (max-width: 1250px) {
+  .network-overview-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .topology-toolbar {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .topology-toolbar-controls {
+    justify-content: flex-start;
+  }
+
+  .topology-toolbar-controls .search-field {
+    width: min(350px, 42vw);
+  }
+}
+
+@media (max-width: 900px) {
+  .topology-toolbar-controls {
+    width: 100%;
+  }
+
+  .topology-toolbar-controls .search-field {
+    width: auto;
+    flex: 1 1 240px;
+  }
+
+  .topology-toolbar-controls .select-field {
+    flex: 1 1 150px;
+    max-width: none;
+  }
+}
+
+@media (max-width: 650px) {
+  .network-overview {
+    padding: 24px 16px;
+  }
+
+  .network-overview-grid {
+    grid-template-columns: 1fr;
+    gap: 16px;
+  }
+
+  .network-overview-card {
+    min-height: 136px;
+    padding: 18px;
+  }
+
+  .network-graph-heading {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 12px;
+    padding-right: 16px;
+    padding-left: 16px;
+  }
+
+  .network-view-tabs {
+    width: 100%;
+    margin-left: 0;
+  }
+
+  .network-view-tabs button {
+    flex: 1;
+  }
+
+  .network-resource-grid {
+    grid-template-columns: 1fr;
+    gap: 24px;
+    padding: 16px;
+  }
+
+  .network-graph-heading > div:not(.network-view-tabs) {
+    padding-left: 3px;
+  }
+
+  .topology-toolbar-controls {
+    align-items: stretch;
+  }
+
+  .topology-toolbar-controls .search-field,
+  .topology-toolbar-controls .select-field {
+    width: 100%;
+    flex: auto;
+  }
+
+  .topology-canvas {
+    height: calc(100vh - 300px);
+    min-height: 460px;
+  }
+}
+
+/* Keep supporting information readable. The previous muted gray worked as
+   decoration, but failed when used for account identifiers and live signals. */
+.brand-lockup span,
+.nav-group-label,
+.sidebar-runtime small,
+.topbar-eyebrow,
+.user-menu-copy small,
+.metric-copy p,
+.panel-v2-header p,
+.health-runtime-big span,
+.recent-account-main span,
+.recent-account-stat span,
+.control-summary-grid small,
+.identity-cell > div > span,
+.primary-secondary span,
+.ratio-cell span,
+.account-hero-stats span,
+.table-empty,
+.pagination-v2,
+.topology-node-copy > span,
+.topology-legend-heading,
+.legend-more,
+.topology-detail-owner,
+.topology-detail dt,
+.system-hero > div > span,
+.system-metrics span,
+.section-kicker,
+.network-kind-label,
+.network-overview-stats i,
+.network-overview-stats > span,
+.network-resource-panel > header span,
+.network-resource-empty,
+.network-overview-empty,
+.connection-detail-list dd small,
+.connection-section-title > span,
+.connection-transition-meta small,
+.connection-health-metric small,
+.health-alert-facts small,
+.health-alert-tail small {
+  color: var(--text-3);
+}
+
+.data-table-container {
+  width: 100%;
+  min-width: 0;
+}
+
+.data-mobile-list {
+  display: none;
+}
+
+.data-mobile-card {
+  min-width: 0;
+  display: grid;
+  gap: 16px;
+  padding: var(--table-cell-padding);
+  border: 0;
+  border-bottom: 1px solid var(--border);
+  border-radius: 0;
+  background: var(--surface);
+  color: var(--text-2);
+  font: inherit;
+  text-align: left;
+}
+
+.data-mobile-card:last-child { border-bottom: 0; }
+
+button.data-mobile-card {
+  width: 100%;
+  cursor: pointer;
+}
+
+.data-mobile-card.clickable:hover,
+.data-mobile-card.clickable:focus-visible {
+  background: var(--surface-subtle);
+}
+
+.data-mobile-card.clickable:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+.data-mobile-card-primary {
+  min-width: 0;
+  color: var(--text);
+  font-weight: 400;
+}
+
+.data-mobile-card-primary .identity-cell,
+.data-mobile-card-primary .primary-secondary {
+  min-width: 0;
+  white-space: normal;
+}
+
+.data-mobile-card-primary .identity-cell > div,
+.data-mobile-card-primary .primary-secondary {
+  overflow-wrap: anywhere;
+}
+
+.data-mobile-facts {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px 20px;
+}
+
+.data-mobile-fact {
+  min-width: 0;
+  display: grid;
+  align-content: start;
+  gap: 3px;
+}
+
+.data-mobile-fact > span {
+  color: var(--text-3);
+  font-weight: 500;
+}
+
+.data-mobile-fact > div {
+  min-width: 0;
+  color: var(--text-2);
+  overflow-wrap: anywhere;
+  white-space: normal;
+}
+
+.data-mobile-fact .badge {
+  white-space: nowrap;
+}
+
+.data-mobile-empty {
+  display: grid;
+  min-height: 100px;
+  place-items: center;
+  padding: 24px;
+  background: var(--surface);
+  color: var(--text-3);
+  text-align: center;
+}
+
+@media (max-width: 760px) {
+  .data-table-container > .data-table-wrap {
+    display: none;
+  }
+
+  .data-table-container > .data-mobile-list {
+    display: grid;
+    gap: 0;
+  }
+
+  .pagination-v2 {
+    align-items: flex-start;
+    flex-direction: column;
+    padding: 11px;
+  }
+
+  .pagination-v2 > div {
+    width: 100%;
+    justify-content: flex-end;
+  }
+}
+
+@media (max-width: 380px) {
+  .data-mobile-facts {
+    gap: 12px;
+  }
+
+  .account-hero-stats div {
+    padding-right: 6px;
+    padding-left: 6px;
+  }
+}
+
+/* Resource links retain their affordance in tables and compact cards. */
+.detail-navigation { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 10px; }
+.primary-secondary > a, .network-resource-copy > a { font-weight: 600; color: var(--text); text-decoration: none; }
+.primary-secondary > a:hover, .primary-secondary > a:focus-visible, .network-resource-copy > a:hover, .network-resource-copy > a:focus-visible, .data-table td > a:hover, .data-table td > a:focus-visible { text-decoration: underline; text-underline-offset: 3px; }
+.data-table td > a { color: var(--accent); }
+.network-graph-heading { flex-wrap: wrap; }
+@media (max-width: 650px) { .topbar-actions-v2 { flex-wrap: wrap; } }

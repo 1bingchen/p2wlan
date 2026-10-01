@@ -15,6 +15,8 @@ async fn test_network_outbound_relay_ignores_missing_direct_business_budget_when
     }));
     peers
         .add_peer(&control::PeerInfo {
+            capabilities: crate::control::PeerCapabilities::default(),
+            registration_seq: 0,
             node_id: "node-b".to_string(),
             device_name: String::new(),
             app_version: String::new(),
@@ -131,6 +133,8 @@ async fn test_network_outbound_uses_relay_until_direct_is_verified() {
     }));
     peers
         .add_peer(&control::PeerInfo {
+            capabilities: crate::control::PeerCapabilities::default(),
+            registration_seq: 0,
             node_id: "node-b".to_string(),
             device_name: String::new(),
             app_version: String::new(),
@@ -253,6 +257,8 @@ async fn test_network_outbound_promotes_direct_before_relay_slot_is_published() 
     ));
     peers
         .add_peer(&control::PeerInfo {
+            capabilities: crate::control::PeerCapabilities::default(),
+            registration_seq: 0,
             node_id: "node-b".to_string(),
             device_name: String::new(),
             app_version: String::new(),
@@ -504,6 +510,8 @@ async fn responder_answer_uses_cached_candidates_while_refresh_is_blocked() {
     daemon
         .peers
         .add_peer(&control::PeerInfo {
+            capabilities: crate::control::PeerCapabilities::default(),
+            registration_seq: 0,
             node_id: peer_id.to_string(),
             device_name: String::new(),
             app_version: String::new(),
@@ -755,6 +763,8 @@ async fn relay_first_packet_liveness_crosses_responder_status_and_writer_content
     daemon
         .peers
         .add_peer(&control::PeerInfo {
+            capabilities: crate::control::PeerCapabilities::default(),
+            registration_seq: 0,
             node_id: peer_id.to_string(),
             public_key: hex::encode(remote_identity.public_key()),
             virtual_ip: "10.20.0.2".to_string(),
@@ -784,6 +794,8 @@ async fn relay_first_packet_liveness_crosses_responder_status_and_writer_content
     }));
     remote_peers
         .add_peer(&control::PeerInfo {
+            capabilities: crate::control::PeerCapabilities::default(),
+            registration_seq: 0,
             node_id: "node-local".to_string(),
             public_key: hex::encode(local_public),
             virtual_ip: "10.20.0.1".to_string(),
@@ -1319,6 +1331,8 @@ async fn test_network_outbound_relay_wait_timeout_emits_reason_and_never_deliver
     ));
     peers
         .add_peer(&control::PeerInfo {
+            capabilities: crate::control::PeerCapabilities::default(),
+            registration_seq: 0,
             node_id: "node-b".to_string(),
             device_name: String::new(),
             app_version: String::new(),
@@ -1435,6 +1449,8 @@ async fn test_network_outbound_direct_only_degrades_immediately_with_stable_reas
     ));
     peers
         .add_peer(&control::PeerInfo {
+            capabilities: crate::control::PeerCapabilities::default(),
+            registration_seq: 0,
             node_id: "node-b".to_string(),
             device_name: String::new(),
             app_version: String::new(),
@@ -1528,6 +1544,8 @@ async fn test_network_outbound_waiting_peer_never_blocks_confirmed_peer() {
     for (peer_id, vip) in [("node-b", "10.20.0.2"), ("node-c", "10.20.0.3")] {
         peers
             .add_peer(&control::PeerInfo {
+                capabilities: crate::control::PeerCapabilities::default(),
+                registration_seq: 0,
                 node_id: peer_id.to_string(),
                 device_name: String::new(),
                 app_version: String::new(),
@@ -1655,6 +1673,8 @@ async fn test_network_outbound_multi_packet_burst_shares_one_startup_deadline() 
     ));
     peers
         .add_peer(&control::PeerInfo {
+            capabilities: crate::control::PeerCapabilities::default(),
+            registration_seq: 0,
             node_id: "node-b".to_string(),
             device_name: String::new(),
             app_version: String::new(),
@@ -1770,6 +1790,8 @@ async fn test_network_outbound_direct_commit_is_bounded_fallback_when_relay_neve
     ));
     peers
         .add_peer(&control::PeerInfo {
+            capabilities: crate::control::PeerCapabilities::default(),
+            registration_seq: 0,
             node_id: "node-b".to_string(),
             device_name: String::new(),
             app_version: String::new(),
@@ -1876,6 +1898,8 @@ async fn test_network_outbound_relay_confirm_after_deadline_flushes_not_drops() 
     }));
     peers
         .add_peer(&control::PeerInfo {
+            capabilities: crate::control::PeerCapabilities::default(),
+            registration_seq: 0,
             node_id: "node-b".to_string(),
             device_name: String::new(),
             app_version: String::new(),
@@ -2010,6 +2034,8 @@ async fn test_relay_probe_ack_mismatch_never_confirms_and_404_revokes() {
     let peers = Arc::new(PeerManager::new(config));
     peers
         .add_peer(&control::PeerInfo {
+            capabilities: crate::control::PeerCapabilities::default(),
+            registration_seq: 0,
             node_id: "node-b".to_string(),
             device_name: String::new(),
             app_version: String::new(),
@@ -2216,6 +2242,8 @@ async fn test_network_outbound_first_packet_wait_never_blocks_relay_probe() {
     }));
     peers
         .add_peer(&control::PeerInfo {
+            capabilities: crate::control::PeerCapabilities::default(),
+            registration_seq: 0,
             node_id: "node-b".to_string(),
             device_name: String::new(),
             app_version: String::new(),
@@ -2399,6 +2427,8 @@ async fn run_burst_confirmation_replay_test(count: usize) {
     ));
     peers
         .add_peer(&control::PeerInfo {
+            capabilities: crate::control::PeerCapabilities::default(),
+            registration_seq: 0,
             node_id: "node-b".to_string(),
             device_name: String::new(),
             app_version: String::new(),
@@ -2589,6 +2619,8 @@ async fn test_network_outbound_control_packet_between_bursts_keeps_monotonic_cou
     }));
     peers
         .add_peer(&control::PeerInfo {
+            capabilities: crate::control::PeerCapabilities::default(),
+            registration_seq: 0,
             node_id: "node-b".to_string(),
             device_name: String::new(),
             app_version: String::new(),
@@ -2760,6 +2792,8 @@ async fn test_network_outbound_queue_overflow_counts_packets_and_bytes_exactly()
     ));
     peers
         .add_peer(&control::PeerInfo {
+            capabilities: crate::control::PeerCapabilities::default(),
+            registration_seq: 0,
             node_id: "node-b".to_string(),
             device_name: String::new(),
             app_version: String::new(),
@@ -2939,6 +2973,8 @@ async fn test_network_outbound_worker_shutdown_counts_parked_packets() {
     ));
     peers
         .add_peer(&control::PeerInfo {
+            capabilities: crate::control::PeerCapabilities::default(),
+            registration_seq: 0,
             node_id: "node-b".to_string(),
             device_name: String::new(),
             app_version: String::new(),
@@ -3043,6 +3079,8 @@ async fn test_relay_probe_old_relay_ack_never_confirms_new_relay_and_duplicate_a
     let peers = Arc::new(PeerManager::new(config));
     peers
         .add_peer(&control::PeerInfo {
+            capabilities: crate::control::PeerCapabilities::default(),
+            registration_seq: 0,
             node_id: "node-b".to_string(),
             device_name: String::new(),
             app_version: String::new(),
@@ -3133,6 +3171,8 @@ async fn test_relay_probe_same_endpoint_replacement_rejects_old_transport_ack() 
     let peers = Arc::new(PeerManager::new(config));
     peers
         .add_peer(&control::PeerInfo {
+            capabilities: crate::control::PeerCapabilities::default(),
+            registration_seq: 0,
             node_id: "node-b".to_string(),
             device_name: String::new(),
             app_version: String::new(),
@@ -3220,6 +3260,8 @@ async fn test_relay_probe_stale_generation_ack_never_confirms() {
     let peers = Arc::new(PeerManager::new(config));
     peers
         .add_peer(&control::PeerInfo {
+            capabilities: crate::control::PeerCapabilities::default(),
+            registration_seq: 0,
             node_id: "node-b".to_string(),
             device_name: String::new(),
             app_version: String::new(),

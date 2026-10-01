@@ -51,6 +51,14 @@ use probe_budget::{
 };
 include!("udp/state.rs");
 
+mod stun_waiter;
+use stun_waiter::StunWaiters;
+#[cfg(test)]
+mod test_ingress;
+#[cfg(test)]
+pub(crate) use test_ingress::TestUdpIngressGate;
+mod direct_validation_preflight;
+
 include!("udp/admission.rs");
 include!("udp/gather.rs");
 include!("udp/fast_gather.rs");
@@ -171,7 +179,18 @@ pub struct UdpTransport {
     /// v2 nonce is simply refused if its bounded session has been removed or
     /// superseded before the ACK arrives.
     hard_hard_probe_bindings: HardHardProbeBindings,
+    pub(super) hard_hard_measurement_gate: Arc<tokio::sync::Semaphore>,
+    #[cfg(test)]
+    hh2_validation_send_gate:
+        Arc<Mutex<Option<Arc<hard_hard_pair_validation::HardHardValidationSendGate>>>>,
+    #[cfg(test)]
+    hh2_probe_ack_send_gate:
+        Arc<Mutex<Option<Arc<hard_hard_pair_validation::HardHardValidationSendGate>>>>,
     stun_waiters: StunWaiters,
+    /// A synthetic NAT owns its complete receive boundary in tests. Omitted
+    /// from production and disabled unless the fixture installs its own gate.
+    #[cfg(test)]
+    test_ingress_gate: Option<Arc<TestUdpIngressGate>>,
     /// Merged socket ownership state: dynamic punch sockets, per-peer
     /// affinity pins and the affinity epoch counter live under one mutex so
     /// every ownership transition is atomic and no lock ordering exists.
@@ -222,7 +241,8 @@ pub struct UdpTransport {
     /// layering: `udp` is below `lib`), so the daemon registers a closure at
     /// setup.  Both matched ACK and peer-reflexive paths call this same
     /// ingress; it only queues/merges evidence and never spawns a worker.
-    validation_trigger: Option<Arc<dyn Fn(PeerReflexiveObservation) + Send + Sync>>,
+    validation_trigger:
+        Option<Arc<dyn Fn(PeerReflexiveObservation) -> DirectValidationAdmission + Send + Sync>>,
     triggered_checks: TriggeredCheckState,
     nat_maintainers: NatMaintainerState,
     /// Dedicated per-(peer, socket) budget for NAT-state binding maintainer
@@ -361,10 +381,20 @@ mod socket_registry;
 mod peer_cleanup;
 
 mod direct_validation;
+mod hard_hard_pair;
+mod hard_hard_pair_commit;
+mod hard_hard_pair_send;
+mod hard_hard_pair_validation;
+use hard_hard_pair_validation::HardHardSocketMode;
+pub(crate) use hard_hard_pair_validation::{HardHardValidationScope, HardHardValidationWork};
 
 mod diagnostics;
 
 mod dynamic_punch;
+mod hard_hard_measurement;
+pub(crate) use hard_hard_measurement::HardHardPreparedMeasurement;
+mod hard_hard_measurement_gate;
+pub(crate) use hard_hard_measurement_gate::HardHardMeasurementLease;
 
 mod socket_lifecycle;
 
@@ -373,5 +403,9 @@ mod learning;
 mod birthday;
 
 mod punch_sender;
+
+mod punch_pacing;
+pub(crate) use punch_pacing::hard_hard_first_wave_pacing_margin;
+use punch_pacing::HardHardProbePacer;
 
 mod punch_reports;

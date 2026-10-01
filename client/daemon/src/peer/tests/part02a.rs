@@ -74,6 +74,8 @@ async fn test_peer_manager_add_remove() {
     let manager = PeerManager::new(config);
 
     let peer_info = PeerInfo {
+        capabilities: crate::control::PeerCapabilities::default(),
+        registration_seq: 0,
         node_id: "peer1".to_string(),
         device_name: "Office Mac".to_string(),
         app_version: String::new(),
@@ -160,6 +162,8 @@ async fn offline_control_peer_remains_visible_without_active_path() {
 
     manager
         .add_peer(&PeerInfo {
+            capabilities: crate::control::PeerCapabilities::default(),
+            registration_seq: 0,
             node_id: "peer-offline".to_string(),
             device_name: "Travel Laptop".to_string(),
             app_version: String::new(),
@@ -1080,6 +1084,8 @@ async fn test_peer_manager_candidates() {
     let manager = PeerManager::new(config);
 
     let peer_info = PeerInfo {
+        capabilities: crate::control::PeerCapabilities::default(),
+        registration_seq: 0,
         node_id: "peer1".to_string(),
         device_name: String::new(),
         app_version: String::new(),
@@ -1125,6 +1131,8 @@ async fn candidate_pairs_track_probe_success_failure_and_generation() {
 
     manager
         .add_peer(&PeerInfo {
+            capabilities: crate::control::PeerCapabilities::default(),
+            registration_seq: 0,
             node_id: "peer1".to_string(),
             device_name: String::new(),
             app_version: String::new(),

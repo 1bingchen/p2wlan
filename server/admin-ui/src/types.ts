@@ -21,6 +21,7 @@ export interface AdminRuntime {
 
 export interface AdminDevice {
   id: string
+  owner_id?: string
   username: string
   device_name: string
   platform: string
@@ -36,6 +37,7 @@ export interface AdminDevice {
 
 export interface AdminNetwork {
   id: string
+  owner_id?: string
   name: string
   cidr: string
   owner_username: string
@@ -48,6 +50,7 @@ export interface AdminNetwork {
 
 export interface AdminRoom {
   id: string
+  owner_id?: string
   code: string
   name: string
   cidr: string
@@ -78,7 +81,17 @@ export interface AdminAccountDetail {
   rooms: AdminRoom[]
 }
 
+export interface AdminAccountSummaryResponse {
+  account: AdminAccount
+}
+
+export interface AdminResourceFilters {
+  query?: string
+  accountId?: string
+}
+
 export interface Page<T> {
+  generated_at?: number
   total: number
   limit: number
   offset: number
@@ -86,6 +99,7 @@ export interface Page<T> {
 }
 
 export interface CursorPage<T> {
+  generated_at?: number
   total: number
   limit: number
   next_cursor?: string
@@ -130,8 +144,9 @@ export interface AdminTopologyEdge {
 export interface AdminTopology {
   generated_at: number
   graph_kind: 'control_relationships'
-  scope: 'global' | 'account'
+  scope: 'global' | 'account' | 'network'
   focus_account_id?: string
+  focus_network_id?: string
   path_observation_available: boolean
   path_observation_note: string
   nodes: AdminTopologyNode[]
@@ -284,7 +299,9 @@ export interface AdminConnectionHealth {
   thresholds: AdminConnectionHealthThresholds
   summary: AdminConnectionHealthSummary
   alerts_total: number
+  alerts_unfiltered_total: number
   alerts_limit: number
+  alerts_offset: number
   alerts: AdminConnectionHealthAlert[]
 }
 
@@ -293,4 +310,23 @@ export interface AdminConnectionHealthFilters {
   accountId?: string
   deviceId?: string
   windowSeconds?: number
+  alertSignal?: string
+  offset?: number
 }
+
+export type TopologyView = 'summary' | 'full'
+
+export interface SnapshotPage<T> extends CursorPage<T> {
+  generated_at: number
+  snapshot_at: number
+}
+
+export interface AdminTopologySnapshotPage extends AdminTopology {
+  snapshot_at: number
+  view: TopologyView
+  phase: string
+  complete: boolean
+  next_cursor?: string
+}
+
+export type ResourceAccountScope = { id: string; username: string }

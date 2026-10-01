@@ -110,6 +110,10 @@ impl VolatilePublishCoalescer {
     /// expiry; the coalescer never publishes itself.
     pub(super) fn on_churn(&mut self, hash: u64, now: Instant) -> VolatileChurnAction {
         if self.last_published_hash == Some(hash) {
+            // A -> B -> A needs no new publication. B is no longer the
+            // committed newest set, so its pending timer must be cancelled.
+            self.pending_hash = None;
+            self.debounce_until = None;
             return VolatileChurnAction::SuppressIdentical;
         }
         if self.pending_hash.is_some() {
@@ -156,6 +160,7 @@ impl VolatilePublishCoalescer {
 struct VolatileCandidatePublish {
     candidates: Vec<String>,
     candidate_sources: HashMap<String, String>,
+    network_generation: u64,
 }
 
 pub(super) async fn run_udp_candidate_refresh(context: UdpCandidateRefreshContext) {
@@ -254,7 +259,9 @@ pub(super) async fn run_udp_candidate_refresh(context: UdpCandidateRefreshContex
                 .take()
                 .expect("pending volatile publication verified above");
             let payload_hash = candidate_set_hash(&pending.candidates, &pending.candidate_sources);
-            if payload_hash == hash {
+            if payload_hash == hash
+                && peers.current_network_generation_sync() == pending.network_generation
+            {
                 publish_local_candidates_to_known_peers(
                     &control,
                     peers.clone(),
@@ -262,6 +269,7 @@ pub(super) async fn run_udp_candidate_refresh(context: UdpCandidateRefreshContex
                     punch_deduplicator.clone(),
                     &pending.candidates,
                     &pending.candidate_sources,
+                    pending.network_generation,
                     probe_interval,
                     punch_attempts,
                     "UDP volatile candidate refresh",
@@ -274,7 +282,9 @@ pub(super) async fn run_udp_candidate_refresh(context: UdpCandidateRefreshContex
                     }),
                 )
                 .await;
-                volatile_coalescer.record_published(hash);
+                if peers.current_network_generation_sync() == pending.network_generation {
+                    volatile_coalescer.record_published(hash);
+                }
                 debug!(
                     target: "p2wlan_daemon::candidate_refresh",
                     event = "candidate_volatile_publish_completed",
@@ -284,7 +294,7 @@ pub(super) async fn run_udp_candidate_refresh(context: UdpCandidateRefreshContex
                 );
             } else {
                 debug!(
-                    "Suppressed volatile UDP candidate publication: coalesced set is identical to the last published set (hash={payload_hash})"
+                    "Suppressed volatile UDP candidate publication: payload hash or network generation changed (hash={payload_hash})"
                 );
             }
         }
@@ -305,6 +315,10 @@ pub(super) async fn run_udp_candidate_refresh(context: UdpCandidateRefreshContex
             continue;
         }
 
+        let gather_fence = {
+            let refresh_guard = candidate_refresh_lock.lock().await;
+            CandidateGatherFence::capture(&refresh_guard, &udp, &peers, &candidate_snapshot).await
+        };
         let gather_started = Instant::now();
         debug!(
             target: "p2wlan_daemon::candidate_refresh",
@@ -320,8 +334,8 @@ pub(super) async fn run_udp_candidate_refresh(context: UdpCandidateRefreshContex
         // operations. Run them concurrently without holding the shared
         // candidate lock. A peer signal must be able to reuse the last
         // committed snapshot while either discovery path is in flight.
-        let mapping_start_udp_addr = udp.local_addr().ok();
-        let mapping_start_generation = peers.current_network_generation_sync();
+        let mapping_start_udp_addr = gather_fence.local_addr;
+        let mapping_start_generation = gather_fence.network_generation;
         let mapping_future = async {
             if !upnp_enabled {
                 return (Vec::new(), HashMap::new());
@@ -336,7 +350,7 @@ pub(super) async fn run_udp_candidate_refresh(context: UdpCandidateRefreshContex
             let existing_candidates = local_candidates.read().await.clone();
             let existing_sources = local_candidate_sources.read().await.clone();
             maybe_add_port_mapping_udp_candidate(
-                mapping_start_udp_addr,
+                (&udp, &peers),
                 &existing_candidates,
                 &existing_sources,
                 &mut discovered,
@@ -365,6 +379,20 @@ pub(super) async fn run_udp_candidate_refresh(context: UdpCandidateRefreshContex
         let refresh_guard = candidate_refresh_lock.lock().await;
         let refresh_lock_wait_ms = refresh_lock_wait_started.elapsed().as_millis() as u64;
 
+        if let Some(reason) = gather_fence
+            .stale_reason(&refresh_guard, &udp, &peers, &candidate_snapshot)
+            .await
+        {
+            debug!(
+                target: "p2wlan_daemon::candidate_refresh",
+                event = "candidate_gather_discarded",
+                reason,
+                gather_elapsed_ms,
+                "Discarding discovery completed after its candidate snapshot or network identity was replaced"
+            );
+            continue;
+        }
+
         let report = match report_result {
             Ok(report) => report,
             Err(err) => {
@@ -382,6 +410,9 @@ pub(super) async fn run_udp_candidate_refresh(context: UdpCandidateRefreshContex
                 continue;
             }
         };
+        // Full discovery deliberately leaves this scheduling policy untouched
+        // until its originating snapshot has passed the commit fence.
+        udp.apply_candidate_report_socket_pool_policy(&report);
         let (mut candidates, mut candidate_sources) = candidate_endpoints_from_report(&report);
         debug!(
             target: "p2wlan_daemon::candidate_refresh",
@@ -656,6 +687,7 @@ pub(super) async fn run_udp_candidate_refresh(context: UdpCandidateRefreshContex
                 .advance_network_generation("UDP network identity changed")
                 .await;
         }
+        let publication_generation = peers.current_network_generation_sync();
         drop(refresh_guard);
 
         // A pending volatile publication belongs to the old candidate state.
@@ -710,6 +742,7 @@ pub(super) async fn run_udp_candidate_refresh(context: UdpCandidateRefreshContex
             let now = Instant::now();
             match volatile_coalescer.on_churn(hash, now) {
                 VolatileChurnAction::SuppressIdentical => {
+                    pending_volatile = None;
                     debug!(
                         "Volatile candidate refresh suppressed: candidate set is identical to the last published set (hash={hash}); no offer fan-out"
                     );
@@ -720,6 +753,7 @@ pub(super) async fn run_udp_candidate_refresh(context: UdpCandidateRefreshContex
                         .expect("coalesced pending verified above");
                     pending.candidates = candidates.clone();
                     pending.candidate_sources = candidate_sources.clone();
+                    pending.network_generation = publication_generation;
                     debug!(
                         "Volatile candidate churn coalesced newest-wins (hash={hash}); retaining the fixed {}-ms publication deadline without offer fan-out",
                         VOLATILE_CANDIDATE_PUBLISH_DEBOUNCE.as_millis()
@@ -729,6 +763,7 @@ pub(super) async fn run_udp_candidate_refresh(context: UdpCandidateRefreshContex
                     pending_volatile = Some(VolatileCandidatePublish {
                         candidates: candidates.clone(),
                         candidate_sources: candidate_sources.clone(),
+                        network_generation: publication_generation,
                     });
                     debug!(
                         "Volatile candidate churn (hash={hash}) will be published once after the {}-ms fixed debounce window",
@@ -753,6 +788,7 @@ pub(super) async fn run_udp_candidate_refresh(context: UdpCandidateRefreshContex
             punch_deduplicator.clone(),
             &candidates,
             &candidate_sources,
+            publication_generation,
             probe_interval,
             punch_attempts,
             "UDP candidate refresh",
@@ -776,6 +812,7 @@ pub(super) async fn publish_local_candidates_to_known_peers(
     punch_deduplicator: PunchAttemptDeduplicator,
     candidates: &[String],
     candidate_sources: &HashMap<String, String>,
+    publication_generation: u64,
     probe_interval: Duration,
     attempts: u32,
     reason: &str,
@@ -787,6 +824,12 @@ pub(super) async fn publish_local_candidates_to_known_peers(
     }
 
     let attempts = peers.recommended_punch_attempts(attempts).await;
+    let publication_hash = candidate_set_hash(candidates, candidate_sources);
+
+    if peers.current_network_generation().await != publication_generation {
+        debug!("Skipping {reason} candidate publication: source network generation was replaced");
+        return;
+    }
 
     let fanout_permits = Arc::new(tokio::sync::Semaphore::new(4));
     let mut fanout_workers = tokio::task::JoinSet::new();
@@ -801,6 +844,11 @@ pub(super) async fn publish_local_candidates_to_known_peers(
         if !peer_info.online || !peers.peer_online(&peer_id).await {
             continue;
         }
+        let Some(publication_peer_session_generation) =
+            peers.peer_session_generation_sync(&peer_id)
+        else {
+            continue;
+        };
         // A healthy confirmed Direct peer is converged: neither a refreshed
         // candidate offer nor a synchronized punch session may be re-created
         // for it (the punch task would otherwise run a fresh-mapping
@@ -865,26 +913,55 @@ pub(super) async fn publish_local_candidates_to_known_peers(
         let reason = reason.to_string();
         fanout_workers.spawn(async move {
             let _permit = permit;
+            let publication_fence = crate::control::CandidatePublicationFence::new(
+                peers.clone(),
+                signal
+                    .as_ref()
+                    .map(|signal| signal.candidate_snapshot.clone()),
+                peer_id.clone(),
+                publication_generation,
+                publication_peer_session_generation,
+                publication_hash,
+            );
+            // The roster and Direct-health decisions above can age while a
+            // worker waits for the bounded fan-out permit. The same fence is
+            // checked again inside the per-peer control worker before HTTP.
+            if !publication_fence.is_current().await {
+                debug!(
+                    "Skipping {reason} UDP candidate publication to peer {peer_id}: fan-out admission became stale"
+                );
+                return;
+            }
             let punch_at_ms = Some(relay_assisted_punch_at_ms());
-            if let Err(error) = control
-                .send_peer_offer_with_sources_and_punch_at(
+            let publication = control
+                .send_peer_offer_with_sources_and_punch_at_fenced(
                     &peer_id,
                     &candidates,
                     &candidate_sources,
                     &[],
                     punch_at_ms,
                     None,
+                    Some(publication_fence.clone()),
                 )
-                .await
-            {
-                warn!("Failed to publish {reason} UDP candidates to peer {peer_id}: {error}");
-                return;
+                .await;
+            match publication {
+                Ok(()) => {}
+                Err(PeerOfferSendFailure::Cancelled) => {
+                    debug!(
+                        "Skipping {reason} UDP candidate publication to peer {peer_id}: publication identity expired"
+                    );
+                    return;
+                }
+                Err(error) => {
+                    warn!("Failed to publish {reason} UDP candidates to peer {peer_id}: {error}");
+                    return;
+                }
             }
 
             debug!(
                 "Published {reason} UDP candidates to peer {peer_id} with punch_at_ms={punch_at_ms:?}"
             );
-            spawn_hole_punch_task(
+            spawn_hole_punch_task_with_lifecycle(
                 udp,
                 peers,
                 punch_deduplicator,
@@ -895,6 +972,8 @@ pub(super) async fn publish_local_candidates_to_known_peers(
                 signal,
                 None,
                 None,
+                None,
+                Some(publication_fence),
             )
             .await;
         });

@@ -329,6 +329,54 @@ class NatEvidenceContractTests(unittest.TestCase):
     SOURCE_SHA = "a" * 40
     WORKFLOW_SHA = "b" * 40
 
+    def test_normal_join_accepts_independent_direction_paths_without_weakening_fixed_topology(self):
+        for direct_first in (False, True):
+            a, b = self._status(1, "direct"), self._status(2, "relay")
+            # The Relay ingress side sends its replies over Direct, so it
+            # legitimately has no Relay-specific send/exchange marker.
+            for field in ("business_sent", "business_exchange"):
+                b["connection_timeline"]["first_usable_summaries"][0][field] = False
+            for field in ("relay_first_business_sent_generation", "relay_first_business_exchange_generation"):
+                b["peers"][0][field] = None
+            if direct_first:
+                first = a["connection_timeline"]["first_usable_summaries"][0]
+                for name in ("relay_ready_at_ms", "first_usable_delta_ms", "direct_first_remaining_ms_at_relay_ready"):
+                    first[name] = None
+            for sides in ((a, b), (b, a)):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    result = self._build_record(root, "normal-join", 1, *sides, *sides)
+                    self.assertEqual(result["result"], "pass", result["decision"])
+                    legacy = self._build_record(root, "direct-cold-start", 1, *sides, *sides)
+                    self.assertEqual(legacy["result"], "fail")
+
+    def test_normal_join_still_requires_both_authenticated_business_directions(self):
+        a, b = self._status(1, "direct"), self._status(2, "relay")
+        b["connection_timeline"]["first_usable_summaries"][0]["business_received"] = False
+        b["peers"][0]["relay_first_business_received_generation"] = None
+        with tempfile.TemporaryDirectory() as directory:
+            result = self._build_record(Path(directory), "normal-join", 1, a, b, a, b)
+        self.assertEqual(result["result"], "fail")
+
+    def test_normal_direct_before_relay_preserves_unknown_delta_and_strict_legacy_gate(self):
+        a, b = self._status(1, "direct"), self._status(2, "direct")
+        for status in (a, b):
+            summary = status["connection_timeline"]["first_usable_summaries"][0]
+            for field in ("relay_ready_at_ms", "first_usable_delta_ms", "direct_first_remaining_ms_at_relay_ready"):
+                summary[field] = None
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            record = self._build_record(root, "normal-join", 1, a, b, a, b)
+            self.assertEqual(record["result"], "pass", record["decision"])
+            first = record["observed"]["a"]["first_usable"]
+            self.assertIsNone(first["delta_ms"])
+            self.assertFalse(first["relay_ready_delta_applicable"])
+            legacy = self._build_record(root, "direct-cold-start", 1, a, b, a, b)
+            self.assertEqual(legacy["result"], "fail")
+            a["connection_timeline"]["first_usable_summaries"][0]["first_usable_at_ms"] = 100
+            future = self._build_record(root, "normal-join", 2, a, b, a, b)
+            self.assertEqual(future["result"], "fail")
+
     @staticmethod
     def _status(process_id: int, expected_path: str = "relay", revision: int = 4) -> dict:
         peer = {

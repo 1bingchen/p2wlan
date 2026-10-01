@@ -798,6 +798,28 @@ pub(super) async fn start_ready_peer_flushes(
     }
 }
 
+fn record_outbound_flush_batch(
+    timeline: &ConnectionTimeline,
+    peers: &PeerManager,
+    peer_id: &str,
+    flushed: usize,
+    remaining: usize,
+) {
+    timeline.record_outbound_flush_batch();
+    let relay_confirm_seq = peers.relay_confirm_seq_sync(peer_id);
+    let direct_commit_seq = peers.direct_commit_seq_sync(peer_id);
+    timeline.emit_first_scoped(
+        &format!("peer:{peer_id}"),
+        "outbound_first_packet_flushed",
+        None,
+        None,
+        Some(format!(
+            "peer={peer_id} flushed={flushed} remaining={remaining} relay_confirm_seq={relay_confirm_seq:?} direct_commit_seq={direct_commit_seq:?}"
+        )),
+    );
+    debug!(peer_id, flushed, remaining, "Flushed a queued packet batch");
+}
+
 /// Flush one peer's queue. This is the sole owner of that peer's queue while
 /// it is in flight. A terminal/uncertain handoff stops the batch immediately:
 /// that counter is consumed, while later plaintext packets remain available
@@ -823,16 +845,12 @@ pub(super) async fn flush_one_peer(
         {
             let reason_code = queue.delivery_deadline_reason();
             if flushed > 0 {
-                let remaining = queue.queue.len();
-                let relay_confirm_seq = peers.relay_confirm_seq_sync(&peer_id);
-                let direct_commit_seq = peers.direct_commit_seq_sync(&peer_id);
-                timeline.emit(
-                    "outbound_first_packet_flushed",
-                    None,
-                    None,
-                    Some(format!(
-                        "peer={peer_id} flushed={flushed} remaining={remaining} relay_confirm_seq={relay_confirm_seq:?} direct_commit_seq={direct_commit_seq:?}"
-                    )),
+                record_outbound_flush_batch(
+                    &timeline,
+                    &peers,
+                    &peer_id,
+                    flushed,
+                    queue.queue.len(),
                 );
             }
             drop_pending_queue(&peers, Some(queue), reason_code, &timeline).await;
@@ -1019,18 +1037,7 @@ pub(super) async fn flush_one_peer(
     }
 
     if flushed > 0 {
-        let remaining = queue.queue.len();
-        let relay_confirm_seq = peers.relay_confirm_seq_sync(&peer_id);
-        let direct_commit_seq = peers.direct_commit_seq_sync(&peer_id);
-        timeline.emit(
-            "outbound_first_packet_flushed",
-            None,
-            None,
-            Some(format!(
-                "peer={peer_id} flushed={flushed} remaining={remaining} relay_confirm_seq={relay_confirm_seq:?} direct_commit_seq={direct_commit_seq:?}"
-            )),
-        );
-        debug!("Flushed {flushed} queued packets for peer {peer_id}");
+        record_outbound_flush_batch(&timeline, &peers, &peer_id, flushed, queue.queue.len());
     }
     (peer_id, queue)
 }

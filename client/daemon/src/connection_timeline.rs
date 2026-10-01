@@ -28,7 +28,7 @@ use std::time::Instant;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info};
 
-use crate::peer::HardHardBusinessAttributionIdentity;
+use crate::peer::{HardHardAttemptReport, HardHardBusinessAttributionIdentity};
 
 /// Bound on the diagnostics ring so `/status` stays bounded while retaining
 /// a complete burst/failure window. 64 events was too small for a 256-packet
@@ -43,6 +43,86 @@ pub const TIMELINE_MAX_EVENTS: usize = 512;
 /// eviction and carries the status revision fence used by the NAT harness.
 pub const FIRST_USABLE_SUMMARY_SCHEMA_VERSION: u32 = 2;
 pub const FIRST_USABLE_SUMMARY_MAX_ENTRIES: usize = 1024;
+pub const HARD_HARD_TERMINAL_SUMMARY_MAX_ENTRIES: usize = 16;
+
+/// Diagnostic-only hot-path categories. Packet observations never own path or
+/// session state, so counting them must not advance the status revision on
+/// every packet. Keep this a fixed set rather than a dynamic peer-keyed map.
+#[derive(Debug, Clone, Copy)]
+#[repr(usize)]
+pub(crate) enum HotPathObservation {
+    ResponderBindingContended,
+    ResponderBindingStale,
+    DirectIngressContended,
+    DirectIngressStale,
+    BusinessIngressDeferred,
+    BusinessIngressStale,
+    OutboundFlushBatch,
+    MatchedAckValidationQueued,
+    MatchedAckValidationCoalesced,
+    MatchedAckValidationBackpressured,
+    MatchedAckValidationInactive,
+}
+
+impl HotPathObservation {
+    fn event(self) -> &'static str {
+        match self {
+            Self::ResponderBindingContended | Self::DirectIngressContended => {
+                "session_evidence_contended"
+            }
+            Self::ResponderBindingStale | Self::DirectIngressStale | Self::BusinessIngressStale => {
+                "stale_session_evidence"
+            }
+            Self::BusinessIngressDeferred => "business_ingress_evidence_deferred",
+            Self::OutboundFlushBatch => "outbound_first_packet_flushed",
+            Self::MatchedAckValidationQueued
+            | Self::MatchedAckValidationCoalesced
+            | Self::MatchedAckValidationBackpressured
+            | Self::MatchedAckValidationInactive => "direct_validation_admission",
+        }
+    }
+}
+
+const HOT_PATH_OBSERVATION_COUNT: usize = 11;
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+pub struct HotPathObservationCounts {
+    pub responder_binding_contended: u64,
+    pub responder_binding_stale: u64,
+    pub direct_ingress_contended: u64,
+    pub direct_ingress_stale: u64,
+    pub business_ingress_deferred: u64,
+    pub business_ingress_stale: u64,
+    pub outbound_flush_batches: u64,
+    pub matched_ack_validation_queued: u64,
+    pub matched_ack_validation_coalesced: u64,
+    pub matched_ack_validation_backpressured: u64,
+    pub matched_ack_validation_inactive: u64,
+}
+
+/// Compact historical HH terminal evidence. This is copied only after the
+/// attempt owner seals its report; it has no authority to commit a path or
+/// resurrect a replaced peer session.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HardHardTerminalSummary {
+    pub at_ms: u64,
+    pub peer_id: String,
+    pub session_tag: String,
+    pub plan_tag: String,
+    pub network_generation: u64,
+    pub peer_session_generation: u64,
+    pub remote_candidate_epoch: u64,
+    pub attempt: u8,
+    pub mode: String,
+    pub failure_class: String,
+    pub terminal_reason: String,
+    pub direct_confirmed: bool,
+    pub send_success_datagrams: u32,
+    pub matched_probe_acks: u64,
+    pub current_connection_committed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archive_reason: Option<String>,
+}
 
 /// One recorded timeline event (serializable, bounded).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -147,6 +227,13 @@ pub struct ConnectionTimelineDiagnostics {
     /// eviction window.
     #[serde(default)]
     pub first_usable_summaries: Vec<FirstUsableEvidenceSummary>,
+    /// Exact process-lifetime counts, independent of the bounded event ring.
+    #[serde(default)]
+    pub hot_path_observations: HotPathObservationCounts,
+    /// Last sealed HH terminals survive replacement of the current peer
+    /// connection object, within this fixed process-level retention window.
+    #[serde(default)]
+    pub hard_hard_terminal_summaries: Vec<HardHardTerminalSummary>,
 }
 
 /// Structured INFO timeline emitter shared across daemon subsystems.
@@ -173,6 +260,8 @@ pub struct ConnectionTimeline {
     /// outside the bounded event ring so reconnects remain observable after
     /// older timeline entries have been evicted.
     control_registration_count: AtomicU64,
+    hot_path_observations: [AtomicU64; HOT_PATH_OBSERVATION_COUNT],
+    hard_hard_terminal_summaries: Mutex<VecDeque<HardHardTerminalSummary>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -206,7 +295,82 @@ impl ConnectionTimeline {
             first_events: Mutex::new(HashSet::new()),
             status_events: Mutex::new(None),
             control_registration_count: AtomicU64::new(0),
+            hot_path_observations: std::array::from_fn(|_| AtomicU64::new(0)),
+            hard_hard_terminal_summaries: Mutex::new(VecDeque::new()),
         })
+    }
+
+    /// Preserve exact counts while emitting only the first and exponentially
+    /// spaced diagnostic samples. This avoids log writes, event-ring eviction,
+    /// and `/events` revision churn proportional to business packet volume.
+    /// The detail closure runs only for an emitted sample and outside locks.
+    pub(crate) fn observe_hot_path<F>(
+        &self,
+        observation: HotPathObservation,
+        path: Option<&str>,
+        reason_code: Option<&str>,
+        detail: F,
+    ) -> u64
+    where
+        F: FnOnce() -> String,
+    {
+        let total = self.hot_path_observations[observation as usize]
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1);
+        if total.is_power_of_two() {
+            self.emit(
+                observation.event(),
+                path,
+                reason_code,
+                Some(format!("observed_total={total} {}", detail())),
+            );
+        }
+        total
+    }
+
+    pub(crate) fn record_outbound_flush_batch(&self) {
+        self.count_hot_path(HotPathObservation::OutboundFlushBatch);
+    }
+
+    /// Exact fixed-cardinality counters for admissions whose individual
+    /// outcome is already represented by a typed traversal event when needed.
+    pub(crate) fn count_hot_path(&self, observation: HotPathObservation) {
+        self.hot_path_observations[observation as usize].fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_hard_hard_terminal(
+        &self,
+        peer_id: &str,
+        report: &HardHardAttemptReport,
+        current_connection_committed: bool,
+        archive_reason: Option<&'static str>,
+    ) {
+        let summary = HardHardTerminalSummary {
+            at_ms: self.uptime_ms(),
+            peer_id: peer_id.to_string(),
+            session_tag: report.session_tag.clone(),
+            plan_tag: report.plan_tag.clone(),
+            network_generation: report.network_generation,
+            peer_session_generation: report.peer_session_generation,
+            remote_candidate_epoch: report.remote_candidate_epoch,
+            attempt: report.attempt,
+            mode: report.mode.clone(),
+            failure_class: report.failure_class.clone(),
+            terminal_reason: report.terminal_reason.clone(),
+            direct_confirmed: report.direct_confirmed,
+            send_success_datagrams: report.counts.send_success_datagrams,
+            matched_probe_acks: report.matched_probe_acks,
+            current_connection_committed,
+            archive_reason: archive_reason.map(str::to_string),
+        };
+        let mut summaries = self
+            .hard_hard_terminal_summaries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if summaries.len() == HARD_HARD_TERMINAL_SUMMARY_MAX_ENTRIES {
+            summaries.pop_front();
+        }
+        summaries.push_back(summary);
     }
 
     /// Attach the diagnostics status event bus so every timeline record is
@@ -615,6 +779,48 @@ impl ConnectionTimeline {
                 .iter()
                 .cloned()
                 .collect(),
+            hot_path_observations: HotPathObservationCounts {
+                responder_binding_contended: self.hot_path_observations
+                    [HotPathObservation::ResponderBindingContended as usize]
+                    .load(Ordering::Relaxed),
+                responder_binding_stale: self.hot_path_observations
+                    [HotPathObservation::ResponderBindingStale as usize]
+                    .load(Ordering::Relaxed),
+                direct_ingress_contended: self.hot_path_observations
+                    [HotPathObservation::DirectIngressContended as usize]
+                    .load(Ordering::Relaxed),
+                direct_ingress_stale: self.hot_path_observations
+                    [HotPathObservation::DirectIngressStale as usize]
+                    .load(Ordering::Relaxed),
+                business_ingress_deferred: self.hot_path_observations
+                    [HotPathObservation::BusinessIngressDeferred as usize]
+                    .load(Ordering::Relaxed),
+                business_ingress_stale: self.hot_path_observations
+                    [HotPathObservation::BusinessIngressStale as usize]
+                    .load(Ordering::Relaxed),
+                outbound_flush_batches: self.hot_path_observations
+                    [HotPathObservation::OutboundFlushBatch as usize]
+                    .load(Ordering::Relaxed),
+                matched_ack_validation_queued: self.hot_path_observations
+                    [HotPathObservation::MatchedAckValidationQueued as usize]
+                    .load(Ordering::Relaxed),
+                matched_ack_validation_coalesced: self.hot_path_observations
+                    [HotPathObservation::MatchedAckValidationCoalesced as usize]
+                    .load(Ordering::Relaxed),
+                matched_ack_validation_backpressured: self.hot_path_observations
+                    [HotPathObservation::MatchedAckValidationBackpressured as usize]
+                    .load(Ordering::Relaxed),
+                matched_ack_validation_inactive: self.hot_path_observations
+                    [HotPathObservation::MatchedAckValidationInactive as usize]
+                    .load(Ordering::Relaxed),
+            },
+            hard_hard_terminal_summaries: self
+                .hard_hard_terminal_summaries
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .iter()
+                .cloned()
+                .collect(),
         }
     }
 }
@@ -670,6 +876,54 @@ fn parse_detail_fields(detail: &str) -> TimelineDetailFields {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hot_path_counters_remain_exact_without_packet_rate_status_revisions() {
+        let timeline = ConnectionTimeline::new("node-a", 0);
+        let bus = crate::diagnostics::StatusEventBus::new();
+        timeline.set_status_event_bus(bus.clone());
+        let details_built = AtomicU64::new(0);
+        for _ in 0..1_000 {
+            timeline.observe_hot_path(
+                HotPathObservation::DirectIngressContended,
+                Some("direct"),
+                Some("session_evidence_fence_contended"),
+                || {
+                    details_built.fetch_add(1, Ordering::Relaxed);
+                    "peer=node-b".to_string()
+                },
+            );
+            timeline.record_outbound_flush_batch();
+            timeline.count_hot_path(HotPathObservation::MatchedAckValidationInactive);
+        }
+        timeline.observe_hot_path(
+            HotPathObservation::DirectIngressStale,
+            Some("direct"),
+            Some("session_replaced_or_removed"),
+            || "peer=node-b".to_string(),
+        );
+
+        let snapshot = timeline.snapshot();
+        assert_eq!(
+            snapshot.hot_path_observations.direct_ingress_contended,
+            1_000
+        );
+        assert_eq!(snapshot.hot_path_observations.direct_ingress_stale, 1);
+        assert_eq!(snapshot.hot_path_observations.outbound_flush_batches, 1_000);
+        assert_eq!(
+            snapshot
+                .hot_path_observations
+                .matched_ack_validation_inactive,
+            1_000
+        );
+        // Powers of two through 512 produce ten samples; the stale category
+        // starts independently at one. Exact counters do not churn /events.
+        assert_eq!(details_built.load(Ordering::Relaxed), 10);
+        assert_eq!(snapshot.events.len(), 11);
+        assert_eq!(bus.current_seq(), 11);
+        assert_eq!(snapshot.events[0].event, "session_evidence_contended");
+        assert_eq!(snapshot.events[10].event, "stale_session_evidence");
+    }
 
     #[test]
     fn timeline_events_are_bounded_and_serde_round_trip() {

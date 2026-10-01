@@ -155,8 +155,12 @@ if [ "$LOCAL_PACKAGE" -ne 1 ]; then
     exit 1
   fi
   case "$VERSION" in
-    v[A-Za-z0-9._-]*) ;;
+    v?*) ;;
     *) echo "--version must look like vX.Y.Z." >&2; exit 1 ;;
+  esac
+  # Match the complete tag grammar used by the release metadata tools.
+  case "$VERSION" in
+    *[!ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-]*) echo "--version must look like vX.Y.Z." >&2; exit 1 ;;
   esac
   need_cmd uname
   need_cmd mktemp

@@ -94,6 +94,14 @@ extension DaemonControllerLaunchToken on DaemonController {
   }
 
   Future<void> protectRuntimeDirectory(Directory runtimeDir) async {
+    final before = await FileSystemEntity.type(
+      runtimeDir.path,
+      followLinks: false,
+    );
+    if (before != FileSystemEntityType.notFound &&
+        before != FileSystemEntityType.directory) {
+      throw const UnsafeLaunchPathException();
+    }
     await runtimeDir.create(recursive: true);
     await _restrictLaunchPath(runtimeDir.path, directory: true);
   }
@@ -180,13 +188,21 @@ extension DaemonControllerLaunchToken on DaemonController {
       return;
     }
 
-    final result = await Process.run('chmod', [
+    final kind = await FileSystemEntity.type(path, followLinks: false);
+    if (kind !=
+        (directory
+            ? FileSystemEntityType.directory
+            : FileSystemEntityType.file)) {
+      throw const UnsafeLaunchPathException();
+    }
+    final result = await Process.run('/bin/chmod', [
       directory ? '700' : '600',
       path,
     ]);
     if (result.exitCode != 0) {
-      throw StateError(
-        'POSIX permissions could not protect the launch ${directory ? 'directory' : 'file'}',
+      throw PosixLaunchPathProtectionException(
+        directory: directory,
+        exitCode: result.exitCode,
       );
     }
   }

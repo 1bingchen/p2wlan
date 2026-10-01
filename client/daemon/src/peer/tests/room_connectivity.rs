@@ -3,6 +3,8 @@ async fn room_old_peer_removal_does_not_erase_a_reassigned_ip_owner() {
     let peers =
         PeerManager::new(Config::generate_default("http://ctrl.test", "room-index").unwrap());
     let info = |id: &str| PeerInfo {
+        capabilities: crate::control::PeerCapabilities::default(),
+        registration_seq: 0,
         node_id: id.into(),
         virtual_ip: "10.21.1.3".into(),
         public_key: "pk".into(),
@@ -28,6 +30,8 @@ async fn room_peer_readdress_rotates_the_session_and_replaces_ip_index() {
     let peers =
         PeerManager::new(Config::generate_default("http://ctrl.test", "room-index").unwrap());
     let mut info = PeerInfo {
+        capabilities: crate::control::PeerCapabilities::default(),
+        registration_seq: 0,
         node_id: "b".into(),
         virtual_ip: "10.21.1.3".into(),
         public_key: "pk".into(),

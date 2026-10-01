@@ -46,7 +46,7 @@ String _networkStatusLabel(
 ) => switch (status) {
   _NetworkStatus.stopped =>
     canControlLocalDaemon ? strings.notRunning : strings.unavailable,
-  _NetworkStatus.unavailable => strings.unavailable,
+  _NetworkStatus.unavailable => strings.isZh ? '状态不可读' : 'Status unavailable',
   _NetworkStatus.healthy => strings.statusNormal,
   _NetworkStatus.degraded => strings.degraded,
   _NetworkStatus.stale => strings.stale,

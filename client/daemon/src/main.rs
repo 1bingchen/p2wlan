@@ -22,6 +22,7 @@ include!("main/instance_lock.rs");
 include!("main/diagnostics_auth.rs");
 include!("main/lifecycle_probe.rs");
 include!("main/windows_lifecycle.rs");
+include!("main/runtime_directory_prepare.rs");
 include!("main/runtime.rs");
 include!("main/overrides.rs");
 include!("main/windows_elevation.rs");

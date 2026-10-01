@@ -1,0 +1,16 @@
+/* Resource task flows: secondary evidence stays available without competing with names. */
+.resource-return { display: flex; align-items: center; min-height: 24px; }
+.resource-empty-state { display: flex; flex-direction: column; align-items: center; gap: 12px; padding: 28px 20px; text-align: center; color: var(--text-2); }
+.resource-query-recovery { padding: 0 20px 20px; }
+.resource-technical-info { margin-top: 5px; font-size: var(--font-caption); }
+.resource-technical-info > summary { width: fit-content; min-height: 24px; cursor: pointer; color: var(--text-2); }
+.resource-technical-info > summary:hover { color: var(--accent); }
+.resource-technical-info > summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; border-radius: 3px; }
+.resource-technical-info dl { display: grid; gap: 8px; margin: 10px 0 2px; }
+.resource-technical-info dl > div { display: flex; align-items: baseline; flex-wrap: wrap; gap: 6px; }
+.resource-technical-info dt { color: var(--text-2); }
+.resource-technical-info dd { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; margin: 0; }
+.resource-technical-info code { display: inline; color: var(--text); overflow-wrap: anywhere; white-space: normal; user-select: text; }
+.resource-primary-value { display: inline-flex; align-items: center; gap: 6px; }
+.resource-technical-info .copy-value span { margin-top: 0; }
+@media (pointer: coarse) { .resource-technical-info > summary { min-height: 36px; padding-block: 8px; } }

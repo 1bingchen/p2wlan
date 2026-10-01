@@ -212,7 +212,9 @@ pub struct NatProfile {
     /// Whether this profile is a good candidate for bounded birthday probing.
     #[serde(default)]
     pub birthday_candidate: bool,
-    /// Confidence score from 0-100.
+    /// Coarse discovery evidence score from 0-100, not a measured probability
+    /// of predicting the peer-facing port. Concurrent allocation observations
+    /// are capped at 60; a fresh ordered PortModel owns execution confidence.
     pub confidence: u8,
 }
 
@@ -624,12 +626,13 @@ pub fn parse_nat_hint(input: &str) -> NatFingerprintHint {
             }
             "d" => {
                 // `control_label` emits `d=?` when there is no port delta, and
-                // a non-negative integer otherwise.  Reject anything else.
+                // a signed allocation stride otherwise. Reverse allocators must
+                // preserve the entire label, including generation/lifecycle fences.
                 port_delta = if value == "?" {
                     None
                 } else {
                     match value.parse::<i32>() {
-                        Ok(d) if d >= 0 => Some(d),
+                        Ok(d) => Some(d),
                         _ => return unparsed_hint(&raw),
                     }
                 };

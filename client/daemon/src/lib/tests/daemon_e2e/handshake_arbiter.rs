@@ -8,6 +8,8 @@ async fn exact_handshake_retry_cancellation_is_merged_and_stale_wake_is_harmless
     let daemon = Daemon::new(config);
     let peer_identity = NodeIdentity::generate();
     let peer_info = control::PeerInfo {
+        capabilities: crate::control::PeerCapabilities::default(),
+        registration_seq: 0,
         node_id: "peer-cancelled-exact-retry".to_string(),
         device_name: String::new(),
         app_version: String::new(),
@@ -476,6 +478,8 @@ async fn network_generation_advance_synchronously_cancels_exact_handshake_retry_
     daemon
         .peers
         .add_peer(&control::PeerInfo {
+            capabilities: crate::control::PeerCapabilities::default(),
+            registration_seq: 0,
             node_id: peer_id.to_string(),
             public_key: hex::encode(peer_identity.public_key()),
             virtual_ip: "10.20.0.9".to_string(),
@@ -505,6 +509,8 @@ async fn network_generation_advance_synchronously_cancels_exact_handshake_retry_
     daemon
         .peers
         .add_peer(&control::PeerInfo {
+            capabilities: crate::control::PeerCapabilities::default(),
+            registration_seq: 0,
             node_id: pending_peer_id.to_string(),
             public_key: hex::encode(pending_peer_identity.public_key()),
             virtual_ip: "10.20.0.10".to_string(),
@@ -809,6 +815,8 @@ async fn maintenance_snapshot_race_yields_to_event_single_offer_and_one_session(
         }
     };
     let peer_info = control::PeerInfo {
+        capabilities: crate::control::PeerCapabilities::default(),
+        registration_seq: 0,
         node_id: "peer-maintenance-event-race".to_string(),
         public_key: hex::encode(remote_identity.public_key()),
         virtual_ip: "10.20.0.2".to_string(),
@@ -967,6 +975,8 @@ async fn responder_preempts_contended_initiator_retry_with_bounded_turn_and_no_s
     };
     let peer_id = "peer-responder-preempts-initiator";
     let peer_info = control::PeerInfo {
+        capabilities: crate::control::PeerCapabilities::default(),
+        registration_seq: 0,
         node_id: peer_id.to_string(),
         public_key: hex::encode(remote_identity.public_key()),
         virtual_ip: "10.20.0.3".to_string(),

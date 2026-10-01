@@ -147,6 +147,9 @@ pub struct PeerConnection {
     pub device_name: String,
     /// Peer application/daemon version reported by the control plane.
     pub app_version: String,
+    /// Authenticated registration-scoped wire capabilities; absent means legacy.
+    pub capabilities: crate::control::PeerCapabilities,
+    pub registration_seq: u64,
     /// Peer's static WireGuard/X25519 public key as hex.
     pub public_key: String,
     /// Symmetric MAC key for authenticated UDP Probe v2.
@@ -610,6 +613,8 @@ impl PeerConnection {
             node_id: node_id.to_string(),
             device_name: String::new(),
             app_version: String::new(),
+            capabilities: crate::control::PeerCapabilities::default(),
+            registration_seq: 0,
             public_key: String::new(),
             probe_mac_key: None,
             probe_session_id: None,
@@ -825,6 +830,7 @@ impl PeerConnection {
         }
         self.sync_direct_cache();
         self.sync_committed_business_path_cache();
+        self.sync_direct_pair_cache();
         self.sync_path_telemetry();
 
         if previous_state != new_state || previous_active != current_active {
@@ -874,12 +880,40 @@ impl PeerConnection {
                 cache.remove(&self.node_id);
             }
         }
-        if self.state != ConnectionState::Direct {
-            if let Some(cache) = &self.direct_pair_cache {
-                cache
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .remove(&self.node_id);
+    }
+
+    /// Final exact-pair projection of the same authoritative transition. A
+    /// pending Direct commit has no active revision until the other path
+    /// mirrors above are published; invalidation removes the entire tuple.
+    fn sync_direct_pair_cache(&self) {
+        if let Some(cache) = &self.direct_pair_cache {
+            let mut cache = cache
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let path = self.path_state_machine.snapshot();
+            let current = cache.get_mut(&self.node_id).filter(|pair| {
+                self.online
+                    && self.state == ConnectionState::Direct
+                    && self.direct_generation == pair.generation
+                    && self.remote_candidate_epoch() == pair.remote_candidate_epoch
+                    && path.state.lifecycle == PeerPathLifecycle::Online
+                    && path.state.epoch
+                        == Some(PathEpoch::new(
+                            pair.generation,
+                            pair.peer_session_generation,
+                            pair.remote_candidate_epoch,
+                        ))
+                    && matches!(&path.state.active, ActiveBusinessPath::Direct(validation)
+                        if validation.epoch == path.state.epoch.expect("matched epoch")
+                            && validation.commit_endpoint() == Some(pair.remote_endpoint))
+                    && self.endpoint == Some(pair.remote_endpoint)
+            });
+            if let Some(pair) = current {
+                // Keep the exact commit projection in step with every typed
+                // path transition, including Direct-preserving observations.
+                pair.path_revision = Some(path.revision);
+            } else {
+                cache.remove(&self.node_id);
             }
         }
     }
@@ -890,13 +924,13 @@ impl PeerConnection {
         self.sync_direct_cache();
     }
 
-    /// Attach the manager's lock-free exact Direct-pair mirror.
+    /// Attach the manager's synchronous exact Direct-pair mirror.
     pub(crate) fn attach_direct_pair_cache(
         &mut self,
         cache: Arc<std::sync::Mutex<HashMap<String, DirectCommitPairSnapshot>>>,
     ) {
         self.direct_pair_cache = Some(cache);
-        self.sync_direct_cache();
+        self.sync_direct_pair_cache();
     }
 
     fn sync_committed_business_path_cache(&self) {

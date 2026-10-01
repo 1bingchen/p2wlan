@@ -162,6 +162,7 @@ def _side_evidence(
     expected_path: str,
     overlay_burst: int,
     allow_replay_rejects: bool = False,
+    normal_join: bool = False,
 ) -> tuple[dict[str, Any], str | None]:
     baseline_identity = _status_identity(baseline)
     final_identity = _status_identity(final)
@@ -220,6 +221,9 @@ def _side_evidence(
         key=lambda item: _int(item.get("at_ms")) if _int(item.get("at_ms")) is not None else 2**63,
         default=None,
     )
+    if normal_join:
+        observed_path = (summary or first_event or {}).get("path")
+        expected_path = observed_path if observed_path in {"direct", "relay"} else "unobserved"
 
     ready_at_ms = None
     first_usable_at_ms = None
@@ -353,7 +357,7 @@ def _side_evidence(
     tasks_ok = tasks_ok and critical_count > 0
 
     source_ok = source in {"persistent_summary", "event"}
-    first_path_ok = first_path == expected_path
+    first_path_ok = first_path in {"direct", "relay"} and first_path == expected_path
     # This side's remaining DirectFirst window is producer evidence.  The
     # acceptance budget is paired in build_record: a daemon's first ingress can
     # be gated by either endpoint's DirectFirst protection / Relay-ready skew.
@@ -365,7 +369,12 @@ def _side_evidence(
         and isinstance(delta_ms, int)
         and delta_ms >= 0
     )
-    business_ok = business_received and (expected_path != "relay" or business_sent or business_exchange)
+    # Normal joining can receive via Relay while sending via Direct. The
+    # paired record must prove authenticated business ingress at BOTH peers;
+    # requiring a Relay send marker here would reject that working exchange.
+    # Dedicated Relay gates still require both Relay-specific directions.
+    business_ok = business_received and (
+        normal_join or expected_path != "relay" or business_sent or business_exchange)
     # Direct cold-start exits the smoke loop as soon as both sides prove the
     # first authenticated Direct business ingress.  Its overlay generator is
     # intentionally not awaited for a full burst; Relay-only waits for the
@@ -487,6 +496,7 @@ def _apply_first_usable_budget(
     counterpart: dict[str, Any],
     expected_path: str,
     reason: str | None,
+    normal_join: bool = False,
 ) -> str | None:
     """Fence one local ingress delta with the paired protection window.
 
@@ -496,13 +506,32 @@ def _apply_first_usable_budget(
     remaining windows.  Direct topology never receives this allowance.
     """
     first = side["observed"]["first_usable"]
+    # Normal joining does not wait for Relay before generating business.
+    # A valid durable Direct commit may therefore precede Relay readiness.
+    # Keep its Relay delta unknown, rather than fabricating zero or rejecting
+    # a faster working path. Calibrated Direct/Relay gates retain their SLO.
+    if (normal_join and expected_path == "direct"
+            and first.get("source") == "persistent_summary"
+            and first.get("path") == "direct"
+            and first.get("relay_ready_at_ms") is None
+            and first.get("delta_ms") is None
+            and type(first.get("first_usable_at_ms")) is int
+            and type(side["final"].get("captured_at_ms")) is int
+            and 0 <= first["first_usable_at_ms"] <= side["final"]["captured_at_ms"]):
+        first["relay_ready_delta_applicable"] = False
+        first["budget_ms"] = None
+        side["invariants"]["first_usable_delta_fenced"] = True
+        return None if reason == "first_usable_delta_missing" else reason
     counterpart_first = counterpart["observed"]["first_usable"]
     budget_remaining_ms = 0
     if expected_path == "relay":
-        candidates = (
+        candidates = [
             first.get("direct_first_remaining_ms_at_relay_ready"),
             counterpart_first.get("direct_first_remaining_ms_at_relay_ready"),
-        )
+        ]
+        if (normal_join and counterpart_first.get("path") == "direct"
+                and counterpart_first.get("relay_ready_delta_applicable") is False):
+            candidates = candidates[:1]
         for candidate in candidates:
             if (
                 not isinstance(candidate, int)
@@ -577,6 +606,7 @@ def build_record(args: argparse.Namespace) -> dict[str, Any]:
             args.expected_path,
             int(args.overlay_burst),
             allow_replay_rejects,
+            topology == "normal-join",
         )
         side_b, reason_b = _side_evidence(
             "b",
@@ -586,13 +616,19 @@ def build_record(args: argparse.Namespace) -> dict[str, Any]:
             args.expected_path,
             int(args.overlay_burst),
             allow_replay_rejects,
+            topology == "normal-join",
         )
-        reason_a = _apply_first_usable_budget(
-            side_a, side_b, args.expected_path, reason_a
-        )
-        reason_b = _apply_first_usable_budget(
-            side_b, side_a, args.expected_path, reason_b
-        )
+        sides = [(side_a, side_b, reason_a), (side_b, side_a, reason_b)]
+        # Mark Direct-before-Relay first, so asymmetric peers do not depend on
+        # which side happened to be named A in the paired timing calculation.
+        if topology == "normal-join":
+            sides.sort(key=lambda item: item[0]["observed"]["first_usable"]["path"] != "direct")
+        reasons = {}
+        for side, counterpart, reason in sides:
+            expected = side["observed"]["first_usable"]["path"] if topology == "normal-join" else args.expected_path
+            reasons[side["label"]] = _apply_first_usable_budget(
+                side, counterpart, expected, reason, topology == "normal-join")
+        reason_a, reason_b = reasons["a"], reasons["b"]
         hard_hard_experiment = topology == "hard-hard-experiment"
         if hard_hard_experiment:
             for side in (side_a, side_b):
@@ -720,7 +756,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument(
         "--topology",
         required=True,
-        choices=["relay-blackhole", "direct-cold-start", "hard-hard-experiment"],
+        choices=["relay-blackhole", "direct-cold-start", "hard-hard-experiment", "normal-join"],
     )
     parser.add_argument("--replica", required=True, type=int)
     parser.add_argument("--round", required=True, type=int)

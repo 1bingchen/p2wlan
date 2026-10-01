@@ -8,7 +8,8 @@ part of '../daemon_controller.dart';
 bool isP2wlanDaemonRuntimeCommandLine(String command) {
   final normalized = command.trim();
   if (!normalized.contains(DaemonController.daemonBinaryName)) return false;
-  return !RegExp(r'(^|\s)--build-info(?:\s|$)').hasMatch(normalized);
+  return !RegExp(r'(^|\s)--(?:build-info|prepare-runtime-directory)(?:\s|=|$)')
+      .hasMatch(normalized);
 }
 
 /// The OS-returned launch PID and the authenticated diagnostics PID are the
@@ -318,13 +319,7 @@ extension DaemonControllerPids on DaemonController {
 
   Future<String?> _windowsProcessName(int processId) async {
     if (!Platform.isWindows) return null;
-    final result = await _runWindowsPowerShell(
-      '\$process = Get-Process -Id $processId -ErrorAction SilentlyContinue; '
-      'if (\$null -ne \$process) { \$process.ProcessName + ".exe" }',
-    );
-    if (result.exitCode != 0) return null;
-    final name = result.stdout.toString().trim();
-    return name.isEmpty ? null : name;
+    return queryWindowsProcess(processId).processName;
   }
 
   @visibleForTesting

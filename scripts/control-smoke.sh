@@ -7,6 +7,8 @@ DIAG_A_PORT=${DIAG_A_PORT:-$((PORT + 101))}
 DIAG_B_PORT=${DIAG_B_PORT:-$((PORT + 102))}
 GO_BIN=${GO_BIN:-go}
 TMP_DIR=$(mktemp -d /tmp/p2wlan-smoke.XXXXXX)
+NODE_A_RUNTIME="$TMP_DIR/node-a-runtime"
+NODE_B_RUNTIME="$TMP_DIR/node-b-runtime"
 source "$ROOT_DIR/scripts/diagnostics-auth.sh"
 
 cleanup() {
@@ -26,6 +28,10 @@ cleanup() {
   rm -rf "$TMP_DIR"
 }
 trap cleanup EXIT
+
+# With no --log-file, each daemon publishes its diagnostics credential beside
+# its config. Keep those process-owned directories private and independent.
+mkdir -m 700 "$NODE_A_RUNTIME" "$NODE_B_RUNTIME"
 
 echo "[smoke] temp dir: $TMP_DIR"
 
@@ -62,7 +68,7 @@ if [[ -z "$TOKEN" ]]; then
 fi
 
 printf '%s\n' "$TOKEN" | P2WLAN_DISABLE_TUN=1 RUST_LOG=info "$ROOT_DIR/target/debug/p2wlan-daemon" \
-  --config "$TMP_DIR/node-a.json" \
+  --config "$NODE_A_RUNTIME/config.json" \
   --control "http://127.0.0.1:$PORT" \
   --network default \
   --token-stdin \
@@ -79,7 +85,7 @@ for _ in {1..40}; do
 done
 
 printf '%s\n' "$TOKEN" | P2WLAN_DISABLE_TUN=1 RUST_LOG=info "$ROOT_DIR/target/debug/p2wlan-daemon" \
-  --config "$TMP_DIR/node-b.json" \
+  --config "$NODE_B_RUNTIME/config.json" \
   --control "http://127.0.0.1:$PORT" \
   --network default \
   --token-stdin \
@@ -99,8 +105,8 @@ for _ in {1..80}; do
      grep -Eq 'Prepared [1-9][0-9]* UDP candidate endpoints' "$TMP_DIR/node-b.log" 2>/dev/null && \
      grep -Eq 'Sent [1-9][0-9]* UDP punch probes to peer' "$TMP_DIR/node-a.log" 2>/dev/null && \
      grep -Eq 'Sent [1-9][0-9]* UDP punch probes to peer' "$TMP_DIR/node-b.log" 2>/dev/null; then
-     STATUS_A=$(DIAGNOSTICS_AUTH_TOKEN_FILE="$TMP_DIR/p2wlan-daemon.diag-auth" p2wlan_diagnostics_curl -fsS "http://127.0.0.1:$DIAG_A_PORT/status" 2>/dev/null || true)
-     STATUS_B=$(DIAGNOSTICS_AUTH_TOKEN_FILE="$TMP_DIR/p2wlan-daemon.diag-auth" p2wlan_diagnostics_curl -fsS "http://127.0.0.1:$DIAG_B_PORT/status" 2>/dev/null || true)
+     STATUS_A=$(DIAGNOSTICS_AUTH_TOKEN_FILE="$NODE_A_RUNTIME/p2wlan-daemon.diag-auth" p2wlan_diagnostics_curl -fsS "http://127.0.0.1:$DIAG_A_PORT/status" 2>/dev/null || true)
+     STATUS_B=$(DIAGNOSTICS_AUTH_TOKEN_FILE="$NODE_B_RUNTIME/p2wlan-daemon.diag-auth" p2wlan_diagnostics_curl -fsS "http://127.0.0.1:$DIAG_B_PORT/status" 2>/dev/null || true)
     if printf '%s' "$STATUS_A" | grep -q '"peers"' && \
        printf '%s' "$STATUS_A" | grep -q '"stats"' && \
        printf '%s' "$STATUS_A" | grep -q '"relay_selection"' && \
@@ -108,7 +114,7 @@ for _ in {1..80}; do
        printf '%s' "$STATUS_B" | grep -q '"stats"' && \
        printf '%s' "$STATUS_B" | grep -q '"relay_selection"'; then
       "$ROOT_DIR/target/debug/p2wlan-daemon" \
-        --config "$TMP_DIR/node-a.json" \
+        --config "$NODE_A_RUNTIME/config.json" \
         --status \
         --diagnostics-url "http://127.0.0.1:$DIAG_A_PORT/status" \
         >"$TMP_DIR/status-cli.json" 2>"$TMP_DIR/status-cli.log" || true

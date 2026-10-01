@@ -3,6 +3,7 @@ package api
 import (
 	"crypto/ed25519"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -383,6 +384,29 @@ func (s *Server) CreateSignal(w http.ResponseWriter, r *http.Request) {
 }
 
 func hardHardA0SessionTags(sessionID string) (role, sessionTag, planTag string, ok bool) {
+	if strings.HasPrefix(sessionID, "hh2:") {
+		// This is only a bounded logging projection. Endpoint wire parsing
+		// remains authoritative for the plan, generations and admission.
+		if len(sessionID) != 124 {
+			return "", "", "", false
+		}
+		wire, err := base64.RawURLEncoding.Strict().DecodeString(sessionID[4:])
+		if err != nil || len(wire) != 90 {
+			return "", "", "", false
+		}
+		flags := wire[0]
+		stage := (flags & 3) | ((flags >> 4) & 4)
+		responder := flags&4 != 0
+		if flags&128 != 0 || (flags>>4)&3 > 2 || stage > 5 || (stage%2 == 1) != responder {
+			return "", "", "", false
+		}
+		role = "initiator"
+		if responder {
+			role = "responder"
+		}
+		token := hex.EncodeToString(wire[1:17])
+		return role, hardHardA0Digest(token, "session"), hardHardA0Digest(token, "rendezvous-plan"), true
+	}
 	fields := strings.SplitN(sessionID, ":", 4)
 	if len(fields) != 4 || fields[0] != "hh1" {
 		return "", "", "", false

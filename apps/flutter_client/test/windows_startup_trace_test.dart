@@ -6,6 +6,35 @@ import 'package:p2wlan_flutter_client/core/daemon/daemon_controller.dart';
 
 void main() {
   test(
+    'startup diagnostics survive an unwritable log root with bounded memory',
+    () async {
+      final root = await Directory.systemTemp.createTemp(
+        'p2wlan-startup-failure-',
+      );
+      addTearDown(() => root.delete(recursive: true));
+      final blocked = File('${root.path}/blocked');
+      await blocked.writeAsString('keep');
+      final trace = WindowsStartupTrace(
+        Directory(blocked.path),
+        platform: 'macos',
+      );
+      await trace.open();
+      for (var index = 0; index < 80; index++) {
+        await trace.detail('event=$index ${'x' * 2000}');
+      }
+      await trace.failure(5, 'ACL_FAILURE');
+      expect(trace.entries, hasLength(64));
+      expect(
+        trace.entries.last,
+        contains('[macos-startup] FAIL stage=05 code=ACL_FAILURE'),
+      );
+      expect(trace.entries.first, isNot(contains('event=0 ')));
+      expect(trace.entries.every((entry) => entry.length < 1100), isTrue);
+      expect(await blocked.readAsString(), 'keep');
+    },
+  );
+
+  test(
     'Windows startup trace records ordered redacted handoff stages',
     () async {
       final root = await Directory.systemTemp.createTemp(

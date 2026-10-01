@@ -454,17 +454,81 @@ void _registerDashboardTests() {
     );
 
     // Health is up but no snapshot: unavailable, never stopped.
-    expect(find.text('Cannot reach P2WLAN'), findsOneWidget);
+    expect(find.text('Runtime status temporarily unavailable'), findsOneWidget);
     expect(
-      find.text('The local network service is currently unavailable.'),
+      find.text(
+        'The service is reachable, but runtime status is temporarily unavailable.',
+      ),
       findsOneWidget,
     );
+    expect(find.text('Cannot reach P2WLAN'), findsNothing);
+    expect(
+      find.text('The local network service is currently unavailable.'),
+      findsNothing,
+    );
     expect(find.text('Not running'), findsNothing);
-    expect(find.text('Unavailable'), findsOneWidget);
+    expect(find.text('Status unavailable'), findsOneWidget);
     expect(find.byKey(const Key('dashboard-start-button')), findsNothing);
     expect(find.byKey(const Key('dashboard-check-button')), findsNothing);
     expect(find.text('Online devices'), findsNothing);
   });
+
+  for (final languageCode in ['en', 'zh-CN']) {
+    testWidgets(
+      'Home keeps reachable local 401 distinct from stopped ($languageCode)',
+      (tester) async {
+        final strings = AppStrings.fromCode(languageCode);
+        final stores = (await tester.runAsync(
+          () => _makeStores(
+            api: _FakeDiagnosticsApi(
+              health: true,
+              statusError: const DiagnosticsApiException(
+                'GET /status returned HTTP 401',
+                statusCode: 401,
+              ),
+            ),
+          ),
+        ))!;
+        addTearDown(stores.dispose);
+
+        await stores.statusStore.refresh();
+        expect(stores.statusStore.healthReachable, isTrue);
+        expect(stores.statusStore.snapshot, isNull);
+        expect(
+          stores.statusStore.lastStatusError,
+          'local_diagnostics_auth_failed',
+        );
+        await tester.pumpWidget(
+          _TestApp(
+            strings: strings,
+            child: DashboardPage(
+              settingsStore: stores.settingsStore,
+              statusStore: stores.statusStore,
+              capabilities: PlatformCapabilities.fromPlatform('macos'),
+            ),
+          ),
+        );
+
+        expect(find.text(strings.issueStatusUnavailableTitle), findsOneWidget);
+        expect(find.text(strings.issueStatusUnavailableDetail), findsOneWidget);
+        expect(
+          find.text(strings.isZh ? '状态不可读' : 'Status unavailable'),
+          findsOneWidget,
+        );
+        expect(
+          find.text(strings.statusMessage('local_diagnostics_auth_failed')!),
+          findsOneWidget,
+        );
+        expect(find.text(strings.homeUnavailableTitle), findsNothing);
+        expect(find.text(strings.homeUnavailableDetail), findsNothing);
+        expect(find.text(strings.notRunning), findsNothing);
+        expect(find.text(strings.statusNormal), findsNothing);
+        expect(find.byKey(const Key('dashboard-start-button')), findsNothing);
+        expect(find.byKey(const Key('dashboard-stop-button')), findsNothing);
+        expect(tester.takeException(), isNull);
+      },
+    );
+  }
 
   testWidgets('Home shows device path and latency in a compact preview', (
     tester,

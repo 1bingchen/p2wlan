@@ -4,6 +4,8 @@
 
 fn flood_peer_112(node_id: &str, virtual_ip: &str, endpoint: SocketAddr) -> PeerInfo {
     PeerInfo {
+        capabilities: crate::control::PeerCapabilities::default(),
+        registration_seq: 0,
         node_id: node_id.to_string(),
         device_name: String::new(),
         app_version: String::new(),
@@ -233,6 +235,116 @@ async fn direct_commit_seq_prevents_post_promotion_udp_sends() {
         .wait_for_direct_commit_or_timeout("peer-fail", Some(seq), Duration::from_secs(1))
         .await;
     assert!(promoted, "the wait must observe the newer direct commit");
+}
+
+#[tokio::test]
+async fn direct_feedback_is_published_after_current_path_mirrors() {
+    struct Hooks<'a> {
+        manager: &'a PeerManager,
+        before: Option<u64>,
+        premature_notification: bool,
+    }
+    impl crate::peer::DirectCommitHooks for Hooks<'_> {
+        fn is_current(&self) -> bool {
+            true
+        }
+        fn committed(&mut self) {
+            self.premature_notification = self.manager.direct_commit_seq_sync("peer-direct")
+                != self.before
+                && !self.manager.is_direct_sync("peer-direct");
+        }
+        fn finish(&mut self) {
+            assert!(self.manager.is_direct_sync("peer-direct"));
+            assert_ne!(
+                self.manager.direct_commit_seq_sync("peer-direct"),
+                self.before
+            );
+        }
+    }
+    let manager = PeerManager::new(test_config());
+    let endpoint = "5.6.7.8:5001".parse().unwrap();
+    manager
+        .add_peer(&flood_peer_112("peer-direct", "10.20.0.3", endpoint))
+        .await;
+    let mut hooks = Hooks {
+        manager: &manager,
+        before: manager.direct_commit_seq_sync("peer-direct"),
+        premature_notification: false,
+    };
+    let epoch = manager.network_epoch_gate();
+    let guard = epoch.lock().await;
+    assert!(
+        manager
+            .record_direct_success_with_commit_hooks(
+                &guard,
+                "peer-direct",
+                Some(endpoint),
+                manager.current_network_generation_sync(),
+                None,
+                None,
+                None,
+                None,
+                Some(&mut hooks),
+            )
+            .await
+    );
+    assert!(!hooks.premature_notification);
+}
+
+#[tokio::test]
+async fn candidate_handover_wakes_feedback_without_claiming_direct() {
+    let manager = PeerManager::new(test_config());
+    manager
+        .add_peer(&flood_peer_112(
+            "peer-handover",
+            "10.20.0.3",
+            "5.6.7.8:5001".parse().unwrap(),
+        ))
+        .await;
+    let seq = manager.direct_commit_seq_sync("peer-handover");
+    let epoch = manager.network_epoch_gate();
+    let guard = epoch.lock().await;
+    manager.bump_direct_commit_seq("peer-handover");
+    drop(guard);
+
+    assert!(!manager.is_direct_sync("peer-handover"));
+    let result = tokio::time::timeout(
+        Duration::from_millis(100),
+        manager.wait_for_direct_commit_or_timeout("peer-handover", seq, Duration::from_secs(1)),
+    )
+    .await
+    .expect("handover must immediately wake the old feedback wait");
+    assert!(!result, "candidate invalidation is not a Direct promotion");
+}
+
+#[tokio::test]
+async fn pending_feedback_wakes_on_handover_without_claiming_direct() {
+    use std::future::Future as _;
+
+    let manager = PeerManager::new(test_config());
+    manager
+        .add_peer(&flood_peer_112(
+            "peer-handover",
+            "10.20.0.3",
+            "5.6.7.8:5001".parse().unwrap(),
+        ))
+        .await;
+    let mut wait = Box::pin(manager.wait_for_direct_commit_or_timeout(
+        "peer-handover",
+        manager.direct_commit_seq_sync("peer-handover"),
+        Duration::from_secs(1),
+    ));
+    let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+    assert!(wait.as_mut().poll(&mut context).is_pending());
+    let epoch = manager.network_epoch_gate();
+    let guard = epoch.lock().await;
+    manager.bump_direct_commit_seq("peer-handover");
+    drop(guard);
+
+    assert_eq!(
+        wait.as_mut().poll(&mut context),
+        std::task::Poll::Ready(false)
+    );
 }
 
 #[tokio::test]

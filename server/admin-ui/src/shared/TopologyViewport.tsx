@@ -1,5 +1,5 @@
+import { getViewportForBounds, useReactFlow, useStore, type Node } from '@xyflow/react'
 import { useEffect } from 'react'
-import { getNodesBounds, getViewportForBounds, type Node, useReactFlow, useStore } from '@xyflow/react'
 
 interface TopologyViewportProps {
   nodes: Node[]
@@ -12,7 +12,7 @@ interface TopologyViewportProps {
 
 /** Fit structural changes without resetting a user's view on telemetry updates. */
 export function TopologyViewport({ nodes, fullscreen, padding = 0.12, maxZoom = 1.12, focusNodeIds = [], focusKey = '' }: TopologyViewportProps) {
-  const { setViewport, viewportInitialized } = useReactFlow()
+  const { getNodesBounds, setViewport, viewportInitialized } = useReactFlow()
   const width = useStore((state) => state.width)
   const height = useStore((state) => state.height)
   const focused = nodes.filter((node) => focusNodeIds.includes(node.id))

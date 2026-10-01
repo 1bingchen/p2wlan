@@ -1,7 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { Download } from 'lucide-react'
 import { tr } from './i18n'
-import './data-actions.css'
 
 const MAX_EXPORT_ITEMS = 1_000
 

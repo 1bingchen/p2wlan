@@ -1,7 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { Check, Copy } from 'lucide-react'
 import { tr } from './i18n'
-import './data-actions.css'
 
 export function CopyValue({ value, label = '复制', compact = false }: { value: string; label?: string; compact?: boolean }) {
   const [status, setStatus] = useState<'idle' | 'copied' | 'failed'>('idle')

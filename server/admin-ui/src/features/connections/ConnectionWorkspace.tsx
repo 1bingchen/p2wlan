@@ -1,17 +1,18 @@
 import { useInfiniteQuery } from '@tanstack/react-query'
-import { Link, useLocation } from 'react-router-dom'
 import { AlertTriangle, ChartNoAxesCombined, Table2, Waypoints } from 'lucide-react'
-import { adminApi } from './api'
-import { ConnectionHealthPage } from './ConnectionHealthPage'
-import { ConnectionsPage } from './ConnectionsPage'
+import { Link, useLocation } from 'react-router-dom'
+import { adminApi } from '../../api'
+import { PageHeader } from '../../components/ui/console'
+import { getLocale, tr } from '../../i18n'
+import { QueryStatus } from '../../refresh'
+import { ResourceReturnLink } from '../../shared/console'
+import { ConnectionHealthPage } from '../health/ConnectionHealthPage'
 import { ConnectionTrends } from './ConnectionTrends'
+import { ConnectionsPage } from './ConnectionsPage'
+import { healthSignalLabel } from './connectionLabels'
 import { connectionWorkspaceSearch, connectionWorkspaceTab, readDirectionOnlySearch, selectConnectionSearch, type ConnectionWorkspaceTab } from './connectionNavigation'
 import { readHealthSearch } from './trends'
-import { QueryStatus } from './refresh'
-import { getLocale, tr } from './i18n'
-import { healthSignalLabel } from './connectionLabels'
 import { useConnectionSearchParams } from './useConnectionSearch'
-import { ResourceReturnLink } from './ResourceUI'
 
 const tabs = [
   { id: 'health', label: '待关注', icon: AlertTriangle },
@@ -43,7 +44,7 @@ function NetworkTrends() {
     return next
   })
   return <div className="page-stack">
-    <div className="page-intro"><div><h2>{tr('历史趋势')}</h2><p>{tr('按网络汇总观测；下方图表不应用账号或设备筛选。')}</p></div></div>
+    <PageHeader title={tr('历史趋势')} description={<> {tr('按网络汇总观测；下方图表不应用账号或设备筛选。')} </>} />
     <div className="connections-toolbar">
       <select className="select-field" aria-label={tr('按网络过滤')} value={networkId} onChange={(event) => update('network_id', event.target.value)}>
         <option value="">{tr('全部网络')}</option>

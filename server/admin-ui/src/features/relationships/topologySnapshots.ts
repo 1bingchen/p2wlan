@@ -1,4 +1,4 @@
-import type { AdminTopologySnapshotPage } from './types'
+import type { AdminTopologySnapshotPage } from '../../types'
 
 export const TOPOLOGY_NODE_LIMIT = 2000
 export const TOPOLOGY_EDGE_LIMIT = 4000

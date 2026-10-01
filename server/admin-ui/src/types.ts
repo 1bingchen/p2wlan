@@ -328,3 +328,5 @@ export interface AdminTopologySnapshotPage extends AdminTopology {
   complete: boolean
   next_cursor?: string
 }
+
+export type ResourceAccountScope = { id: string; username: string }

@@ -4,7 +4,7 @@ import test from 'node:test'
 import { build } from 'esbuild'
 import { createElement } from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
-import { CONNECTION_PAGE_SIZE, closeConnectionDetailSearch, connectionDetailIsOpen, connectionWorkspaceSearch, connectionWorkspaceTab, isolateConnectionSearch, lastAvailableConnectionPage, readConnectionSearch, readDirectionOnlySearch, selectConnectionSearch, updateConnectionSearch } from '../src/connectionNavigation.ts'
+import { CONNECTION_PAGE_SIZE, closeConnectionDetailSearch, connectionDetailIsOpen, connectionWorkspaceSearch, connectionWorkspaceTab, isolateConnectionSearch, lastAvailableConnectionPage, readConnectionSearch, readDirectionOnlySearch, selectConnectionSearch, updateConnectionSearch } from '../src/features/connections/connectionNavigation.ts'
 
 const require = createRequire(import.meta.url)
 // Share the CJS contexts used by the in-memory compiled component.
@@ -27,8 +27,8 @@ async function compileSource(entry) {
   return module.exports
 }
 
-const { ConnectionsPage } = await compileSource('src/ConnectionsPage.tsx')
-const { ConnectionTopology } = await compileSource('src/ConnectionTopology.tsx')
+const { ConnectionsPage } = await compileSource('src/features/connections/ConnectionsPage.tsx')
+const { ConnectionTopology } = await compileSource('src/features/connections/ConnectionTopology.tsx')
 
 test('connection scope, filters, view and page round-trip through a copied URL', () => {
   const search = updateConnectionSearch(new URLSearchParams(), {

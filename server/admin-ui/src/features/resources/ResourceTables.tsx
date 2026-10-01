@@ -1,11 +1,11 @@
-import { useMemo } from 'react'
 import { type ColumnDef } from '@tanstack/react-table'
+import { useMemo } from 'react'
 import { Link, useLocation } from 'react-router-dom'
-import { tr } from './i18n'
-import { connectionLink, relationshipLink, resourceOriginState } from './pageState'
-import { CopyValue } from './CopyValue'
-import { DataTable, Status, natLabel, formatAgo } from './ResourceUI'
-import type { AdminDevice, AdminNetwork, AdminRoom } from './types'
+import { CopyValue } from '../../CopyValue'
+import { tr } from '../../i18n'
+import { connectionLink, relationshipLink, resourceOriginState } from '../../pageState'
+import { DataTable, Status, formatAgo, natLabel } from '../../shared/console'
+import type { AdminDevice, AdminNetwork, AdminRoom } from '../../types'
 
 export function DeviceTable({ devices, accountId }: { devices: AdminDevice[]; accountId?: string }) {
   const location = useLocation()

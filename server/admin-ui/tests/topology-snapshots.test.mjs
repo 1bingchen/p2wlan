@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { mergeTopologySnapshots, nextTopologySnapshotCursor, TOPOLOGY_NODE_LIMIT, TOPOLOGY_PAGE_LIMIT } from '../src/topologySnapshots.ts'
+import { mergeTopologySnapshots, nextTopologySnapshotCursor, TOPOLOGY_NODE_LIMIT, TOPOLOGY_PAGE_LIMIT } from '../src/features/relationships/topologySnapshots.ts'
 
 const page = (values = {}) => ({
   generated_at: 20, snapshot_at: 10, graph_kind: 'control_relationships', scope: 'global', view: 'summary',

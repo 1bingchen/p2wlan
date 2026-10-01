@@ -1,4 +1,4 @@
-import type { AdminTopology, AdminTopologyNode } from './types'
+import type { AdminTopology, AdminTopologyNode } from '../../types'
 
 export interface NetworkSummary {
   id: string

@@ -28,7 +28,7 @@ async function compileSource(entry, plugins = []) {
 
 // Export private pure functions only in the test build, preserving the public
 // component API and testing the implementation used by the actual application.
-const graph = await compileSource('src/TopologyCanvas.tsx', [{
+const graph = await compileSource('src/features/relationships/TopologyCanvas.tsx', [{
   name: 'test-layout-functions',
   setup(builder) {
     builder.onLoad({ filter: /TopologyCanvas\.tsx$/ }, ({ path: filename }) => ({

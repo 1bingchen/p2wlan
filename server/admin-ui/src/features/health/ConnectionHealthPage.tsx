@@ -1,18 +1,12 @@
-import { tr } from './i18n'
-import { getLocale } from './i18n'
-import { type ReactNode, useEffect, useMemo } from 'react'
 import { useInfiniteQuery, useQuery } from '@tanstack/react-query'
-import { Link, useLocation } from 'react-router-dom'
-import { useConnectionSearchParams } from './useConnectionSearch'
-import { healthSignalLabel } from './connectionLabels'
 import {
   Activity,
   AlertTriangle,
   ArrowDownRight,
-  CircleAlert,
-  CircleCheck,
   ChevronLeft,
   ChevronRight,
+  CircleAlert,
+  CircleCheck,
   Clock3,
   Gauge,
   MonitorSmartphone,
@@ -21,14 +15,19 @@ import {
   Route,
   X,
 } from 'lucide-react'
-import { adminApi } from './api'
-import { ConnectionDrawer } from './ConnectionDrawer'
-import { SnapshotExport } from './SnapshotExport'
-import { resourceOriginState } from './pageState'
-import { closeConnectionDetailSearch, connectionDetailIsOpen, connectionWorkspaceSearch } from './connectionNavigation'
-import { QueryStatus, useAutoRefresh } from './refresh'
-import { clearHealthScope, HEALTH_PAGE_SIZE, HEALTH_SIGNALS, readHealthSearch, selectHealthDirection, type HealthDirection } from './trends'
-import type { AdminConnectionHealthAlert } from './types'
+import { useEffect, useMemo, type ReactNode } from 'react'
+import { Link, useLocation } from 'react-router-dom'
+import { SnapshotExport } from '../../SnapshotExport'
+import { adminApi } from '../../api'
+import { getLocale, tr } from '../../i18n'
+import { resourceOriginState } from '../../pageState'
+import { QueryStatus, useAutoRefresh } from '../../refresh'
+import type { AdminConnectionHealthAlert } from '../../types'
+import { ConnectionDrawer } from '../connections/ConnectionDrawer'
+import { healthSignalLabel } from '../connections/connectionLabels'
+import { closeConnectionDetailSearch, connectionDetailIsOpen, connectionWorkspaceSearch } from '../connections/connectionNavigation'
+import { HEALTH_PAGE_SIZE, HEALTH_SIGNALS, clearHealthScope, readHealthSearch, selectHealthDirection, type HealthDirection } from '../connections/trends'
+import { useConnectionSearchParams } from '../connections/useConnectionSearch'
 
 const HEALTH_ALERT_LIMIT = HEALTH_PAGE_SIZE
 

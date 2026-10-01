@@ -1,4 +1,4 @@
-import { api } from './api'
+import { api } from '../../api'
 import { readConnectionSearch, selectConnectionSearch } from './connectionNavigation'
 
 export interface TrendBucket {

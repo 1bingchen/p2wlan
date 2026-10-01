@@ -1,4 +1,4 @@
-import type { AdminConnection } from './types'
+import type { AdminConnection } from '../../types'
 
 export const CONNECTION_PAGE_SIZE = 25
 

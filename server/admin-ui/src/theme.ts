@@ -1,52 +1,54 @@
 import { useSyncExternalStore } from 'react'
 
-export type AdminTheme = 'light' | 'dark'
-
+export type AdminTheme = 'system' | 'light' | 'dark'
 const STORAGE_KEY = 'p2wlan-admin-theme'
 const listeners = new Set<() => void>()
+const normalize = (value: string | null): AdminTheme => value === 'light' || value === 'dark' ? value : 'system'
+const media = typeof window !== 'undefined' && typeof window.matchMedia === 'function' ? window.matchMedia('(prefers-color-scheme: dark)') : undefined
 
 function readInitialTheme(): AdminTheme {
-  if (typeof window === 'undefined') return 'light'
-  try { return window.localStorage.getItem(STORAGE_KEY) === 'dark' ? 'dark' : 'light' } catch { return 'light' }
+  try { return normalize(window.localStorage.getItem(STORAGE_KEY)) } catch { return 'system' }
 }
+let activeTheme = readInitialTheme()
 
-let activeTheme: AdminTheme = readInitialTheme()
-
-function applyTheme(theme: AdminTheme) {
-  if (typeof document !== 'undefined') document.documentElement.dataset.theme = theme
+function applyTheme() {
+  if (typeof document === 'undefined') return
+  document.documentElement.dataset.theme = activeTheme === 'system' ? media?.matches ? 'dark' : 'light' : activeTheme
+  document.documentElement.dataset.themeMode = activeTheme
 }
+applyTheme()
 
-applyTheme(activeTheme)
-
-function subscribe(listener: () => void) {
-  listeners.add(listener)
-  const onStorage = (event: StorageEvent) => {
-    if (event.key !== STORAGE_KEY && event.key !== null) return
-    const next = event.newValue === 'dark' ? 'dark' : 'light'
-    if (next === activeTheme) return
-    activeTheme = next
-    applyTheme(activeTheme)
-    for (const subscriber of listeners) subscriber()
-  }
-  window.addEventListener('storage', onStorage)
-  return () => {
-    listeners.delete(listener)
-    window.removeEventListener('storage', onStorage)
-  }
-}
-
-export function getTheme(): AdminTheme {
-  return activeTheme
-}
-
-export function setTheme(theme: AdminTheme) {
-  if (theme === activeTheme) return
-  activeTheme = theme
-  try { if (typeof window !== 'undefined') window.localStorage.setItem(STORAGE_KEY, theme) } catch { /* Preferences still work for this page when storage is blocked. */ }
-  applyTheme(theme)
+function storageChanged(event: StorageEvent) {
+  if (event.key !== STORAGE_KEY && event.key !== null) return
+  activeTheme = normalize(event.newValue)
+  applyTheme()
   for (const listener of listeners) listener()
 }
 
-export function useTheme(): AdminTheme {
-  return useSyncExternalStore(subscribe, getTheme, () => 'light')
+function subscribe(listener: () => void) {
+  if (listeners.size === 0) {
+    window.addEventListener('storage', storageChanged)
+    media?.addEventListener('change', applyTheme)
+    // Refresh preferences after a view remount without losing blocked-storage choices.
+    try { activeTheme = normalize(window.localStorage.getItem(STORAGE_KEY)) } catch { /* Keep the current page preference. */ }
+    applyTheme()
+  }
+  listeners.add(listener)
+  return () => {
+    listeners.delete(listener)
+    if (listeners.size === 0) {
+      window.removeEventListener('storage', storageChanged)
+      media?.removeEventListener('change', applyTheme)
+    }
+  }
 }
+
+export function getTheme(): AdminTheme { return activeTheme }
+export function setTheme(theme: AdminTheme) {
+  if (theme === activeTheme) return
+  activeTheme = theme
+  try { window.localStorage.setItem(STORAGE_KEY, theme) } catch { /* Keep preferences usable when storage is blocked. */ }
+  applyTheme()
+  for (const listener of listeners) listener()
+}
+export function useTheme(): AdminTheme { return useSyncExternalStore(subscribe, getTheme, () => 'system') }

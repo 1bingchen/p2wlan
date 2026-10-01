@@ -148,6 +148,8 @@ function buildGraph(connections: AdminConnection[], locale: string, onSelect: (c
     const pair = [connection.reporting_device_id, connection.remote_device_id].sort().join(':')
     const hasReverse = (pairCounts.get(pair) ?? 0) > 1
     const lexicalForward = connection.reporting_device_id.localeCompare(connection.remote_device_id) < 0
+    // Reciprocal paths can share the same midpoint even when their bends differ.
+    const labelTransform = hasReverse ? `translateY(${lexicalForward ? -10 : 10}px)` : undefined
     const stroke = kind === 'direct' ? '#16803d' : kind === 'relay' ? '#2563eb' : '#98a2b3'
     const label = `${pathLabel(connection.current_path)}${connection.fresh ? '' : ` · ${tr('Stale')}`}`
     return {
@@ -158,8 +160,8 @@ function buildGraph(connections: AdminConnection[], locale: string, onSelect: (c
       pathOptions: { offset: hasReverse ? (lexicalForward ? 18 : 38) : 24, borderRadius: 14 },
       markerEnd: { type: MarkerType.ArrowClosed, color: stroke, width: 14, height: 14 },
       label,
-      labelStyle: { fontSize: 12, fill: 'var(--topology-edge-label-color, #344054)', fontWeight: 650 },
-      labelBgStyle: { fill: 'var(--topology-edge-label-bg, #ffffff)', fillOpacity: 0.94 },
+      labelStyle: { fontSize: 12, fill: 'var(--topology-edge-label-color, #344054)', fontWeight: 650, transform: labelTransform },
+      labelBgStyle: { fill: 'var(--topology-edge-label-bg, #ffffff)', fillOpacity: 0.94, transform: labelTransform },
       style: {
         stroke,
         strokeWidth: selected && connectionKey(selected) === connectionKey(connection) ? 4 : connection.fresh ? 2 : 1.6,

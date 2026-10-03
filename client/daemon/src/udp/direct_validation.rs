@@ -864,8 +864,9 @@ impl UdpTransport {
             .is_some_and(|expectation| expectation.expires_at > now)
     }
 
-    /// Snapshot the active validation target for a peer (test-only).
-    #[cfg(test)]
+    /// Snapshot the authoritative validation owner. Candidate scheduling may
+    /// briefly yield to this owner; the snapshot never authorizes a send or
+    /// commit and must be resolved again after any wait.
     pub(crate) async fn direct_validation_target(
         &self,
         peer_id: &str,

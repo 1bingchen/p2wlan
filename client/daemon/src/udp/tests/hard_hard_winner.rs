@@ -191,6 +191,40 @@ impl WinnerFixture {
 #[path = "hard_hard_pair.rs"]
 mod pair_nomination;
 
+#[tokio::test]
+async fn hard_hard_token_cleanup_drops_only_detached_socket_pending_before_drain() {
+    let _serial = crate::tests::HARD_HARD_E2E_SERIAL.acquire().await.unwrap();
+    let fixture = WinnerFixture::new().await;
+    let kept = fixture.send(0).await;
+    let discarded = fixture.send(1).await;
+    let reader = fixture.udp.socket_state.lock().await.dynamic[&fixture.indices[1]]
+        .reader
+        .abort_handle();
+    timeout(
+        Duration::from_millis(500),
+        fixture.udp.detach_hard_hard_sockets_for_token(
+            "peer-b",
+            TOKEN,
+            Some(fixture.indices[0]),
+            "token_cleanup_regression",
+        ),
+    )
+    .await
+    .expect("a removed HH socket cannot use its ACK; cleanup must not spend its two-second grace");
+    let pending = fixture.udp.pending_probes.lock().await;
+    assert!(pending.contains_key(&kept.nonce));
+    assert!(!pending.contains_key(&discarded.nonce));
+    drop(pending);
+    let bindings = fixture.udp.hard_hard_probe_bindings.lock().await;
+    assert_eq!(bindings.get(&kept.nonce).map(String::as_str), Some(TOKEN));
+    assert!(!bindings.contains_key(&discarded.nonce));
+    drop(bindings);
+    assert_eq!(fixture.udp.dynamic_socket_count().await, 1);
+    tokio::task::yield_now().await;
+    assert!(reader.is_finished());
+    fixture.cleanup().await;
+}
+
 // Real loopback I/O must use the real clock: a paused Tokio clock can jump
 // directly to the timeout before the OS reports socket readiness. The held
 // loser lease, not a timer race, establishes the blocking condition here.

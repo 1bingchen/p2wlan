@@ -110,6 +110,7 @@ impl ProvisionalSocketGuard {
     ) -> Self {
         let watcher_transport = transport.clone();
         let watcher_cancellation = cancellation.clone();
+        let watcher_peer = peer_id.clone();
         let (stop_tx, mut stop_rx) = tokio::sync::watch::channel(false);
         let (commit_tx, mut commit_rx) = tokio::sync::watch::channel::<Option<CommitOutcome>>(None);
         let (finalize_tx, mut finalize_rx) = tokio::sync::watch::channel(false);
@@ -138,12 +139,7 @@ impl ProvisionalSocketGuard {
                     }
                 }
                 if *finalize_rx.borrow() {
-                    // Durable handoff: the peer's long-term ownership owns
-                    // this socket now; the watcher's job is done.  Ack so the
-                    // guard's `finalize` never times out on a healthy
-                    // watcher.
-                    let _ = finalize_ack_tx.send(());
-                    return;
+                    break;
                 }
                 if watcher_cancellation.is_cancelled() || *stop_rx.borrow() {
                     break;
@@ -166,7 +162,9 @@ impl ProvisionalSocketGuard {
                 }
             }
             if *finalize_rx.borrow() {
-                let _ = finalize_ack_tx.send(());
+                watcher_transport
+                    .finish_socket_handoff(&watcher_peer, socket_index, committed, finalize_ack_tx)
+                    .await;
                 return;
             }
             // The rollback decision runs under ONE socket-state lock
@@ -183,13 +181,27 @@ impl ProvisionalSocketGuard {
                     // channel closure.  Ack if the finalize raced us anyway.
                     if *finalize_rx.borrow() {
                         drop(state);
-                        let _ = finalize_ack_tx.send(());
+                        watcher_transport
+                            .finish_socket_handoff(
+                                &watcher_peer,
+                                socket_index,
+                                watched_commit_outcome(&mut commit_rx).or(committed),
+                                finalize_ack_tx,
+                            )
+                            .await;
                     }
                     return;
                 };
                 if *finalize_rx.borrow() || entry.phase == DynamicSocketPhase::Finalized {
                     drop(state);
-                    let _ = finalize_ack_tx.send(());
+                    watcher_transport
+                        .finish_socket_handoff(
+                            &watcher_peer,
+                            socket_index,
+                            watched_commit_outcome(&mut commit_rx).or(committed),
+                            finalize_ack_tx,
+                        )
+                        .await;
                     return;
                 }
                 match committed {
@@ -571,26 +583,6 @@ impl ProvisionalSocketGuard {
         let ack = self.finalize_ack.lock().expect("finalize ack mutex").take();
         if let Some(ack) = ack {
             let _ = tokio::time::timeout(FINALIZE_ACK_TIMEOUT, ack).await;
-        }
-        // The predecessor detach runs only now, after the durable handoff: a
-        // cancellation between the commit and this point must still be able
-        // to roll the peer back to the predecessor.
-        let predecessor = self
-            .outcome
-            .lock()
-            .expect("guard outcome mutex")
-            .and_then(|outcome| outcome.predecessor);
-        if let Some(predecessor) = predecessor.filter(|pin| {
-            pin.socket_index >= DYNAMIC_SOCKET_INDEX_BASE && pin.socket_index != self.socket_index
-        }) {
-            self.transport
-                .detach_predecessor_unless_repinned(
-                    &self.peer_id,
-                    predecessor,
-                    self.socket_index,
-                    "superseded_by_new_generation",
-                )
-                .await;
         }
         true
     }
@@ -1173,6 +1165,13 @@ impl UdpTransport {
             entries
         };
         for entry in entries {
+            // This exact token's entry is already revoked from SocketState;
+            // it can no longer win a HH confirmation. Waiting for its pending
+            // ACKs would serialize a two-second grace for every losing socket
+            // and block the next rendezvous. Preserve live send-lease drain,
+            // but release only the pending probes of this removed socket.
+            self.drop_pending_probes_for_socket(entry.socket_index)
+                .await;
             self.detach_dynamic_entry(entry, reason).await;
         }
     }
@@ -1469,53 +1468,45 @@ impl UdpTransport {
     /// unambiguous ownership evidence.  The entry is additionally verified to
     /// still belong to `peer_id` before it is removed.
     ///
-    /// Must only be called after the new socket's durable handoff finalized:
-    /// until then a cancellation rolls the peer back to the predecessor and
-    /// the predecessor must stay attached.
-    pub(super) async fn detach_predecessor_unless_repinned(
+    /// The existing guard watcher removes the predecessor after durable
+    /// handoff, then acknowledges before its bounded ACK/lease drain. This
+    /// retains the old reader without delaying the new rendezvous or spawning
+    /// another cleanup task. Re-pinned predecessors remain attached.
+    async fn finish_socket_handoff(
         &self,
         peer_id: &str,
-        predecessor: PeerSocketPin,
         our_socket_index: usize,
-        reason: &str,
+        outcome: Option<CommitOutcome>,
+        acknowledgement: oneshot::Sender<()>,
     ) {
+        let predecessor = outcome
+            .and_then(|outcome| outcome.predecessor)
+            .filter(|pin| {
+                pin.socket_index >= DYNAMIC_SOCKET_INDEX_BASE
+                    && pin.socket_index != our_socket_index
+            });
         let entry = {
             let mut state = self.socket_state.lock().await;
-            let repinned = state
-                .affinity
-                .get(peer_id)
-                .is_some_and(|pin| pin.socket_index == predecessor.socket_index);
-            if repinned {
-                debug!(
-                    "predecessor detach skipped for socket index={} peer={peer_id}: the predecessor socket was re-pinned by traffic after the commit",
-                    predecessor.socket_index
-                );
-                return;
-            }
-            let Some(entry) = state.dynamic.get(&predecessor.socket_index) else {
-                return;
-            };
-            if entry.peer_id != peer_id {
-                // The entry was re-purposed for another peer in between (an
-                // index can only be re-used by a counter wrap): never touch
-                // another peer's socket.
-                return;
-            }
-            let entry = state
-                .dynamic
-                .remove(&predecessor.socket_index)
-                .expect("predecessor entry verified above");
-            if state
-                .affinity
-                .get(&entry.peer_id)
-                .is_some_and(|pin| pin.socket_index == predecessor.socket_index)
-            {
-                state.affinity.remove(&entry.peer_id);
-            }
-            let _ = our_socket_index;
-            entry
+            predecessor.and_then(|predecessor| {
+                if state
+                    .affinity
+                    .get(peer_id)
+                    .is_some_and(|pin| pin.socket_index == predecessor.socket_index)
+                    || state
+                        .dynamic
+                        .get(&predecessor.socket_index)
+                        .is_none_or(|entry| entry.peer_id != peer_id)
+                {
+                    return None;
+                }
+                state.dynamic.remove(&predecessor.socket_index)
+            })
         };
-        self.detach_dynamic_entry(entry, reason).await;
+        let _ = acknowledgement.send(());
+        if let Some(entry) = entry {
+            self.detach_dynamic_entry(entry, "superseded_by_new_generation")
+                .await;
+        }
     }
 
     /// Detach the dedicated punch socket(s) for a peer, if any.

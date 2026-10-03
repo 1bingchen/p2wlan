@@ -113,7 +113,7 @@ manifest 分开报告 requested 场景/轮次、smoke 执行结果、证据有�
       NAT_SIM_ARTIFACT_DIR=/absolute/path/outside/repository/normal-nat-evidence \
       bash scripts/nat-sim/nat-sim-smoke.sh
 
-背景流量在每端第一次 daemon UDP 出站后启动：每个逻辑设备使用独立 socket 和带种子的时间抖动发送真实 STUN 请求，与该端共享端口分配器，不读取候选或扫描阶段。设备数上限 16，每设备最多 64 个短流，间隔 10–5000 ms；默认关闭。`mapping-evidence.json` 核对请求完成数、失败数以及与 daemon 流量的时间重叠，噪声未实际覆盖测试窗口时判定失败。该模型覆盖共享端口分配干扰；无线频谱竞争、真实基站切换、IPv6/NAT64、多层 CGNAT 和 TCP 控制/中继链路拥塞仍需要额外测试。`LOSS`、`REORDER` 和 UDP 延迟仅作用于通过 NAT 过滤后的 peer UDP，不能据此宣称测过控制或中继链路的弱网。
+背景流量在每端第一次 daemon UDP 出站后启动：每个逻辑设备使用独立 socket 和带种子的时间抖动发送真实 STUN 请求，与该端共享端口分配器，不读取候选或扫描阶段。设备数上限 16，间隔 10–5000 ms；默认关闭。有限流模式每设备最多 64 个短流；`BACKGROUND_DURATION_MS` 可启用最长 120000 ms 的持续流量，每端配置上限为 16384 次流尝试。`mapping-evidence.json` 核对请求完成、失败、退出取消以及与 daemon 流量的时间重叠；持续模式逐台检查从接入到最终捕获期间的流量间隔，缺少任一设备或出现超限空档都会失败。SIGTERM 退出会先回收背景任务并记录尚未完成流的取消，再关闭 trace。该模型覆盖共享端口分配干扰；无线频谱竞争、真实基站切换、IPv6/NAT64、多层 CGNAT 和 TCP 控制/中继链路拥塞仍需要额外测试。`LOSS`、`REORDER` 和 UDP 延迟仅作用于通过 NAT 过滤后的 peer UDP，不能据此宣称测过控制或中继链路的弱网。
 
 `run-network-matrix.py` 全部使用 `MODE=normal`，覆盖严格/宽松过滤、两端不同的时延抖动、单侧丢包、连续丢包、UDP 限速与有限队列、共享分配器、随机端口、接入期间短时 UDP 中断、单/双侧 NAT 映射重建、加速映射超时、错峰信令和慢中继。需要 Python 3.11 或更高版本及 smoke 入口使用的 Rust、Go 和本机编译器。
 
@@ -122,7 +122,13 @@ manifest 分开报告 requested 场景/轮次、smoke 执行结果、证据有�
       --scenario asymmetric-jitter --scenario live-nat-rebind \
       --rounds 2 --output /absolute/path/outside/repository/network-evidence
 
-不指定 `--scenario` 时运行全部 16 个配置，默认每个配置 1 轮，总执行数上限 32。每轮独立冷启动，使用固定种子、不做失败重试，默认观察 30 秒。输出目录必须是仓库外尚不存在的绝对路径。manifest 记录源代码 commit 与包含未跟踪文件的补丁摘要、参数、实际 NAT seed、原始证据路径、每方向首业务路径和最终活动路径。两端首业务可以分别来自 Direct 和 Relay，收发方向不必使用同一路径，但双方都必须有真实业务 ingress；固定 Direct/Relay 拓扑仍执行原有路径要求。配置不是运营商实测画像，不能用于推算移动网络直连成功率。
+不指定 `--scenario` 时运行全部 17 个配置，默认每个配置 1 轮，总执行数上限 32。每轮独立冷启动，使用固定种子、不做失败重试，通常观察 30 秒；`shared-allocator-continuous` 观察 60 秒，双方各 8 台背景设备持续发流，并为启动及回收预留 120 秒流量上限。输出目录必须是仓库外尚不存在的绝对路径。manifest 记录源代码 commit 与包含未跟踪文件的补丁摘要、参数、实际 NAT seed、原始证据路径、每方向首业务路径和最终活动路径。两端首业务可以分别来自 Direct 和 Relay，收发方向不必使用同一路径，但双方都必须有真实业务 ingress；固定 Direct/Relay 拓扑仍执行原有路径要求。配置不是运营商实测画像，不能用于推算移动网络直连成功率。
+
+需要验收直连时使用 `--require-direct`：双方最终活动路径必须为 Direct，且最后 2–5 秒内双方各有至少两个新的已验证 Direct 业务包。Relay 可用或历史 Direct 计数不满足该门禁。运行器保留每轮失败，不通过重跑挑选成功结果；产品自身有界重试仍按正常策略执行。
+
+    python3 scripts/nat-sim/run-network-matrix.py \
+      --scenario shared-allocator-continuous --rounds 3 --require-direct \
+      --output /absolute/path/outside/repository/continuous-direct-evidence
 
 单轮使用 `NETWORK_PROFILE=/absolute/path/profile.json` 传入版本化配置，例如：
 

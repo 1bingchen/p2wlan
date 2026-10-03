@@ -1,5 +1,45 @@
 // Included in hard_hard_wire_v2_tests to exercise the real manager transaction
 // and coordination fences using the same canonical transcript fixtures.
+#[test]
+fn hard_hard_submillisecond_rpc_keeps_its_measured_sync_uncertainty() {
+    let mut local = envelope(HardHardV2Stage::Offer).v2.unwrap();
+    let mut remote = envelope(HardHardV2Stage::Answer).v2.unwrap();
+    // The production short-RPC clock truncates RTT to milliseconds and adds
+    // one millisecond to uncertainty. (0, 1) is a measured RPC, not absent data.
+    (local.rtt_ms, local.uncertainty_ms) =
+        hard_hard_wire_timing(Some(control::ControlTimingHint {
+            rtt_ms: 0,
+            uncertainty_ms: 1,
+            age_ms: 0,
+        }));
+    assert_eq!((local.rtt_ms, local.uncertainty_ms), (1, 1));
+    remote.rtt_ms = 4;
+    remote.uncertainty_ms = 3;
+    assert_eq!(
+        hard_hard_sync_uncertainty(&local, &remote),
+        Duration::from_millis(25)
+    );
+    remote.uncertainty_ms = 90;
+    assert_eq!(
+        hard_hard_sync_uncertainty(&local, &remote),
+        Duration::from_millis(90)
+    );
+    local.uncertainty_ms = 0;
+    assert_eq!(
+        hard_hard_sync_uncertainty(&local, &remote),
+        HARD_HARD_RESPONSE_DEADLINE_TOLERANCE
+    );
+    assert_eq!(hard_hard_wire_timing(None), (0, 0));
+    assert_eq!(
+        hard_hard_wire_timing(Some(control::ControlTimingHint {
+            rtt_ms: u64::MAX,
+            uncertainty_ms: u64::MAX,
+            age_ms: 0,
+        })),
+        (u16::MAX, u16::MAX)
+    );
+}
+
 #[tokio::test]
 async fn cold_start_answer_accepts_and_fences_generation_zero() {
     for remote_generation in [11, 0] {
@@ -89,11 +129,19 @@ async fn new_registration_can_retry_hard_hard_without_heartbeat_budget_refills()
     else {
         panic!("initial recovery must be admitted");
     };
-    peers
-        .try_begin_hard_hard_generation_for_epoch(&info.node_id, epoch)
+    let quota = peers
+        .recovery_epoch_work_budget_report(&info.node_id)
         .await
         .unwrap()
-        .commit();
+        .hard_hard_generations_remaining;
+    assert_eq!(quota, 4);
+    for _ in 0..quota {
+        peers
+            .try_begin_hard_hard_generation_for_epoch(&info.node_id, epoch)
+            .await
+            .unwrap()
+            .commit();
+    }
     let old_epoch = epoch;
     // Ordinary snapshots and endpoint churn must never replenish the quota.
     info.endpoint = "203.0.113.20:40002".into();
@@ -122,11 +170,13 @@ async fn new_registration_can_retry_hard_hard_without_heartbeat_budget_refills()
         panic!("new authenticated registration must be admitted");
     };
     assert_ne!(epoch, old_epoch);
-    peers
-        .try_begin_hard_hard_generation_for_epoch(&info.node_id, epoch)
-        .await
-        .expect("a new authenticated registration must have one bounded HH retry")
-        .commit();
+    for _ in 0..quota {
+        peers
+            .try_begin_hard_hard_generation_for_epoch(&info.node_id, epoch)
+            .await
+            .expect("a new registration must have its bounded HH allowance")
+            .commit();
+    }
     peers.add_peer(&info).await;
     assert!(peers
         .try_begin_hard_hard_generation_for_epoch(&info.node_id, epoch)
@@ -138,6 +188,93 @@ async fn new_registration_can_retry_hard_hard_without_heartbeat_budget_refills()
         .try_begin_hard_hard_generation_for_epoch(&info.node_id, epoch)
         .await
         .is_none());
+}
+
+#[tokio::test]
+async fn hard_hard_fresh_retries_spend_one_shared_epoch_budget() {
+    let peers =
+        PeerManager::new(Config::generate_default("https://ctrl.test", "retry-budget").unwrap());
+    let info = crate::control::PeerInfo {
+        node_id: "peer-retry-budget".into(),
+        registration_seq: 1,
+        public_key: "pk".into(),
+        online: true,
+        ..Default::default()
+    };
+    peers.add_peer(&info).await;
+    let RecoveryAdmission::Accepted { epoch } = peers.recovery_epoch_admit(&info.node_id).await
+    else {
+        panic!("initial admission");
+    };
+    let before = peers
+        .recovery_epoch_work_budget_report(&info.node_id)
+        .await
+        .unwrap();
+    let mut identity = None;
+    for _ in 0..before.hard_hard_generations_remaining {
+        let reservation = peers
+            .try_begin_hard_hard_generation_for_epoch(&info.node_id, epoch)
+            .await
+            .expect("bounded fresh retry");
+        let current = reservation.identity();
+        if let Some(expected) = identity {
+            assert_eq!(current, expected);
+        }
+        identity = Some(current);
+        reservation.commit();
+        assert!(
+            peers
+                .try_consume_recovery_http_quota_for_identity(&info.node_id, current)
+                .await
+        );
+        assert_eq!(
+            peers
+                .consume_recovery_probe_credit_for_purpose(
+                    &info.node_id,
+                    current,
+                    crate::peer::RecoveryProbePurpose::HardHardExploration
+                )
+                .await,
+            crate::peer::RecoveryProbeCreditAdmission::Accepted
+        );
+    }
+    assert!(
+        !peers
+            .recovery_hard_hard_available(&info.node_id, epoch)
+            .await
+    );
+    assert!(peers
+        .try_begin_hard_hard_generation_for_epoch(&info.node_id, epoch)
+        .await
+        .is_none());
+    let after = peers
+        .recovery_epoch_work_budget_report(&info.node_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        after.probe_credit_remaining,
+        before.probe_credit_remaining - before.hard_hard_generations_remaining
+    );
+    assert_eq!(
+        after.http_remaining,
+        before.http_remaining - before.hard_hard_generations_remaining
+    );
+    assert_eq!(
+        after.fresh_generations_remaining,
+        before.fresh_generations_remaining
+    );
+    for _ in 0..after.http_remaining {
+        assert!(
+            peers
+                .try_consume_recovery_http_quota_for_identity(&info.node_id, identity.unwrap())
+                .await
+        );
+    }
+    assert!(
+        !peers
+            .try_consume_recovery_http_quota_for_identity(&info.node_id, identity.unwrap())
+            .await
+    );
 }
 
 #[tokio::test]
@@ -204,11 +341,18 @@ async fn old_recovery_reservation_cannot_spend_or_refund_into_restarted_peer() {
     else {
         panic!("new admission");
     };
-    peers
-        .try_begin_hard_hard_generation_for_epoch(&info.node_id, epoch)
+    let quota = peers
+        .recovery_epoch_work_budget_report(&info.node_id)
         .await
         .unwrap()
-        .commit();
+        .hard_hard_generations_remaining;
+    for _ in 0..quota {
+        peers
+            .try_begin_hard_hard_generation_for_epoch(&info.node_id, epoch)
+            .await
+            .unwrap()
+            .commit();
+    }
     old.refund().await;
     assert!(peers
         .try_begin_hard_hard_generation_for_epoch(&info.node_id, epoch)

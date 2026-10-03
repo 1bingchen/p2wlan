@@ -48,6 +48,7 @@ enum FreshPunchRejection {
     CandidateSetNotApplied(CandidateSetApplyResult),
     Superseded,
     Contended,
+    Ingress(OfferIngressVerdict),
 }
 
 fn hard_hard_fresh_rejection_reason(rejection: FreshPunchRejection) -> HardHardA0Reason {
@@ -62,6 +63,10 @@ fn hard_hard_fresh_rejection_reason(rejection: FreshPunchRejection) -> HardHardA
         }
         FreshPunchRejection::Superseded => HardHardA0Reason::FreshPredictionSuperseded,
         FreshPunchRejection::Contended => HardHardA0Reason::FreshAdmissionContended,
+        FreshPunchRejection::Ingress(OfferIngressVerdict::RateLimited) => {
+            HardHardA0Reason::SignalRateLimited
+        }
+        FreshPunchRejection::Ingress(_) => HardHardA0Reason::SignalDuplicate,
     }
 }
 
@@ -613,16 +618,6 @@ impl Daemon {
                 )
                 .await
             };
-        if candidate_apply_result == CandidateSetApplyResult::Applied
-            && !matches!(
-                hard_hard_handling,
-                HardHardOfferHandling::Started | HardHardOfferHandling::RejectedPreservingSession
-            )
-        {
-            self.peers
-                .clear_hard_hard_sessions(Some(&offer.from_node_id))
-                .await;
-        }
         if self.peers.hard_hard_experiment_only()
             && hard_hard_handling != HardHardOfferHandling::NotHardHard
         {
@@ -712,16 +707,6 @@ impl Daemon {
                 )
                 .await
             };
-        if candidate_apply_result == CandidateSetApplyResult::Applied
-            && !matches!(
-                hard_hard_handling,
-                HardHardOfferHandling::Started | HardHardOfferHandling::RejectedPreservingSession
-            )
-        {
-            self.peers
-                .clear_hard_hard_sessions(Some(&offer.from_node_id))
-                .await;
-        }
         if self.peers.hard_hard_experiment_only()
             && hard_hard_handling != HardHardOfferHandling::NotHardHard
         {

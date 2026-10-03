@@ -59,6 +59,13 @@ fn validate_prepared_publication_timing(
 }
 
 impl HardHardPreparedMeasurement {
+    /// Strategy preference only: a regular verified primary tail retains the cheap
+    /// primary-socket attempt. It does not establish an allocator scope or
+    /// promise that other clients will remain quiet after the measurement.
+    pub(crate) fn prefers_narrow_prediction(&self) -> bool {
+        regular_allocation_measurement(&self.measurement_samples, &self.measurement_trace)
+    }
+
     pub(crate) fn measurement_cost(&self) -> HardHardMeasurementStats {
         self.birthday.measurement
     }
@@ -191,6 +198,26 @@ impl HardHardPreparedMeasurement {
             .collect())
     }
 
+    /// Candidate guesses for the existing birthday lane. This deliberately
+    /// grants no predictable prefix or shared-allocator/anchor authority.
+    pub(crate) fn contention_candidates(
+        &self,
+        network_generation: u64,
+        cap: usize,
+    ) -> std::result::Result<Vec<SocketAddr>, AllocationEvidenceRejection> {
+        self.prediction_candidates(network_generation, 1)?;
+        let prediction = self
+            .predictable
+            .as_ref()
+            .ok_or(AllocationEvidenceRejection::NoConsistentStep)?;
+        Ok(
+            p2pnet_nat::mapping::rendezvous::contention_candidate_window(&prediction.model, cap)
+                .into_iter()
+                .map(|port| SocketAddr::new(self.birthday.public_ip, port))
+                .collect(),
+        )
+    }
+
     /// A bounded conditional attempt. Prefix consumption is before the first
     /// socket sends, not an allowance for arbitrary interleaved allocations.
     pub(crate) fn fixed_anchor_plan(
@@ -217,6 +244,32 @@ impl HardHardPreparedMeasurement {
             max_prefix_allocations,
         )
     }
+}
+
+fn regular_allocation_measurement(
+    samples: &[AllocationSample],
+    attempts: &[AllocationAttempt],
+) -> bool {
+    let Some(last) = samples.last() else {
+        return false;
+    };
+    let Ok(tail) = validate_allocation_prediction_tail(
+        samples,
+        attempts,
+        last.socket_id,
+        last.observation.local_endpoint,
+    ) else {
+        return false;
+    };
+    // Different sockets may have different allocators. Their gaps are not
+    // proof of contention on this validated primary socket.
+    infer_port_domain(
+        &tail
+            .iter()
+            .map(|sample| sample.observation.observed.port())
+            .collect::<Vec<_>>(),
+    )
+    .is_ok()
 }
 
 pub(super) struct HardHardGridMeasurement {
@@ -431,6 +484,33 @@ pub(super) fn prepared_prediction(
 mod tests {
     use super::*;
     use p2pnet_nat::AllocationAttemptOutcome as Outcome;
+
+    #[test]
+    fn regular_measurement_preference_rejects_gaps_and_unobserved_allocations() {
+        let (mut samples, mut attempts, _) = grid(2);
+        assert!(regular_allocation_measurement(&samples, &attempts));
+        samples[1].observation.observed.set_port(51000);
+        samples[2].observation.observed.set_port(51002);
+        assert!(
+            regular_allocation_measurement(&samples, &attempts),
+            "another socket's allocator must not disable the regular primary tail"
+        );
+        samples
+            .last_mut()
+            .unwrap()
+            .observation
+            .observed
+            .set_port(40012);
+        assert!(!regular_allocation_measurement(&samples, &attempts));
+        samples
+            .last_mut()
+            .unwrap()
+            .observation
+            .observed
+            .set_port(40010);
+        attempts.last_mut().unwrap().outcome = Outcome::SentUnobserved;
+        assert!(!regular_allocation_measurement(&samples, &attempts));
+    }
 
     fn grid(
         step: i32,

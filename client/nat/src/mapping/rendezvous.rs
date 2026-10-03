@@ -13,6 +13,52 @@ use std::time::Duration;
 
 const PRESERVED_PREDICTION_PREFIX: usize = 8;
 
+/// Bounded guesses for a shared allocator, not evidence of its scope or an
+/// anchor. A short regular tail does not prove that competing clients will
+/// stop allocating while signaling completes. Keep a dense successor window
+/// instead of replacing its far half with guesses across all 65,535 ports.
+/// The caller must validate the tail's identity, ledger and freshness first.
+/// No port-domain wrap is inferred from these hypotheses.
+pub fn contention_candidate_window(model: &PortModel, cap: usize) -> Vec<u16> {
+    if !matches!(
+        model.kind,
+        PortModelKind::FixedStep { .. }
+            | PortModelKind::Linear { .. }
+            | PortModelKind::NoisyLinear { .. }
+            | PortModelKind::MonotonicWindow { .. }
+    ) || model.sequence.len() < 3
+        || model.sequence.contains(&0)
+    {
+        return Vec::new();
+    }
+    let deltas = model
+        .sequence
+        .windows(2)
+        .map(|pair| i32::from(pair[1]) - i32::from(pair[0]))
+        .collect::<Vec<_>>();
+    let direction = deltas[0].signum();
+    if direction == 0 || deltas.iter().any(|d| d.signum() != direction) {
+        return Vec::new();
+    }
+    let stride = deltas.iter().fold(0, |mut a, delta| {
+        let mut b = delta.abs();
+        while b != 0 {
+            (a, b) = (b, a % b);
+        }
+        a
+    });
+    if stride > 2048 || deltas.iter().any(|d| d.abs() > stride * 8) {
+        return Vec::new();
+    }
+    let last = i32::from(*model.sequence.last().unwrap_or(&0));
+    (1..=cap.min(96))
+        .map_while(|distance| {
+            let port = last + direction * stride * distance as i32;
+            (1..=65535).contains(&port).then_some(port as u16)
+        })
+        .collect()
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct RendezvousPredictionTiming {
     pub measurement_span_ms: u64,
@@ -294,8 +340,8 @@ pub fn fixed_step_rendezvous_targets(
                 .iter()
                 .all(|delta| *delta == min_delta || *delta == max_delta)
     }
-    if !(3..=32).contains(&local.len())
-        || !(3..=32).contains(&remote.len())
+    if !(3..=96).contains(&local.len())
+        || !(3..=96).contains(&remote.len())
         || !complete_window(local)
         || !complete_window(remote)
     {

@@ -656,11 +656,8 @@ pub(crate) async fn spawn_hard_hard_responder(
                 return;
             };
             meta.local = offer;
-            let timing = signal.control.hard_hard_timing_hint();
-            meta.rtt_ms = timing.map_or(0, |hint| hint.rtt_ms.min(u64::from(u16::MAX)) as u16);
-            meta.uncertainty_ms = timing.map_or(0, |hint| {
-                hint.uncertainty_ms.min(u64::from(u16::MAX)) as u16
-            });
+            (meta.rtt_ms, meta.uncertainty_ms) =
+                hard_hard_wire_timing(signal.control.hard_hard_timing_hint());
             let Some(mut agreed) = hard_hard_new_coordinated_plan(
                 &peers,
                 &signal.control,

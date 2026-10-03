@@ -65,7 +65,9 @@ fn validate_cli(cli: &Cli) -> std::result::Result<(), &'static str> {
             .filter(|x| !x.is_empty())
         {
             if !is_valid_stun_server_spec(observer) {
-                return Err("--udp-observer must contain valid host:port endpoints or a disable value");
+                return Err(
+                    "--udp-observer must contain valid host:port endpoints or a disable value",
+                );
             }
         }
     }

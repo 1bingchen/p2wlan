@@ -1,7 +1,7 @@
-import { getLocale, tr } from './i18n'
 import { ArrowDownRight, ChevronRight, CircleAlert } from 'lucide-react'
+import { getLocale, tr } from '../../i18n'
+import type { AdminConnection } from '../../types'
 import { transitionReasonLabel } from './connectionLabels'
-import type { AdminConnection } from './types'
 
 export function formatAgo(unix?: number): string {
   if (!unix) return '—'

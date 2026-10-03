@@ -2,7 +2,6 @@ import { createContext, useContext, useState, type ReactNode } from 'react'
 import { useIsFetching } from '@tanstack/react-query'
 import { Clock3, RefreshCw, WifiOff } from 'lucide-react'
 import { getLocale, tr } from './i18n'
-import './refresh.css'
 
 const RefreshContext = createContext({ enabled: true, setEnabled: (_enabled: boolean) => {} })
 

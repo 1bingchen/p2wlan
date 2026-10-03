@@ -34,7 +34,7 @@ dependencies:
   flutter:
     sdk: flutter
   tray_manager: ^0.5.3
-  url_launcher: ^6.3.2
+  url_launcher: ^6.3.3
   window_manager: ^0.5.2
 
 dev_dependencies:

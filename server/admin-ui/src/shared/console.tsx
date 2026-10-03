@@ -1,12 +1,11 @@
-import { type CSSProperties, type ReactNode, useEffect, useState } from 'react'
 import { flexRender, getCoreRowModel, useReactTable, type ColumnDef } from '@tanstack/react-table'
 import { ChevronLeft, ChevronRight, CircleAlert } from 'lucide-react'
-import { getLocale, tr } from './i18n'
-import { accountColor, colorWithAlpha } from './colors'
-import type { AdminAccount, AdminTopology } from './types'
+import { useEffect, useState, type CSSProperties } from 'react'
 import { Link, useLocation } from 'react-router-dom'
-import { readResourceReturn } from './pageState'
-import './resource-workflow.css'
+import { accountColor, colorWithAlpha } from '../colors'
+import { getLocale, tr } from '../i18n'
+import { readResourceReturn } from '../pageState'
+import type { AdminAccount, AdminTopology } from '../types'
 
 export function formatAgo(unix?: number): string {
   if (!unix) return tr('从未')
@@ -111,22 +110,7 @@ export function PathNotice({ data, fallback }: { data?: AdminTopology; fallback:
   return <div className="truth-notice"><CircleAlert size={15} /><span>{tr(note || fallback)}</span></div>
 }
 
-export function MetricCard({ icon, label, value, meta }: { icon: ReactNode; label: string; value: ReactNode; meta: ReactNode }) {
-  return <article className="metric-card-v2">
-    <div className="metric-icon">{icon}</div>
-    <div className="metric-copy"><span>{label}</span><strong>{value}</strong><p>{meta}</p></div>
-  </article>
-}
-
-export function Panel({ title, subtitle, action, className = '', children }: { title?: string; subtitle?: string; action?: ReactNode; className?: string; children: ReactNode }) {
-  return <section className={`panel-v2 ${className}`}>
-    {(title || action) && <header className="panel-v2-header">
-      <div>{title && <h2>{title}</h2>}{subtitle && <p>{subtitle}</p>}</div>
-      {action}
-    </header>}
-    {children}
-  </section>
-}
+export { MetricCard, Panel } from '../components/ui/console'
 
 export function DataTable<T>({ columns, data, onRowClick, empty = '暂无数据' }: {
   columns: ColumnDef<T, unknown>[]

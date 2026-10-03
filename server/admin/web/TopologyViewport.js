@@ -1,4 +1,4 @@
-import{c as a}from"./app.js";import{r as w}from"./react-vendor.js";import{u as l,c as m,g as f,e as M}from"./graph-vendor.js";/**
+import{c as a}from"./app.js";import{u as l,c as m,g as f}from"./graph-vendor.js";import{r as M}from"./react-vendor.js";/**
  * @license lucide-react v0.544.0 - ISC
  *
  * This source code is licensed under the ISC license.
@@ -13,5 +13,5 @@ import{c as a}from"./app.js";import{r as w}from"./react-vendor.js";import{u as l
  *
  * This source code is licensed under the ISC license.
  * See the LICENSE file in the root directory of this source tree.
- */const V=[["path",{d:"m15 15 6 6m-6-6v4.8m0-4.8h4.8",key:"17vawe"}],["path",{d:"M9 19.8V15m0 0H4.2M9 15l-6 6",key:"chjx8e"}],["path",{d:"M15 4.2V9m0 0h4.8M15 9l6-6",key:"lav6yq"}],["path",{d:"M9 4.2V9m0 0H4.2M9 9 3 3",key:"1pxi2q"}]],F=a("shrink",V);function N({nodes:o,fullscreen:y,padding:s=.12,maxZoom:c=1.12,focusNodeIds:k=[],focusKey:u=""}){const{setViewport:d,viewportInitialized:h}=l(),n=m(t=>t.width),i=m(t=>t.height),r=o.filter(t=>k.includes(t.id)),e=f(r.length?r:o),p=o.map(t=>t.id).sort().join(`
-`);return w.useEffect(()=>{if(!h||!p||n<=0||i<=0)return;const t=window.requestAnimationFrame(()=>{d(M(e,n,i,.08,c,s))});return()=>window.cancelAnimationFrame(t)},[h,p,u,e.x,e.y,e.width,e.height,n,i,y,c,s,d]),null}export{I as E,E as I,F as S,N as T};
+ */const V=[["path",{d:"m15 15 6 6m-6-6v4.8m0-4.8h4.8",key:"17vawe"}],["path",{d:"M9 19.8V15m0 0H4.2M9 15l-6 6",key:"chjx8e"}],["path",{d:"M15 4.2V9m0 0h4.8M15 9l6-6",key:"lav6yq"}],["path",{d:"M9 4.2V9m0 0H4.2M9 9 3 3",key:"1pxi2q"}]],F=a("shrink",V);function N({nodes:o,fullscreen:y,padding:s=.12,maxZoom:c=1.12,focusNodeIds:k=[],focusKey:u=""}){const{getNodesBounds:w,setViewport:d,viewportInitialized:h}=l(),n=m(t=>t.width),i=m(t=>t.height),r=o.filter(t=>k.includes(t.id)),e=w(r.length?r:o),p=o.map(t=>t.id).sort().join(`
+`);return M.useEffect(()=>{if(!h||!p||n<=0||i<=0)return;const t=window.requestAnimationFrame(()=>{d(f(e,n,i,.08,c,s))});return()=>window.cancelAnimationFrame(t)},[h,p,u,e.x,e.y,e.width,e.height,n,i,y,c,s,d]),null}export{I as E,E as I,F as S,N as T};

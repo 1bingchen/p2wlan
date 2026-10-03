@@ -162,3 +162,25 @@ test('login verification forwards cancellation without creating a session', asyn
   await assert.rejects(verifyAdminToken('candidate-token', controller.signal), { name: 'AbortError' })
   assert.equal(getAdminToken(), '')
 })
+
+
+test('snapshot queries preserve scope, opaque cursors, and cancellation while legacy APIs remain separate', async (t) => {
+  setup(t)
+  setAdminToken('snapshot-session')
+  const controller = new AbortController()
+  const calls = []
+  globalThis.fetch = async (url, init) => { calls.push([new URL(url, 'https://example.test'), init]); return new Response('{}') }
+  await adminApi.accountsSnapshot('name & value', 'opaque+/=', 25, controller.signal)
+  await adminApi.devicesSnapshot('laptop', 'online', 'device-cursor', 25, controller.signal, 'owner/a')
+  await adminApi.networksSnapshot({ query: 'room & 1', accountId: 'owner/a' }, 'network-cursor', 25, controller.signal)
+  await adminApi.roomsSnapshot({ query: 'room & 1', accountId: 'owner/a' }, 'room-cursor', 25, controller.signal)
+  await adminApi.topologySnapshot('owner/a', 'full', 'topology-cursor', 100, controller.signal)
+  assert.equal(calls[0][0].pathname, '/admin/api/v1/accounts')
+  assert.equal(calls[0][0].searchParams.get('q'), 'name & value')
+  assert.equal(calls[0][0].searchParams.get('cursor'), 'opaque+/=')
+  for (const [url, init] of calls) assert.equal(init.signal, controller.signal)
+  for (const [url] of calls.slice(0, 4)) assert.equal(url.searchParams.get('pagination'), 'cursor')
+  for (const [url] of calls.slice(1, 4)) assert.equal(url.searchParams.get('account_id'), 'owner/a')
+  assert.equal(calls[4][0].pathname, '/admin/api/v1/accounts/owner%2Fa/topology')
+  assert.equal(calls[4][0].searchParams.get('view'), 'full')
+})

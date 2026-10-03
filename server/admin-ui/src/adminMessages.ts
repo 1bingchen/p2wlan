@@ -1,4 +1,7 @@
 export const adminMessages: Record<string, string> = {
+  '主题：跟随系统': 'Theme: system', '主题：浅色': 'Theme: light', '主题：深色': 'Theme: dark',
+  '跟随系统': 'System', '浅色': 'Light', '深色': 'Dark', '打开导航': 'Open navigation', '关闭导航': 'Close navigation',
+
   "查看设备之间的连接路径、延迟与最近变化。": "View connection paths, latency, and recent changes between devices.",
   "观测说明": "About these observations",
   "没有匹配的连接观测": "No matching connection observations",

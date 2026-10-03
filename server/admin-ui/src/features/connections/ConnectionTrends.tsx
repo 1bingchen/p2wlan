@@ -1,11 +1,10 @@
-import { useId, type ReactNode } from 'react'
 import { useQuery } from '@tanstack/react-query'
-import { useConnectionSearchParams } from './useConnectionSearch'
 import { Activity, CircleAlert } from 'lucide-react'
-import { getLocale, tr } from './i18n'
-import { QueryStatus, useAutoRefresh } from './refresh'
-import { bucketP95, connectionTrends, lineSegments, readHealthSearch, summarizeTrends, TREND_WINDOWS, type TrendBucket } from './trends'
-import './trends.css'
+import { useId, type ReactNode } from 'react'
+import { getLocale, tr } from '../../i18n'
+import { QueryStatus, useAutoRefresh } from '../../refresh'
+import { TREND_WINDOWS, bucketP95, connectionTrends, lineSegments, readHealthSearch, summarizeTrends, type TrendBucket } from './trends'
+import { useConnectionSearchParams } from './useConnectionSearch'
 
 const CHART_WIDTH = 640
 const CHART_HEIGHT = 150

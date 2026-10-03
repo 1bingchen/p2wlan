@@ -1,6 +1,3 @@
-import { getFlowAriaLabelConfig, tr, useLocale } from './i18n'
-import '@xyflow/react/dist/style.css'
-import { type CSSProperties, useEffect, useMemo, useState } from 'react'
 import dagre from '@dagrejs/dagre'
 import {
   Background,
@@ -13,10 +10,11 @@ import {
   type Node,
 } from '@xyflow/react'
 import { CircleAlert, Expand, Eye, EyeOff, Info, MonitorSmartphone, Shrink } from 'lucide-react'
-import type { AdminConnection } from './types'
-import { useTheme } from './theme'
-import { useOverlay } from './useOverlay'
-import { TopologyViewport } from './TopologyViewport'
+import { useEffect, useMemo, useState, type CSSProperties } from 'react'
+import { getFlowAriaLabelConfig, tr, useLocale } from '../../i18n'
+import { TopologyViewport } from '../../shared/TopologyViewport'
+import type { AdminConnection } from '../../types'
+import { useOverlay } from '../../useOverlay'
 import type { ConnectionIdentity } from './connectionNavigation'
 
 const NODE_WIDTH = 220
@@ -150,6 +148,8 @@ function buildGraph(connections: AdminConnection[], locale: string, onSelect: (c
     const pair = [connection.reporting_device_id, connection.remote_device_id].sort().join(':')
     const hasReverse = (pairCounts.get(pair) ?? 0) > 1
     const lexicalForward = connection.reporting_device_id.localeCompare(connection.remote_device_id) < 0
+    // Reciprocal paths can share the same midpoint even when their bends differ.
+    const labelTransform = hasReverse ? `translateY(${lexicalForward ? -10 : 10}px)` : undefined
     const stroke = kind === 'direct' ? '#16803d' : kind === 'relay' ? '#2563eb' : '#98a2b3'
     const label = `${pathLabel(connection.current_path)}${connection.fresh ? '' : ` · ${tr('Stale')}`}`
     return {
@@ -160,8 +160,8 @@ function buildGraph(connections: AdminConnection[], locale: string, onSelect: (c
       pathOptions: { offset: hasReverse ? (lexicalForward ? 18 : 38) : 24, borderRadius: 14 },
       markerEnd: { type: MarkerType.ArrowClosed, color: stroke, width: 14, height: 14 },
       label,
-      labelStyle: { fontSize: 12, fill: 'var(--topology-edge-label-color, #344054)', fontWeight: 650 },
-      labelBgStyle: { fill: 'var(--topology-edge-label-bg, #ffffff)', fillOpacity: 0.94 },
+      labelStyle: { fontSize: 12, fill: 'var(--topology-edge-label-color, #344054)', fontWeight: 650, transform: labelTransform },
+      labelBgStyle: { fill: 'var(--topology-edge-label-bg, #ffffff)', fillOpacity: 0.94, transform: labelTransform },
       style: {
         stroke,
         strokeWidth: selected && connectionKey(selected) === connectionKey(connection) ? 4 : connection.fresh ? 2 : 1.6,
@@ -204,7 +204,6 @@ export function ConnectionTopology({
   const [fullscreen, setFullscreen] = useState(false)
   const [legendOpen, setLegendOpen] = useState(false)
   const locale = useLocale()
-  const theme = useTheme()
   const [narrow, setNarrow] = useState(() => typeof window !== 'undefined' && window.matchMedia('(max-width: 650px)').matches)
   const [showCanvas, setShowCanvas] = useState(false)
   const [focusDevice, setFocusDevice] = useState('')
@@ -286,8 +285,8 @@ export function ConnectionTopology({
       {!narrow && <MiniMap
         pannable
         zoomable
-        bgColor={theme === 'dark' ? '#142033' : 'rgba(255, 255, 255, .96)'}
-        maskColor={theme === 'dark' ? 'rgba(148, 163, 184, .2)' : 'rgba(240, 240, 240, .6)'}
+        bgColor="var(--surface)"
+        maskColor="var(--minimap-mask)"
         nodeStrokeWidth={2}
         nodeColor={() => '#cbd5e1'}
       />}

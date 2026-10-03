@@ -1,3 +1,4 @@
+import type { SnapshotPage, AdminTopologySnapshotPage, TopologyView } from './types'
 import type {
   AdminAccount,
   AdminAccountDetail,
@@ -106,7 +107,32 @@ async function accountPage(query: string, limit: number, offset: number): Promis
   return api<Page<AdminAccount>>(`/accounts?${params}`)
 }
 
+function snapshotParams(cursor: string, limit: number, filters: AdminResourceFilters = {}): URLSearchParams {
+  const params = new URLSearchParams({ pagination: 'cursor', limit: String(limit) })
+  if (cursor) params.set('cursor', cursor)
+  if (filters.query) params.set('q', filters.query)
+  if (filters.accountId) params.set('account_id', filters.accountId)
+  return params
+}
+
 export const adminApi = {
+  accountsSnapshot: (query = '', cursor = '', limit = 25, signal?: AbortSignal) =>
+    api<SnapshotPage<AdminAccount>>(`/accounts?${snapshotParams(cursor, limit, { query })}`, signal),
+  devicesSnapshot: (query = '', status = 'all', cursor = '', limit = 25, signal?: AbortSignal, accountId = '') => {
+    const params = snapshotParams(cursor, limit, { query, accountId })
+    params.set('status', status)
+    return api<SnapshotPage<AdminDevice>>(`/devices?${params}`, signal)
+  },
+  networksSnapshot: (filters: AdminResourceFilters = {}, cursor = '', limit = 25, signal?: AbortSignal) =>
+    api<SnapshotPage<AdminNetwork>>(`/networks?${snapshotParams(cursor, limit, filters)}`, signal),
+  roomsSnapshot: (filters: AdminResourceFilters = {}, cursor = '', limit = 25, signal?: AbortSignal) =>
+    api<SnapshotPage<AdminRoom>>(`/rooms?${snapshotParams(cursor, limit, filters)}`, signal),
+  topologySnapshot: (accountId = '', view: TopologyView = 'summary', cursor = '', limit = 100, signal?: AbortSignal) => {
+    const params = new URLSearchParams({ view, limit: String(limit) })
+    if (cursor) params.set('cursor', cursor)
+    const path = accountId ? `/accounts/${encodeURIComponent(accountId)}/topology` : '/topology'
+    return api<AdminTopologySnapshotPage>(`${path}?${params}`, signal)
+  },
   overview: (signal?: AbortSignal) => api<AdminOverview>('/overview', signal),
   runtime: (signal?: AbortSignal) => api<AdminRuntime>('/runtime', signal),
   accounts: (query = '', limit = 50, offset = 0) => {

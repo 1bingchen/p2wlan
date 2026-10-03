@@ -1,13 +1,14 @@
 import { useQuery } from '@tanstack/react-query'
 import { ArrowRight, ChevronRight, CircleAlert, CircleCheck, MonitorSmartphone, RadioTower } from 'lucide-react'
 import { Link } from 'react-router-dom'
-import { adminApi } from './api'
-import { selectConnectionSearch } from './connectionNavigation'
-import { healthSignalLabel } from './connectionLabels'
-import { getLocale, tr } from './i18n'
-import { AccountMark, ErrorBlock, Panel, PendingBlock, formatAgo } from './ResourceUI'
-import { QueryStatus, useAutoRefresh } from './refresh'
-import type { AdminConnectionHealthAlert } from './types'
+import { adminApi } from '../../api'
+import { PageHeader } from '../../components/ui/console'
+import { getLocale, tr } from '../../i18n'
+import { QueryStatus, useAutoRefresh } from '../../refresh'
+import { AccountMark, ErrorBlock, Panel, PendingBlock, formatAgo } from '../../shared/console'
+import type { AdminConnectionHealthAlert } from '../../types'
+import { healthSignalLabel } from '../connections/connectionLabels'
+import { selectConnectionSearch } from '../connections/connectionNavigation'
 
 function AttentionRow({ alert }: { alert: AdminConnectionHealthAlert }) {
   const search = selectConnectionSearch(new URLSearchParams('tab=health'), alert)
@@ -30,7 +31,7 @@ export function Dashboard() {
   const overviewSnapshot = !refetchInterval || overview.isError || overview.fetchStatus !== 'idle'
   const accountsSnapshot = !refetchInterval || accounts.isError || accounts.fetchStatus !== 'idle'
   return <div className="page-stack dashboard-page">
-    <div className="page-intro"><div><h2>{tr('运维概览')}</h2><p>{tr('全部账号 · 先查看需要关注的连接，再浏览资源。')}</p></div></div>
+    <PageHeader title={tr('运维概览')} description={<> {tr('全部账号 · 先查看需要关注的连接，再浏览资源。')} </>} />
     <section className="dashboard-section" aria-label={tr('连接待关注')}>
       <QueryStatus queries={[health]} label="连接观测" />
       <Panel title={tr('需要关注')} subtitle={tr('最近 1 小时 · 依据端点上报与路径迁移记录')} action={<Link className="text-link" to="/connections?tab=health">{tr('查看全部提醒')}{health.data && <span>({health.data.alerts_total})</span>}<ArrowRight size={14} /></Link>}>

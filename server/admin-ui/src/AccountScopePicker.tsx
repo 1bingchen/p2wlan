@@ -5,7 +5,6 @@ import { adminApi, ApiError } from './api'
 import { tr } from './i18n'
 import type { AdminAccount } from './types'
 import { useOverlay } from './useOverlay'
-import './account-scope-picker.css'
 
 type AccountScope = Pick<AdminAccount, 'id' | 'username'>
 const PAGE_SIZE = 25

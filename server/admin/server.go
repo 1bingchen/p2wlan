@@ -213,6 +213,10 @@ func (s *Server) overview(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (s *Server) accounts(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Query().Get("pagination") == "cursor" {
+		s.snapshot(w, r, "accounts", "")
+		return
+	}
 	limit, offset, ok := parsePage(w, r)
 	if !ok {
 		return
@@ -245,6 +249,10 @@ func (s *Server) accountsCursor(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) topology(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Query().Get("view") != "" {
+		s.snapshot(w, r, "topology", "")
+		return
+	}
 	if strings.TrimSpace(r.URL.Query().Get("network_id")) != "" {
 		s.networkTopology(w, r)
 		return
@@ -277,6 +285,10 @@ func (s *Server) topology(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) accountTopology(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Query().Get("view") != "" {
+		s.snapshot(w, r, "topology", r.PathValue("id"))
+		return
+	}
 	value, err := s.store.AdminTopology(r.PathValue("id"))
 	if errors.Is(err, database.ErrAdminAccountNotFound) {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "account not found"})
@@ -290,6 +302,10 @@ func (s *Server) accountTopology(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) devices(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Query().Get("pagination") == "cursor" {
+		s.snapshot(w, r, "devices", "")
+		return
+	}
 	limit, offset, ok := parsePage(w, r)
 	if !ok {
 		return

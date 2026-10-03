@@ -1,6 +1,3 @@
-import { getFlowAriaLabelConfig, getLocale, tr, useLocale } from './i18n'
-import '@xyflow/react/dist/style.css'
-import { type CSSProperties, useEffect, useMemo, useState } from 'react'
 import dagre from '@dagrejs/dagre'
 import {
   Background,
@@ -29,14 +26,15 @@ import {
   Users,
   X,
 } from 'lucide-react'
-import { accountColor, accountIdentity, colorWithAlpha } from './colors'
-import { useTheme } from './theme'
-import { useOverlay } from './useOverlay'
+import { useEffect, useMemo, useState, type CSSProperties } from 'react'
 import { Link, useLocation } from 'react-router-dom'
-import { CopyValue } from './CopyValue'
-import { connectionLink, relationshipLink, resourceOriginState } from './pageState'
-import { TopologyViewport } from './TopologyViewport'
-import type { AdminTopology, AdminTopologyNode } from './types'
+import { CopyValue } from '../../CopyValue'
+import { accountColor, accountIdentity, colorWithAlpha } from '../../colors'
+import { getFlowAriaLabelConfig, getLocale, tr, useLocale } from '../../i18n'
+import { connectionLink, relationshipLink, resourceOriginState } from '../../pageState'
+import { TopologyViewport } from '../../shared/TopologyViewport'
+import type { AdminTopology, AdminTopologyNode } from '../../types'
+import { useOverlay } from '../../useOverlay'
 
 interface TopologyCanvasProps {
   data?: AdminTopology
@@ -301,7 +299,6 @@ function useNarrowViewport() {
 
 export function TopologyCanvas({ data, loading, error, search = '', compact = false, accountId, networkId }: TopologyCanvasProps) {
   const locale = useLocale()
-  const theme = useTheme()
   const [fullscreen, setFullscreen] = useState(false)
   const [legendOpen, setLegendOpen] = useState(false)
   const [selectedId, setSelectedId] = useState<string | null>(null)
@@ -358,8 +355,8 @@ export function TopologyCanvas({ data, loading, error, search = '', compact = fa
         {!compact && <MiniMap
           pannable
           zoomable
-          bgColor={theme === 'dark' ? '#142033' : 'rgba(255, 255, 255, .96)'}
-          maskColor={theme === 'dark' ? 'rgba(148, 163, 184, .2)' : 'rgba(240, 240, 240, .6)'}
+          bgColor="var(--surface)"
+          maskColor="var(--minimap-mask)"
           nodeStrokeWidth={3}
           nodeColor={(node) => {
             const source = data.nodes.find((item) => item.id === node.id)

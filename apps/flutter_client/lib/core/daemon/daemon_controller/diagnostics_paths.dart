@@ -8,6 +8,7 @@ enum DaemonStartupFailureCode {
   uacLaunchFailed,
   daemonBinaryLoadFailed,
   daemonExitedDuringStartup,
+  startupConfigInvalid,
   daemonNotElevated,
   tokenAccessFailed,
   wintunDllMissing,
@@ -36,6 +37,7 @@ extension DaemonStartupFailureCodeText on DaemonStartupFailureCode {
       'DAEMON_BINARY_LOAD_FAILED',
     DaemonStartupFailureCode.daemonExitedDuringStartup =>
       'DAEMON_EXITED_DURING_STARTUP',
+    DaemonStartupFailureCode.startupConfigInvalid => 'STARTUP_CONFIG_INVALID',
     DaemonStartupFailureCode.daemonNotElevated => 'DAEMON_NOT_ELEVATED',
     DaemonStartupFailureCode.tokenAccessFailed => 'TOKEN_ACCESS_FAILED',
     DaemonStartupFailureCode.wintunDllMissing => 'WINTUN_DLL_MISSING',
@@ -95,6 +97,12 @@ DaemonStartupFailure? classifyDaemonStartupLog(String contents) {
   DaemonStartupFailure failure(DaemonStartupFailureCode code, String message) =>
       DaemonStartupFailure(code, message);
 
+  if (lower.contains('startup_config_invalid')) {
+    return failure(
+      DaemonStartupFailureCode.startupConfigInvalid,
+      '启动配置无效，请检查服务器、虚拟 IP、监听地址、MTU 和 Relay 设置；日志中会标明无效参数。',
+    );
+  }
   if (lower.contains('windows acl protection failed') ||
       lower.contains('acl protection failed') ||
       lower.contains('acl_failure')) {

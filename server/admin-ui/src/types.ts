@@ -313,3 +313,20 @@ export interface AdminConnectionHealthFilters {
   alertSignal?: string
   offset?: number
 }
+
+export type TopologyView = 'summary' | 'full'
+
+export interface SnapshotPage<T> extends CursorPage<T> {
+  generated_at: number
+  snapshot_at: number
+}
+
+export interface AdminTopologySnapshotPage extends AdminTopology {
+  snapshot_at: number
+  view: TopologyView
+  phase: string
+  complete: boolean
+  next_cursor?: string
+}
+
+export type ResourceAccountScope = { id: string; username: string }

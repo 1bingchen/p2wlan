@@ -184,29 +184,33 @@ void main() {
     expect(await logTailShowsPermanentAuthFailure(log.path), isFalse);
   });
 
-  test(
-    'classifies actionable startup stages without exposing log contents',
-    () {
-      final cases = <String, DaemonStartupFailureCode>{
-        '[startup] windows_elevated=false':
-            DaemonStartupFailureCode.daemonNotElevated,
-        'Windows ACL protection failed': DaemonStartupFailureCode.aclFailure,
-        'failed to open existing Wintun adapter':
-            DaemonStartupFailureCode.wintunAdapterOpenFailed,
-        '[tun] IPv4 configuration failed':
-            DaemonStartupFailureCode.ipConfigFailed,
-        '[tun] MTU configuration failed':
-            DaemonStartupFailureCode.mtuConfigFailed,
-        'route install failed: access denied':
-            DaemonStartupFailureCode.routeInstallFailed,
-        'failed to bind diagnostics endpoint at 127.0.0.1:39277':
-            DaemonStartupFailureCode.diagnosticsBindFailed,
-      };
-      for (final entry in cases.entries) {
-        expect(classifyDaemonStartupLog(entry.key)?.code, entry.value);
-      }
-    },
-  );
+  test('classifies actionable startup stages without exposing log contents', () {
+    final cases = <String, DaemonStartupFailureCode>{
+      'ERROR p2wlan-daemon startup before logging: STARTUP_CONFIG_INVALID: --control must use HTTP or HTTPS':
+          DaemonStartupFailureCode.startupConfigInvalid,
+      '[startup] windows_elevated=false':
+          DaemonStartupFailureCode.daemonNotElevated,
+      'Windows ACL protection failed': DaemonStartupFailureCode.aclFailure,
+      'failed to open existing Wintun adapter':
+          DaemonStartupFailureCode.wintunAdapterOpenFailed,
+      '[tun] IPv4 configuration failed':
+          DaemonStartupFailureCode.ipConfigFailed,
+      '[tun] MTU configuration failed':
+          DaemonStartupFailureCode.mtuConfigFailed,
+      'route install failed: access denied':
+          DaemonStartupFailureCode.routeInstallFailed,
+      'failed to bind diagnostics endpoint at 127.0.0.1:39277':
+          DaemonStartupFailureCode.diagnosticsBindFailed,
+    };
+    for (final entry in cases.entries) {
+      expect(classifyDaemonStartupLog(entry.key)?.code, entry.value);
+    }
+    final invalidConfig = classifyDaemonStartupLog(
+      'STARTUP_CONFIG_INVALID: private-user secret-value',
+    )!;
+    expect(invalidConfig.message, isNot(contains('private-user')));
+    expect(invalidConfig.message, isNot(contains('secret-value')));
+  });
 
   test(
     'startup probe fails fast on child exit and preserves stage details',

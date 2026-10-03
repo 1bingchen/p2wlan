@@ -70,9 +70,10 @@ async fn run_daemon_inner(
     // This guarantees --help and --version exit cleanly without side effects.
     let cli = Cli::parse();
 
-    if let Err(e) = validate_cli(&cli) {
-        eprintln!("Configuration Error: {}", e);
-        std::process::exit(1);
+    if let Err(error) = validate_cli(&cli) {
+        let error = DaemonError::Config(format!("STARTUP_CONFIG_INVALID: {error}"));
+        append_early_startup_error(cli.log_file.as_ref(), &error);
+        return Err(error);
     }
 
     // Resolve this before any generated config is saved.  The token file keeps
@@ -466,36 +467,16 @@ const MAX_LAUNCH_TOKEN_BYTES: usize = 16 * 1024;
 
 fn append_early_startup_error(log_path: Option<&PathBuf>, error: &dyn std::fmt::Display) {
     let Some(path) = log_path else { return };
-    let Some(parent) = path.parent() else { return };
-    if std::fs::create_dir_all(parent).is_err() {
-        return;
-    }
-    let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) else {
+    // Use the normal bounded private writer so early failures cannot follow
+    // links, grow an unbounded file, or bypass the regular log permissions.
+    let Ok((sink, _guard)) = p2pnet_daemon::diagnostics::logging::bounded_file_writer(path) else {
         return;
     };
-    if restrict_log_file_permissions(path).is_err() {
-        return;
-    }
+    let mut writer = tracing_subscriber::fmt::MakeWriter::make_writer(&sink);
     let _ = std::io::Write::write_fmt(
-        &mut file,
+        &mut writer,
         format_args!("ERROR p2wlan-daemon startup before logging: {error}\n"),
     );
-}
-
-/// Keep daemon logs private on Unix hosts.  Windows uses the user's inherited
-/// ACL, while macOS/Linux otherwise honor the process umask only at creation
-/// time and would leave an old broad-permission log unchanged.
-fn restrict_log_file_permissions(path: &std::path::Path) -> std::io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut permissions = std::fs::metadata(path)?.permissions();
-        permissions.set_mode(0o600);
-        std::fs::set_permissions(path, permissions)?;
-    }
-    #[cfg(not(unix))]
-    let _ = path;
-    Ok(())
 }
 
 fn read_launch_token_file(path: &std::path::Path) -> p2pnet_daemon::Result<String> {

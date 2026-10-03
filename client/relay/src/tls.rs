@@ -52,6 +52,10 @@ pub fn parse_endpoint(
             ));
         }
         ("tcp", rest)
+    } else if endpoint.contains("://") {
+        return Err(RelayError::TlsError(
+            "unsupported relay endpoint scheme".into(),
+        ));
     } else {
         // Legacy: bare host:port is treated as tcp:// for backward compat
         if !allow_insecure_plaintext {
@@ -95,6 +99,18 @@ pub fn parse_endpoint(
     let port: u16 = port_str
         .parse()
         .map_err(|_| RelayError::TlsError(format!("invalid port in endpoint: {endpoint}")))?;
+
+    let valid_host = if let Some(ipv6) = host.strip_prefix('[').and_then(|h| h.strip_suffix(']')) {
+        ipv6.parse::<std::net::Ipv6Addr>().is_ok()
+    } else {
+        !host.is_empty()
+            && !host.chars().any(|c| {
+                c.is_whitespace() || matches!(c, '/' | '\\' | '@' | '?' | '#' | ':' | '[' | ']')
+            })
+    };
+    if !valid_host {
+        return Err(RelayError::TlsError("invalid relay endpoint host".into()));
+    }
 
     Ok(ParsedEndpoint {
         scheme: scheme.to_string(),
@@ -312,5 +328,22 @@ mod tests {
         assert!(parse_endpoint("tls://host", false).is_err());
         assert!(parse_endpoint("tls://host:", false).is_err());
         assert!(parse_endpoint("", false).is_err());
+    }
+
+    #[test]
+    fn invalid_authorities_and_unsupported_schemes_are_rejected() {
+        for endpoint in [
+            "tls://:18081",
+            "https://relay.example.com:18081",
+            "tls://user@relay.example.com:18081",
+            "tls://relay.example.com/path:18081",
+            "tls://relay.example.com?query:18081",
+            "tls://relay.example.com#fragment:18081",
+            "tls://relay name:18081",
+            "tls://[not-ipv6]:18081",
+            "tls://::1:18081",
+        ] {
+            assert!(parse_endpoint(endpoint, true).is_err(), "{endpoint}");
+        }
     }
 }

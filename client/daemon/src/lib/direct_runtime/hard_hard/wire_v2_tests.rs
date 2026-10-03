@@ -718,4 +718,5 @@ mod hard_hard_wire_v2_tests {
     include!("negotiation_tests.rs");
     include!("barrier_tests.rs");
     include!("ingress_regression_tests.rs");
+    include!("candidate_validation_tests.rs");
 }

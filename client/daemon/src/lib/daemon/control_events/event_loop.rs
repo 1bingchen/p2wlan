@@ -708,27 +708,17 @@ impl Daemon {
                                 )
                                 .await;
                             }
-                        } else if update.endpoint_changed {
-                            // Endpoint metadata changes are normal NAT/candidate
-                            // churn. They must not tear down a confirmed relay or
-                            // WireGuard session. A same-node restart is reset only
-                            // when a later peer offer carries a different encoded
-                            // candidate-generation incarnation.
-                            // The explicit Hard↔Hard experiment lane owns one
-                            // authoritative fresh-mapping attempt. Registration
-                            // endpoint churn can arrive while the responder is
-                            // still measuring, before its bounded session ledger
-                            // record exists; cancelling the punch permit here
-                            // would make unrelated roster metadata decide the
-                            // experiment outcome. Production/default traversal
-                            // keeps the existing cancellation behavior.
-                            if !self.peers.hard_hard_experiment_only() {
-                                self.punch_attempts.cancel(&peer_info.node_id);
-                            }
-                            if let Some(udp) = self.udp_transport.read().await.clone() {
-                                udp.clear_pending_probes_for_peer(&peer_info.node_id).await;
-                            }
                         }
+                        // A registry endpoint revision is not a transport or
+                        // identity replacement. It may describe a different NAT
+                        // mapping than the live punch's exact auxiliary socket.
+                        // Preserve its owner and authenticated pending ACKs in
+                        // normal mode too, including before measurement has
+                        // installed the HH ledger. Their original deadlines,
+                        // candidate epochs and session/identity fences still
+                        // apply; the lifecycle branches above retire real
+                        // replacements. Candidate replay below supplies the
+                        // new endpoint without cancelling the current window.
                         let was_offline = update.was_offline;
                         if (update.virtual_ip_changed || was_offline) && self.dns.is_enabled() {
                             if let Some(previous_virtual_ip) = update.previous_virtual_ip.as_ref() {

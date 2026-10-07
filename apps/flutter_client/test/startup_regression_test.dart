@@ -68,29 +68,38 @@ void main() {
   });
 
   for (final locale in ['en', 'zh-Hans']) {
-    testWidgets('startup failure is safe and localized in $locale', (
-      tester,
-    ) async {
-      final harness = (await tester.runAsync(_Harness.create))!;
-      addTearDown(harness.dispose);
-      harness.api.health = false;
-      harness.controller.result = const DaemonCommandResult(
-        ok: false,
-        message: 'SocketException SECRET bearer_token=secret',
-        failureCode: DaemonStartupFailureCode.uacCancelled,
-      );
-      await tester.pumpWidget(harness.app(locale));
-      await harness.store.startDaemon();
-      await tester.pump();
-      expect(
-        find.text(AppStrings.fromCode(locale).windowsUacCancelled),
-        findsOneWidget,
-      );
-      expect(find.textContaining('SECRET'), findsNothing);
-      expect(find.textContaining('SocketException'), findsNothing);
-      expect(harness.store.daemonStarting, isFalse);
-      expect(tester.takeException(), isNull);
-    });
+    for (final code in [
+      DaemonStartupFailureCode.uacCancelled,
+      DaemonStartupFailureCode.startupConfigInvalid,
+    ]) {
+      testWidgets('startup failure $code is safe and localized in $locale', (
+        tester,
+      ) async {
+        final harness = (await tester.runAsync(_Harness.create))!;
+        addTearDown(harness.dispose);
+        harness.api.health = false;
+        harness.controller.result = DaemonCommandResult(
+          ok: false,
+          message: 'SocketException SECRET bearer_token=secret',
+          failureCode: code,
+        );
+        await tester.pumpWidget(harness.app(locale));
+        await harness.store.startDaemon();
+        await tester.pump();
+        expect(
+          find.text(
+            code == DaemonStartupFailureCode.uacCancelled
+                ? AppStrings.fromCode(locale).windowsUacCancelled
+                : AppStrings.fromCode(locale).daemonStartupConfigInvalid,
+          ),
+          findsOneWidget,
+        );
+        expect(find.textContaining('SECRET'), findsNothing);
+        expect(find.textContaining('SocketException'), findsNothing);
+        expect(harness.store.daemonStarting, isFalse);
+        expect(tester.takeException(), isNull);
+      });
+    }
   }
 }
 

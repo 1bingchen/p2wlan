@@ -53,6 +53,8 @@ String daemonStartupFailurePresentation(
     DaemonStartupFailureCode.pidMarkerFailed => strings.windowsPidMarkerFailed,
     DaemonStartupFailureCode.daemonExitedDuringStartup =>
       strings.daemonExitedDuringStartup,
+    DaemonStartupFailureCode.startupConfigInvalid =>
+      strings.daemonStartupConfigInvalid,
     DaemonStartupFailureCode.daemonBinaryLoadFailed =>
       strings.daemonBinaryLoadFailed,
     DaemonStartupFailureCode.aclFailure => strings.daemonAclFailure,

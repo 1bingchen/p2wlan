@@ -34,6 +34,7 @@ NETWORK_PROFILE=${NETWORK_PROFILE:-}
 BACKGROUND_DEVICES=${BACKGROUND_DEVICES:-0}
 BACKGROUND_FLOWS=${BACKGROUND_FLOWS:-32}
 BACKGROUND_INTERVAL_MS=${BACKGROUND_INTERVAL_MS:-250}
+BACKGROUND_DURATION_MS=${BACKGROUND_DURATION_MS:-0}
 # Keep the local regression logs at the same diagnostic granularity as the
 # dual-end harness: per-packet counter/order and transport handoff boundaries
 # are DEBUG, while the rest remains INFO. Override this for a quieter run.
@@ -1215,6 +1216,7 @@ for round in $(seq 1 "$ROUNDS"); do
     --background-devices "$BACKGROUND_DEVICES"
     --background-flows "$BACKGROUND_FLOWS"
     --background-interval-ms "$BACKGROUND_INTERVAL_MS"
+    --background-duration-ms "$BACKGROUND_DURATION_MS"
     --sweep-noise-every "$SWEEP_NOISE_EVERY"
     --sweep-noise-count "$SWEEP_NOISE_COUNT"
     --sweep-noise-limit "$SWEEP_NOISE_LIMIT"
@@ -2376,6 +2378,7 @@ except Exception:
       SWEEP_NOISE_COUNT="$SWEEP_NOISE_COUNT" SWEEP_NOISE_LIMIT="$SWEEP_NOISE_LIMIT" \
       BACKGROUND_DEVICES="$BACKGROUND_DEVICES" BACKGROUND_FLOWS="$BACKGROUND_FLOWS" \
       BACKGROUND_INTERVAL_MS="$BACKGROUND_INTERVAL_MS" \
+      BACKGROUND_DURATION_MS="$BACKGROUND_DURATION_MS" \
       NETWORK_PROFILE="$NETWORK_PROFILE" \
       python3 "$ROOT_DIR/scripts/nat-sim/mapping_evidence.py" "$ROUND_DIR"; then
       echo "[nat-sim] ROUND $round: FAIL reason_code=mapping_evidence_invalid" >&2

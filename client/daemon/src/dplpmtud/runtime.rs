@@ -242,7 +242,7 @@ impl DplpmtudRuntime {
 
     fn allocate_worker_owner_token(&self) -> Option<u64> {
         self.next_worker_owner_token
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                 current.checked_add(1)
             })
             .ok()
@@ -251,7 +251,7 @@ impl DplpmtudRuntime {
 
     fn allocate_budget_revision(&self) -> Option<u64> {
         NEXT_DPLPMTUD_BUDGET_REVISION
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                 current.checked_add(1)
             })
             .ok()

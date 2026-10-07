@@ -594,6 +594,15 @@ fn hard_hard_sweep_plan(
         }
         Some((targets, None))
     } else {
+        if strategy == crate::peer::HardHardProbeStrategy::Birthday && !record.initiator {
+            targets = p2pnet_nat::mapping::rendezvous::fixed_step_rendezvous_targets(
+                &record.prediction_window,
+                &targets,
+                true,
+                plan.phase,
+            )
+            .unwrap_or(targets);
+        }
         Some((targets, Some(record.requested_socket_indices.clone())))
     }
 }

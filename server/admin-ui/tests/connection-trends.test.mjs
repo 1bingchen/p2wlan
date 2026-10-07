@@ -21,10 +21,10 @@ async function source(entry, plugins = []) {
   new Function('module', 'exports', 'require', result.outputFiles[0].text)(module, module.exports, require)
   return module.exports
 }
-const { connectionTrends, clearHealthScope, readHealthSearch, selectHealthDirection, summarizeTrends, bucketP95, lineSegments, trendWindowForTimestamp } = await source('src/trends.ts')
+const { connectionTrends, clearHealthScope, readHealthSearch, selectHealthDirection, summarizeTrends, bucketP95, lineSegments, trendWindowForTimestamp } = await source('src/features/connections/trends.ts')
 const { adminApi } = await source('src/api.ts')
-const { ConnectionTrends } = await source('src/ConnectionTrends.tsx')
-const { ConnectionHealthPage } = await source('src/ConnectionHealthPage.tsx', [{
+const { ConnectionTrends } = await source('src/features/connections/ConnectionTrends.tsx')
+const { ConnectionHealthPage } = await source('src/features/health/ConnectionHealthPage.tsx', [{
   name: 'unused-drawer',
   setup(builder) {
     builder.onResolve({ filter: /^\.\/ConnectionDrawer$/ }, () => ({ path: 'drawer', namespace: 'test' }))

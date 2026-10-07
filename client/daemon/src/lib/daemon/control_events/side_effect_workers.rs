@@ -716,15 +716,38 @@ impl Daemon {
             };
 
             offer.peer_session_generation = self.peers.peer_session_generation_sync(&peer_id);
-            let ingress = self
-                .offer_ingress_verdict(
-                    &peer_id,
-                    &offer.candidates,
-                    &offer.candidate_sources,
-                    offer.candidates_expires_at_ms,
-                    offer.sender_public_key.as_deref(),
-                )
-                .await;
+            // A real incarnation reset has already retired the old HH owner.
+            // Finish its candidate/republication transaction before yielding;
+            // otherwise a successor could lose the required handshake replay.
+            if !remote_incarnation_reset {
+                if !self
+                    .wait_for_hard_hard_candidate_owner(&offer, &mut reservation)
+                    .await
+                {
+                    let Some(next) = self
+                        .pending_handshakes
+                        .lock()
+                        .finish_candidate_offer_work(&peer_id, reservation.owner)
+                    else {
+                        return;
+                    };
+                    offer = next;
+                    continue;
+                }
+                if let Some(newest) = self
+                    .pending_handshakes
+                    .lock()
+                    .take_queued_candidate_offer_work_before_commit(
+                        &peer_id,
+                        reservation.owner,
+                        &offer,
+                    )
+                {
+                    offer = newest;
+                    continue;
+                }
+            }
+            let ingress = self.offer_ingress_verdict(&offer).await;
             let (_fresh_verdict, candidate_apply_result, fresh_punch) = if ingress
                 == OfferIngressVerdict::Apply
             {
@@ -869,7 +892,7 @@ impl Daemon {
                 (
                     FreshSignalVerdict::None,
                     CandidateSetApplyResult::IgnoredStale,
-                    FreshPunchDecision::None,
+                    FreshPunchDecision::Rejected(FreshPunchRejection::Ingress(ingress)),
                 )
             };
             if !offer.handshake_init.is_empty() {

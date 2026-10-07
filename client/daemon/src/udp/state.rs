@@ -289,7 +289,7 @@ static NEXT_RELAY_BACKOFF_HEARTBEAT_OWNER_TOKEN: AtomicU64 = AtomicU64::new(1);
 
 fn next_relay_backoff_heartbeat_owner_token() -> u64 {
     NEXT_RELAY_BACKOFF_HEARTBEAT_OWNER_TOKEN
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+        .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
             current.checked_add(1)
         })
         .expect("relay-backoff heartbeat owner token space exhausted")
@@ -322,7 +322,7 @@ static NEXT_DIRECT_VALIDATION_OWNER_TOKEN: AtomicU64 = AtomicU64::new(1);
 
 pub(crate) fn next_direct_validation_owner_token() -> u64 {
     NEXT_DIRECT_VALIDATION_OWNER_TOKEN
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+        .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
             current.checked_add(1)
         })
         .expect("direct-validation owner token space exhausted")
@@ -968,7 +968,7 @@ impl DynamicSocketLeaseState {
         // wrap the counter (a wrapped counter would look like a huge
         // outstanding count and block every future detach).
         self.count
-            .fetch_update(
+            .try_update(
                 std::sync::atomic::Ordering::AcqRel,
                 std::sync::atomic::Ordering::Acquire,
                 |count| Some(count.saturating_sub(1)),

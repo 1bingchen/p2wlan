@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import { test } from 'node:test'
-import { lifecycleLabel, transitionReasonLabel, transitionReasonLabels } from '../src/connectionLabels.ts'
+import { lifecycleLabel, transitionReasonLabel, transitionReasonLabels } from '../src/features/connections/connectionLabels.ts'
 
 test('every backend transition reason has Chinese and English labels', () => {
   const backend = readFileSync(new URL('../../database/path_telemetry.go', import.meta.url), 'utf8')

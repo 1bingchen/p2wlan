@@ -22,6 +22,7 @@ const HARD_HARD_BARRIER_MAX_ATTEMPTS: u8 = 3;
 const HARD_HARD_MAX_PREDICTION_TARGETS: usize = 32;
 const HARD_HARD_MAX_BIRTHDAY_TARGETS: usize = 256;
 const HARD_HARD_PROTECTED_CLAIM_RETRY_SLACK: Duration = Duration::from_millis(10);
+const HARD_HARD_CLEANUP_CLAIM_MAX_WAIT: Duration = Duration::from_millis(500);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum HardHardInitiatorStart {
@@ -542,7 +543,8 @@ fn hard_hard_punch_window_is_usable(now_ms: u64, punch_at_ms: u64) -> bool {
 /// deduplicator deliberately protects an ordinary rendezvous which already
 /// reached its lead/first-send edge.  Wait only until that short protection is
 /// guaranteed to have elapsed, then retry exactly once while the much longer
-/// canonical Hard↔Hard window is still useful.
+/// canonical Hard↔Hard window is still useful. A cancelled previous HH owner
+/// may instead need a short bounded wait for its exact cleanup to finish.
 fn hard_hard_protected_claim_retry_delay(
     deferred: DeferredPunchClaim,
     now_ms: u64,
@@ -553,6 +555,9 @@ fn hard_hard_protected_claim_retry_delay(
         .min(u64::MAX as u128) as u64;
     let max_delay_ms = guard_ms.saturating_mul(2).saturating_add(slack_ms);
     let delay_ms = match deferred.reason {
+        PunchClaimDeferredReason::CancelledOwnerCleanup => {
+            return Some(HARD_HARD_CLEANUP_CLAIM_MAX_WAIT);
+        }
         PunchClaimDeferredReason::FirstSendProtected => guard_ms.saturating_add(slack_ms),
         PunchClaimDeferredReason::RendezvousLeadProtected => deferred
             .active_punch_at_ms
@@ -568,6 +573,21 @@ fn hard_hard_protected_claim_retry_delay(
         | PunchClaimDeferredReason::SameOrOlderFreshPrediction => return None,
     };
     Some(Duration::from_millis(delay_ms.clamp(1, max_delay_ms)))
+}
+
+async fn wait_for_hard_hard_claim_retry(
+    deduplicator: &PunchAttemptDeduplicator,
+    peer_id: &str,
+    deferred: DeferredPunchClaim,
+    retry_delay: Duration,
+) {
+    if deferred.reason == PunchClaimDeferredReason::CancelledOwnerCleanup {
+        deduplicator
+            .wait_for_cancelled_owner_release(peer_id, deferred.active_session_id, retry_delay)
+            .await;
+    } else {
+        sleep(retry_delay).await;
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -621,7 +641,7 @@ async fn claim_hard_hard_responder_session(
             peer_session_generation,
             plan.local_network_generation,
             epoch,
-            PUNCH_PRIORITY_FRESH_PREDICTION,
+            PUNCH_PRIORITY_HARD_HARD,
             None,
             Some(punch_at_ms),
         )
@@ -691,14 +711,14 @@ async fn claim_hard_hard_responder_session(
             None,
             None,
             format!(
-                "Hard↔Hard responder waiting once for protected ordinary session_id={} reason={} retry_delay_ms={}",
+                "Hard↔Hard responder waiting once for session_id={} reason={} max_wait_ms={}",
                 deferred.active_session_id,
                 deferred.reason.label(),
                 retry_delay.as_millis(),
             ),
         )
         .await;
-    sleep(retry_delay).await;
+    wait_for_hard_hard_claim_retry(punch_deduplicator, peer_id, deferred, retry_delay).await;
 
     let retry_fence_is_current = hard_hard_plan_claim_fence(
         peers,
@@ -754,7 +774,7 @@ async fn claim_hard_hard_responder_session(
             peer_session_generation,
             plan.local_network_generation,
             epoch,
-            PUNCH_PRIORITY_FRESH_PREDICTION,
+            PUNCH_PRIORITY_HARD_HARD,
             None,
             Some(punch_at_ms),
         )
@@ -943,7 +963,7 @@ async fn claim_hard_hard_initiator_response_session(
             peer_session_generation,
             record.local_network_generation,
             epoch,
-            PUNCH_PRIORITY_FRESH_PREDICTION,
+            PUNCH_PRIORITY_HARD_HARD,
             None,
             Some(record.punch_at_ms),
         )
@@ -1002,14 +1022,14 @@ async fn claim_hard_hard_initiator_response_session(
             None,
             None,
             format!(
-                "Hard↔Hard initiator response waiting once for protected ordinary session_id={} reason={} retry_delay_ms={}",
+                "Hard↔Hard initiator response waiting once for session_id={} reason={} max_wait_ms={}",
                 deferred.active_session_id,
                 deferred.reason.label(),
                 retry_delay.as_millis(),
             ),
         )
         .await;
-    sleep(retry_delay).await;
+    wait_for_hard_hard_claim_retry(punch_deduplicator, peer_id, deferred, retry_delay).await;
 
     let retry_fence_is_current = hard_hard_initiator_response_claim_fence(
         peers,
@@ -1041,7 +1061,7 @@ async fn claim_hard_hard_initiator_response_session(
             peer_session_generation,
             record.local_network_generation,
             epoch,
-            PUNCH_PRIORITY_FRESH_PREDICTION,
+            PUNCH_PRIORITY_HARD_HARD,
             None,
             Some(record.punch_at_ms),
         )

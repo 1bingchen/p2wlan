@@ -873,6 +873,9 @@ class AppStrings {
   String get daemonExitedDuringStartup => isZh
       ? 'daemon 在启动完成前退出，请查看启动日志中的阶段和失败代码。'
       : 'The daemon exited during startup. Check the startup log for its stage and failure code.';
+  String get daemonStartupConfigInvalid => isZh
+      ? '启动配置无效。请检查服务器、虚拟 IP、监听地址、MTU 和 Relay 设置；启动日志会标明无效参数。'
+      : 'The startup configuration is invalid. Check the server, virtual IP, bind addresses, MTU, and relay settings; the startup log identifies the invalid option.';
   String get daemonBinaryLoadFailed => isZh
       ? 'p2wlan-daemon 或其运行库无法加载，请重新安装完整发布包。'
       : 'p2wlan-daemon or one of its runtimes could not load. Reinstall the complete package.';

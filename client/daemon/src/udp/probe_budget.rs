@@ -628,7 +628,7 @@ impl GlobalRelayBackoffHeartbeatBudget {
 
         let id = self
             .next_reservation_id
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                 current.checked_add(1)
             })
             .expect("relay-backoff heartbeat reservation ID space exhausted");

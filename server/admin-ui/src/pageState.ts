@@ -58,7 +58,7 @@ export function relationshipLink(networkId: string, accountId?: string) {
 }
 
 // History state contains only bounded navigation data, never arbitrary nested state.
-const RESOURCE_QUERY_KEYS = ['q', 'status', 'cursor', 'page', 'network_page', 'room_page', 'relationship_page', 'network_id', 'resource_q', 'relationship_view'] as const
+const RESOURCE_QUERY_KEYS = ['q', 'status', 'cursor', 'page', 'network_page', 'room_page', 'relationship_page', 'network_id', 'resource_q', 'relationship_view', 'topology_view'] as const
 const RESOURCE_TABS = ['topology', 'devices', 'networks', 'rooms'] as const
 const MAX_ORIGINS = 4
 const MAX_QUERY_LENGTH = 8192

@@ -51,7 +51,7 @@ fn hard_hard_prepared_payload(
     let mut endpoints = result
         .prediction_candidates(network_generation, HARD_HARD_MAX_PREDICTION_TARGETS)
         .unwrap_or_default();
-    let prediction_count = endpoints.len() as u8;
+    let mut prediction_count = endpoints.len() as u8;
     let anchor = result
         .fixed_anchor_plan(
             network_generation,
@@ -59,6 +59,18 @@ fn hard_hard_prepared_payload(
             birthday.sockets.len().saturating_sub(1),
         )
         .ok();
+    let contention = result
+        .contention_candidates(network_generation, cap)
+        .unwrap_or_default();
+    if contention.len() > endpoints.len() {
+        endpoints = contention;
+        // Preserve the cheap primary-socket attempt for a regular verified
+        // tail, but advertise the dense full window too: the other peer may
+        // have observed contention, or later feedback may favor birthday.
+        if !result.prefers_narrow_prediction() {
+            prediction_count = 0;
+        }
+    }
     if let Some(anchor) = anchor {
         if !endpoints.contains(&anchor.local_anchor) {
             endpoints.push(anchor.local_anchor);
@@ -96,8 +108,8 @@ fn hard_hard_prepared_payload(
             birthday.requested_level,
             candidates.len(),
         );
-    // All alternatives use the same fresh batch label. Preserve the measured
-    // prefix because both peers bind its exact order in the agreement digest.
+    // All alternatives use the same fresh batch label. Both peers bind the
+    // exact published order in the agreement digest.
     if hard_hard_prediction_targets(&candidates, cap) != endpoints {
         return Err(HardHardPayloadRejection::EmptyPredictionWindow);
     }

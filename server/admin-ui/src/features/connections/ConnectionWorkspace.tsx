@@ -1,0 +1,118 @@
+import { useInfiniteQuery } from '@tanstack/react-query'
+import { AlertTriangle, ChartNoAxesCombined, Table2, Waypoints } from 'lucide-react'
+import { Link, useLocation } from 'react-router-dom'
+import { adminApi } from '../../api'
+import { PageHeader } from '../../components/ui/console'
+import { getLocale, tr } from '../../i18n'
+import { QueryStatus } from '../../refresh'
+import { ResourceReturnLink } from '../../shared/console'
+import { ConnectionHealthPage } from '../health/ConnectionHealthPage'
+import { ConnectionTrends } from './ConnectionTrends'
+import { ConnectionsPage } from './ConnectionsPage'
+import { healthSignalLabel } from './connectionLabels'
+import { connectionWorkspaceSearch, connectionWorkspaceTab, readDirectionOnlySearch, selectConnectionSearch, type ConnectionWorkspaceTab } from './connectionNavigation'
+import { readHealthSearch } from './trends'
+import { useConnectionSearchParams } from './useConnectionSearch'
+
+const tabs = [
+  { id: 'health', label: '待关注', icon: AlertTriangle },
+  { id: 'all', label: '全部观测', icon: Table2 },
+  { id: 'topology', label: '连接拓扑', icon: Waypoints },
+  { id: 'trends', label: '历史趋势', icon: ChartNoAxesCombined },
+] as const
+
+function NetworkTrends() {
+  const [params, setParams] = useConnectionSearchParams()
+  const { networkId, trendHours } = readHealthSearch(params)
+  const networks = useInfiniteQuery({
+    queryKey: ['connections', 'networks'],
+    queryFn: ({ pageParam, signal }) => adminApi.networks(100, pageParam, signal),
+    initialPageParam: 0,
+    getNextPageParam: (last) => last.items.length > 0 && last.offset + last.items.length < last.total ? last.offset + last.items.length : undefined,
+    staleTime: 60_000,
+  })
+  const items = networks.data?.pages.flatMap((page) => page.items) ?? []
+  const update = (key: string, value: string) => setParams((current) => {
+    const next = key === 'network_id' ? selectConnectionSearch(current, null) : new URLSearchParams(current)
+    if (value) next.set(key, value)
+    else next.delete(key)
+    if (key === 'network_id') {
+      next.delete('trend_hour')
+      next.delete('page')
+      next.delete('alert_page')
+    }
+    return next
+  })
+  return <div className="page-stack">
+    <PageHeader title={tr('历史趋势')} description={<> {tr('按网络汇总观测；下方图表不应用账号或设备筛选。')} </>} />
+    <div className="connections-toolbar">
+      <select className="select-field" aria-label={tr('按网络过滤')} value={networkId} onChange={(event) => update('network_id', event.target.value)}>
+        <option value="">{tr('全部网络')}</option>
+        {networkId && !items.some((item) => item.id === networkId) && <option value={networkId}>{networkId}</option>}
+        {items.map((item) => <option value={item.id} key={item.id}>{item.name}</option>)}
+      </select>
+      {networks.hasNextPage && <button className="button secondary compact" disabled={networks.isFetchingNextPage} onClick={() => void networks.fetchNextPage()}>{tr('加载更多网络')}</button>}
+    </div>
+    {(networks.error || networks.fetchStatus === 'paused') && <QueryStatus queries={[networks]} />}
+    <ConnectionTrends networkId={networkId} windowHours={trendHours} onWindowChange={(hours) => update('window_hours', String(hours))} />
+  </div>
+}
+
+function retainedFilterValue(key: string, value: string): string {
+  if (key === 'window_seconds') return ['3600', '21600', '86400'].includes(value) ? `${Number(value) / 3600}h` : '—'
+  if (key === 'window_hours') return ({ '24': '24h', '168': '7d', '720': '30d' } as Record<string, string>)[value] ?? '—'
+  if (key === 'path') return tr(({ direct: 'Direct', relay: 'Relay', none: 'None' } as Record<string, string>)[value] ?? '未知')
+  if (key === 'freshness') return tr(({ fresh: 'Fresh', stale: 'Stale / reporter offline' } as Record<string, string>)[value] ?? '未知')
+  if (key === 'signal') return healthSignalLabel(value, getLocale())
+  if (key === 'direction_only') return tr('仅显示所选方向')
+  return value
+}
+
+function RetainedFilters({ active }: { active: ConnectionWorkspaceTab }) {
+  const [params, setParams] = useConnectionSearchParams()
+  const filters = [
+    ['q', '搜索', ['all', 'topology']],
+    ['path', '路径', ['all', 'topology']],
+    ['freshness', '观测新鲜度', ['all', 'topology']],
+    ['signal', '健康信号', ['health']],
+    ['window_seconds', '健康窗口', ['health']],
+    ['window_hours', '趋势窗口', ['trends']],
+    ['account_id', '账号', ['all', 'topology', 'health']],
+    ['user_id', '账号', ['all', 'topology', 'health']],
+    ['device_id', '设备', ['all', 'topology', 'health']],
+    ['direction_only', '方向范围', ['all', 'topology']],
+  ] as const
+  const unused = filters.filter(([key, , views]) => params.get(key) && !(views as readonly string[]).includes(active) && (key !== 'direction_only' || readDirectionOnlySearch(params)))
+  if (!unused.length) return null
+  const scope = active === 'trends' ? '当前图表仅按网络和趋势窗口汇总。'
+    : active === 'health' ? '当前按网络、账号、设备、健康信号和健康窗口筛选。'
+      : '当前按网络、账号、设备、搜索、路径和新鲜度筛选。'
+  return <details className="connection-retained-filters">
+    <summary>{tr('保留但未应用的筛选')} · {unused.length}<span>{tr(scope)}</span></summary>
+    <div>{unused.map(([key, label]) => <span className="connection-retained-filter" key={key}>{tr(label)}：<span>{retainedFilterValue(key, params.get(key)!)}</span></span>)}
+      <button type="button" className="button secondary compact" onClick={() => setParams((current) => {
+        const removesScope = unused.some(([key]) => ['account_id', 'user_id', 'device_id'].includes(key))
+        const next = removesScope ? selectConnectionSearch(current, null) : new URLSearchParams(current)
+        for (const [key] of unused) next.delete(key)
+        if (removesScope || unused.some(([key]) => ['q', 'path', 'freshness'].includes(key))) next.delete('page')
+        if (removesScope || unused.some(([key]) => ['signal', 'window_seconds'].includes(key))) next.delete('alert_page')
+        return next
+      })}>{tr('清除这些保留筛选')}</button>
+    </div>
+  </details>
+}
+
+export function ConnectionWorkspace() {
+  const [params] = useConnectionSearchParams()
+  const { pathname, state } = useLocation()
+  const active = connectionWorkspaceTab(params, pathname)
+  const href = (tab: ConnectionWorkspaceTab) => `/connections?${connectionWorkspaceSearch(params, tab)}`
+  return <div className="page-stack connection-workspace">
+    <ResourceReturnLink />
+    <nav className="connection-workspace-tabs" aria-label={tr('连接排障视图')}>
+      {tabs.map(({ id, label, icon: Icon }) => <Link key={id} to={href(id)} state={state} aria-current={active === id ? 'page' : undefined} className={active === id ? 'active' : ''}><Icon size={16} aria-hidden />{tr(label)}</Link>)}
+    </nav>
+    <RetainedFilters active={active} />
+    {active === 'health' ? <ConnectionHealthPage /> : active === 'trends' ? <NetworkTrends /> : <ConnectionsPage />}
+  </div>
+}

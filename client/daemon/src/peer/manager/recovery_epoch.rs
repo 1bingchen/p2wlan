@@ -113,14 +113,17 @@ pub(crate) const RECOVERY_EPOCH_CANDIDATE_ITERATIONS: u64 = 30_000;
 pub(crate) const RECOVERY_EPOCH_FRESH_GENERATIONS: u32 = 1;
 
 /// A Hard↔Hard rendezvous owns a separate fresh-socket reservation. Ordinary
-/// recovery must not be able to consume the only experiment that can produce
-/// the synchronized local mapping, and a failed Hard↔Hard claim must refund
-/// only its own reservation.
-pub(crate) const RECOVERY_EPOCH_HARD_HARD_GENERATIONS: u32 = 1;
+/// recovery cannot consume these synchronized measurements. Shared allocators
+/// can move past one bounded window, so the existing retry scheduler may use
+/// at most four fresh generations. They share the unchanged probe/session
+/// totals; neither candidate churn nor a failed sweep refills any credit.
+pub(crate) const RECOVERY_EPOCH_HARD_HARD_GENERATIONS: u32 = 4;
 
 /// HTTP publishes (fresh-prediction advertisements) allowed per recovery
-/// epoch.
-pub(crate) const RECOVERY_EPOCH_HTTP_PUBLISHES: u32 = 8;
+/// epoch, including four bounded HH2 negotiations (at most eight publications
+/// each). Ordinary recovery and HH2 share this total rather than resetting it
+/// for each fresh socket generation.
+pub(crate) const RECOVERY_EPOCH_HTTP_PUBLISHES: u32 = 32;
 
 /// An exhausted epoch is re-armed after this age so long-running recovery
 /// keeps a slow heartbeat; age-based rotation is time-driven, not
@@ -475,7 +478,7 @@ impl RecoveryEpochState {
 impl PeerManager {
     fn next_recovery_epoch_allocation_id(&self) -> Option<u64> {
         self.recovery_epoch_allocation_id
-            .fetch_update(
+            .try_update(
                 std::sync::atomic::Ordering::AcqRel,
                 std::sync::atomic::Ordering::Acquire,
                 |current| current.checked_add(1),

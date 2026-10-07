@@ -35,10 +35,11 @@ import json
 import os
 from pathlib import Path
 import random
+import signal
 import socket
 import struct
 import time
-from background_traffic import run_background
+from background_traffic import run_background, validate_background_limits
 from network_conditions import Impairments, NetworkProfile, load_profiles
 from typing import Deque, Dict, List, Optional, Set, Tuple
 
@@ -1074,6 +1075,7 @@ def main() -> None:
     parser.add_argument("--background-devices", type=int, default=0)
     parser.add_argument("--background-flows", type=int, default=32)
     parser.add_argument("--background-interval-ms", type=int, default=250)
+    parser.add_argument("--background-duration-ms", type=int, default=0)
     parser.add_argument("--network-profile", type=Path)
     args = parser.parse_args()
     try:
@@ -1086,6 +1088,11 @@ def main() -> None:
         parser.error("background limits: devices 0..16, flows 1..64, interval 10..5000 ms")
     if args.background_devices and args.egress_capture != "shim":
         parser.error("background traffic requires complete shim capture")
+    try:
+        validate_background_limits(max(1, args.background_devices), args.background_flows,
+                                   args.background_interval_ms, args.background_duration_ms)
+    except ValueError as error:
+        parser.error(str(error))
 
     async def run() -> None:
         trace = NatTrace(args.trace_file) if args.trace_file else None
@@ -1148,7 +1155,7 @@ def main() -> None:
                     # move all interference outside the tested traffic window.
                     await nat.egress_activity.wait()
                     await run_background(nat, args.background_devices, args.background_flows,
-                                         args.background_interval_ms, seed)
+                                         args.background_interval_ms, seed, args.background_duration_ms)
                 background_tasks = [asyncio.create_task(background_after_join(nat, args.seed + offset))
                     for offset, nat in enumerate((nat_a, nat_b))]
             if args.egress_capture == "shim":
@@ -1172,6 +1179,7 @@ def main() -> None:
                         "background_devices": args.background_devices,
                         "background_flows": args.background_flows,
                         "background_interval_ms": args.background_interval_ms,
+                        "background_duration_ms": args.background_duration_ms,
                         "network_profiles": {name: profile.to_dict() for name, profile in profiles.items()},
                         "consume_a": args.consume_a,
                         "consume_b": args.consume_b,
@@ -1196,7 +1204,16 @@ def main() -> None:
                 ),
                 flush=True,
             )
-            await asyncio.Event().wait()
+            # The harness uses SIGTERM after draining the real daemons. Let
+            # in-flight background flows record cancellation and close their
+            # sockets before the trace is finalized.
+            stopped = asyncio.Event()
+            loop = asyncio.get_running_loop()
+            loop.add_signal_handler(signal.SIGTERM, stopped.set)
+            try:
+                await stopped.wait()
+            finally:
+                loop.remove_signal_handler(signal.SIGTERM)
         finally:
             for task in background_tasks:
                 task.cancel()

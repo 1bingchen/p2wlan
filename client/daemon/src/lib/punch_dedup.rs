@@ -56,6 +56,7 @@ struct PunchAttemptRecord {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PunchClaimDeferredReason {
     SameEpochActive,
+    CancelledOwnerCleanup,
     LowerPriorityActive,
     SameOrOlderFreshPrediction,
     RendezvousLeadProtected,
@@ -66,6 +67,7 @@ impl PunchClaimDeferredReason {
     fn label(self) -> &'static str {
         match self {
             Self::SameEpochActive => "same_epoch_active_session",
+            Self::CancelledOwnerCleanup => "cancelled_owner_cleanup_pending",
             Self::LowerPriorityActive => "higher_priority_active_session",
             Self::SameOrOlderFreshPrediction => "same_or_older_fresh_prediction",
             Self::RendezvousLeadProtected => "active_rendezvous_lead_protected",
@@ -130,6 +132,10 @@ const PUNCH_PRIORITY_SYNCHRONIZED: u8 = 1;
 /// this session must preempt every older ordinary/birthday session so the
 /// prediction is used while it is still fresh.
 const PUNCH_PRIORITY_FRESH_PREDICTION: u8 = 2;
+/// A bilateral measured rendezvous cannot be ordered against a one-sided
+/// prediction's boot/generation ID. Give it its own priority while retaining
+/// the same lifecycle fences and bounded first-send protection below.
+const PUNCH_PRIORITY_HARD_HARD: u8 = 3;
 
 #[derive(Debug, Default)]
 pub(crate) struct PunchSessionCancellation {
@@ -474,7 +480,12 @@ impl PunchAttemptDeduplicator {
                 || priority_preempts
                 || newer_fresh_preempts;
             if !preempt {
-                let reason = if priority < active.priority {
+                let reason = if priority == PUNCH_PRIORITY_HARD_HARD
+                    && active.priority == PUNCH_PRIORITY_HARD_HARD
+                    && active.cancellation.is_cancelled()
+                {
+                    PunchClaimDeferredReason::CancelledOwnerCleanup
+                } else if priority < active.priority {
                     PunchClaimDeferredReason::LowerPriorityActive
                 } else if priority == PUNCH_PRIORITY_FRESH_PREDICTION {
                     PunchClaimDeferredReason::SameOrOlderFreshPrediction
@@ -518,7 +529,7 @@ impl PunchAttemptDeduplicator {
                 PunchCancellationReason::NetworkGenerationChanged
             } else if epoch_preempts {
                 PunchCancellationReason::RecoveryEpochChanged
-            } else if priority == PUNCH_PRIORITY_FRESH_PREDICTION {
+            } else if priority >= PUNCH_PRIORITY_FRESH_PREDICTION {
                 PunchCancellationReason::FreshPredictionPreempted
             } else {
                 PunchCancellationReason::SynchronizedPreemptedBackground
@@ -604,8 +615,61 @@ impl PunchAttemptDeduplicator {
         }
     }
 
+    /// An exact cancelled owner still holds its UDP cleanup transaction.
+    /// Observe the authoritative permit ledger until its last reference is
+    /// released, without preempting cleanup or retaining a lock across await.
+    /// The caller retries once and rechecks all lifecycle/time fences.
+    async fn wait_for_cancelled_owner_release(
+        &self,
+        peer_id: &str,
+        session_id: u64,
+        max_wait: Duration,
+    ) {
+        let deadline = tokio::time::Instant::now() + max_wait;
+        loop {
+            let pending = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .active
+                .get(peer_id)
+                .is_some_and(|active| {
+                    active.session_id == session_id && active.cancellation.is_cancelled()
+                });
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if !pending || remaining.is_zero() {
+                return;
+            }
+            sleep(remaining.min(Duration::from_millis(20))).await;
+        }
+    }
+
+    /// A locally measured HH owner claims fresh priority before its session
+    /// record exists. Ordinary fresh predictions instead carry their remote
+    /// prediction identity. Consult this same permit ledger during candidate
+    /// deferral so measurement cannot be invalidated by unrelated refreshes.
+    fn has_local_fresh_owner(
+        &self,
+        peer_id: &str,
+        network_generation: u64,
+        peer_session: Option<crate::peer::PeerSessionGeneration>,
+    ) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .active
+            .get(peer_id)
+            .is_some_and(|active| {
+                active.priority == PUNCH_PRIORITY_HARD_HARD
+                    && active.fresh_generation.is_none()
+                    && active.network_generation == network_generation
+                    && Some(active.peer_session_generation) == peer_session
+                    && !active.cancellation.is_cancelled()
+            })
+    }
+
     /// Cancel the current owner without retiring its peer lifecycle. This is
-    /// for same-lifecycle endpoint churn, Direct convergence and quarantine.
+    /// for Direct convergence and quarantine, not roster endpoint metadata.
     /// Structural cleanup must use `retire_peer_session` instead.
     pub(crate) fn cancel(&self, peer_id: &str) {
         let mut state = self

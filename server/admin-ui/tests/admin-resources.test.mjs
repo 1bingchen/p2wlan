@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import { build } from 'esbuild'
 import { createRequire } from 'node:module'
-import { summarizeNetworks, topologyForNetwork } from '../src/relationships.ts'
+import { summarizeNetworks, topologyForNetwork } from '../src/features/relationships/relationships.ts'
 import { withPageParams, connectionLink, relationshipLink } from '../src/pageState.ts'
 
 const fixture = {

@@ -897,22 +897,50 @@ func TestSignalQueueLimitsRejectFloods(t *testing.T) {
 		if err != nil {
 			t.Fatalf("CreateDevice global target failed: %v", err)
 		}
+		probeTarget, err := db.CreateDevice(device.UserID, "default", "signal-global-probe-pubkey", "signal-global-probe", "linux", "")
+		if err != nil {
+			t.Fatalf("CreateDevice global probe failed: %v", err)
+		}
 		tx, err := db.Begin()
 		if err != nil {
 			t.Fatalf("begin bulk insert: %v", err)
 		}
-		now := time.Now().Unix()
+		defer tx.Rollback()
+		insert, err := tx.Prepare(`INSERT INTO signals (id, from_node_id, to_node_id, type, candidates, created_at, signal_seq) VALUES (?, ?, ?, 'peer_offer', '["c"]', 0, ?)`)
+		if err != nil {
+			t.Fatalf("prepare bulk insert: %v", err)
+		}
+		defer insert.Close()
 		for i := 0; i < MaxSignalsGlobal; i++ {
-			if _, err := tx.Exec(`INSERT INTO signals (id, from_node_id, to_node_id, type, candidates, created_at, signal_seq) VALUES (?, ?, ?, 'peer_offer', '["c"]', ?, ?)`,
-				fmt.Sprintf("bulk-%d", i), device.ID, target.ID, now, i+1); err != nil {
+			if _, err := insert.Exec(fmt.Sprintf("bulk-%d", i), device.ID, target.ID, i+1); err != nil {
 				t.Fatalf("bulk insert %d failed: %v", i, err)
 			}
+		}
+		// Start the fixture TTL after seeding; slow race builds may spend more
+		// than one signal lifetime inserting the full global queue.
+		if _, err := tx.Exec(`UPDATE signals SET created_at = ?`, time.Now().Unix()); err != nil {
+			t.Fatalf("refresh bulk signal timestamps: %v", err)
 		}
 		if err := tx.Commit(); err != nil {
 			t.Fatalf("commit bulk insert: %v", err)
 		}
-		if _, err := db.CreateSignal(device.ID, target.ID, "peer_offer", []string{"candidate"}, nil, "0102"); !errors.Is(err, ErrSignalQueueLimit) {
+		// The new pair has no queued rows or bytes, and the SQL fixture has
+		// no sender-rate events, so only the global bound can reject this write.
+		if _, err := db.CreateSignal(device.ID, probeTarget.ID, "peer_offer", []string{"candidate"}, nil, "0102"); !errors.Is(err, ErrSignalQueueLimit) {
 			t.Fatalf("expected ErrSignalQueueLimit for the global bound, got %v", err)
+		}
+		if _, err := db.Exec(`DELETE FROM signals WHERE id = 'bulk-0'`); err != nil {
+			t.Fatalf("free one global signal slot: %v", err)
+		}
+		if _, err := db.CreateSignal(device.ID, probeTarget.ID, "peer_offer", []string{"candidate"}, nil, "0102"); err != nil {
+			t.Fatalf("expected a signal to fill the freed global slot: %v", err)
+		}
+		var queued int
+		if err := db.QueryRow(`SELECT COUNT(*) FROM signals`).Scan(&queued); err != nil {
+			t.Fatalf("count global signals: %v", err)
+		}
+		if queued != MaxSignalsGlobal {
+			t.Fatalf("expected %d live global signals, got %d", MaxSignalsGlobal, queued)
 		}
 	})
 }

@@ -1,12 +1,13 @@
 use super::*;
 use std::ffi::c_void;
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicU32, AtomicUsize};
 use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 #[derive(Default)]
 struct ReaderState {
     received: AtomicUsize,
+    receive_error: AtomicU32,
     reader_exited: AtomicBool,
     session_ended: AtomicBool,
     ended_before_reader: AtomicBool,
@@ -28,6 +29,11 @@ unsafe extern "C" fn receive(session: *mut c_void, size: *mut u32) -> *mut u8 {
     while *held {
         held = state.receive_gate.wait(held).unwrap();
     }
+    let error = state.receive_error.load(Ordering::SeqCst);
+    if error != 0 {
+        windows_sys::Win32::Foundation::SetLastError(error);
+        return std::ptr::null_mut();
+    }
     *size = PACKET.len() as u32;
     PACKET.as_ptr().cast_mut()
 }
@@ -40,8 +46,8 @@ unsafe extern "C" fn release(session: *mut c_void, _packet: *const u8) {
 }
 
 unsafe extern "C" fn read_event(_session: *mut c_void) -> *mut c_void {
-    // These fixtures always return a packet, so the reader never waits on
-    // this non-null sentinel or invokes any real Wintun/driver operation.
+    // These fixtures return a packet or terminal error, so the reader never
+    // waits on this sentinel or invokes any real Wintun/driver operation.
     std::ptr::NonNull::<u8>::dangling().as_ptr().cast()
 }
 
@@ -170,4 +176,23 @@ fn in_flight_packet_finishes_before_session_is_released() {
     state.receive_gate.notify_all();
     closer.join().unwrap();
     assert_clean_shutdown(&state);
+}
+
+#[test]
+fn terminal_receive_errors_close_the_packet_channel() {
+    // ERROR_HANDLE_EOF and ERROR_INVALID_DATA are permanent session failures,
+    // not the ERROR_NO_MORE_ITEMS result used while a healthy ring is idle.
+    for error in [38, 13] {
+        let state = Arc::new(ReaderState::default());
+        state.receive_error.store(error, Ordering::SeqCst);
+        let mut device = fixture(&state);
+        wait_until(|| state.reader_exited.load(Ordering::SeqCst));
+        assert!(matches!(
+            device.read_rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Disconnected)
+        ));
+        assert_eq!(state.received.load(Ordering::SeqCst), 1);
+        drop(device);
+        assert_clean_shutdown(&state);
+    }
 }

@@ -57,7 +57,16 @@ fn spawn_read_thread(
                     break;
                 }
             } else {
-                // No packet available - wait for the read event
+                // Only an empty ring is retryable. Adapter termination or a
+                // corrupt ring must close the receiver so the daemon can
+                // observe DeviceClosed instead of spinning on a dead session.
+                let error = io::Error::last_os_error();
+                const ERROR_NO_MORE_ITEMS: i32 = 259;
+                if error.raw_os_error() != Some(ERROR_NO_MORE_ITEMS) {
+                    error!("WintunReceivePacket failed: {error}");
+                    break;
+                }
+                // No packet available - wait for the read event.
                 // Use a short timeout so we can check the shutdown flag periodically
                 unsafe {
                     WaitForSingleObject(read_event, 100); // 100ms timeout

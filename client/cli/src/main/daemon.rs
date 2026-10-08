@@ -23,6 +23,10 @@ async fn start_with_state_dir(config_path: &Path, instance_state_dir: &Path) -> 
         return Ok(());
     }
 
+    if is_openwrt_system_profile(config_path) {
+        return start_openwrt_service(&config).await;
+    }
+
     let args = InternalStartArgs {
         config: absolute_path(config_path)?,
         state_dir: instance_state_dir.to_path_buf(),
@@ -139,6 +143,11 @@ async fn stop(config_path: &Path) -> Result<(), String> {
 }
 
 async fn stop_with_state_dir(config_path: &Path, instance_state_dir: &Path) -> Result<(), String> {
+    if is_openwrt_system_profile(config_path) {
+        openwrt_service("stop").await?;
+        println!("p2wlan OpenWrt 服务已停止。");
+        return Ok(());
+    }
     let config = load_config(config_path)?;
     let url = format!(
         "http://{}/shutdown",

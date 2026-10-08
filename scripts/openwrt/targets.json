@@ -1,0 +1,36 @@
+{
+  "24.10": {
+    "version": "24.10.8",
+    "gcc": "13.3.0",
+    "extension": "ipk",
+    "arm64": {
+      "target": "armsr/armv8",
+      "sdk_sha256": "5f430f5b30c9ea6dc472710356c139abf916b7ebd5de14e108e9cc204f40a2a4",
+      "kernel_sha256": "ccc97f1598224e73a5f75fb1612c284db037f02fa050d1a18b5b2ee93631e37e",
+      "rootfs_sha256": "1d829b6087d561f9e278679a5525ae4fdd68716d8d2a4e1525500b247d99aada"
+    },
+    "x64": {
+      "target": "x86/64",
+      "sdk_sha256": "ac4a0405d2eea821b06f93c14ba13ffa90ad0457648903df7dde02570027ab21",
+      "kernel_sha256": "75e5ec1a12c6e253173cf51a2ae5ab13380931849ab4588407e72c51cac562f3",
+      "rootfs_sha256": "cf39cd1043fbff86ad2936c951fd6afe607437acf3531082cf11b20febc95b03"
+    }
+  },
+  "25.12": {
+    "version": "25.12.5",
+    "gcc": "14.3.0",
+    "extension": "apk",
+    "arm64": {
+      "target": "armsr/armv8",
+      "sdk_sha256": "1b0316604a3e820b2b008a1baff3f9dac6716af942bef800930e58c7de98c98b",
+      "kernel_sha256": "8cf43c4901efae72b0a04bb655158e03335067e8757926bca4c81d5c952aca51",
+      "rootfs_sha256": "03172dd9a91e7cb477ab73bcb5de544bfe19f42698d7f66d9b2bb80ca692eaa6"
+    },
+    "x64": {
+      "target": "x86/64",
+      "sdk_sha256": "0c8df0151a1e88feb7c03d694d61f6a18d51872815b7c811d76e2b77504d5e9c",
+      "kernel_sha256": "e440f082d59550072b1421f10d1a83449c6a4cf356eea5bfa9ac1306978d649b",
+      "rootfs_sha256": "a1cb366a0af03d0f4afbce90aed9b4db35b07140629eabf7ae21c45dc08eeb23"
+    }
+  }
+}

@@ -29,7 +29,21 @@ fn is_github_slug(value: &str) -> bool {
 }
 
 fn linux_release_arch() -> Result<&'static str, String> {
-    match (env::consts::OS, env::consts::ARCH) {
+    linux_release_arch_for(
+        env::consts::OS,
+        env::consts::ARCH,
+        cfg!(target_env = "musl") || is_openwrt(),
+    )
+}
+
+fn linux_release_arch_for(os: &str, arch: &str, musl: bool) -> Result<&'static str, String> {
+    if musl {
+        return Err(
+            "musl/OpenWrt 请使用对应版本的 apk/opkg 安装包升级；update 的 Linux 包需要 glibc"
+                .to_string(),
+        );
+    }
+    match (os, arch) {
         ("linux", "x86_64") => Ok("x64"),
         ("linux", "aarch64") => Ok("arm64"),
         (os, arch) => Err(format!(

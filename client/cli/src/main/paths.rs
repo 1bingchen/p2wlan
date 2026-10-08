@@ -9,6 +9,9 @@ fn config_dir() -> PathBuf {
     if let Some(path) = env::var_os("P2WLAN_HOME") {
         return PathBuf::from(path);
     }
+    if is_openwrt() {
+        return PathBuf::from("/etc/p2wlan");
+    }
     if env::var_os("SUDO_USER").is_none() {
         if let Some(path) = env::var_os("XDG_CONFIG_HOME") {
             return PathBuf::from(path).join("p2wlan");
@@ -20,6 +23,9 @@ fn config_dir() -> PathBuf {
 fn state_dir() -> PathBuf {
     if let Some(path) = env::var_os("P2WLAN_STATE_DIR") {
         return PathBuf::from(path);
+    }
+    if is_openwrt() {
+        return PathBuf::from(OPENWRT_STATE);
     }
     if env::var_os("SUDO_USER").is_none() {
         if let Some(path) = env::var_os("XDG_STATE_HOME") {
@@ -33,6 +39,9 @@ fn state_dir() -> PathBuf {
 /// must not share the default PID, diagnostics token, or log with another
 /// profile.
 fn state_dir_for_config(config_path: &Path) -> PathBuf {
+    if is_openwrt_system_profile(config_path) {
+        return PathBuf::from(OPENWRT_STATE);
+    }
     if config_path == default_config_path() {
         return state_dir();
     }

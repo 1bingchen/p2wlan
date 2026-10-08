@@ -86,6 +86,11 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 
+if [ -f /etc/openwrt_release ]; then
+  echo "OpenWrt requires the native .apk (25.12) or .ipk (24.10) package; this installer selects glibc binaries." >&2
+  exit 1
+fi
+
 if [ -z "$REPO" ] || [ -z "$INSTALL_DIR" ]; then
   echo "P2WLAN_REPO and P2WLAN_INSTALL_DIR must not be empty." >&2
   exit 1

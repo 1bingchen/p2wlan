@@ -223,6 +223,7 @@ include!("main/diagnostics.rs");
 include!("main/update.rs");
 include!("main/config.rs");
 include!("main/paths.rs");
+include!("main/openwrt.rs");
 include!("main/routes.rs");
 include!("main/rooms.rs");
 include!("main/support.rs");

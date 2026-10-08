@@ -215,6 +215,7 @@ jobs:
             --require "Windows Lifecycle Required" \
             --require "Mobile Lifecycle Required" \
             --require "CI Required" \
+            --require "OpenWrt Packages Required" \
             --require "Analyze and Test" \
             --require "Android arm64 CI test APK" \
             --require "iOS Compile" \

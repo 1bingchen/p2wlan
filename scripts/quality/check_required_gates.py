@@ -56,6 +56,7 @@ AUTHORITATIVE_EVENTS = frozenset({"pull_request", "push"})
 # publishes it. Keeping the pair here means a rename in either place fails
 # loudly instead of silently matching an unrelated check.
 GATE_WORKFLOWS: Mapping[str, str] = {
+    "OpenWrt Packages Required": "OpenWrt Packages",
     "Business MTU Budget Required": "Business MTU Budget Required",
     "Path State Machine Required": "Path State Machine",
     "NAT Topology Required": "NAT Topology Gate",

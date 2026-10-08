@@ -173,6 +173,7 @@ P2WLAN 提供一张跨地域的虚拟三层网络。应用通过对端的虚拟 
 | Windows x64 | `p2wlan-windows-x64-setup.exe` | 支持 |
 | Linux x64 | `p2wlan-linux-x64.tar.gz`（GUI） / `p2wlan-linux-x64-cli.tar.gz`（CLI + daemon） | 支持 |
 | Linux arm64 | `p2wlan-linux-arm64-cli.tar.gz`（CLI + daemon） | 支持 |
+| OpenWrt ARM64 / x86_64 | 24.10 `.ipk` / 25.12 `.apk`（CLI + daemon） | [安装指南](docs/guides/openwrt.md) |
 | Android 7.0+ (API 24+) arm64 | `p2wlan-android-arm64-release.apk` | 支持 |
 
 Linux 无桌面环境选择 CLI 包，也可使用固定版本安装脚本。把 `vX.Y.Z` 替换为实际客户端 Release 标签：

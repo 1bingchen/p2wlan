@@ -1,5 +1,7 @@
 # 客户端指南
 
+OpenWrt 使用原生 IPK/APK 和 procd 服务，安装、路径与升级规则见 [OpenWrt 指南](openwrt.md)。普通 Linux 的 CLI tarball 使用 glibc，不能用于 OpenWrt。
+
 ## 安装与配置
 
 优先使用 GitHub Release 的固定版本包。安装脚本只负责安装公开的客户端文件，不包含 Control 地址、账号或凭据。

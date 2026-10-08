@@ -68,6 +68,7 @@ jobs:
             "CI"
             "Flutter Client"
             "Package Test Builds"
+            "OpenWrt Packages"
             "Windows Lifecycle"
             "Mobile Lifecycle"
             "Self-hosted Server"
@@ -762,9 +763,15 @@ jobs:
             dist-release/p2wlan-linux-${{ matrix.arch }}-cli.tar.gz.sha256
             dist-release/p2wlan-linux-${{ matrix.arch }}-cli.tar.gz.metadata.json
 
+  openwrt:
+    needs: quality-gate
+    uses: ./.github/workflows/openwrt.yml
+    with:
+      tag: ${{ github.ref_name }}
+
   publish:
     name: Publish complete client release
-    if: ${{ always() && startsWith(github.ref, 'refs/tags/v') && needs.flutter-android.result == 'success' && needs.flutter-ios.result == 'success' && needs.flutter-macos.result == 'success' && needs.flutter-linux.result == 'success' && needs.flutter-windows.result == 'success' && needs.linux-cli.result == 'success' }}
+    if: ${{ always() && startsWith(github.ref, 'refs/tags/v') && needs.flutter-android.result == 'success' && needs.flutter-ios.result == 'success' && needs.flutter-macos.result == 'success' && needs.flutter-linux.result == 'success' && needs.flutter-windows.result == 'success' && needs.linux-cli.result == 'success' && needs.openwrt.result == 'success' }}
     needs:
       - flutter-android
       - flutter-ios
@@ -772,6 +779,7 @@ jobs:
       - flutter-linux
       - flutter-windows
       - linux-cli
+      - openwrt
     runs-on: ubuntu-22.04
     permissions:
       contents: write
@@ -817,18 +825,14 @@ jobs:
           P2WLAN_RELEASE_TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          public_assets=(
-            release-assets/p2wlan-android-arm64-release.apk
-            release-assets/p2wlan-ios-arm64-unsigned.ipa
-            release-assets/p2wlan-linux-arm64-cli.tar.gz
-            release-assets/p2wlan-linux-arm64-cli.tar.gz.sha256
-            release-assets/p2wlan-linux-x64-cli.tar.gz
-            release-assets/p2wlan-linux-x64-cli.tar.gz.sha256
-            release-assets/p2wlan-linux-x64.tar.gz
-            release-assets/p2wlan-macos-arm64.dmg
-            release-assets/p2wlan-macos-x64.dmg
-            release-assets/p2wlan-windows-x64-setup.exe
-            release-assets/RELEASE-MANIFEST.json
+          mapfile -t public_assets < <(python3 - <<'PYASSETS'
+          import json
+          from pathlib import Path
+          root = Path('release-assets')
+          manifest = json.loads((root / 'RELEASE-MANIFEST.json').read_text())
+          for name in sorted([*manifest['files'], 'RELEASE-MANIFEST.json']):
+              print(root / name)
+          PYASSETS
           )
           for asset in "${public_assets[@]}"; do
             test -f "$asset" || { echo "missing public release asset: $asset" >&2; exit 1; }

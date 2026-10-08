@@ -10,7 +10,6 @@ from http.server import HTTPServer, SimpleHTTPRequestHandler
 import json
 import os
 from pathlib import Path
-import shlex
 import shutil
 import socket
 import subprocess
@@ -44,7 +43,10 @@ def verify(args: argparse.Namespace) -> None:
     with gzip.open(rootfs, "rb") as src, image.open("wb") as dst:
         shutil.copyfileobj(src, dst)
     subprocess.run(["truncate", "-s", "512M", str(image)], check=True)
-    subprocess.run(["e2fsck", "-pf", str(image)], check=True)
+    checked = subprocess.run(["e2fsck", "-pf", str(image)], check=False)
+    # e2fsck's status 1 means errors were corrected, not a failed filesystem.
+    if checked.returncode not in (0, 1):
+        raise RuntimeError(f"OpenWrt rootfs check failed: {checked.returncode}")
     subprocess.run(["resize2fs", str(image)], check=True)
     package_arch = "aarch64_generic" if args.arch == "arm64" else "x86_64"
     package = args.directory.resolve() / f"p2wlan-openwrt-{args.series}-{package_arch}.{release['extension']}"
@@ -60,6 +62,7 @@ def verify(args: argparse.Namespace) -> None:
         shutil.copyfile(key.with_suffix(".pub"), public / "key.pub")
         shutil.copyfile(package, public / package.name)
         shutil.copyfile(Path(__file__).resolve().parents[1] / "install-linux-cli.sh", public / "install-linux-cli.sh")
+        shutil.copyfile(Path(__file__).resolve().parents[1] / "install-openwrt.sh", public / "install-openwrt.sh")
         server = HTTPServer(("0.0.0.0", 0), partial(QuietHandler, directory=str(public)))
         threading.Thread(target=server.serve_forever, daemon=True).start()
         ssh_port = free_port()
@@ -145,6 +148,9 @@ def verify(args: argparse.Namespace) -> None:
             info = json.loads(remote("p2wlan-daemon --build-info"))
             if info["git_commit"] != args.source_sha or info["dirty"]:
                 raise ValueError("installed daemon source identity differs from checkout")
+            version = json.loads(package.with_name(package.name + ".metadata.json").read_text())["tag"].removeprefix("v")
+            if info["app_version"] != version or info["daemon_version"] != version:
+                raise ValueError("installed binary version differs from package tag")
             if info["binary_sha256"] != remote("sha256sum /usr/bin/p2wlan-daemon").split()[0]:
                 raise ValueError("installed daemon self-reported digest differs from package bytes")
             remote("p2wlan config set control https://control.example.com")
@@ -168,6 +174,11 @@ def verify(args: argparse.Namespace) -> None:
             remote("p2wlan update --dry-run", success=False)
             remote(f"wget -q -O /tmp/install-linux-cli.sh {address}/install-linux-cli.sh")
             remote("sh /tmp/install-linux-cli.sh --version v1.2.3 --dry-run", success=False)
+            remote(f"wget -q -O /tmp/install-openwrt.sh {address}/install-openwrt.sh")
+            selection = remote(f"sh /tmp/install-openwrt.sh --version v{version} --dry-run")
+            if package.name not in selection:
+                raise ValueError(f"installer selected the wrong native package: {selection}")
+            remote("sh /tmp/install-openwrt.sh --version v1.2.3/escape --dry-run", success=False)
             # Stop must still work when the JSON has become unreadable; a bad
             # config must never cause a new unmanaged process to be spawned.
             remote("p2wlan up", timeout=90)
@@ -179,7 +190,8 @@ def verify(args: argparse.Namespace) -> None:
             report = {"series": args.series, "arch": args.arch, "firmware": release["version"],
                       "source_sha": args.source_sha, "package": package.name, "sha256": sha256(package),
                       "checks": ["native-dependencies", "build-identity", "real-tun", "single-owner-up",
-                                 "procd-down-no-respawn", "invalid-config-stop", "glibc-update-refused"]}
+                                 "procd-down-no-respawn", "invalid-config-stop", "glibc-update-refused",
+                                 "native-installer-selection"]}
             (work / "verification.json").write_text(json.dumps(report, indent=2) + "\n")
             print("PASS OpenWrt VM", json.dumps(report), flush=True)
         except Exception:

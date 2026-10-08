@@ -17,10 +17,9 @@ TARGETS = json.loads(Path(__file__).with_name("targets.json").read_text())
 ARM_ARCHES = ("aarch64_generic", "aarch64_cortex-a53", "aarch64_cortex-a72", "aarch64_cortex-a76")
 
 
-def run(*args: str, cwd: Path = ROOT, env: dict | None = None, timeout: int = 1800) -> str:
+def run(*args: str, cwd: Path = ROOT, env: dict | None = None, timeout: int = 1800) -> None:
     print("+", " ".join(map(str, args)), flush=True)
     subprocess.run(args, cwd=cwd, env=env, check=True, timeout=timeout)
-    return ""
 
 
 def sha256(path: Path) -> str:
@@ -97,6 +96,7 @@ def build(args: argparse.Namespace) -> None:
         f"AR_{rust_target.replace('-', '_')}": str(compiler).removesuffix("gcc") + "ar",
         "CARGO_TARGET_DIR": str(args.work_dir / "cargo-target"),
         "RUSTFLAGS": "-C target-feature=+crt-static -C link-self-contained=yes",
+        "CARGO_PROFILE_RELEASE_OPT_LEVEL": "s",
     })
     run("cargo", "build", "--locked", "--release", "-p", "p2wlan-cli", "-p", "p2wlan-daemon",
         "--target", rust_target, env=env, timeout=2700)
@@ -108,12 +108,16 @@ def build(args: argparse.Namespace) -> None:
     shutil.copytree(ROOT / "deploy/openwrt", recipe)
     (sdk / ".config").write_text("CONFIG_ALL_NONSHARED=n\nCONFIG_ALL_KMODS=n\nCONFIG_PACKAGE_p2wlan=m\nCONFIG_SIGNED_PACKAGES=n\n")
     common = [f"P2WLAN_VERSION={version}", f"P2WLAN_BINARY_DIR={binaries}"]
-    run("make", "defconfig", *common, cwd=sdk, env=env)
     arches = ARM_ARCHES if args.arch == "arm64" else ("x86_64",)
+    # STAGING_DIR is needed by the cross-GCC wrapper above. SDK make owns its
+    # target/host staging paths and must not inherit that Cargo-only override.
+    sdk_env = os.environ.copy()
+    sdk_env.pop("STAGING_DIR", None)
+    run("make", "defconfig", *common, f"P2WLAN_PACKAGE_ARCH={arches[0]}", cwd=sdk, env=sdk_env)
     for package_arch in arches:
         variables = [*common, f"P2WLAN_PACKAGE_ARCH={package_arch}"]
-        run("make", "package/p2wlan/clean", *variables, cwd=sdk, env=env)
-        run("make", "package/p2wlan/compile", "V=s", "-j2", *variables, cwd=sdk, env=env)
+        run("make", "package/p2wlan/clean", *variables, cwd=sdk, env=sdk_env)
+        run("make", "package/p2wlan/compile", "V=s", "-j2", *variables, cwd=sdk, env=sdk_env)
         packages = list(sdk.glob(f"bin/packages/**/p2wlan*.{release['extension']}"))
         # SDK output names vary between IPK and APK. Reject ambiguous/stale
         # output rather than selecting a previous variant by modification time.

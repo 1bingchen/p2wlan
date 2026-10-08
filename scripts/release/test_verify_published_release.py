@@ -21,7 +21,7 @@ class PublishedReleaseAuditTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
-        self.tag = "v0.1.999"
+        self.tag = "v0.1.169"
         self.commit = "a" * 40
         self.files = {}
         for index, name in enumerate(MODULE.EXPECTED_PAYLOADS):
@@ -101,6 +101,32 @@ class PublishedReleaseAuditTests(unittest.TestCase):
         self._write_manifest()
         errors, _, _ = self.verify()
         self.assertTrue(any("schema_version" in error for error in errors))
+
+    def test_new_tag_cannot_downgrade_to_legacy_asset_set(self) -> None:
+        self.tag = "v0.1.170"
+        self.manifest["tag"] = self.tag
+        self._write_manifest()
+        self.release = self._release_fixture()
+        errors, _, _ = self.verify()
+        self.assertTrue(any("schema_version" in error for error in errors))
+        self.assertTrue(any("missing payload: p2wlan-openwrt" in error for error in errors))
+
+    def test_openwrt_release_requires_all_native_architectures(self) -> None:
+        self.tag = "v0.1.170"
+        self.manifest.update(tag=self.tag, schema_version=3)
+        for name, (platform, arch) in MODULE.PRIMARY.items():
+            self.files.setdefault(name, {"bytes": 100, "sha256": "a" * 64,
+                                         "platform": platform, "arch": arch, "identity": "vm-verified"})
+        self._write_manifest()
+        self.release = self._release_fixture()
+        errors, _, report = self.verify()
+        self.assertEqual(errors, [])
+        self.assertEqual(report["asset_count"], 21)
+        self.files.pop("p2wlan-openwrt-25.12-aarch64_cortex-a53.apk")
+        self._write_manifest()
+        self.release = self._release_fixture()
+        errors, _, _ = self.verify()
+        self.assertTrue(any("missing payload: p2wlan-openwrt" in error for error in errors))
 
     def test_primary_artifact_identity_is_required(self) -> None:
         self.files["p2wlan-windows-x64-setup.exe"].pop("identity")

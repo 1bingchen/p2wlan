@@ -26,6 +26,8 @@ Linux CLI 远程安装器对 `--version TAG`、`--version=TAG` 和 `P2WLAN_VERSI
 
 ## 发布后审计
 
+从 `v0.1.170` 开始，客户端 manifest 使用 schema 3，完整集合包含 OpenWrt 24.10 IPK 和 25.12 APK 的十个原生架构包，共二十个 payload 加 manifest。OpenWrt 候选产物绑定固件系列和准确包架构，并通过匹配内核的 QEMU 安装、TUN 和 procd 生命周期门禁。缺少任一原生包时发布失败。历史版本仍按 schema 2 的集合审计，新版本不能降级 schema 隐藏缺失资产。
+
 客户端 Release 发布后，`Release Post-publish Audit` 会重新从 GitHub API 解析 tag、Release 和资产摘要，并下载已发布的 `RELEASE-MANIFEST.json`。审计要求：
 
 - tag 最终解析到一个 main 可达的准确提交；

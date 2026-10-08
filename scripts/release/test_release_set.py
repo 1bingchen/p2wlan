@@ -9,6 +9,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from release_assets import OPENWRT_PRIMARY
+
 ROOT = Path(__file__).resolve().parents[2]
 VERIFY = ROOT / "scripts/release/verify_release_set.py"
 WRITE_METADATA = ROOT / "scripts/release/write_artifact_metadata.py"
@@ -24,6 +26,7 @@ PRIMARY = {
     "p2wlan-macos-x64.dmg": ("macos", "x64", "client-stamped-daemon-verified"),
     "p2wlan-windows-x64-setup.exe": ("windows", "x64", "client-stamped-daemon-verified"),
 }
+PRIMARY.update({name: (*identity, "musl-static-sdk-packaged") for name, identity in OPENWRT_PRIMARY.items()})
 
 
 def sha256(path: Path) -> str:
@@ -86,9 +89,9 @@ class ReleaseSetTests(unittest.TestCase):
         result = self.verify()
         self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
         manifest = json.loads((self.root / "RELEASE-MANIFEST.json").read_text(encoding="utf-8"))
-        self.assertEqual(manifest["schema_version"], 2)
+        self.assertEqual(manifest["schema_version"], 3)
         self.assertEqual(manifest["source_sha"], SOURCE_SHA)
-        self.assertEqual(len(manifest["files"]), 10)
+        self.assertEqual(len(manifest["files"]), 20)
         self.assertEqual(
             manifest["files"]["p2wlan-android-arm64-release.apk"]["identity"],
             "client-stamped",
@@ -115,6 +118,22 @@ class ReleaseSetTests(unittest.TestCase):
         result = self.verify()
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("missing artifact metadata", result.stdout)
+
+    def test_missing_openwrt_variant_fails(self) -> None:
+        (self.root / "p2wlan-openwrt-24.10-aarch64_cortex-a72.ipk").unlink()
+        result = self.verify()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("missing release asset: p2wlan-openwrt", result.stdout)
+
+    def test_openwrt_series_and_arch_cannot_be_relabelled(self) -> None:
+        path = self.root / "p2wlan-openwrt-25.12-aarch64_cortex-a53.apk.metadata.json"
+        original = json.loads(path.read_text())
+        for field, wrong in (("platform", "openwrt-24.10"), ("arch", "aarch64_generic")):
+            with self.subTest(field=field):
+                path.write_text(json.dumps({**original, field: wrong}))
+                result = self.verify()
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(f"{field}=", result.stdout)
 
 
 class PlatformApplicationIdentityTests(unittest.TestCase):

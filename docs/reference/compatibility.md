@@ -7,6 +7,7 @@
 | Windows x64 | 安装器 | 需要 Wintun、路由和防火墙权限 |
 | Linux x64 | GUI、CLI/daemon 包 | CLI/daemon 适合无桌面服务 |
 | Linux arm64 | CLI/daemon 包 | 以对应 Release 归档为准 |
+| OpenWrt 24.10 / 25.12 ARM64、x86_64 | IPK / APK | [原生包与 procd](../guides/openwrt.md)，路由器本机节点 |
 | Android 7.0+ arm64 | arm64 APK | 受系统 VPN、生命周期和后台策略影响 |
 
 当前公开支持范围为 Windows、macOS、Linux 和 Android。iOS 暂不纳入支持范围；已有 unsigned IPA 构建入口不作为当前受支持客户端的下载或兼容性承诺。

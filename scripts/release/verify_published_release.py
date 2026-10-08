@@ -10,29 +10,11 @@ import re
 from pathlib import Path
 from typing import Any
 
+from release_assets import LEGACY_PAYLOADS, LEGACY_PRIMARY, PAYLOADS, PRIMARY, manifest_schema
+
 MANIFEST_NAME = "RELEASE-MANIFEST.json"
-EXPECTED_PAYLOADS = (
-    "p2wlan-android-arm64-release.apk",
-    "p2wlan-ios-arm64-unsigned.ipa",
-    "p2wlan-linux-arm64-cli.tar.gz",
-    "p2wlan-linux-arm64-cli.tar.gz.sha256",
-    "p2wlan-linux-x64-cli.tar.gz",
-    "p2wlan-linux-x64-cli.tar.gz.sha256",
-    "p2wlan-linux-x64.tar.gz",
-    "p2wlan-macos-arm64.dmg",
-    "p2wlan-macos-x64.dmg",
-    "p2wlan-windows-x64-setup.exe",
-)
-PRIMARY_ARTIFACTS = {
-    "p2wlan-android-arm64-release.apk": ("android", "arm64"),
-    "p2wlan-ios-arm64-unsigned.ipa": ("ios", "arm64"),
-    "p2wlan-linux-arm64-cli.tar.gz": ("linux-cli", "arm64"),
-    "p2wlan-linux-x64-cli.tar.gz": ("linux-cli", "x64"),
-    "p2wlan-linux-x64.tar.gz": ("linux", "x64"),
-    "p2wlan-macos-arm64.dmg": ("macos", "arm64"),
-    "p2wlan-macos-x64.dmg": ("macos", "x64"),
-    "p2wlan-windows-x64-setup.exe": ("windows", "x64"),
-}
+EXPECTED_PAYLOADS = LEGACY_PAYLOADS
+PRIMARY_ARTIFACTS = LEGACY_PRIMARY
 SHA256_RE = re.compile(r"[0-9a-f]{64}")
 COMMIT_RE = re.compile(r"[0-9a-f]{40}")
 TOKEN_RE = re.compile(r"[A-Za-z0-9._-]+")
@@ -87,7 +69,10 @@ def verify(
     if not COMMIT_RE.fullmatch(tag_commit):
         errors.append(f"tag commit is not a full lowercase SHA-1: {tag_commit!r}")
 
-    if manifest.get("schema_version") != 2:
+    schema = manifest_schema(expected_tag)
+    payloads = PAYLOADS if schema == 3 else LEGACY_PAYLOADS
+    primary = PRIMARY if schema == 3 else LEGACY_PRIMARY
+    if manifest.get("schema_version") != schema:
         errors.append(f"unsupported manifest schema_version: {manifest.get('schema_version')!r}")
     if manifest.get("tag") != expected_tag:
         errors.append(f"manifest tag mismatch: {manifest.get('tag')!r} != {expected_tag!r}")
@@ -100,7 +85,7 @@ def verify(
         errors.append("manifest files is not an object")
         files = {}
 
-    expected_payloads = set(EXPECTED_PAYLOADS)
+    expected_payloads = set(payloads)
     manifest_payloads = set(files)
     for name in sorted(expected_payloads - manifest_payloads):
         errors.append(f"manifest is missing payload: {name}")
@@ -129,7 +114,7 @@ def verify(
     for name in sorted(actual_assets - expected_assets):
         errors.append(f"release has unexpected asset: {name}")
 
-    for name in EXPECTED_PAYLOADS:
+    for name in payloads:
         meta = files.get(name)
         asset = assets.get(name)
         if not isinstance(meta, dict):
@@ -143,8 +128,8 @@ def verify(
             errors.append(f"manifest has invalid byte size for {name}")
         if not isinstance(expected_digest, str) or not SHA256_RE.fullmatch(expected_digest):
             errors.append(f"manifest has invalid sha256 for {name}")
-        if name in PRIMARY_ARTIFACTS:
-            expected_platform, expected_arch = PRIMARY_ARTIFACTS[name]
+        if name in primary:
+            expected_platform, expected_arch = primary[name]
             if meta.get("platform") != expected_platform:
                 errors.append(
                     f"manifest platform mismatch for {name}: {meta.get('platform')!r} != {expected_platform!r}"

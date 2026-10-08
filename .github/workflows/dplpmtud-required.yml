@@ -272,6 +272,7 @@ jobs:
             --require "Path Observability Required" \
             --require "Security Audit Required" \
             --require "CI Required" \
+            --require "OpenWrt Packages Required" \
             --require "Analyze and Test" \
             --require "Android arm64 CI test APK" \
             --require "iOS Compile" \

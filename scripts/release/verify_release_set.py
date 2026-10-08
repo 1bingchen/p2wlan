@@ -10,29 +10,9 @@ import re
 from pathlib import Path
 from typing import Any
 
-EXPECTED = (
-    "p2wlan-android-arm64-release.apk",
-    "p2wlan-ios-arm64-unsigned.ipa",
-    "p2wlan-linux-arm64-cli.tar.gz",
-    "p2wlan-linux-arm64-cli.tar.gz.sha256",
-    "p2wlan-linux-x64-cli.tar.gz",
-    "p2wlan-linux-x64-cli.tar.gz.sha256",
-    "p2wlan-linux-x64.tar.gz",
-    "p2wlan-macos-arm64.dmg",
-    "p2wlan-macos-x64.dmg",
-    "p2wlan-windows-x64-setup.exe",
-)
+from release_assets import PAYLOADS, PRIMARY
 
-PRIMARY = {
-    "p2wlan-android-arm64-release.apk": ("android", "arm64"),
-    "p2wlan-ios-arm64-unsigned.ipa": ("ios", "arm64"),
-    "p2wlan-linux-arm64-cli.tar.gz": ("linux-cli", "arm64"),
-    "p2wlan-linux-x64-cli.tar.gz": ("linux-cli", "x64"),
-    "p2wlan-linux-x64.tar.gz": ("linux", "x64"),
-    "p2wlan-macos-arm64.dmg": ("macos", "arm64"),
-    "p2wlan-macos-x64.dmg": ("macos", "x64"),
-    "p2wlan-windows-x64-setup.exe": ("windows", "x64"),
-}
+EXPECTED = PAYLOADS
 
 
 def digest(path: Path) -> str:
@@ -131,7 +111,7 @@ def main() -> int:
         return 1
 
     manifest = {
-        "schema_version": 2,
+        "schema_version": 3,
         "tag": args.tag,
         "source_sha": args.source_sha,
         "files": files,

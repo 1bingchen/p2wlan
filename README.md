@@ -52,6 +52,15 @@ P2WLAN 为参与设备分配私有虚拟 IP，优先建立 **局域网 / IPv6 / 
 - **连接路径看得见。** 客户端展示在线设备、Direct / Relay、延迟和收发信息，遇到问题可使用内置诊断定位。
 - **软件免费，基础设施自己掌握。** MIT 许可开放客户端、Control 和 Relay 源码；可自行选择服务位置、管理账号与数据。自托管的服务器、带宽和域名费用由部署者承担。
 
+## 赞助商
+
+<table>
+  <tr>
+    <td width="220" valign="middle"><a href="https://www.moeflux.com/zh-CN/plan?AFF=INV-BFD8315B"><img src="assets/readme/moeflux.webp" alt="Moeflux" width="200" /></a></td>
+    <td>感谢 Moeflux 赞助本项目！Moeflux 是一家面向重度 AI 开发者的官方直连高品质模型 API 中转服务商，专注提供 Grok 系列、Claude 系列、Codex 系列与 DeepSeek 系列等模型。100% 官方源直供，不掺假、不注水，欢迎随时检验。价格显著低于同行，倍率<strong>低至 0.1折</strong>，稳定性高，支持企业级高并发，计费透明，Token 级账单可逐笔核验。为企业客户提供专业管理平台，支持签订正式合同并可开发票。现在通过<a href="https://www.moeflux.com/zh-CN/plan?AFF=INV-BFD8315B">此链接</a>下单即可获赠 $1 额度。</td>
+  </tr>
+</table>
+
 ## 界面预览
 
 <table align="center">

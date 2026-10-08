@@ -53,6 +53,7 @@ def verify(args: argparse.Namespace) -> None:
     package = args.directory.resolve() / f"p2wlan-openwrt-{args.series}-{package_arch}.{release['extension']}"
     if not package.is_file():
         raise ValueError(f"native package missing: {package}")
+    metadata = json.loads(package.with_name(package.name + ".metadata.json").read_text())
     with tempfile.TemporaryDirectory(prefix="p2wlan-openwrt-") as tmp:
         shared = Path(tmp)
         key = shared / "id_ed25519"
@@ -62,6 +63,10 @@ def verify(args: argparse.Namespace) -> None:
         public.mkdir()
         shutil.copyfile(key.with_suffix(".pub"), public / "key.pub")
         shutil.copyfile(package, public / package.name)
+        (public / "RELEASE-MANIFEST.json").write_text(json.dumps({
+            "schema_version": 3, "tag": metadata["tag"], "source_sha": args.source_sha,
+            "files": {package.name: {"sha256": sha256(package)}},
+        }))
         shutil.copyfile(Path(__file__).resolve().parents[1] / "install-linux-cli.sh", public / "install-linux-cli.sh")
         shutil.copyfile(Path(__file__).resolve().parents[1] / "install-openwrt.sh", public / "install-openwrt.sh")
         server = HTTPServer(("0.0.0.0", 0), partial(QuietHandler, directory=str(public)))
@@ -187,7 +192,7 @@ def verify(args: argparse.Namespace) -> None:
             info = json.loads(remote("p2wlan-daemon --build-info"))
             if info["git_commit"] != args.source_sha or info["dirty"]:
                 raise ValueError("installed daemon source identity differs from checkout")
-            version = json.loads(package.with_name(package.name + ".metadata.json").read_text())["tag"].removeprefix("v")
+            version = metadata["tag"].removeprefix("v")
             if info["app_version"] != version or info["daemon_version"] != version:
                 raise ValueError("installed binary version differs from package tag")
             if info["binary_sha256"] != remote("sha256sum /usr/bin/p2wlan-daemon").split()[0]:
@@ -199,8 +204,8 @@ def verify(args: argparse.Namespace) -> None:
                    "-e 's/\"udp_liveness_enabled\": true/\"udp_liveness_enabled\": false/' "
                    "/etc/p2wlan/p2wlan-config.json")
             remote("p2wlan up", timeout=90)
-            remote("test \"$(stat -c %a /etc/p2wlan/p2wlan-config.json)\" = 600 && "
-                   "test \"$(stat -c %a /var/run/p2wlan)\" = 700")
+            remote("test \"$(ls -ld /etc/p2wlan/p2wlan-config.json | cut -c 1-10)\" = '-rw-------' && "
+                   "test \"$(ls -ld /var/run/p2wlan | cut -c 1-10)\" = 'drwx------'")
             remote("sysupgrade -l | grep -Fxq '/etc/p2wlan/p2wlan-config.json'")
             snapshot = json.loads(remote("p2wlan status --json"))
             if snapshot.get("virtual_ip") != "10.20.0.1":
@@ -231,6 +236,11 @@ def verify(args: argparse.Namespace) -> None:
             selection = remote(f"sh /tmp/install-openwrt.sh --version v{version} --dry-run")
             if package.name not in selection:
                 raise ValueError(f"installer selected the wrong native package: {selection}")
+            remote(f"wget -q -O /tmp/release-manifest.json {address}/RELEASE-MANIFEST.json")
+            parsed_checksum = remote("jsonfilter -i /tmp/release-manifest.json "
+                                     f"-e '@.files[\"{package.name}\"].sha256'").strip()
+            if parsed_checksum != sha256(package):
+                raise ValueError("native installer manifest checksum expression failed")
             remote("sh /tmp/install-openwrt.sh --version v1.2.3/escape --dry-run", success=False)
             # Stop must still work when the JSON has become unreadable; a bad
             # config must never cause a new unmanaged process to be spawned.
@@ -255,7 +265,7 @@ def verify(args: argparse.Namespace) -> None:
                                  "procd-down-no-respawn", "invalid-config-stop", "glibc-update-refused",
                                  "native-installer-selection", "private-runtime-permissions",
                                  "sysupgrade-config-backup", "disabled-service-refused", "firewall-example",
-                                 "loopback-diagnostics"]}
+                                 "loopback-diagnostics", "native-installer-manifest"]}
             (work / "verification.json").write_text(json.dumps(report, indent=2) + "\n")
             print("PASS OpenWrt VM", json.dumps(report), flush=True)
         except Exception as error:

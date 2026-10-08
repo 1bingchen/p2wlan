@@ -114,7 +114,10 @@ def build(args: argparse.Namespace) -> None:
     recipe = sdk / "package/p2wlan"
     shutil.rmtree(recipe, ignore_errors=True)
     shutil.copytree(ROOT / "deploy/openwrt", recipe)
-    (sdk / ".config").write_text("CONFIG_ALL_NONSHARED=n\nCONFIG_ALL_KMODS=n\nCONFIG_PACKAGE_p2wlan=m\nCONFIG_SIGNED_PACKAGES=n\n")
+    (sdk / ".config").write_text(
+        "# CONFIG_ALL is not set\n# CONFIG_ALL_NONSHARED is not set\n"
+        "# CONFIG_ALL_KMODS is not set\nCONFIG_PACKAGE_p2wlan=m\n"
+        "# CONFIG_SIGNED_PACKAGES is not set\n")
     common = [f"P2WLAN_VERSION={version}", f"P2WLAN_BINARY_DIR={binaries}"]
     arches = ARM_ARCHES if args.arch == "arm64" else ("x86_64",)
     # STAGING_DIR is needed by the cross-GCC wrapper above. SDK make owns its
@@ -122,10 +125,18 @@ def build(args: argparse.Namespace) -> None:
     sdk_env = os.environ.copy()
     sdk_env.pop("STAGING_DIR", None)
     run("make", "defconfig", *common, f"P2WLAN_PACKAGE_ARCH={arches[0]}", cwd=sdk, env=sdk_env)
+    resolved_config = set((sdk / ".config").read_text().splitlines())
+    for option in ("ALL", "ALL_NONSHARED", "ALL_KMODS"):
+        if f"# CONFIG_{option} is not set" not in resolved_config:
+            raise ValueError(f"SDK unexpectedly enabled bulk package selection: {option}")
     for package_arch in arches:
         variables = [*common, f"P2WLAN_PACKAGE_ARCH={package_arch}"]
         run("make", "package/p2wlan/clean", *variables, cwd=sdk, env=sdk_env)
-        run("make", "package/p2wlan/compile", "V=s", "-j2", *variables, cwd=sdk, env=sdk_env)
+        # Packaging copies the verified static binaries and needs no target
+        # library builds. The SDK otherwise repackages every pinned kmod via
+        # the TUN dependency. Runtime DEPENDS stay in the recipe and the VM
+        # installs them normally from the matching firmware's package feeds.
+        run("make", "package/p2wlan/compile", "NO_DEPS=1", "V=s", "-j2", *variables, cwd=sdk, env=sdk_env)
         packages = list(sdk.glob(f"bin/packages/**/p2wlan*.{release['extension']}"))
         # SDK output names vary between IPK and APK. Reject ambiguous/stale
         # output rather than selecting a previous variant by modification time.

@@ -52,6 +52,15 @@ Participating devices receive private virtual IPs. P2WLAN prefers **LAN / IPv6 /
 - **See how devices connect.** View availability, Direct / Relay paths, latency, and traffic information, with built-in diagnostics for troubleshooting.
 - **Control your infrastructure.** Client, Control, and Relay source code is available under MIT. Choose server locations and manage accounts and data yourself. Hosting, bandwidth, and domain costs remain the deployer's responsibility.
 
+## Sponsors
+
+<table>
+  <tr>
+    <td width="220" valign="middle"><a href="https://www.moeflux.com/zh-CN/plan?AFF=INV-BFD8315B"><img src="assets/readme/moeflux.webp" alt="Moeflux" width="200" /></a></td>
+    <td>Thanks to Moeflux for sponsoring this project! Moeflux is a high-quality model API relay service for heavy AI developers, offering direct official connections to the Grok, Claude, Codex, and DeepSeek families. All supply is 100% from official sources — no fillers, no watered-down routes — and you're welcome to verify that anytime. Prices are significantly lower than typical relays, <strong>as low as 0.14% of the official price</strong>. It delivers high stability with enterprise-grade concurrency support, transparent billing, and token-level statements you can check line by line. Business customers receive a professional management console, formal contracts, and invoices. Order through <a href="https://www.moeflux.com/zh-CN/plan?AFF=INV-BFD8315B">this link</a> now and get $1 in free credit.</td>
+  </tr>
+</table>
+
 ## Screenshots
 
 <table align="center">

@@ -261,15 +261,21 @@ impl Drop for WintunDevice {
         // Signal the read thread to stop
         self.shutdown.store(true, Ordering::SeqCst);
 
-        // End the session (this also signals the read wait event)
+        // A full channel can block the reader in blocking_send. Wake that
+        // sender before joining; dropping the receiver after Drop returns
+        // would leave both threads waiting for each other indefinitely.
+        self.read_rx.close();
+
+        // Keep the session and its ring/event valid until the last receive,
+        // packet copy and release have finished. Idle reads poll shutdown at
+        // most every 100 ms, so ending the session is not needed to wake them.
+        if let Some(handle) = self.read_thread.take() {
+            let _ = handle.join();
+        }
+
         let session_ptr = self.session as *mut std::ffi::c_void;
         if !session_ptr.is_null() {
             unsafe { (self.api.end_session)(session_ptr) };
-        }
-
-        // Wait for the read thread to finish
-        if let Some(handle) = self.read_thread.take() {
-            let _ = handle.join();
         }
 
         // Close the adapter

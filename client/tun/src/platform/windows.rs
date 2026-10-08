@@ -42,3 +42,7 @@ use crate::interface::VirtualInterface;
 include!("windows/api.rs");
 include!("windows/device.rs");
 include!("windows/helpers.rs");
+
+#[cfg(test)]
+#[path = "windows/shutdown_tests.rs"]
+mod shutdown_tests;

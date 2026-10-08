@@ -72,6 +72,27 @@ Future<WindowsProcessProbe> waitForWindowsProcess(
   return result;
 }
 
+/// Wait for OS-confirmed exit within the caller's complete shutdown budget.
+/// An inaccessible process may still be draining elevated resources, so query
+/// failures remain pending and never count as a successful shutdown.
+Future<bool> waitForWindowsProcessExit(
+  int processId, {
+  required Duration timeout,
+  WindowsProcessProbe Function(int) query = queryWindowsProcess,
+  Duration pollInterval = const Duration(milliseconds: 100),
+}) async {
+  final clock = Stopwatch()..start();
+  while (true) {
+    if (query(processId).state == WindowsProcessState.exited) return true;
+    final remaining = timeout - clock.elapsed;
+    if (remaining <= Duration.zero) return false;
+    await Future<void>.delayed(
+      pollInterval < remaining ? pollInterval : remaining,
+    );
+    if (clock.elapsed >= timeout) return false;
+  }
+}
+
 class _WindowsProcessApi {
   static final instance = _WindowsProcessApi();
 

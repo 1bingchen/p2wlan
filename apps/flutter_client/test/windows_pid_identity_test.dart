@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:io';
 
 import 'package:flutter_test/flutter_test.dart';
@@ -112,6 +113,86 @@ void main() {
       expect(calls, 1);
     }
   });
+
+  test(
+    'shutdown waits through running and unavailable native queries',
+    () async {
+      final observations = [
+        const WindowsProcessProbe.running(r'C:\P2WLAN\p2wlan-daemon.exe'),
+        const WindowsProcessProbe.unavailable('open_process', 5),
+        const WindowsProcessProbe.exited(0),
+      ];
+      var calls = 0;
+      expect(
+        await waitForWindowsProcessExit(
+          4242,
+          timeout: const Duration(seconds: 1),
+          pollInterval: Duration.zero,
+          query: (pid) {
+            expect(pid, 4242);
+            return observations[calls++];
+          },
+        ),
+        isTrue,
+      );
+      expect(calls, observations.length);
+    },
+  );
+
+  test(
+    'shutdown deadline never treats access denial as process exit',
+    () async {
+      for (final observation in [
+        const WindowsProcessProbe.running(r'C:\P2WLAN\p2wlan-daemon.exe'),
+        const WindowsProcessProbe.unavailable('open_process', 5),
+        const WindowsProcessProbe.unavailable('image_name', 31),
+        const WindowsProcessProbe.exited(7),
+      ]) {
+        var calls = 0;
+        final exited = await waitForWindowsProcessExit(
+          4242,
+          timeout: Duration.zero,
+          query: (_) {
+            calls += 1;
+            return observation;
+          },
+        );
+        expect(exited, observation.state == WindowsProcessState.exited);
+        expect(calls, 1);
+      }
+    },
+  );
+
+  test('Windows shutdown can finish after the helper timeout', () async {
+    final windir = Platform.environment['WINDIR']!;
+    final child = await Process.start('$windir\\System32\\cmd.exe', [
+      '/d',
+      '/q',
+      '/c',
+      'set /p p2wlan_shutdown_fixture=',
+    ]);
+    final stdout = child.stdout.drain<void>();
+    final stderr = child.stderr.drain<void>();
+    final release = Timer(const Duration(milliseconds: 10500), () {
+      child.stdin.writeln('done');
+      unawaited(child.stdin.close());
+    });
+    try {
+      expect(
+        await waitForWindowsProcessExit(
+          child.pid,
+          timeout: const Duration(seconds: 12),
+        ),
+        isTrue,
+      );
+      expect(await child.exitCode, 0);
+    } finally {
+      release.cancel();
+      child.kill(ProcessSignal.sigkill);
+      await child.exitCode.timeout(const Duration(seconds: 5));
+      await Future.wait([stdout, stderr]);
+    }
+  }, skip: !Platform.isWindows);
 
   test('native image paths preserve Unicode and the exact executable name', () {
     const process = WindowsProcessProbe.running(

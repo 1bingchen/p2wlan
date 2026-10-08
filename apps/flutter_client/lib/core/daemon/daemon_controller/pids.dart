@@ -139,22 +139,10 @@ extension DaemonControllerPids on DaemonController {
 
   Future<bool> _waitForDaemonPidExit(int pid, Duration timeout) async {
     if (Platform.isWindows) {
-      // Do not start a new PowerShell process every 400 ms while a Windows
-      // daemon is shutting down. One hidden PowerShell can poll the already
-      // verified PID in-process, which removes a large source of UI stalls.
-      final timeoutMs = timeout.inMilliseconds.clamp(1, 60000);
-      final result = await _runWindowsPowerShell(
-        '\$targetPid = $pid; '
-        '\$deadline = [DateTime]::UtcNow.AddMilliseconds($timeoutMs); '
-        'while ([DateTime]::UtcNow -lt \$deadline) { '
-        'if (\$null -eq (Get-Process -Id \$targetPid -ErrorAction SilentlyContinue)) { '
-        'return '
-        '} '
-        'Start-Sleep -Milliseconds 100 '
-        '} '
-        '\$global:LASTEXITCODE = 1',
-      );
-      return result.exitCode == 0;
+      // The shutdown budget exceeds the generic PowerShell helper's ten-second
+      // timeout. Query Win32 directly so a slow graceful exit gets its full
+      // budget and access denial cannot be mistaken for process termination.
+      return waitForWindowsProcessExit(pid, timeout: timeout);
     }
     final deadline = DateTime.now().add(timeout);
     while (DateTime.now().isBefore(deadline)) {

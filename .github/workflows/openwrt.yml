@@ -39,6 +39,19 @@ jobs:
         uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
         with:
           targets: aarch64-unknown-linux-musl,x86_64-unknown-linux-musl
+      - name: Restore OpenWrt build cache
+        id: rust-cache
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ${{ runner.temp }}/openwrt/cargo-target
+            ${{ runner.temp }}/openwrt/*.tar.zst
+            ${{ runner.temp }}/openwrt/vm/*.bin
+            ${{ runner.temp }}/openwrt/vm/*.img.gz
+          key: openwrt-v1-${{ matrix.series }}-${{ matrix.arch }}-${{ hashFiles('Cargo.lock', 'scripts/openwrt/targets.json') }}-${{ github.sha }}
+          restore-keys: openwrt-v1-${{ matrix.series }}-${{ matrix.arch }}-${{ hashFiles('Cargo.lock', 'scripts/openwrt/targets.json') }}-
       - name: Install SDK and VM dependencies
         run: |
           sudo apt-get update
@@ -57,13 +70,39 @@ jobs:
           with open(os.environ['GITHUB_ENV'], 'a') as out:
               out.write(f'P2WLAN_OPENWRT_TAG={tag}\n')
           PY
-      - name: Build native packages and verify on OpenWrt kernel
+      - name: Compile static musl binaries
         run: >
-          python3 scripts/openwrt/build.py
+          python3 scripts/openwrt/build.py --stage compile
           --series '${{ matrix.series }}' --arch '${{ matrix.arch }}'
           --tag "$P2WLAN_OPENWRT_TAG"
           --work-dir "$RUNNER_TEMP/openwrt"
           --output dist-release
+      - name: Assemble native SDK packages
+        run: >
+          python3 scripts/openwrt/build.py --stage package
+          --series '${{ matrix.series }}' --arch '${{ matrix.arch }}'
+          --tag "$P2WLAN_OPENWRT_TAG"
+          --work-dir "$RUNNER_TEMP/openwrt"
+          --output dist-release
+      - name: Install and verify on matching OpenWrt kernel
+        run: >
+          python3 scripts/openwrt/build.py --stage verify
+          --series '${{ matrix.series }}' --arch '${{ matrix.arch }}'
+          --tag "$P2WLAN_OPENWRT_TAG"
+          --work-dir "$RUNNER_TEMP/openwrt"
+          --output dist-release
+      - name: Save OpenWrt build cache
+        if: always() && steps.rust-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ${{ runner.temp }}/openwrt/cargo-target
+            ${{ runner.temp }}/openwrt/*.tar.zst
+            ${{ runner.temp }}/openwrt/vm/*.bin
+            ${{ runner.temp }}/openwrt/vm/*.img.gz
+          key: ${{ steps.rust-cache.outputs.cache-primary-key }}
       - name: Upload verified package candidates
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
@@ -78,6 +117,8 @@ jobs:
           if-no-files-found: warn
           path: |
             ${{ runner.temp }}/openwrt/vm/verification.json
+            ${{ runner.temp }}/openwrt/vm/failure.json
+            ${{ runner.temp }}/openwrt/vm/service-diagnostics.log
             ${{ runner.temp }}/openwrt/vm/console.log
 
   required:

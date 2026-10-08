@@ -21,6 +21,7 @@ from build import download, sha256, target_config
 
 
 class QuietHandler(SimpleHTTPRequestHandler):
+    timeout = 15
     def log_message(self, *_args) -> None:
         pass
 
@@ -106,7 +107,7 @@ def verify(args: argparse.Namespace) -> None:
             deadline = time.monotonic() + 180
             while time.monotonic() < deadline:
                 with lock:
-                    ready = b"init complete" in tail
+                    ready = b"Please press Enter to activate this console" in tail
                 if ready:
                     break
                 if process.poll() is not None:
@@ -114,23 +115,58 @@ def verify(args: argparse.Namespace) -> None:
                 time.sleep(1)
             else:
                 raise RuntimeError("OpenWrt boot timed out")
+            # askfirst consumes the activation line before it starts ash;
+            # sending setup in the same write loses it during login startup.
+            process.stdin.write(b"\n")
+            process.stdin.flush()
+            deadline = time.monotonic() + 30
+            while time.monotonic() < deadline:
+                with lock:
+                    ready = b":~# " in tail
+                if ready:
+                    break
+                if process.poll() is not None:
+                    raise RuntimeError("QEMU exited before the console shell started")
+                time.sleep(0.5)
+            else:
+                raise RuntimeError("OpenWrt console shell did not become ready")
             address = f"http://192.168.1.2:{server.server_port}"
-            setup = ("\n" + "\n".join([
-                "ip link set eth0 up",
-                "ip addr replace 192.168.1.1/24 dev eth0",
-                "ip route replace default via 192.168.1.2",
+            # This is a disposable VM network, independent of the package.
+            # Persist it before restarting netifd so first-boot rcS cannot
+            # overwrite a temporary route/address while the harness connects.
+            setup = ("\n".join([
+                "cat > /etc/config/network <<'P2WLAN_NETWORK'",
+                "config interface 'loopback'",
+                " option device 'lo'",
+                " option proto 'static'",
+                " option ipaddr '127.0.0.1'",
+                " option netmask '255.0.0.0'",
+                "config interface 'lan'",
+                " option device 'eth0'",
+                " option proto 'static'",
+                " option ipaddr '192.168.1.1'",
+                " option netmask '255.255.255.0'",
+                " option gateway '192.168.1.2'",
+                " list dns '192.168.1.3'",
+                "P2WLAN_NETWORK",
+                "/etc/init.d/network restart",
                 "echo nameserver 192.168.1.3 > /etc/resolv.conf",
                 f"date -s @{int(time.time())}",
                 "mkdir -p /etc/dropbear",
-                f"wget -q -O /etc/dropbear/authorized_keys {address}/key.pub",
+                "for attempt in 1 2 3 4 5 6 7 8 9 10; do "
+                f"wget -q -T 5 -O /etc/dropbear/authorized_keys {address}/key.pub && break; sleep 1; done",
                 "chmod 600 /etc/dropbear/authorized_keys",
                 "/etc/init.d/dropbear restart",
             ]) + "\n")
             process.stdin.write(setup.encode())
             process.stdin.flush()
-            deadline = time.monotonic() + 60
+            deadline = time.monotonic() + 90
             while time.monotonic() < deadline:
-                if subprocess.run([*ssh, "true"], capture_output=True, timeout=8).returncode == 0:
+                try:
+                    connected = subprocess.run([*ssh, "true"], capture_output=True, timeout=8).returncode == 0
+                except subprocess.TimeoutExpired:
+                    connected = False
+                if connected:
                     break
                 time.sleep(2)
             else:
@@ -160,10 +196,24 @@ def verify(args: argparse.Namespace) -> None:
                    "-e 's/\"udp_liveness_enabled\": true/\"udp_liveness_enabled\": false/' "
                    "/etc/p2wlan/p2wlan-config.json")
             remote("p2wlan up", timeout=90)
+            remote("test \"$(stat -c %a /etc/p2wlan/p2wlan-config.json)\" = 600 && "
+                   "test \"$(stat -c %a /var/run/p2wlan)\" = 700")
+            remote("sysupgrade -l | grep -Fxq '/etc/p2wlan/p2wlan-config.json'")
             snapshot = json.loads(remote("p2wlan status --json"))
             if snapshot.get("virtual_ip") != "10.20.0.1":
                 raise ValueError(f"real TUN did not receive the configured address: {snapshot.get('virtual_ip')}")
             remote("ip -4 addr show | grep -q 10.20.0.1")
+            # Exercise the optional firewall example on stock firewall4;
+            # package installation itself must not alter firewall policy.
+            remote("uci set firewall.p2wlan=zone; uci set firewall.p2wlan.name=p2wlan; "
+                   "uci add_list firewall.p2wlan.device=p2wlan0; uci add_list firewall.p2wlan.device='p2r+'; "
+                   "uci set firewall.p2wlan.input=REJECT; uci set firewall.p2wlan.output=ACCEPT; "
+                   "uci set firewall.p2wlan.forward=REJECT; uci set firewall.p2wlan_ping=rule; "
+                   "uci set firewall.p2wlan_ping.name=Allow-P2WLAN-Ping; uci set firewall.p2wlan_ping.src=p2wlan; "
+                   "uci set firewall.p2wlan_ping.family=ipv4; uci set firewall.p2wlan_ping.proto=icmp; "
+                   "uci add_list firewall.p2wlan_ping.icmp_type=echo-request; "
+                   "uci set firewall.p2wlan_ping.target=ACCEPT; uci commit firewall; "
+                   "fw4 check && /etc/init.d/firewall reload && fw4 zone p2wlan p2wlan0")
             pid = remote("pidof p2wlan-daemon").strip()
             remote("p2wlan up")
             if remote("pidof p2wlan-daemon").strip() != pid or len(pid.split()) != 1:
@@ -181,20 +231,47 @@ def verify(args: argparse.Namespace) -> None:
             remote("sh /tmp/install-openwrt.sh --version v1.2.3/escape --dry-run", success=False)
             # Stop must still work when the JSON has become unreadable; a bad
             # config must never cause a new unmanaged process to be spawned.
+            remote("p2wlan config set diagnostics 127.0.0.1:39278")
             remote("p2wlan up", timeout=90)
+            json.loads(remote("p2wlan status --json"))
             remote("cp /etc/p2wlan/p2wlan-config.json /tmp/config.saved; echo broken > /etc/p2wlan/p2wlan-config.json")
             remote("p2wlan down", timeout=60)
             remote("/etc/init.d/p2wlan start", success=False)
             remote("! pidof p2wlan-daemon")
             remote("mv /tmp/config.saved /etc/p2wlan/p2wlan-config.json; chmod 600 /etc/p2wlan/p2wlan-config.json")
+            remote("uci set p2wlan.main.enabled=0; uci commit p2wlan")
+            remote("p2wlan up", success=False)
+            remote("! pidof p2wlan-daemon")
+            remote("uci set p2wlan.main.enabled=1; uci commit p2wlan")
+            remote("sed -i 's/127.0.0.1:39278/0.0.0.0:39278/' /etc/p2wlan/p2wlan-config.json")
+            remote("/etc/init.d/p2wlan start", success=False)
+            remote("! pidof p2wlan-daemon")
             report = {"series": args.series, "arch": args.arch, "firmware": release["version"],
                       "source_sha": args.source_sha, "package": package.name, "sha256": sha256(package),
                       "checks": ["native-dependencies", "build-identity", "real-tun", "single-owner-up",
                                  "procd-down-no-respawn", "invalid-config-stop", "glibc-update-refused",
-                                 "native-installer-selection"]}
+                                 "native-installer-selection", "private-runtime-permissions",
+                                 "sysupgrade-config-backup", "disabled-service-refused", "firewall-example",
+                                 "loopback-diagnostics"]}
             (work / "verification.json").write_text(json.dumps(report, indent=2) + "\n")
             print("PASS OpenWrt VM", json.dumps(report), flush=True)
-        except Exception:
+        except Exception as error:
+            # Only synthetic VM state is collected; never copy config keys or
+            # the diagnostics token into public build evidence.
+            try:
+                diagnostics = subprocess.run([*ssh,
+                    "tail -c 12000 /var/run/p2wlan/p2wlan-daemon.log 2>/dev/null; "
+                    "logread -e p2wlan | tail -c 12000; "
+                    "ubus call service list '{\"name\":\"p2wlan\"}'; "
+                    "ls -ld /etc/p2wlan /var/run/p2wlan"],
+                    capture_output=True, text=True, timeout=10)
+                (work / "service-diagnostics.log").write_text((diagnostics.stdout + diagnostics.stderr)[-26000:])
+            except (subprocess.TimeoutExpired, OSError):
+                pass
+            (work / "failure.json").write_text(json.dumps({
+                "series": args.series, "arch": args.arch, "source_sha": args.source_sha,
+                "error": f"{type(error).__name__}: {error}"[-6000:],
+            }, indent=2) + "\n")
             with lock:
                 print(bytes(tail[-4000:]).decode(errors="replace"), flush=True)
             raise

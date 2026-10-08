@@ -15,7 +15,7 @@ OpenWrt 包包含 CLI、daemon、procd 服务和 sysupgrade 配置保留规则�
 
 ## 安装和连接
 
-在路由器上以 root 运行，使用一个明确且包含 OpenWrt 资产的版本：
+在路由器上以 root 运行，使用一个明确且包含 OpenWrt 资产的版本。将示例控制台地址和账号替换为实际值：
 
 ```sh
 VERSION=v0.1.170
@@ -44,13 +44,35 @@ p2wlan logs
 logread -e p2wlan
 ```
 
-默认配置的 `up/down` 由 procd 管理。停止会同时移除 procd 的自动重启状态；重复 `up` 复用同一进程。启动失败时检查日志，CLI 不会另起一个绕过 procd 的 daemon。服务崩溃后最多进行五次快速重启，持续失败会停止重试。`enable/disable` 控制开机启动；`/etc/config/p2wlan` 的 `main.enabled` 可禁用服务启动。
+默认个人网络配置的 `up/down` 由 procd 管理。`room connect` 创建的独立房间实例仍由 CLI 管理，重启路由器后需重新连接。停止会同时移除 procd 的自动重启状态；重复 `up` 复用同一进程。启动失败时检查日志，CLI 不会另起一个绕过 procd 的 daemon。服务崩溃后最多进行五次快速重启，持续失败会停止重试。`enable/disable` 控制开机启动；`/etc/config/p2wlan` 的 `main.enabled` 可禁用服务启动。
 
-日志、诊断令牌和运行状态位于 `/var/run/p2wlan`，重启后清空；daemon 的文件日志有轮转上限。`--config` 指向其他配置时仍使用独立 CLI 实例，不归默认 procd 服务管理。系统服务固定使用默认配置和状态目录，环境变量不能把它的诊断状态重定向到另一个实例。
+日志和诊断令牌位于 `/var/run/p2wlan`，重启后清空；daemon 的文件日志有轮转上限。系统服务启用 loopback 诊断接口供 CLI 查询状态，端口沿用配置中的 `diagnostics.bind`。`--config` 指向其他配置时仍使用独立 CLI 实例，不归默认 procd 服务管理。系统服务固定使用默认配置和状态目录，环境变量不能把它的诊断状态重定向到另一个实例。
 
 升级时先 `p2wlan down`，将上面的 `VERSION` 改为目标版本并重新运行原生安装器，再 `p2wlan up`。`p2wlan update` 会拒绝在 musl/OpenWrt 上安装普通 Linux 的 glibc 包。JSON 配置不随包覆盖，UCI 配置属于包管理器的 conffile；`/lib/upgrade/keep.d/p2wlan` 保留 `/etc/p2wlan/`。跨固件升级仍需自行备份配置，并确认新固件属于兼容范围。
 
 TUN 设备由 daemon 创建并分配地址；不要同时让 netifd 为同一设备分配地址或删除路由。需要通过虚拟网访问路由器上的业务端口时，应为自己的防火墙配置添加最小范围的接口和端口规则。此包不自动开放管理端口，也不提供全 LAN 子网路由。
+
+默认防火墙可能拒绝未归属 zone 的 TUN 入站流量。需要允许其他节点 ping 路由器时，可按现有配置在 `/etc/config/firewall` 中合并下面的独立 zone 和 IPv4 ICMP 规则。默认个人网络接口为 `p2wlan0`，房间接口为 `p2r` 加房间 profile 摘要；`p2r+` 匹配这些房间接口。自定义接口名时应相应修改 `device`；已有同名 zone 时先合并规则，避免重复定义。语法见 [OpenWrt 防火墙配置](https://openwrt.org/docs/guide-user/firewall/firewall_configuration)。
+
+```text
+config zone 'p2wlan'
+        option name 'p2wlan'
+        list device 'p2wlan0'
+        list device 'p2r+'
+        option input 'REJECT'
+        option output 'ACCEPT'
+        option forward 'REJECT'
+
+config rule 'p2wlan_ping'
+        option name 'Allow-P2WLAN-Ping'
+        option src 'p2wlan'
+        option family 'ipv4'
+        option proto 'icmp'
+        list icmp_type 'echo-request'
+        option target 'ACCEPT'
+```
+
+用 `fw4 check` 检查后运行 `/etc/init.d/firewall reload` 应用。这条规则只允许虚拟网络上的 IPv4 ping；业务 TCP/UDP 端口需单独添加以 `p2wlan` 为来源 zone 的规则，按需限定来源虚拟 IP 和目标端口。不要把 WAN 或 LAN 接口加入这个 zone。
 
 ## 从源码构建
 

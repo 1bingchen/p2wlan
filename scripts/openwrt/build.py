@@ -75,6 +75,11 @@ def build(args: argparse.Namespace) -> None:
     args.output = args.output.resolve()
     args.work_dir.mkdir(parents=True, exist_ok=True)
     args.output.mkdir(parents=True, exist_ok=True)
+    vm_command = ("python3", "scripts/openwrt/verify_vm.py", "--series", args.series, "--arch", args.arch,
+                  "--directory", str(args.output), "--work-dir", str(args.work_dir), "--source-sha", source)
+    if args.stage == "verify":
+        run(*vm_command, timeout=1000)
+        return
     sdk_name = f"{stem.replace('openwrt-', 'openwrt-sdk-', 1)}_gcc-{release['gcc']}_musl.Linux-x86_64.tar.zst"
     archive = args.work_dir / sdk_name
     download(base + sdk_name, archive, target["sdk_sha256"])
@@ -98,11 +103,14 @@ def build(args: argparse.Namespace) -> None:
         "RUSTFLAGS": "-C target-feature=+crt-static -C link-self-contained=yes",
         "CARGO_PROFILE_RELEASE_OPT_LEVEL": "s",
     })
-    run("cargo", "build", "--locked", "--release", "-p", "p2wlan-cli", "-p", "p2wlan-daemon",
-        "--target", rust_target, env=env, timeout=2700)
+    if args.stage in ("all", "compile"):
+        run("cargo", "build", "--locked", "--release", "-p", "p2wlan-cli", "-p", "p2wlan-daemon",
+            "--target", rust_target, env=env, timeout=2700)
     binaries = args.work_dir / "cargo-target" / rust_target / "release"
     for name in ("p2wlan", "p2wlan-daemon"):
         verify_elf(binaries / name, args.arch, readelf)
+    if args.stage == "compile":
+        return
     recipe = sdk / "package/p2wlan"
     shutil.rmtree(recipe, ignore_errors=True)
     shutil.copytree(ROOT / "deploy/openwrt", recipe)
@@ -134,9 +142,8 @@ def build(args: argparse.Namespace) -> None:
             "--arch", package_arch, "--identity", "musl-static-sdk-packaged")
     # Each architecture/series must boot and install its native package with
     # real dependencies on the matching OpenWrt kernel before it can ship.
-    run("python3", "scripts/openwrt/verify_vm.py", "--series", args.series, "--arch", args.arch,
-        "--directory", str(args.output), "--work-dir", str(args.work_dir), "--source-sha", source,
-        timeout=1000)
+    if args.stage == "all":
+        run(*vm_command, timeout=1000)
 
 
 def verify_package_arch(package: Path, arch: str, sdk: Path) -> None:
@@ -160,6 +167,7 @@ def main() -> None:
     parser.add_argument("--work-dir", type=Path, required=True)
     parser.add_argument("--output", type=Path, default=ROOT / "dist-release")
     parser.add_argument("--tag", required=True)
+    parser.add_argument("--stage", choices=("all", "compile", "package", "verify"), default="all")
     build(parser.parse_args())
 
 

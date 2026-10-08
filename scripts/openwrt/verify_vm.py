@@ -176,8 +176,11 @@ def verify(args: argparse.Namespace) -> None:
             downloaded = remote(f"sha256sum {guest_package}").split()[0]
             if downloaded != sha256(package):
                 raise ValueError("package bytes changed before OpenWrt installation")
-            install = (f"apk update && apk add --allow-untrusted {guest_package}" if args.series == "25.12"
-                       else f"opkg update && opkg install {guest_package}")
+            manager = "apk" if args.series == "25.12" else "opkg"
+            remote(f"for attempt in 1 2 3; do {manager} update && exit 0; "
+                   '[ "$attempt" -lt 3 ] || exit 1; sleep 3; done', timeout=480)
+            install = (f"apk add --allow-untrusted {guest_package}" if args.series == "25.12"
+                       else f"opkg install {guest_package}")
             remote(install, timeout=240)
             remote("! pidof p2wlan-daemon")  # unconfigured install must stay idle
             remote("/etc/init.d/p2wlan enable && /etc/init.d/p2wlan enabled")

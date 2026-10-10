@@ -103,7 +103,7 @@ class ConsoleCtrlCInjectorTests(unittest.TestCase):
                 self.assertEqual(ready["console_query_error"], 6, ready)
                 self.assertIs(ready["no_console"], True, ready)
                 self.assertIsNone(target_process.poll(), ready)
-                result = subprocess.run(
+                injector_process = subprocess.Popen(
                     [
                         powershell,
                         "-NoLogo",
@@ -120,10 +120,19 @@ class ConsoleCtrlCInjectorTests(unittest.TestCase):
                         "-EvidencePath",
                         str(evidence),
                     ],
-                    capture_output=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
                     text=True,
-                    timeout=10,
-                    check=False,
+                )
+                try:
+                    injector_stdout, injector_stderr = injector_process.communicate(timeout=10)
+                except subprocess.TimeoutExpired:
+                    injector_process.kill()
+                    injector_process.communicate(timeout=3)
+                    raise
+                result = subprocess.CompletedProcess(
+                    injector_process.args, injector_process.returncode,
+                    injector_stdout, injector_stderr,
                 )
                 # Capture the helper record before the first result assertion.
                 # Native 0 can never pass, but its own JSON is retained in the
@@ -134,6 +143,22 @@ class ConsoleCtrlCInjectorTests(unittest.TestCase):
                     native = _bounded_json(evidence)
                 except (OSError, UnicodeError, ValueError) as error:
                     native_error = str(error)
+                phase_records = []
+                phase_error = None
+                try:
+                    phase_paths = sorted(
+                        Path(str(evidence) + ".diagnostic").glob("phase-*.json")
+                    )
+                    if not 1 <= len(phase_paths) <= 12:
+                        raise ValueError("phase count outside the fixed 1..12 bound")
+                    for phase_path in phase_paths:
+                        with phase_path.open("rb") as stream:
+                            raw = stream.read(2049)
+                        if len(raw) > 2048:
+                            raise ValueError("injector phase exceeded 2048 bytes")
+                        phase_records.append(json.loads(raw.decode("utf-8")))
+                except (OSError, UnicodeError, ValueError) as error:
+                    phase_error = str(error)
                 diagnostic = json.dumps(
                     {
                         "returncode": result.returncode,
@@ -143,6 +168,9 @@ class ConsoleCtrlCInjectorTests(unittest.TestCase):
                         "target_still_live": target_process.poll() is None,
                         "injector_record": native,
                         "injector_record_error": native_error,
+                        "injector_pid": injector_process.pid,
+                        "injector_phases": phase_records,
+                        "injector_phase_error": phase_error,
                     },
                     sort_keys=True,
                 )
@@ -155,6 +183,31 @@ class ConsoleCtrlCInjectorTests(unittest.TestCase):
                 self.assertEqual(native["stage"], "attach_console", diagnostic)
                 self.assertTrue(native["detail"], diagnostic)
                 self.assertIsNone(target_process.poll(), diagnostic)
+                self.assertIsNone(phase_error, diagnostic)
+                self.assertEqual(
+                    [phase["phase"] for phase in phase_records],
+                    ["initialize", "native_helper_ready", "attach_console",
+                     "caught_exception", "write_native_evidence", "native_evidence_written"],
+                    diagnostic,
+                )
+                previous_ticks = -1
+                frequency = None
+                for index, phase in enumerate(phase_records, 1):
+                    self.assertEqual(phase["schema_version"], 1, diagnostic)
+                    self.assertEqual(phase["request_id"], request, diagnostic)
+                    self.assertEqual(phase["target_process_id"], target, diagnostic)
+                    self.assertEqual(phase["helper_process_id"], injector_process.pid, diagnostic)
+                    self.assertEqual(type(phase["helper_process_id"]), int, diagnostic)
+                    self.assertEqual(phase["sequence"], index, diagnostic)
+                    self.assertEqual(type(phase["elapsed_monotonic_ticks"]), int, diagnostic)
+                    self.assertGreaterEqual(phase["elapsed_monotonic_ticks"], previous_ticks, diagnostic)
+                    self.assertEqual(type(phase["monotonic_frequency_hz"]), int, diagnostic)
+                    self.assertGreater(phase["monotonic_frequency_hz"], 0, diagnostic)
+                    if frequency is not None:
+                        self.assertEqual(phase["monotonic_frequency_hz"], frequency, diagnostic)
+                    frequency = phase["monotonic_frequency_hz"]
+                    previous_ticks = phase["elapsed_monotonic_ticks"]
+                    self.assertIs(phase["broadcast_succeeded"], False, diagnostic)
             finally:
                 try:
                     target_process.communicate(input=b"x", timeout=3)

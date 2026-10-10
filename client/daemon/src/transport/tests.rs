@@ -30,6 +30,7 @@ mod tests {
     include!("tests/direct_validation_contention.rs");
     include!("tests/auth_lifecycle_source.rs");
     include!("tests/overlay_ingress_source.rs");
+    include!("tests/encryption_origin.rs");
 
     #[test]
     fn first_usable_evidence_requires_a_decrypted_overlay_ip_packet() {

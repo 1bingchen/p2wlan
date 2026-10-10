@@ -2,6 +2,9 @@ use super::*;
 
 mod decryption;
 mod encryption;
+pub(crate) use encryption::{
+    EncryptedOutboundWithSource, OriginalEncryptionSource, SessionBoundEncryptionWithSource,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ResponderTokenDisposition {

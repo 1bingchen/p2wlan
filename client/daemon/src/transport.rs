@@ -407,6 +407,71 @@ struct PathCommitIngress<'a> {
     token: crate::path_commit::PathCommitToken,
 }
 
+/// Immutable identity of the exact receive key which authenticated a packet.
+/// This is provenance, not a transferable current-owner or business-credit guard.
+#[derive(Clone)]
+#[allow(dead_code)] // S1 captures provenance; S2/S3 will carry and fence it.
+pub(crate) struct OriginalSessionSource {
+    owner: Weak<Mutex<HashMap<String, PeerTransportSessions>>>,
+    peer_id: String,
+    session_instance: u64,
+    from_previous_session: bool,
+    authorized_peer_lifecycle: Option<PeerSessionGeneration>,
+    authenticated_at: Instant,
+}
+
+#[allow(dead_code)]
+impl OriginalSessionSource {
+    pub(crate) fn peer_id(&self) -> &str {
+        &self.peer_id
+    }
+
+    pub(crate) fn session_instance(&self) -> u64 {
+        self.session_instance
+    }
+
+    pub(crate) fn is_previous_session(&self) -> bool {
+        self.from_previous_session
+    }
+
+    pub(crate) fn authorized_peer_lifecycle(&self) -> Option<PeerSessionGeneration> {
+        self.authorized_peer_lifecycle
+    }
+
+    pub(crate) fn authenticated_at(&self) -> Instant {
+        self.authenticated_at
+    }
+
+    pub(crate) fn belongs_to(&self, transport: &WireGuardTransport) -> bool {
+        Weak::ptr_eq(&self.owner, &Arc::downgrade(&transport.sessions))
+    }
+}
+
+pub(crate) struct DecryptedInboundWithSource {
+    pub(crate) packet: InboundPacket,
+    pub(crate) source: OriginalSessionSource,
+}
+
+impl WireGuardTransport {
+    // Called only under the successful key's sessions guard, before any await.
+    fn original_session_source(
+        &self,
+        peer_id: &str,
+        session_instance: u64,
+        from_previous_session: bool,
+        authorized_peer_lifecycle: Option<PeerSessionGeneration>,
+    ) -> OriginalSessionSource {
+        OriginalSessionSource {
+            owner: Arc::downgrade(&self.sessions),
+            peer_id: peer_id.to_string(),
+            session_instance,
+            from_previous_session,
+            authorized_peer_lifecycle,
+            authenticated_at: Instant::now(),
+        }
+    }
+}
+
 enum CurrentSessionEvidenceGuardOutcome {
     Current(OwnedMutexGuard<()>),
     Contended,
@@ -564,3 +629,7 @@ mod sessions;
 pub(crate) use resource_queue_test_gate::ResourceQueueTestGate;
 mod wire;
 use sessions::PeerTransportSessions;
+#[allow(unused_imports)] // Opaque rollback API is available for future qualified callers.
+pub(crate) use sessions::{
+    SessionRollback, SessionRollbackIdentityMismatch, SessionRollbackRejection,
+};

@@ -141,8 +141,11 @@ impl WireGuardTransport {
                 "encrypted datagram reached the daemon transport decrypt boundary"
             );
             let decrypt_started = Instant::now();
-            match self.decrypt_inbound_classified(&packet.wire_bytes).await {
-                Ok(Some(mut inbound)) => {
+            match self.decrypt_inbound_with_source(&packet.wire_bytes).await {
+                Ok(Some(DecryptedInboundWithSource {
+                    packet: mut inbound,
+                    source: _original_session_source,
+                })) => {
                     let decrypt_completed = Instant::now();
                     if let Some(capture) = self.rx_business_capture.as_ref() {
                         let wire = match (

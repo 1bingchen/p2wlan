@@ -28,6 +28,7 @@ mod tests {
     use tokio::time::{sleep, timeout};
 
     include!("tests/direct_validation_contention.rs");
+    include!("tests/auth_lifecycle_source.rs");
 
     #[test]
     fn first_usable_evidence_requires_a_decrypted_overlay_ip_packet() {

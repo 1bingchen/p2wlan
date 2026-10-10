@@ -28,15 +28,63 @@ struct TransportSessionSlot {
     /// process-local instance lets the inbound worker detect removal or
     /// replacement between decrypt and evidence processing.
     session_instance: u64,
+    /// Original handshake authorization; generic/legacy key installs are unknown.
+    /// Packet network generation remains a separate ingress-envelope property.
+    authorized_peer_lifecycle: Option<PeerSessionGeneration>,
+}
+
+/// Owns the actual displaced slot; restoration never reconstructs its lifecycle
+/// from a later PeerManager observation. Previous/pending cleanup keeps its policy.
+pub(crate) struct SessionRollback {
+    slot: TransportSessionSlot,
+    peer_id: String,
+    owner: Weak<Mutex<HashMap<String, PeerTransportSessions>>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SessionRollbackIdentityMismatch {
+    PeerMismatch,
+    OwnerMismatch,
+}
+
+/// Rejected restoration keeps ownership of the original slot for a valid retry.
+pub(crate) struct SessionRollbackRejection {
+    reason: SessionRollbackIdentityMismatch,
+    rollback: Box<SessionRollback>,
+}
+
+impl std::fmt::Debug for SessionRollbackRejection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SessionRollbackRejection")
+            .field("reason", &self.reason)
+            .finish_non_exhaustive()
+    }
+}
+
+#[allow(dead_code)] // Qualified rollback has no production caller yet.
+impl SessionRollbackRejection {
+    pub(crate) fn reason(&self) -> SessionRollbackIdentityMismatch {
+        self.reason
+    }
+
+    pub(crate) fn into_rollback(self) -> SessionRollback {
+        *self.rollback
+    }
 }
 
 impl TransportSessionSlot {
-    fn new(session: TransportSession, token: Option<String>, session_instance: u64) -> Self {
+    fn new(
+        session: TransportSession,
+        token: Option<String>,
+        session_instance: u64,
+        authorized_peer_lifecycle: Option<PeerSessionGeneration>,
+    ) -> Self {
         Self {
             session,
             token,
             awaiting_confirmation: false,
             session_instance,
+            authorized_peer_lifecycle,
         }
     }
 }
@@ -467,6 +515,35 @@ impl WireGuardTransport {
         token: Option<String>,
         session: TransportSession,
     ) -> bool {
+        self.install_active_session_with_lifecycle_locked(peer_id, token, session, None)
+            .await
+    }
+
+    /// The caller has already validated this original handshake lifecycle under
+    /// its emit -> epoch boundary. This API does not observe current membership.
+    pub(crate) async fn install_active_session_for_lifecycle_locked(
+        &self,
+        peer_id: &str,
+        token: Option<String>,
+        session: TransportSession,
+        authorized_peer_lifecycle: PeerSessionGeneration,
+    ) -> bool {
+        self.install_active_session_with_lifecycle_locked(
+            peer_id,
+            token,
+            session,
+            Some(authorized_peer_lifecycle),
+        )
+        .await
+    }
+
+    async fn install_active_session_with_lifecycle_locked(
+        &self,
+        peer_id: &str,
+        token: Option<String>,
+        session: TransportSession,
+        authorized_peer_lifecycle: Option<PeerSessionGeneration>,
+    ) -> bool {
         let now = Instant::now();
         let session_instance = self.allocate_session_instance();
         let replaced_existing = {
@@ -474,7 +551,12 @@ impl WireGuardTransport {
             if let Some(existing) = sessions.get_mut(peer_id) {
                 existing.prune_expired(now);
                 existing.install_with_overlap(
-                    TransportSessionSlot::new(session, token, session_instance),
+                    TransportSessionSlot::new(
+                        session,
+                        token,
+                        session_instance,
+                        authorized_peer_lifecycle,
+                    ),
                     now,
                 )
             } else {
@@ -484,6 +566,7 @@ impl WireGuardTransport {
                         session,
                         token,
                         session_instance,
+                        authorized_peer_lifecycle,
                     )),
                 );
                 false
@@ -527,12 +610,66 @@ impl WireGuardTransport {
             .await
     }
 
+    /// Bind newly prepared responder keys to their original verified lifecycle.
+    pub(crate) async fn stage_responder_session_for_lifecycle(
+        &self,
+        peer_id: impl Into<String>,
+        token: String,
+        session: TransportSession,
+        authorized_peer_lifecycle: PeerSessionGeneration,
+    ) -> ResponderSessionStage {
+        self.stage_responder_session_with_lifecycle(
+            peer_id.into(),
+            token,
+            session,
+            false,
+            Some(authorized_peer_lifecycle),
+        )
+        .await
+    }
+
+    /// The caller's existing cache has verified exact keys/fingerprint/lifecycle.
+    pub(crate) async fn restage_cached_responder_session_for_lifecycle(
+        &self,
+        peer_id: impl Into<String>,
+        token: String,
+        session: TransportSession,
+        authorized_peer_lifecycle: PeerSessionGeneration,
+    ) -> ResponderSessionStage {
+        self.stage_responder_session_with_lifecycle(
+            peer_id.into(),
+            token,
+            session,
+            true,
+            Some(authorized_peer_lifecycle),
+        )
+        .await
+    }
+
     pub(in crate::transport) async fn stage_responder_session_inner(
         &self,
         peer_id: String,
         token: String,
         session: TransportSession,
         allow_seen_restage: bool,
+    ) -> ResponderSessionStage {
+        self.stage_responder_session_with_lifecycle(
+            peer_id,
+            token,
+            session,
+            allow_seen_restage,
+            None,
+        )
+        .await
+    }
+
+    async fn stage_responder_session_with_lifecycle(
+        &self,
+        peer_id: String,
+        token: String,
+        session: TransportSession,
+        allow_seen_restage: bool,
+        authorized_peer_lifecycle: Option<PeerSessionGeneration>,
     ) -> ResponderSessionStage {
         // Staging is a session-lifecycle mutation even though it does not
         // publish an outbound key yet. Serialize it with remove/flush/live
@@ -552,9 +689,18 @@ impl WireGuardTransport {
                 .and_then(|active| active.token.as_deref())
                 == Some(token.as_str())
             {
+                if existing.active.as_ref().is_some_and(|active| {
+                    active.authorized_peer_lifecycle != authorized_peer_lifecycle
+                }) {
+                    return ResponderSessionStage::StaleDuplicate;
+                }
                 return ResponderSessionStage::ReplayableDuplicate { had_active };
             }
             if let Some(pending) = existing.pending.get_mut(&token) {
+                // A replay may extend delivery, never re-authorize the old key.
+                if pending.slot.authorized_peer_lifecycle != authorized_peer_lifecycle {
+                    return ResponderSessionStage::StaleDuplicate;
+                }
                 // Give an exact cached-answer replay a fresh delivery window.
                 // The cached key is still installed, so replaying the same
                 // answer remains safe and can recover an ambiguous send.
@@ -595,6 +741,7 @@ impl WireGuardTransport {
                         session,
                         Some(token.clone()),
                         pending_session_instance,
+                        authorized_peer_lifecycle,
                     ),
                     expires_at: now + PENDING_RESPONDER_SESSION_GRACE,
                     answer_committed: false,
@@ -606,7 +753,12 @@ impl WireGuardTransport {
             let mut peer_sessions = PeerTransportSessions::pending_only(
                 token.clone(),
                 PendingTransportSession {
-                    slot: TransportSessionSlot::new(session, Some(token.clone()), session_instance),
+                    slot: TransportSessionSlot::new(
+                        session,
+                        Some(token.clone()),
+                        session_instance,
+                        authorized_peer_lifecycle,
+                    ),
                     expires_at: now + PENDING_RESPONDER_SESSION_GRACE,
                     answer_committed: false,
                 },
@@ -944,13 +1096,40 @@ impl WireGuardTransport {
         }
     }
 
-    /// Replace a session and return the previous value for transactional rollback.
+    /// Legacy replacement returns only a key, deliberately without authorization.
     pub async fn replace_session(
         &self,
         peer_id: impl Into<String>,
         session: TransportSession,
     ) -> Option<TransportSession> {
-        let peer_id = peer_id.into();
+        self.replace_session_with_lifecycle(peer_id.into(), session, None)
+            .await
+            .map(|previous| previous.slot.session)
+    }
+
+    /// Transactional companion for callers with original handshake authorization.
+    /// The returned opaque value owns the old key and all its slot metadata.
+    #[allow(dead_code)] // No production rollback caller yet; legacy API stays intact.
+    pub(crate) async fn replace_session_for_lifecycle(
+        &self,
+        peer_id: impl Into<String>,
+        session: TransportSession,
+        authorized_peer_lifecycle: PeerSessionGeneration,
+    ) -> Option<SessionRollback> {
+        self.replace_session_with_lifecycle(
+            peer_id.into(),
+            session,
+            Some(authorized_peer_lifecycle),
+        )
+        .await
+    }
+
+    async fn replace_session_with_lifecycle(
+        &self,
+        peer_id: String,
+        session: TransportSession,
+        authorized_peer_lifecycle: Option<PeerSessionGeneration>,
+    ) -> Option<SessionRollback> {
         let emit_lock = self.outbound_emit_lock(&peer_id).await;
         let _emit_guard = emit_lock.lock().await;
         let now = Instant::now();
@@ -965,8 +1144,13 @@ impl WireGuardTransport {
                     session,
                     None,
                     self.allocate_session_instance(),
+                    authorized_peer_lifecycle,
                 ))
-                .map(|previous| previous.session)
+                .map(|slot| SessionRollback {
+                    slot,
+                    peer_id: peer_id.clone(),
+                    owner: Arc::downgrade(&self.sessions),
+                })
         } else {
             sessions.insert(
                 peer_id,
@@ -974,27 +1158,62 @@ impl WireGuardTransport {
                     session,
                     None,
                     self.allocate_session_instance(),
+                    authorized_peer_lifecycle,
                 )),
             );
             None
         }
     }
 
-    /// Restore the session state captured before a transactional replacement.
+    /// Legacy raw-key restoration remains unqualified; no current-lifecycle lookup.
     pub async fn restore_session(&self, peer_id: &str, previous: Option<TransportSession>) {
+        self.restore_session_slot(
+            peer_id,
+            previous.map(|session| TransportSessionSlot::new(session, None, 0, None)),
+        )
+        .await;
+    }
+
+    /// Restore only to the original peer and actual session-map owner. Identity
+    /// rejection precedes every lock/mutation and returns the untouched token.
+    /// A valid restore keeps original authorization and allocates a fresh instance.
+    #[allow(dead_code)]
+    pub(crate) async fn restore_session_rollback(
+        &self,
+        peer_id: &str,
+        previous: Option<SessionRollback>,
+    ) -> std::result::Result<(), SessionRollbackRejection> {
+        let previous = match previous {
+            Some(previous) => {
+                let reason = if previous.peer_id != peer_id {
+                    Some(SessionRollbackIdentityMismatch::PeerMismatch)
+                } else if !Weak::ptr_eq(&previous.owner, &Arc::downgrade(&self.sessions)) {
+                    Some(SessionRollbackIdentityMismatch::OwnerMismatch)
+                } else {
+                    None
+                };
+                if let Some(reason) = reason {
+                    return Err(SessionRollbackRejection {
+                        reason,
+                        rollback: Box::new(previous),
+                    });
+                }
+                Some(previous.slot)
+            }
+            None => None,
+        };
+        self.restore_session_slot(peer_id, previous).await;
+        Ok(())
+    }
+
+    async fn restore_session_slot(&self, peer_id: &str, previous: Option<TransportSessionSlot>) {
         let emit_lock = self.outbound_emit_lock(peer_id).await;
         let _emit_guard = emit_lock.lock().await;
         let restored_previous = previous.is_some();
         let mut sessions = self.sessions.lock().await;
-        if let Some(previous) = previous {
-            sessions.insert(
-                peer_id.to_string(),
-                PeerTransportSessions::new(TransportSessionSlot::new(
-                    previous,
-                    None,
-                    self.allocate_session_instance(),
-                )),
-            );
+        if let Some(mut previous) = previous {
+            previous.session_instance = self.allocate_session_instance();
+            sessions.insert(peer_id.to_string(), PeerTransportSessions::new(previous));
         } else {
             sessions.remove(peer_id);
         }

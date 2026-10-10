@@ -135,7 +135,7 @@ impl Daemon {
             let shutdown_rx = self.shutdown_rx.clone();
             self.task_manager
                 .spawn("overlay-validate", false, async move {
-                    run_overlay_validate_loop(
+                    run_sourced_overlay_validate_loop(
                         controller,
                         overlay_peers,
                         overlay_local_vip,

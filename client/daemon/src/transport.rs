@@ -40,6 +40,8 @@ use crate::peer::{PeerManager, PeerSessionGeneration, PendingProbeBindingCommitO
 
 use crate::relay::RelayTransport;
 
+pub(crate) use inbound::OverlayIngressDelivery;
+
 pub(crate) use wire::wire_fingerprint;
 
 pub(crate) use wire::wire_counter;
@@ -384,7 +386,7 @@ pub(crate) struct InboundEvidenceFeed {
     /// feed below. A decrypted non-control packet is therefore recorded as
     /// first-usable evidence on the normal production path too.
     pub(crate) timeline: Option<Arc<crate::connection_timeline::ConnectionTimeline>>,
-    pub(crate) overlay_ingress_tx: Option<mpsc::Sender<OverlayIngressEvent>>,
+    pub(crate) overlay_ingress_tx: Option<mpsc::Sender<OverlayIngressDelivery>>,
 }
 
 struct RelayProbeIngress<'a> {

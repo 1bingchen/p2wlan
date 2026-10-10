@@ -2,6 +2,10 @@ use super::*;
 use crate::connection_timeline::HotPathObservation;
 use crate::transport::wire::wire_receiver_index;
 
+mod overlay_ingress;
+use overlay_ingress::EncryptedOverlayOrigin;
+pub(crate) use overlay_ingress::OverlayIngressDelivery;
+
 impl WireGuardTransport {
     /// Consume encrypted network packets, decrypt them, and emit raw inbound IP packets.
     pub async fn run_inbound(
@@ -115,6 +119,10 @@ impl WireGuardTransport {
                     Instant::now().duration_since(udp_received),
                 );
             }
+            let overlay_origin = evidence
+                .as_ref()
+                .and_then(|feed| feed.overlay_ingress_tx.as_ref())
+                .map(|_| EncryptedOverlayOrigin::capture(&packet));
             let source = packet.source;
             let local_endpoint = packet.local_endpoint;
             let relay_endpoint = packet.relay_endpoint;
@@ -144,8 +152,10 @@ impl WireGuardTransport {
             match self.decrypt_inbound_with_source(&packet.wire_bytes).await {
                 Ok(Some(DecryptedInboundWithSource {
                     packet: mut inbound,
-                    source: _original_session_source,
+                    source: original_session_source,
                 })) => {
+                    let overlay_source =
+                        overlay_origin.map(|origin| origin.authenticated(original_session_source));
                     let decrypt_completed = Instant::now();
                     if let Some(capture) = self.rx_business_capture.as_ref() {
                         let wire = match (
@@ -1349,7 +1359,9 @@ impl WireGuardTransport {
                                     None
                                 };
                                 if let Some(ingress) = ingress {
-                                    if let Some(tx) = &feed.overlay_ingress_tx {
+                                    if let (Some(tx), Some(original_source)) =
+                                        (&feed.overlay_ingress_tx, overlay_source)
+                                    {
                                         let connection_generation = packet_network_generation
                                             .or_else(|| {
                                                 peers.as_ref().map(|manager| {
@@ -1357,13 +1369,17 @@ impl WireGuardTransport {
                                                 })
                                             })
                                             .unwrap_or_default();
+                                        let event = OverlayIngressEvent {
+                                            peer_id: inbound.peer_id.clone(),
+                                            packet: inbound.packet.clone(),
+                                            ingress,
+                                            connection_generation,
+                                        };
                                         let _ = tx
-                                            .send(OverlayIngressEvent {
-                                                peer_id: inbound.peer_id.clone(),
-                                                packet: inbound.packet.clone(),
-                                                ingress,
-                                                connection_generation,
-                                            })
+                                            .send(OverlayIngressDelivery::authenticated(
+                                                event,
+                                                original_source,
+                                            ))
                                             .await;
                                     }
                                 }

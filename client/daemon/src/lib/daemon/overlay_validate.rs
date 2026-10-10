@@ -39,7 +39,7 @@
 use std::collections::VecDeque;
 use std::path::PathBuf;
 
-use crate::transport::{OverlayIngress, OverlayIngressEvent};
+use crate::transport::{OverlayIngress, OverlayIngressDelivery, OverlayIngressEvent};
 use p2pnet_tun::mock::MockTunController;
 
 /// Overlay payload magic ("P2WLOV"), shared with the transport-layer
@@ -442,9 +442,71 @@ pub async fn run_overlay_validate_loop(
     udp_transport: Arc<RwLock<Option<UdpTransport>>>,
     overlay_burst: usize,
     timeline: Arc<ConnectionTimeline>,
-    mut overlay_ingress_rx: mpsc::Receiver<OverlayIngressEvent>,
-    mut shutdown_rx: watch::Receiver<bool>,
+    overlay_ingress_rx: mpsc::Receiver<OverlayIngressEvent>,
+    shutdown_rx: watch::Receiver<bool>,
 ) {
+    run_overlay_validate_loop_inner(
+        controller,
+        peers,
+        local_vip,
+        local_node_id,
+        overlay_start_gate_file,
+        overlay_any_path,
+        udp_transport,
+        overlay_burst,
+        timeline,
+        overlay_ingress_rx,
+        shutdown_rx,
+    )
+    .await;
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_sourced_overlay_validate_loop(
+    controller: MockTunController,
+    peers: Arc<PeerManager>,
+    local_vip: String,
+    local_node_id: String,
+    overlay_start_gate_file: Option<PathBuf>,
+    overlay_any_path: bool,
+    udp_transport: Arc<RwLock<Option<UdpTransport>>>,
+    overlay_burst: usize,
+    timeline: Arc<ConnectionTimeline>,
+    overlay_ingress_rx: mpsc::Receiver<OverlayIngressDelivery>,
+    shutdown_rx: watch::Receiver<bool>,
+) {
+    run_overlay_validate_loop_inner(
+        controller,
+        peers,
+        local_vip,
+        local_node_id,
+        overlay_start_gate_file,
+        overlay_any_path,
+        udp_transport,
+        overlay_burst,
+        timeline,
+        overlay_ingress_rx,
+        shutdown_rx,
+    )
+    .await;
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_overlay_validate_loop_inner<T>(
+    controller: MockTunController,
+    peers: Arc<PeerManager>,
+    local_vip: String,
+    local_node_id: String,
+    overlay_start_gate_file: Option<PathBuf>,
+    overlay_any_path: bool,
+    udp_transport: Arc<RwLock<Option<UdpTransport>>>,
+    overlay_burst: usize,
+    timeline: Arc<ConnectionTimeline>,
+    mut overlay_ingress_rx: mpsc::Receiver<T>,
+    mut shutdown_rx: watch::Receiver<bool>,
+) where
+    T: Into<OverlayIngressDelivery> + Send + 'static,
+{
     info!(
         "overlay_validate loop started local_vip={local_vip} any_path={overlay_any_path} burst={overlay_burst}: sending real encrypted overlay payloads through the production dataplane"
     );
@@ -647,6 +709,7 @@ pub async fn run_overlay_validate_loop(
                     warn!("overlay_validate: overlay ingress feed closed; stopping");
                     break;
                 };
+                let event: OverlayIngressDelivery = event.into();
                 handle_overlay_ingress(
                     event,
                     &controller,
@@ -841,7 +904,7 @@ enum OverlayVerdict {
 /// inbound path with its real ingress metadata.
 #[allow(clippy::too_many_arguments)]
 async fn handle_overlay_ingress(
-    event: OverlayIngressEvent,
+    event: impl Into<OverlayIngressDelivery>,
     controller: &MockTunController,
     local_vip: &str,
     _local_node_id: &str,
@@ -856,6 +919,8 @@ async fn handle_overlay_ingress(
     pending_echoes: &mut VecDeque<PendingOverlayEcho>,
     udp_transport: Option<&Arc<RwLock<Option<UdpTransport>>>>,
 ) {
+    // Carried intact to validation. S3 will qualify it before granting credit.
+    let (event, _original_source) = event.into().into_parts();
     let current_generation = peers.current_network_generation_sync();
     if event.connection_generation != current_generation {
         stats.received_invalid = stats.received_invalid.saturating_add(1);

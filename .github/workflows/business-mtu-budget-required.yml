@@ -17,6 +17,10 @@ on:
       - "docs/reference/networking.md"
       - "Cargo.toml"
       - "Cargo.lock"
+      # Close same-head network/CI prerequisites; regression checks read the dependency graph.
+      - ".github/workflows/**"
+      - "scripts/mtu-smoke.sh"
+      - "scripts/quality/**"
   pull_request:
     branches:
       - main
@@ -33,6 +37,10 @@ on:
       - "docs/reference/networking.md"
       - "Cargo.toml"
       - "Cargo.lock"
+      # Close same-head network/CI prerequisites; regression checks read the dependency graph.
+      - ".github/workflows/**"
+      - "scripts/mtu-smoke.sh"
+      - "scripts/quality/**"
   workflow_dispatch:
     inputs:
       validation_sha:

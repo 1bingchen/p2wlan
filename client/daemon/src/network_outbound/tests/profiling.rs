@@ -24,7 +24,7 @@ fn packet(sequence: u8, bytes: usize, sampled: Option<bool>) -> OutboundPacket {
 
 fn pending_packet(sequence: u8, queued_at: Instant) -> PendingPacket {
     PendingPacket::Plain {
-        packet: packet(sequence, 4, None),
+        packet: packet(sequence, 4, None).into(),
         direct_budget_reroutes: 0,
         local_backpressure_retries: 0,
         pending_residence: Some(PendingQueueResidence::start_at(queued_at)),

@@ -252,25 +252,66 @@ impl WireGuardTransport {
     pub fn new() -> (Self, mpsc::Receiver<OutboundPacket>) {
         let (outbound_tx, outbound_rx) = mpsc::channel(1024);
         (
-            Self {
-                resource_capture: None,
-                #[cfg(test)]
-                resource_queue_gate: None,
-                rx_business_capture: None,
-                wg_evidence_owner: crate::business_evidence::WgEvidenceOwnerId::allocate(),
-                sessions: Arc::new(Mutex::new(HashMap::new())),
-                next_session_instance: Arc::new(AtomicU64::new(1)),
-                pending_outbound: Arc::new(Mutex::new(HashMap::new())),
-                outbound_ingress_locks: Arc::new(Mutex::new(HashMap::new())),
-                outbound_emit_locks: Arc::new(Mutex::new(HashMap::new())),
-                promoted_responder_tokens: Arc::new(std::sync::Mutex::new(HashMap::new())),
-                hedge_replay_counters: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            Self::with_raw_outbound_sink(crate::request_carriage::RawOutboundSink::Legacy(
                 outbound_tx,
-                outbound_loss_sink: Arc::new(std::sync::Mutex::new(None)),
-                outbound_loss_context: Arc::new(std::sync::Mutex::new(None)),
-            },
+            )),
             outbound_rx,
         )
+    }
+
+    pub(crate) fn new_with_request_carriage() -> (
+        Self,
+        mpsc::Receiver<crate::request_carriage::RawRequestDelivery>,
+    ) {
+        let (outbound_tx, outbound_rx) = mpsc::channel(1024);
+        (
+            Self::with_raw_outbound_sink(crate::request_carriage::RawOutboundSink::Tracked(
+                outbound_tx,
+            )),
+            outbound_rx,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_request_handoff_probe(
+        mut self,
+        probe: Arc<crate::request_carriage::test_probe::RequestHandoffArgumentProbe>,
+    ) -> Self {
+        self.request_handoff_probe = Some(probe);
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn observe_request_handoff_for_test(
+        &self,
+        packet: &crate::request_carriage::EncryptedRequestDelivery,
+        point: crate::request_carriage::test_probe::HandoffArgumentPoint,
+    ) {
+        if let Some(probe) = self.request_handoff_probe.as_ref() {
+            probe.observe(packet, self, point);
+        }
+    }
+
+    fn with_raw_outbound_sink(outbound_tx: crate::request_carriage::RawOutboundSink) -> Self {
+        Self {
+            resource_capture: None,
+            #[cfg(test)]
+            resource_queue_gate: None,
+            #[cfg(test)]
+            request_handoff_probe: None,
+            rx_business_capture: None,
+            wg_evidence_owner: crate::business_evidence::WgEvidenceOwnerId::allocate(),
+            sessions: Arc::new(Mutex::new(HashMap::new())),
+            next_session_instance: Arc::new(AtomicU64::new(1)),
+            pending_outbound: Arc::new(Mutex::new(HashMap::new())),
+            outbound_ingress_locks: Arc::new(Mutex::new(HashMap::new())),
+            outbound_emit_locks: Arc::new(Mutex::new(HashMap::new())),
+            promoted_responder_tokens: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            hedge_replay_counters: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            outbound_tx,
+            outbound_loss_sink: Arc::new(std::sync::Mutex::new(None)),
+            outbound_loss_context: Arc::new(std::sync::Mutex::new(None)),
+        }
     }
 
     /// Install one aggregate observer before spawning the transport workers.

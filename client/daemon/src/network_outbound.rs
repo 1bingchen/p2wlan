@@ -95,7 +95,10 @@ use crate::peer::{
 
 use crate::relay::RelayTransport;
 
-use crate::transport::{EncryptedPeerPacket, SessionBoundEncryption, WireGuardTransport};
+use crate::request_carriage::{
+    EncryptedRequestDelivery, RawOutboundReceiver, RawRequestDelivery, RequestEncryptionAttempt,
+};
+use crate::transport::{EncryptedPeerPacket, WireGuardTransport};
 
 use crate::udp::{
     DirectBusinessBudgetGate, DirectBusinessUdpSendError, PreparedDirectBusinessSend, UdpTransport,
@@ -381,26 +384,28 @@ use diagnostics::complete_inner_ip_packet_len;
 
 use fast_path::try_lan_direct_fast_path;
 
+#[cfg(test)]
 pub(crate) use queue::run_network_outbound;
+pub(crate) use queue::run_network_outbound_with_request_carriage;
 
 /// Outcome of encrypting and sending one RAW packet.
 enum EncryptSendOutcome {
     Sent,
     BudgetPending {
-        packet: OutboundPacket,
+        packet: RawRequestDelivery,
         reason: String,
     },
     Retryable {
-        packet: OutboundPacket,
+        packet: RawRequestDelivery,
         reason_code: &'static str,
         reason: String,
     },
     RetryableLocalBackpressure {
-        packet: OutboundPacket,
+        packet: RawRequestDelivery,
         reason: String,
     },
     Terminal {
-        packet: OutboundPacket,
+        packet: RawRequestDelivery,
         reason_code: &'static str,
         reason: String,
     },

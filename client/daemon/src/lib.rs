@@ -56,6 +56,7 @@ pub mod port_mapping;
 pub mod relay;
 pub(crate) mod relay_probe;
 pub(crate) mod relay_runtime;
+mod request_carriage;
 pub mod rooms;
 pub mod route;
 pub mod tasks;
@@ -138,7 +139,11 @@ use diagnostics::{
 };
 use dns::DnsResolver;
 use gateway_mapping::{record_method_result, GatewayMappingDiagnostics, GatewayMappingRuntime};
-use network_outbound::{run_direct_first_deadline_loop, run_network_outbound, RelayStartupWait};
+#[cfg(test)]
+use network_outbound::run_network_outbound;
+use network_outbound::{
+    run_direct_first_deadline_loop, run_network_outbound_with_request_carriage, RelayStartupWait,
+};
 #[cfg(target_os = "android")]
 use p2pnet_tun::AndroidTunMode;
 use p2pnet_tun::{InterfaceConfig, Ipv4Packet, TunDevice, VirtualInterface};

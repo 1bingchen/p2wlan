@@ -30,9 +30,9 @@ impl FastPathEligibilityToken {
 
 pub(super) enum FastPathAttempt {
     Sent,
-    Fallback(OutboundPacket),
+    Fallback(RawRequestDelivery),
     Terminal {
-        packet: OutboundPacket,
+        packet: RawRequestDelivery,
         generation: u64,
         reason_code: &'static str,
         reason: String,
@@ -52,7 +52,7 @@ pub(super) enum FastPathAttempt {
 /// successful fast send cannot overtake an earlier plaintext packet.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn try_lan_direct_fast_path(
-    packet: OutboundPacket,
+    packet: impl Into<RawRequestDelivery>,
     transport: &WireGuardTransport,
     peers: &PeerManager,
     prefer_direct: bool,
@@ -60,6 +60,7 @@ pub(super) fn try_lan_direct_fast_path(
     fast_paths: &mut HashMap<String, DirectFastPathEntry>,
     ineligible: &mut HashMap<String, FastPathEligibilityToken>,
 ) -> FastPathAttempt {
+    let packet = packet.into();
     let peer_id = packet.peer_id.as_str();
     let profiler = global_dataplane_profiler();
     // The legacy LAN specialization predates business-budget tokens. A
@@ -317,18 +318,18 @@ pub(super) fn try_lan_direct_fast_path(
         };
 
         let (encrypted, plaintext, session_lock_wait_us, crypto_us) = match transport
-            .try_encrypt_outbound_with_emit_guard_for_session(packet, entry.session_instance)
+            .try_encrypt_request_with_emit_guard_for_session(packet, entry.session_instance)
         {
-            SessionBoundEncryption::Encrypted {
+            RequestEncryptionAttempt::Encrypted {
                 packet: encrypted,
                 plaintext,
                 session_lock_wait_us,
                 crypto_us,
             } => (encrypted, plaintext, session_lock_wait_us, crypto_us),
-            SessionBoundEncryption::Contended(packet) => {
+            RequestEncryptionAttempt::Contended(packet) => {
                 return FastPathAttempt::Fallback(packet);
             }
-            SessionBoundEncryption::Unavailable { packet, reason } => {
+            RequestEncryptionAttempt::Unavailable { packet, reason } => {
                 debug!(
                     event = "wireguard_session_unavailable",
                     peer_id = %packet.peer_id,
@@ -341,7 +342,7 @@ pub(super) fn try_lan_direct_fast_path(
                 fast_paths.remove(packet.peer_id.as_str());
                 return FastPathAttempt::Fallback(packet);
             }
-            SessionBoundEncryption::Failed { packet, error } => {
+            RequestEncryptionAttempt::Failed { packet, error } => {
                 drop(emit_guard);
                 fast_paths.remove(packet.peer_id.as_str());
                 return FastPathAttempt::Terminal {
@@ -405,6 +406,11 @@ pub(super) fn try_lan_direct_fast_path(
         session_instance = entry.session_instance,
         counter = ?crate::transport::wire_counter(&encrypted.wire_bytes),
         "encrypted packet entered the LAN Direct fast path"
+    );
+    #[cfg(test)]
+    transport.observe_request_handoff_for_test(
+        &encrypted,
+        crate::request_carriage::test_probe::HandoffArgumentPoint::FastUdpCall,
     );
     let send_result = udp.try_send_lan_business_packet_on_socket(
         &socket,
@@ -576,3 +582,7 @@ pub(super) fn try_lan_direct_fast_path(
 #[cfg(test)]
 #[path = "tests/fast_path.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "tests/request_carriage_fast.rs"]
+mod request_carriage_tests;

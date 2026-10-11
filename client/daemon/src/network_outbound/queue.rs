@@ -50,7 +50,7 @@ impl QueueLossReason {
 /// operation; a retry releases the guard and allocates a fresh counter.
 pub(super) enum PendingPacket {
     Plain {
-        packet: OutboundPacket,
+        packet: RawRequestDelivery,
         direct_budget_reroutes: u8,
         local_backpressure_retries: u32,
         pending_residence: Option<PendingQueueResidence>,
@@ -58,7 +58,8 @@ pub(super) enum PendingPacket {
 }
 
 impl PendingPacket {
-    fn plain(packet: OutboundPacket) -> Self {
+    fn plain(packet: impl Into<RawRequestDelivery>) -> Self {
+        let packet = packet.into();
         let pending_residence =
             PendingQueueResidence::start(packet.trace.as_ref().is_some_and(|trace| trace.sampled));
         Self::Plain {
@@ -342,8 +343,37 @@ pub(super) fn bump_probe_kick(kick: &mut u64, relay_probe_kick_tx: &watch::Sende
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code)] // Preserve the original raw-only compatibility entry.
 pub(crate) async fn run_network_outbound(
-    mut outbound_rx: mpsc::Receiver<OutboundPacket>,
+    outbound_rx: mpsc::Receiver<OutboundPacket>,
+    transport: WireGuardTransport,
+    peers: Arc<PeerManager>,
+    prefer_direct: bool,
+    udp_transport: Arc<RwLock<Option<UdpTransport>>>,
+    relay_transport: Arc<RwLock<Option<RelayTransport>>>,
+    relay_available_rx: watch::Receiver<bool>,
+    relay_startup_wait: RelayStartupWait,
+    relay_probe_kick_tx: watch::Sender<u64>,
+    timeline: Arc<ConnectionTimeline>,
+) {
+    run_network_outbound_with_request_carriage(
+        outbound_rx.into(),
+        transport,
+        peers,
+        prefer_direct,
+        udp_transport,
+        relay_transport,
+        relay_available_rx,
+        relay_startup_wait,
+        relay_probe_kick_tx,
+        timeline,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_network_outbound_with_request_carriage(
+    mut outbound_rx: RawOutboundReceiver,
     transport: WireGuardTransport,
     peers: Arc<PeerManager>,
     prefer_direct: bool,
@@ -1011,7 +1041,7 @@ pub(super) async fn record_retry_and_repark(
     peers: &PeerManager,
     peer_id: &str,
     entry: &mut PeerPendingQueue,
-    packet: OutboundPacket,
+    packet: impl Into<RawRequestDelivery> + Send,
     direct_budget_reroutes: u8,
     local_backpressure_retries: u32,
     mut pending_residence: Option<PendingQueueResidence>,
@@ -1019,6 +1049,7 @@ pub(super) async fn record_retry_and_repark(
     reason: String,
     timeline: &ConnectionTimeline,
 ) {
+    let packet = packet.into();
     let bytes = packet.packet.len();
     let generation = entry
         .wait_generation
@@ -1097,11 +1128,12 @@ pub(super) async fn record_terminal_drop(
     peers: &PeerManager,
     peer_id: &str,
     packet_generation: u64,
-    packet: OutboundPacket,
+    packet: impl Into<RawRequestDelivery> + Send,
     reason_code: &'static str,
     reason: String,
     timeline: &ConnectionTimeline,
 ) {
+    let packet = packet.into();
     report_fast_path_terminal(
         transport,
         peers,
@@ -1287,3 +1319,7 @@ mod tests;
 #[cfg(test)]
 #[path = "tests/profiling.rs"]
 mod profiling_tests;
+
+#[cfg(test)]
+#[path = "queue/request_carriage_tests.rs"]
+mod request_carriage_tests;

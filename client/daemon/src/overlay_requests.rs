@@ -60,6 +60,7 @@ pub(crate) struct CanonicalOverlayRequest {
     local_vip: String,
     target_vip: String,
     target: OriginalTargetExpectation,
+    original_packet: Box<[u8]>,
     injection_accepted: AtomicBool,
 }
 
@@ -83,6 +84,10 @@ impl CanonicalOverlayRequest {
         &self.target_vip
     }
 
+    pub(crate) fn original_packet(&self) -> &[u8] {
+        &self.original_packet
+    }
+
     pub(crate) fn injection_accepted(&self) -> bool {
         self.injection_accepted.load(Ordering::Acquire)
     }
@@ -95,9 +100,8 @@ pub(crate) struct RequestSendToken {
     request: Weak<CanonicalOverlayRequest>,
 }
 
-// B13 intentionally does not add a DataPlane consumer. Decoding identifies a
-// record only; the future consumer must separately validate original bytes,
-// peer/VIP/owner/TTL and acceptance. It grants no native ACK authority.
+// Decoding only identifies the original record. The carriage consumer checks
+// bytes/peer/VIP/owner/TTL separately; this grants no native ACK authority.
 #[allow(dead_code)]
 impl RequestSendToken {
     pub(crate) fn from_read_context(context: PacketReadContext) -> Option<Self> {
@@ -138,6 +142,7 @@ async fn inject_request(
     seq: u32,
     packet: Vec<u8>,
     creation_time: RequestCreationTime,
+    #[cfg(test)] publication_gate: Option<&InjectionPublicationGate>,
 ) -> p2pnet_tun::Result<Arc<CanonicalOverlayRequest>> {
     let request = Arc::new(CanonicalOverlayRequest {
         nonce,
@@ -148,12 +153,19 @@ async fn inject_request(
         local_vip: local_vip.to_string(),
         target_vip: target_vip.to_string(),
         target: target.clone(),
+        // The actual random packet is copied once; the original Vec moves to TUN.
+        original_packet: packet.clone().into_boxed_slice(),
         injection_accepted: AtomicBool::new(false),
     });
     let context = Box::new(RequestSendToken {
         request: Arc::downgrade(&request),
     });
     controller.inject_with_context(packet, context).await?;
+    #[cfg(test)]
+    if let Some(gate) = publication_gate {
+        gate.reached.notify_one();
+        gate.release.notified().await;
+    }
     request.injection_accepted.store(true, Ordering::Release);
     Ok(request)
 }
@@ -294,6 +306,8 @@ async fn fire_pending_bursts_with_creation_time(
                 seq,
                 packet,
                 creation_time,
+                #[cfg(test)]
+                None,
             )
             .await
             {
@@ -349,6 +363,85 @@ pub(super) async fn send_overlay_payloads(
     sent_nonces: &mut HashMap<u64, SentOverlayNonce>,
     nonce_order: &mut VecDeque<u64>,
 ) -> u64 {
+    send_overlay_payloads_inner(
+        controller,
+        peers,
+        local_vip,
+        overlay_any_path,
+        udp_transport,
+        next_nonce,
+        next_seq,
+        stats,
+        sent_nonces,
+        nonce_order,
+        #[cfg(test)]
+        None,
+    )
+    .await
+}
+
+#[cfg(test)]
+pub(crate) struct InjectionPublicationGate {
+    pub(crate) reached: tokio::sync::Notify,
+    pub(crate) release: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+impl InjectionPublicationGate {
+    pub(crate) fn new() -> Self {
+        Self {
+            reached: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        }
+    }
+}
+
+/// A bounded test owns this gate; production has no gate or pause mechanism.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn send_overlay_payloads_with_publication_gate_for_test(
+    controller: &MockTunController,
+    peers: &Arc<PeerManager>,
+    local_vip: &str,
+    overlay_any_path: bool,
+    udp_transport: Option<&Arc<RwLock<Option<UdpTransport>>>>,
+    next_nonce: &mut u64,
+    next_seq: &mut u32,
+    stats: &mut OverlayStats,
+    sent_nonces: &mut HashMap<u64, SentOverlayNonce>,
+    nonce_order: &mut VecDeque<u64>,
+    publication_gate: &InjectionPublicationGate,
+) -> u64 {
+    send_overlay_payloads_inner(
+        controller,
+        peers,
+        local_vip,
+        overlay_any_path,
+        udp_transport,
+        next_nonce,
+        next_seq,
+        stats,
+        sent_nonces,
+        nonce_order,
+        Some(publication_gate),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn send_overlay_payloads_inner(
+    controller: &MockTunController,
+    peers: &Arc<PeerManager>,
+    local_vip: &str,
+    overlay_any_path: bool,
+    udp_transport: Option<&Arc<RwLock<Option<UdpTransport>>>>,
+    next_nonce: &mut u64,
+    next_seq: &mut u32,
+    stats: &mut OverlayStats,
+    sent_nonces: &mut HashMap<u64, SentOverlayNonce>,
+    nonce_order: &mut VecDeque<u64>,
+    #[cfg(test)] publication_gate: Option<&InjectionPublicationGate>,
+) -> u64 {
     let mut sent = 0u64;
     let generation = peers.current_network_generation_sync();
     let committed_peers = peers.committed_business_path_snapshots_sync();
@@ -402,6 +495,8 @@ pub(super) async fn send_overlay_payloads(
             *next_seq,
             packet,
             RequestCreationTime::Now,
+            #[cfg(test)]
+            publication_gate,
         )
         .await
         {

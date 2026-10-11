@@ -5,7 +5,7 @@ use super::*;
 #[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn encrypt_then_send(
-    packet: OutboundPacket,
+    packet: impl Into<RawRequestDelivery> + Send,
     transport: &WireGuardTransport,
     peers: &PeerManager,
     expected_generation: u64,
@@ -33,7 +33,7 @@ pub(super) async fn encrypt_then_send(
 /// guard is still held.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn encrypt_then_send_with_deadline(
-    packet: OutboundPacket,
+    packet: impl Into<RawRequestDelivery> + Send,
     transport: &WireGuardTransport,
     peers: &PeerManager,
     expected_generation: u64,
@@ -44,6 +44,7 @@ pub(super) async fn encrypt_then_send_with_deadline(
     admission_deadline: Option<Instant>,
     stopping: Option<&AtomicBool>,
 ) -> EncryptSendOutcome {
+    let packet = packet.into();
     let retry_packet = packet.clone();
     if let Some(capture) = transport.resource_capture() {
         let _ = capture.observe_vec(
@@ -263,7 +264,7 @@ pub(super) async fn encrypt_then_send_with_deadline(
             } else {
                 None
             };
-            let result = match transport.encrypt_outbound_with_emit_guard(packet).await {
+            let result = match transport.encrypt_request_with_emit_guard(packet).await {
                 Ok(Some(value)) => value,
                 Ok(None) => {
                     debug!(
@@ -406,6 +407,11 @@ pub(super) async fn encrypt_then_send_with_deadline(
         };
     }
     let transport_handoff_started = Instant::now();
+    #[cfg(test)]
+    transport.observe_request_handoff_for_test(
+        &encrypted,
+        crate::request_carriage::test_probe::HandoffArgumentPoint::SlowBoundedEntry,
+    );
     let outcome = send_encrypted_packet_bounded(
         &encrypted,
         peers,
@@ -582,7 +588,7 @@ impl SendAdmissionWindow<'_> {
 /// and releases it immediately after this classification returns.
 #[allow(clippy::too_many_arguments)]
 async fn send_encrypted_packet_bounded(
-    packet: &EncryptedPeerPacket,
+    packet: &EncryptedRequestDelivery,
     peers: &PeerManager,
     prefer_direct: bool,
     udp_transport: &RwLock<Option<UdpTransport>>,
@@ -714,7 +720,7 @@ pub(super) fn outbound_send_timeout_failure_for_path(reason: &'static str) -> Se
 
 #[allow(clippy::too_many_arguments)]
 async fn send_encrypted_packet_once(
-    packet: &EncryptedPeerPacket,
+    packet: &EncryptedRequestDelivery,
     peers: &PeerManager,
     prefer_direct: bool,
     udp_transport: &RwLock<Option<UdpTransport>>,
@@ -1059,3 +1065,7 @@ mod tests;
 #[cfg(test)]
 #[path = "tests/resource_capture_send.rs"]
 mod resource_capture_tests;
+
+#[cfg(test)]
+#[path = "tests/request_carriage_send.rs"]
+mod request_carriage_tests;

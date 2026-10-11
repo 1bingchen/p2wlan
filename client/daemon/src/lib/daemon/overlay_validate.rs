@@ -1353,6 +1353,10 @@ mod ack01_exact_injection_tests {
     use super::*;
     use p2pnet_tun::VirtualInterface;
 
+    mod b14_carriage_read_tests {
+        include!("overlay_validate/b14_carriage_read_tests.rs");
+    }
+
     mod b1_canonical_request_tests {
         include!("overlay_validate/b1_canonical_request_tests.rs");
     }

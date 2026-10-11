@@ -129,19 +129,43 @@ async fn b17_slow_actual_udp_success_fixed_b_g_and_legacy_unknown() {
         );
         assert_eq!(record.encryption_generation(), f.record.generation);
         assert_eq!(
-            record.udp().transport_instance(),
+            record
+                .udp()
+                .expect("genuine UDP record")
+                .transport_instance(),
             udp.transport_instance_id()
         );
-        assert_eq!(record.udp().sent(), n);
-        assert_eq!(record.udp().endpoint(), receiver.local_addr().unwrap());
-        assert_eq!(record.udp().fence(), UdpSendFence::LegacyUnknown);
-        assert_eq!(record.udp().publication_owner(), None);
+        assert_eq!(record.udp().expect("genuine UDP record").sent(), n);
+        assert_eq!(
+            record.udp().expect("genuine UDP record").endpoint(),
+            receiver.local_addr().unwrap()
+        );
+        assert_eq!(
+            record.udp().expect("genuine UDP record").fence(),
+            UdpSendFence::LegacyUnknown
+        );
+        assert_eq!(
+            record
+                .udp()
+                .expect("genuine UDP record")
+                .publication_owner(),
+            None
+        );
         assert_eq!(
             record.qualify(&f.record, Instant::now()),
             PhysicalInputQualification::UnknownUdpPublication
         );
-        assert!(record.encryption().encrypted_at() <= record.udp().syscall_started());
-        assert!(record.udp().syscall_started() <= record.udp().syscall_completed());
+        assert!(
+            record.encryption().encrypted_at()
+                <= record.udp().expect("genuine UDP record").syscall_started()
+        );
+        assert!(
+            record.udp().expect("genuine UDP record").syscall_started()
+                <= record
+                    .udp()
+                    .expect("genuine UDP record")
+                    .syscall_completed()
+        );
         assert!(transport.try_acquire_outbound_emit_guard(PEER).is_some());
     })
     .await
@@ -168,8 +192,8 @@ async fn b17_slow_full_syscall_then_original_diagnostics_wait_external_cancel_pu
         assert!(f.peers.network_epoch_gate().try_lock_owned().is_ok());
         assert!(udps.try_write().is_ok());
         let record = f.record.physical_publication.record().unwrap();
-        assert_eq!(record.udp().sent(), received);
-        assert_eq!(record.udp().publication_owner(), None);
+        assert_eq!(record.udp().expect("genuine UDP record").sent(), received);
+        assert_eq!(record.udp().expect("genuine UDP record").publication_owner(), None);
         assert_eq!(f.record.physical_publication.state(), PhysicalPublicationState::Recorded);
         drop(diagnostics);
     }).await.unwrap();
@@ -229,8 +253,17 @@ async fn b17_fast_actual_full_and_synthetic_wouldblock_retry_has_new_b_and_count
         );
         let record = f.record.physical_publication.record().unwrap();
         assert_eq!(record.attempt_id(), 2);
-        assert_eq!(record.udp().fence(), UdpSendFence::LanPublication);
-        assert_eq!(record.udp().publication_owner(), Some(717));
+        assert_eq!(
+            record.udp().expect("genuine UDP record").fence(),
+            UdpSendFence::LanPublication
+        );
+        assert_eq!(
+            record
+                .udp()
+                .expect("genuine UDP record")
+                .publication_owner(),
+            Some(717)
+        );
         assert_eq!(record.encryption_generation(), f.record.generation);
         assert_eq!(
             record.qualify(&f.record, Instant::now()),
@@ -371,9 +404,18 @@ async fn b17_managed_original_core_full_fact_and_synthetic_emsgsize_has_no_fact(
         );
         let n = receive_original(&receiver, &mut remote, &f).await;
         let record = f.record.physical_publication.record().unwrap();
-        assert_eq!(record.udp().fence(), UdpSendFence::ManagedPublication);
-        assert_eq!(record.udp().publication_owner(), Some(817));
-        assert_eq!(record.udp().sent(), n);
+        assert_eq!(
+            record.udp().expect("genuine UDP record").fence(),
+            UdpSendFence::ManagedPublication
+        );
+        assert_eq!(
+            record
+                .udp()
+                .expect("genuine UDP record")
+                .publication_owner(),
+            Some(817)
+        );
+        assert_eq!(record.udp().expect("genuine UDP record").sent(), n);
         assert_eq!(record.encryption_generation(), f.record.generation);
         assert_eq!(
             record.qualify(&f.record, Instant::now()),
@@ -621,10 +663,16 @@ async fn b17_original_pipeline_minter_mock_route_actor_actual_udp_decrypt_and_ca
         .physical_publication
         .record()
         .expect("actual original actor publishes its full UDP fact");
-    assert_eq!(physical.udp().sent(), n);
+    assert_eq!(physical.udp().expect("genuine UDP record").sent(), n);
     assert_eq!(physical.encryption_generation(), record.generation);
     assert_eq!(physical.encryption().session_instance(), instance);
-    assert_eq!(physical.udp().publication_owner(), None);
+    assert_eq!(
+        physical
+            .udp()
+            .expect("genuine UDP record")
+            .publication_owner(),
+        None
+    );
     assert_eq!(
         physical.qualify(&record, Instant::now()),
         PhysicalInputQualification::UnknownUdpPublication

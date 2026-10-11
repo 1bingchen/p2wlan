@@ -36,6 +36,28 @@ pub(super) async fn send_via_relay(
     relay_send_started: &AtomicBool,
     sampled: Option<bool>,
 ) -> SendOutcome {
+    send_via_relay_with_origin(
+        relay,
+        packet,
+        peers,
+        generation,
+        relay_send_started,
+        sampled,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn send_via_relay_with_origin(
+    relay: &RelayTransport,
+    packet: &EncryptedPeerPacket,
+    peers: &PeerManager,
+    generation: u64,
+    relay_send_started: &AtomicBool,
+    sampled: Option<bool>,
+    origin: Option<Arc<crate::relay::RelaySendCapture>>,
+) -> SendOutcome {
     relay_send_started.store(true, Ordering::Release);
     debug!(
         event = "relay_data_send_started",
@@ -51,7 +73,10 @@ pub(super) async fn send_via_relay(
         "encrypted packet handed to the relay client command boundary"
     );
     let relay_send_call_started = Instant::now();
-    let send_result = relay.send_packet(packet).await;
+    let send_result = match origin {
+        Some(origin) => relay.send_packet_with_origin(packet, origin).await,
+        None => relay.send_packet(packet).await,
+    };
     let relay_send_call_us = relay_send_call_started.elapsed();
     if let Some(sampled) = sampled {
         global_dataplane_profiler().record(sampled, "relay_send_call_us", relay_send_call_us);

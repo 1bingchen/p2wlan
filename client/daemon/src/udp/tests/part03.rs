@@ -511,6 +511,13 @@ async fn matching_keepalive_ack_preserves_direct_health() {
         .record_direct_success("peer-b", Some(remote_addr))
         .await;
 
+    let success_count_before = peers
+        .get_connection("peer-b")
+        .await
+        .unwrap()
+        .direct_health
+        .success_count;
+
     let transport = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers.clone())
         .await
         .unwrap();
@@ -535,9 +542,21 @@ async fn matching_keepalive_ack_preserves_direct_health() {
         .await;
     responder.await.unwrap();
 
+    // The ACK transaction holds this original peer guard before consuming its
+    // pending nonce and through the final consent event attempt. Wait before
+    // snapshotting so this test's connection read cannot race that try_write.
+    let _ack_transaction = transport
+        .lock_peer_adoption_for_direct_validation("peer-b")
+        .await;
+
     let conn = peers.get_connection("peer-b").await.unwrap();
     assert_eq!(conn.state, ConnectionState::Direct);
     assert_eq!(conn.direct_health.consecutive_failures, 0);
+    assert_eq!(
+        conn.direct_health.success_count,
+        success_count_before + 1,
+        "one matching ACK must commit one new Direct health sample",
+    );
     assert!(conn
         .direct_events
         .iter()

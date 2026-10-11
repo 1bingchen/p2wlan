@@ -310,6 +310,15 @@ impl UdpTransport {
         prepared: &PreparedDirectBusinessSend,
         packet: &EncryptedPeerPacket,
     ) -> std::result::Result<usize, DirectBusinessUdpSendError> {
+        self.try_send_direct_business_packet_with_origin(prepared, packet, None)
+    }
+
+    pub(crate) fn try_send_direct_business_packet_with_origin(
+        &self,
+        prepared: &PreparedDirectBusinessSend,
+        packet: &EncryptedPeerPacket,
+        origin: Option<&mut UdpSendCapture>,
+    ) -> std::result::Result<usize, DirectBusinessUdpSendError> {
         if packet.wire_bytes.len() > prepared.token.max_udp_datagram_size.0 as usize {
             return Err(DirectBusinessUdpSendError::CiphertextTooLarge);
         }
@@ -346,7 +355,8 @@ impl UdpTransport {
                 ) {
                     return Err(DirectBusinessUdpSendError::WouldBlock);
                 }
-                prepared
+                let syscall_started = origin.as_ref().map(|_| Instant::now());
+                let result = prepared
                     .socket
                     .try_send_to(&packet.wire_bytes, prepared.endpoint)
                     .map_err(|error| {
@@ -357,7 +367,22 @@ impl UdpTransport {
                         } else {
                             DirectBusinessUdpSendError::Io(error.to_string())
                         }
-                    })
+                    });
+                if let (Ok(sent), Some(started), Some(capture)) = (&result, syscall_started, origin)
+                {
+                    capture.record_full_success(
+                        self,
+                        &prepared.socket,
+                        prepared.socket_index,
+                        prepared.endpoint,
+                        *sent,
+                        packet,
+                        started,
+                        Some(prepared.token.udp_publication_owner),
+                        UdpSendFence::ManagedPublication,
+                    );
+                }
+                result
             });
         let sent = attempted.ok_or(DirectBusinessUdpSendError::StaleToken)??;
         if sent != packet.wire_bytes.len() {

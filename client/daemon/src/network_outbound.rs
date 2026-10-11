@@ -425,12 +425,15 @@ use diagnostics::record_loss_event;
 use relay::send_via_relay;
 
 use direct::send_direct_if_selected;
+use direct::send_direct_if_selected_with_origin;
 mod diagnostics;
 mod direct;
 mod fast_path;
+mod physical_attempt;
 mod queue;
 mod relay;
 mod send;
+use physical_attempt::PhysicalAttempt;
 
 #[cfg(test)]
 mod test_support;

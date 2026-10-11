@@ -16,6 +16,7 @@ use crate::transport::{EncryptedPeerPacket, OriginalEncryptionSource};
 
 mod channel;
 mod crypto;
+mod physical;
 pub(crate) use channel::{RawOutboundReceiver, RawOutboundSink};
 pub(crate) use crypto::RequestEncryptionAttempt;
 #[cfg(test)]
@@ -151,7 +152,7 @@ impl RequestBinding {
     }
 }
 
-fn in_original_window(created_at: Instant, observed_at: Instant) -> bool {
+pub(crate) fn in_original_window(created_at: Instant, observed_at: Instant) -> bool {
     observed_at
         .checked_duration_since(created_at)
         .is_some_and(|age| age <= crate::OVERLAY_NONCE_TTL)

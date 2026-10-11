@@ -1683,6 +1683,16 @@ impl UdpTransport {
         packet: &EncryptedPeerPacket,
         endpoint: SocketAddr,
     ) -> Result<usize> {
+        self.send_packet_to_with_origin(packet, endpoint, None)
+            .await
+    }
+
+    pub(crate) async fn send_packet_to_with_origin(
+        &self,
+        packet: &EncryptedPeerPacket,
+        endpoint: SocketAddr,
+        origin: Option<&mut UdpSendCapture>,
+    ) -> Result<usize> {
         let (socket_index, socket) = match self
             .socket_for_peer_endpoint(Some(&packet.peer_id), Some(endpoint))
             .await
@@ -1695,8 +1705,15 @@ impl UdpTransport {
                 )))
             }
         };
-        self.send_encrypted_packet_on_socket(&socket, socket_index, packet, endpoint)
-            .await
+        self.send_encrypted_packet_on_socket_until_with_origin(
+            &socket,
+            socket_index,
+            packet,
+            endpoint,
+            None,
+            origin,
+        )
+        .await
     }
 
     /// Send an encrypted packet on the exact socket identified by the
@@ -1751,6 +1768,26 @@ impl UdpTransport {
         packet: &EncryptedPeerPacket,
         endpoint: SocketAddr,
         publication_owner: u64,
+    ) -> std::result::Result<usize, DirectBusinessUdpSendError> {
+        self.try_send_lan_business_packet_on_socket_with_origin(
+            socket,
+            socket_index,
+            packet,
+            endpoint,
+            publication_owner,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn try_send_lan_business_packet_on_socket_with_origin(
+        &self,
+        socket: &Arc<UdpSocket>,
+        socket_index: usize,
+        packet: &EncryptedPeerPacket,
+        endpoint: SocketAddr,
+        publication_owner: u64,
+        origin: Option<&mut UdpSendCapture>,
     ) -> std::result::Result<usize, DirectBusinessUdpSendError> {
         if self.inbound_publication_owner() != publication_owner
             || self.peer_requires_direct_business_budget(&packet.peer_id)
@@ -1820,7 +1857,8 @@ impl UdpTransport {
                 {
                     return Err(DirectBusinessUdpSendError::StaleToken);
                 }
-                socket
+                let syscall_started = origin.as_ref().map(|_| Instant::now());
+                let result = socket
                     .try_send_to(&packet.wire_bytes, endpoint)
                     .map_err(|error| {
                         if is_local_packet_too_large(&error) {
@@ -1830,7 +1868,22 @@ impl UdpTransport {
                         } else {
                             DirectBusinessUdpSendError::Io(error.to_string())
                         }
-                    })
+                    });
+                if let (Ok(sent), Some(started), Some(capture)) = (&result, syscall_started, origin)
+                {
+                    capture.record_full_success(
+                        self,
+                        socket,
+                        socket_index,
+                        endpoint,
+                        *sent,
+                        packet,
+                        started,
+                        Some(publication_owner),
+                        UdpSendFence::LanPublication,
+                    );
+                }
+                result
             })
             .ok_or(DirectBusinessUdpSendError::WouldBlock)??;
         if sent != packet.wire_bytes.len() {
@@ -1855,6 +1908,27 @@ impl UdpTransport {
         packet: &EncryptedPeerPacket,
         endpoint: SocketAddr,
         deadline: Option<tokio::time::Instant>,
+    ) -> Result<usize> {
+        self.send_encrypted_packet_on_socket_until_with_origin(
+            socket,
+            socket_index,
+            packet,
+            endpoint,
+            deadline,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn send_encrypted_packet_on_socket_until_with_origin(
+        &self,
+        socket: &Arc<UdpSocket>,
+        socket_index: usize,
+        packet: &EncryptedPeerPacket,
+        endpoint: SocketAddr,
+        deadline: Option<tokio::time::Instant>,
+        mut origin: Option<&mut UdpSendCapture>,
     ) -> Result<usize> {
         if !self
             .permits_ordinary_send_on_socket(&packet.peer_id, socket_index, socket)
@@ -1886,7 +1960,24 @@ impl UdpTransport {
             if self.poll_udp_send_pending_for_test(&packet.peer_id, cx) {
                 return std::task::Poll::Pending;
             }
-            socket.poll_send_to(cx, &packet.wire_bytes, endpoint)
+            let syscall_started = origin.as_ref().map(|_| Instant::now());
+            let result = socket.poll_send_to(cx, &packet.wire_bytes, endpoint);
+            if let (std::task::Poll::Ready(Ok(sent)), Some(started), Some(capture)) =
+                (&result, syscall_started, origin.as_deref_mut())
+            {
+                capture.record_full_success(
+                    self,
+                    socket,
+                    socket_index,
+                    endpoint,
+                    *sent,
+                    packet,
+                    started,
+                    None,
+                    UdpSendFence::LegacyUnknown,
+                );
+            }
+            result
         })
         .await
         .map_err(|e| {

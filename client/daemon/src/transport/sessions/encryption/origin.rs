@@ -25,6 +25,25 @@ pub(crate) struct OriginalEncryptionSource {
 }
 
 impl OriginalEncryptionSource {
+    pub(crate) fn try_copy_for_publication(
+        &self,
+    ) -> std::result::Result<Self, std::collections::TryReserveError> {
+        let mut peer_id = String::new();
+        peer_id.try_reserve_exact(self.peer_id.len())?;
+        peer_id.push_str(&self.peer_id);
+        Ok(Self {
+            owner: self.owner.clone(),
+            peer_id,
+            session_instance: self.session_instance,
+            authorized_peer_lifecycle: self.authorized_peer_lifecycle,
+            encrypted_at: self.encrypted_at,
+        })
+    }
+
+    pub(crate) fn owner_is_live(&self) -> bool {
+        self.owner.upgrade().is_some()
+    }
+
     // Only the encryption parent may capture after encrypt_to_bytes Ok, while
     // the same original sessions guard still owns this actual active slot.
     pub(super) fn capture_successful_slot(

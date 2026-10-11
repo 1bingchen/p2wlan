@@ -22,6 +22,13 @@ use crate::{
     OVERLAY_DIRECTION_REQUEST, OVERLAY_EVIDENCE_PREFIX, OVERLAY_NONCE_CAP,
 };
 
+mod send_publication;
+#[cfg(test)]
+pub(crate) use send_publication::{PhysicalInputQualification, PhysicalPublicationState};
+pub(crate) use send_publication::{
+    PhysicalRequestPublisher, PhysicalSendPublication, PreparedPhysicalPublication,
+};
+
 #[derive(Clone)]
 struct OriginalTargetExpectation {
     owner: Weak<PeerManager>,
@@ -62,6 +69,7 @@ pub(crate) struct CanonicalOverlayRequest {
     target: OriginalTargetExpectation,
     original_packet: Box<[u8]>,
     injection_accepted: AtomicBool,
+    pub(crate) physical_publication: PhysicalSendPublication,
 }
 
 // These immutable accessors are consumed by the next carriage step. They do
@@ -74,6 +82,10 @@ impl CanonicalOverlayRequest {
 
     pub(crate) fn belongs_to(&self, peers: &Arc<PeerManager>) -> bool {
         Weak::ptr_eq(&self.target.owner, &Arc::downgrade(peers))
+    }
+
+    pub(crate) fn original_peer_owner(&self, peers: &PeerManager) -> Option<Weak<PeerManager>> {
+        std::ptr::eq(self.target.owner.as_ptr(), peers).then(|| self.target.owner.clone())
     }
 
     pub(crate) fn local_vip(&self) -> &str {
@@ -156,6 +168,7 @@ async fn inject_request(
         // The actual random packet is copied once; the original Vec moves to TUN.
         original_packet: packet.clone().into_boxed_slice(),
         injection_accepted: AtomicBool::new(false),
+        physical_publication: PhysicalSendPublication::new(),
     });
     let context = Box::new(RequestSendToken {
         request: Arc::downgrade(&request),

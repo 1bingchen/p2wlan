@@ -109,7 +109,7 @@ pub(super) async fn encrypt_then_send_with_deadline(
             lock_wait_ms = emit_lock_wait_ms,
             "business packet acquired its per-peer WireGuard counter-ordering lock"
         );
-        let (encrypted, direct_business_plan, force_relay) = {
+        let (encrypted, direct_business_plan, force_relay, physical_preparation) = {
             let epoch_gate = peers.network_epoch_gate();
             let epoch_gate_wait_started = Instant::now();
             let _epoch_guard = epoch_gate.lock().await;
@@ -298,6 +298,8 @@ pub(super) async fn encrypt_then_send_with_deadline(
                     });
                 }
             };
+            let physical_preparation =
+                result.prepare_physical_publication(peers, transport, current_generation);
             if let Some(trace) = sampled_trace.as_ref() {
                 profiler.record(
                     trace.sampled,
@@ -320,7 +322,12 @@ pub(super) async fn encrypt_then_send_with_deadline(
                         .await;
                 }
             }
-            (result, direct_business_plan, force_relay)
+            (
+                result,
+                direct_business_plan,
+                force_relay,
+                physical_preparation,
+            )
         };
         Ok((
             emit_guard,
@@ -329,9 +336,10 @@ pub(super) async fn encrypt_then_send_with_deadline(
             force_relay,
             emit_lock_started,
             emit_guard_acquired,
+            physical_preparation,
         ))
     };
-    let (emit_guard, encrypted, direct_business_plan, force_relay, emit_lock_started, emit_guard_acquired) =
+    let (emit_guard, encrypted, direct_business_plan, force_relay, emit_lock_started, emit_guard_acquired, physical_preparation) =
         match timeout(preparation_bound, prepare).await {
             Ok(Ok(prepared)) => prepared,
             Ok(Err(outcome)) => return outcome,
@@ -341,6 +349,7 @@ pub(super) async fn encrypt_then_send_with_deadline(
                 reason: "bounded pre-handoff emit/epoch/slot/session admission timed out; no transport owned ciphertext".into(),
             },
         };
+    let mut physical_attempt = PhysicalAttempt::new(emit_guard, physical_preparation);
     let encrypt_completed = Instant::now();
     if let Some(plan) = direct_business_plan.as_ref() {
         if encrypted.wire_bytes.len() > plan.prepared.token.max_udp_datagram_size.0 as usize {
@@ -354,7 +363,7 @@ pub(super) async fn encrypt_then_send_with_deadline(
                     inner_ip_mtu: plan.prepared.token.max_overlay_payload_size.0,
                 },
             );
-            drop(emit_guard);
+            physical_attempt.finish(true);
             return EncryptSendOutcome::Terminal {
                 packet: retry_packet,
                 reason_code: REASON_DIRECT_CIPHERTEXT_OVERSIZE,
@@ -412,7 +421,7 @@ pub(super) async fn encrypt_then_send_with_deadline(
         &encrypted,
         crate::request_carriage::test_probe::HandoffArgumentPoint::SlowBoundedEntry,
     );
-    let outcome = send_encrypted_packet_bounded(
+    let outcome = send_encrypted_packet_bounded_with_origin(
         &encrypted,
         peers,
         prefer_direct,
@@ -424,6 +433,7 @@ pub(super) async fn encrypt_then_send_with_deadline(
         complete_inner_ip_packet_len(&retry_packet.packet).unwrap_or(retry_packet.packet.len()),
         force_relay,
         window,
+        physical_attempt.capture(),
     )
     .await;
     let transport_handoff_completed = Instant::now();
@@ -507,7 +517,12 @@ pub(super) async fn encrypt_then_send_with_deadline(
     // The guard is deliberately released before any asynchronous retry is
     // queued. A retry is always the original plaintext and receives a fresh
     // WireGuard counter.
-    drop(emit_guard);
+    physical_attempt.finish(matches!(
+        &outcome,
+        SendOutcome::DirectBudgetStale { .. }
+            | SendOutcome::RetryableLocalBackpressure { .. }
+            | SendOutcome::LocalMtuFailure { .. }
+    ));
     match outcome {
         SendOutcome::Sent => EncryptSendOutcome::Sent,
         SendOutcome::Retryable(failure) => EncryptSendOutcome::Retryable {
@@ -586,6 +601,7 @@ impl SendAdmissionWindow<'_> {
 /// Send one encrypted packet with a hard time bound so a stalled relay cannot
 /// block the shared outbound worker. The caller owns the per-peer emit guard
 /// and releases it immediately after this classification returns.
+#[allow(dead_code)] // Retain the original None compatibility signature.
 #[allow(clippy::too_many_arguments)]
 async fn send_encrypted_packet_bounded(
     packet: &EncryptedRequestDelivery,
@@ -599,6 +615,72 @@ async fn send_encrypted_packet_bounded(
     inner_ip_packet_len: usize,
     force_relay: bool,
     window: SendAdmissionWindow<'_>,
+) -> SendOutcome {
+    send_encrypted_packet_bounded_with_origin(
+        packet,
+        peers,
+        prefer_direct,
+        udp_transport,
+        relay_transport,
+        relay_expected,
+        sampled,
+        direct_business_plan,
+        inner_ip_packet_len,
+        force_relay,
+        window,
+        None,
+    )
+    .await
+}
+
+#[allow(dead_code)] // Retain the original None compatibility signature.
+#[allow(clippy::too_many_arguments)]
+async fn send_encrypted_packet_once(
+    packet: &EncryptedRequestDelivery,
+    peers: &PeerManager,
+    prefer_direct: bool,
+    udp_transport: &RwLock<Option<UdpTransport>>,
+    relay: Option<RelayTransport>,
+    relay_send_started: &AtomicBool,
+    relay_expected: bool,
+    sampled: Option<bool>,
+    direct_business_plan: Option<&DirectBusinessSendPlan>,
+    inner_ip_packet_len: usize,
+    force_relay: bool,
+    window: SendAdmissionWindow<'_>,
+) -> SendOutcome {
+    send_encrypted_packet_once_with_origin(
+        packet,
+        peers,
+        prefer_direct,
+        udp_transport,
+        relay,
+        relay_send_started,
+        relay_expected,
+        sampled,
+        direct_business_plan,
+        inner_ip_packet_len,
+        force_relay,
+        window,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn send_encrypted_packet_bounded_with_origin(
+    packet: &EncryptedRequestDelivery,
+    peers: &PeerManager,
+    prefer_direct: bool,
+    udp_transport: &RwLock<Option<UdpTransport>>,
+    relay_transport: &RwLock<Option<RelayTransport>>,
+    relay_expected: bool,
+    sampled: Option<bool>,
+    direct_business_plan: Option<&DirectBusinessSendPlan>,
+    inner_ip_packet_len: usize,
+    force_relay: bool,
+    window: SendAdmissionWindow<'_>,
+    origin: Option<&mut crate::udp::UdpSendCapture>,
 ) -> SendOutcome {
     // Capture the exact shared connection before entering the bounded send.
     // The same snapshot is passed into the send operation, so a supervisor
@@ -658,7 +740,7 @@ async fn send_encrypted_packet_bounded(
     }
     match timeout(
         remaining,
-        send_encrypted_packet_once(
+        send_encrypted_packet_once_with_origin(
             packet,
             peers,
             prefer_direct,
@@ -671,6 +753,7 @@ async fn send_encrypted_packet_bounded(
             inner_ip_packet_len,
             force_relay,
             window,
+            origin,
         ),
     )
     .await
@@ -719,7 +802,7 @@ pub(super) fn outbound_send_timeout_failure_for_path(reason: &'static str) -> Se
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn send_encrypted_packet_once(
+async fn send_encrypted_packet_once_with_origin(
     packet: &EncryptedRequestDelivery,
     peers: &PeerManager,
     prefer_direct: bool,
@@ -732,6 +815,7 @@ async fn send_encrypted_packet_once(
     inner_ip_packet_len: usize,
     force_relay: bool,
     window: SendAdmissionWindow<'_>,
+    mut origin: Option<&mut crate::udp::UdpSendCapture>,
 ) -> SendOutcome {
     let profiler = global_dataplane_profiler();
     // Take one path/generation snapshot atomically. Managed Direct keeps this
@@ -837,9 +921,16 @@ async fn send_encrypted_packet_once(
             // active-path replacement, while the runtime's independent
             // publication gate orders revision/owner revocation against this
             // one nonblocking `try_send_to` syscall.
-            let send_result = plan
-                .udp
-                .try_send_direct_business_packet(&plan.prepared, packet);
+            let send_result = match origin.as_deref_mut() {
+                Some(origin) => plan.udp.try_send_direct_business_packet_with_origin(
+                    &plan.prepared,
+                    packet,
+                    Some(origin),
+                ),
+                None => plan
+                    .udp
+                    .try_send_direct_business_packet(&plan.prepared, packet),
+            };
             if let Some(sampled) = sampled {
                 profiler.record(sampled, "udp_send_call_us", send_started.elapsed());
                 profiler.record(
@@ -929,9 +1020,25 @@ async fn send_encrypted_packet_once(
                 reason: "managed Direct became selected without a pre-encryption token".to_string(),
             };
         }
-        match send_direct_if_selected(packet, peers, udp, &selection, udp_local_endpoint, sampled)
-            .await
-        {
+        let direct_result = match origin {
+            Some(origin) => {
+                send_direct_if_selected_with_origin(
+                    packet,
+                    peers,
+                    udp,
+                    &selection,
+                    udp_local_endpoint,
+                    sampled,
+                    Some(origin),
+                )
+                .await
+            }
+            None => {
+                send_direct_if_selected(packet, peers, udp, &selection, udp_local_endpoint, sampled)
+                    .await
+            }
+        };
+        match direct_result {
             DirectSendOutcome::HandoffAccepted => return SendOutcome::Sent,
             DirectSendOutcome::DeliveryUncertain { err } => {
                 // The Direct counter may have reached the kernel. Never send
@@ -1069,3 +1176,7 @@ mod resource_capture_tests;
 #[cfg(test)]
 #[path = "tests/request_carriage_send.rs"]
 mod request_carriage_tests;
+
+#[cfg(test)]
+#[path = "tests/physical_publication.rs"]
+mod physical_publication_tests;

@@ -415,6 +415,8 @@ mod birthday_tests;
 mod core;
 
 mod business_mtu;
+mod send_origin;
+pub(crate) use send_origin::{UdpFullSendFact, UdpSendCapture, UdpSendFence};
 
 mod socket_registry;
 

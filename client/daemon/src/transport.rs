@@ -629,6 +629,10 @@ mod resource_queue_test_gate;
 mod sessions;
 #[cfg(test)]
 pub(crate) use resource_queue_test_gate::ResourceQueueTestGate;
+#[allow(unused_imports)] // Staged encryption metadata API, before qualified send consumers.
+pub(crate) use sessions::{
+    EncryptedOutboundWithSource, OriginalEncryptionSource, SessionBoundEncryptionWithSource,
+};
 mod wire;
 use sessions::PeerTransportSessions;
 #[allow(unused_imports)] // Opaque rollback API is available for future qualified callers.

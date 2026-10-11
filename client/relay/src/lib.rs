@@ -60,7 +60,8 @@ pub use auth::{
     VerifiedTicket, MAX_TICKET_LEN, MSG_AUTH_REGISTER, RELAY_PROTOCOL_VERSION,
 };
 pub use client::{
-    OriginalRelayDelivery, OriginalRelayFrameRead, RelayClient, RelayCloseReason, RelayMessage,
+    OriginalRelayDelivery, OriginalRelayFrameRead, OriginalRelayWriteFact, RelayClient,
+    RelayCloseReason, RelayMessage,
 };
 pub use error::{RelayError, RelayErrorCode, Result as RelayResult};
 pub use protocol::{Frame, MAX_PAYLOAD, VERSION as PROTOCOL_VERSION};

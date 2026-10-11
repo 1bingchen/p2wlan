@@ -197,6 +197,7 @@ pub enum RelayCloseReason {
 
 /// Commands sent from the client handle to the background write task.
 type WriteBoundaryHook = Box<dyn FnOnce(Instant) -> bool + Send + 'static>;
+type WriteObserver = Box<dyn FnOnce(OriginalRelayWriteFact) + Send + 'static>;
 
 enum ClientCommand {
     /// Send a raw frame (currently unused by public API but available for extensions).
@@ -210,6 +211,8 @@ enum ClientCommand {
         /// dequeues and encodes this frame, immediately before `write_all`.
         /// Returning false rejects the frame without touching the socket.
         write_boundary: Option<WriteBoundaryHook>,
+        /// Opt-in observation after the original full frame write succeeds.
+        write_observer: Option<WriteObserver>,
         /// Completion is sent only after the writer has completed
         /// `write_all`. A successful `try_send` alone is only local queue
         /// acceptance and must not be reported as transport success.
@@ -262,6 +265,9 @@ mod read_origin;
 use read_origin::OriginalRelayReadWitness;
 pub use read_origin::{OriginalRelayDelivery, OriginalRelayFrameRead};
 use read_origin::{ReadInput, ReadOptions};
+
+mod write_origin;
+pub use write_origin::OriginalRelayWriteFact;
 
 mod commands;
 mod connect;

@@ -279,6 +279,7 @@ impl RelayClient {
 
         // Channels
         let (cmd_tx, mut cmd_rx) = mpsc::channel::<ClientCommand>(config.cmd_queue_capacity);
+        let write_origin = cmd_tx.downgrade();
         let (msg_tx, msg_rx) = options.channel(config.inbound_queue_capacity);
         #[cfg(test)]
         let read_witness = options.witness();
@@ -326,6 +327,7 @@ impl RelayClient {
                                 dst,
                                 data,
                                 write_boundary,
+                                write_observer,
                                 completion,
                             } => {
                                 let data_len = data.len();
@@ -354,12 +356,30 @@ impl RelayClient {
                                                 bytes = data_len,
                                                 "relay writer passed the write-boundary guard and is entering write_all"
                                             );
-                                            write_all_or_shutdown(
+                                            match write_all_or_shutdown(
                                                 &mut writer,
                                                 &encoded,
                                                 &mut write_close_rx,
                                             )
                                             .await
+                                            {
+                                                Ok(()) => {
+                                                    if let Some(observer) = write_observer {
+                                                        let completed_at = Instant::now();
+                                                        let fact = OriginalRelayWriteFact::completed(
+                                                            &write_origin,
+                                                            dst.clone(),
+                                                            data_len,
+                                                            encoded.len(),
+                                                            write_started,
+                                                            completed_at,
+                                                        );
+                                                        observer(fact);
+                                                    }
+                                                    Ok(())
+                                                }
+                                                Err(error) => Err(error),
+                                            }
                                         }
                                     }
                                     Err(err) => Err(err),
@@ -694,4 +714,9 @@ impl RelayClient {
 
         Ok((Self { cmd_tx, close_tx }, msg_rx))
     }
+}
+
+#[cfg(test)]
+mod original_write_helper_controls {
+    include!("tests/original_write_helpers.rs");
 }

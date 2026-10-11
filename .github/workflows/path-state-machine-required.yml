@@ -11,6 +11,7 @@ on:
       - ".github/workflows/windows-lifecycle.yml"
       - ".github/workflows/mobile-lifecycle.yml"
       - "client/daemon/**"
+      - "client/tun/**"
       - "Cargo.toml"
       - "Cargo.lock"
   workflow_dispatch:

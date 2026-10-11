@@ -6,6 +6,7 @@ on:
     paths:
       - ".github/workflows/path-observability-required.yml"
       - "client/daemon/**"
+      - "client/tun/**"
       - "client/cli/**"
       - "apps/flutter_client/**"
       - "contracts/**"
@@ -19,6 +20,7 @@ on:
     paths:
       - ".github/workflows/path-observability-required.yml"
       - "client/daemon/**"
+      - "client/tun/**"
       - "client/cli/**"
       - "apps/flutter_client/**"
       - "contracts/**"

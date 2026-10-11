@@ -1,0 +1,132 @@
+//! Immutable encrypted-ingress provenance carried to the overlay validator.
+//! This module owns no session, publication or credit state.
+
+use std::net::SocketAddr;
+use std::time::Instant;
+
+use crate::transport::{OriginalSessionSource, OverlayIngressEvent, ReceivedEncryptedPacket};
+
+pub(crate) struct OverlayIngressDelivery {
+    event: OverlayIngressEvent,
+    original_source: Option<OriginalOverlayIngressSource>,
+}
+
+impl OverlayIngressDelivery {
+    // Only the actual inbound parent can supply a successful decrypt source.
+    pub(super) fn authenticated(
+        event: OverlayIngressEvent,
+        original_source: OriginalOverlayIngressSource,
+    ) -> Self {
+        Self {
+            event,
+            original_source: Some(original_source),
+        }
+    }
+
+    pub(crate) fn into_parts(self) -> (OverlayIngressEvent, Option<OriginalOverlayIngressSource>) {
+        (self.event, self.original_source)
+    }
+}
+
+impl From<OverlayIngressEvent> for OverlayIngressDelivery {
+    fn from(event: OverlayIngressEvent) -> Self {
+        Self {
+            event,
+            original_source: None,
+        }
+    }
+}
+
+pub(super) struct EncryptedOverlayOrigin {
+    network_generation: Option<u64>,
+    relay_endpoint: Option<String>,
+    relay_connection_id: Option<u64>,
+    relay_peer_id: Option<String>,
+    udp_transport_owner: Option<u64>,
+    source: Option<SocketAddr>,
+    local_endpoint: Option<SocketAddr>,
+    socket_index: Option<usize>,
+    received_at: Option<Instant>,
+    queue_send_started: Option<Instant>,
+}
+
+impl EncryptedOverlayOrigin {
+    pub(super) fn capture(packet: &ReceivedEncryptedPacket) -> Self {
+        Self {
+            network_generation: packet.network_generation,
+            relay_endpoint: packet.relay_endpoint.clone(),
+            relay_connection_id: packet.relay_connection_id,
+            relay_peer_id: packet.relay_peer_id.clone(),
+            udp_transport_owner: packet.udp_transport_owner,
+            source: packet.source,
+            local_endpoint: packet.local_endpoint,
+            socket_index: packet.socket_index,
+            received_at: packet.udp_received,
+            queue_send_started: packet.transport_queue_send_started,
+        }
+    }
+
+    pub(super) fn authenticated(
+        self,
+        session: OriginalSessionSource,
+    ) -> OriginalOverlayIngressSource {
+        OriginalOverlayIngressSource {
+            session,
+            envelope: self,
+        }
+    }
+}
+
+/// Original observations only; no current-owner or once-credit qualification.
+pub(crate) struct OriginalOverlayIngressSource {
+    session: OriginalSessionSource,
+    envelope: EncryptedOverlayOrigin,
+}
+
+// S2 exposes immutable metadata; the production final-authority consumer is S3.
+#[allow(dead_code)]
+impl OriginalOverlayIngressSource {
+    pub(crate) fn session(&self) -> &OriginalSessionSource {
+        &self.session
+    }
+
+    pub(crate) fn network_generation(&self) -> Option<u64> {
+        self.envelope.network_generation
+    }
+
+    pub(crate) fn relay_endpoint(&self) -> Option<&str> {
+        self.envelope.relay_endpoint.as_deref()
+    }
+
+    pub(crate) fn relay_connection_id(&self) -> Option<u64> {
+        self.envelope.relay_connection_id
+    }
+
+    pub(crate) fn relay_peer_id(&self) -> Option<&str> {
+        self.envelope.relay_peer_id.as_deref()
+    }
+
+    pub(crate) fn udp_transport_owner(&self) -> Option<u64> {
+        self.envelope.udp_transport_owner
+    }
+
+    pub(crate) fn source(&self) -> Option<SocketAddr> {
+        self.envelope.source
+    }
+
+    pub(crate) fn local_endpoint(&self) -> Option<SocketAddr> {
+        self.envelope.local_endpoint
+    }
+
+    pub(crate) fn socket_index(&self) -> Option<usize> {
+        self.envelope.socket_index
+    }
+
+    pub(crate) fn received_at(&self) -> Option<Instant> {
+        self.envelope.received_at
+    }
+
+    pub(crate) fn queue_send_started(&self) -> Option<Instant> {
+        self.envelope.queue_send_started
+    }
+}

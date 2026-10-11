@@ -714,3 +714,7 @@ async fn room_authorization_is_checked_at_relay_writer_boundary() {
 }
 
 include!("tests/rendezvous.rs");
+
+mod original_read_origin {
+    include!("tests/original_read_origin.rs");
+}

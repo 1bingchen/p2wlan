@@ -94,6 +94,28 @@ impl RelayTransport {
         allow_insecure_plaintext: bool,
         ca_cert_path: Option<String>,
     ) -> std::result::Result<(Self, mpsc::Receiver<RelayMessage>), p2pnet_relay::RelayError> {
+        Self::connect_in_region_for_read::<RelayMessage>(
+            relay_endpoint,
+            relay_region,
+            node_id,
+            peers,
+            relay_ticket,
+            allow_insecure_plaintext,
+            ca_cert_path,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn connect_in_region_for_read<I: RelayReadItem>(
+        relay_endpoint: &str,
+        relay_region: &str,
+        node_id: &str,
+        peers: Arc<PeerManager>,
+        relay_ticket: Option<String>,
+        allow_insecure_plaintext: bool,
+        ca_cert_path: Option<String>,
+    ) -> std::result::Result<(Self, mpsc::Receiver<I>), p2pnet_relay::RelayError> {
         let started = Instant::now();
         let mut config = RelayClientConfig {
             idle_timeout: RELAY_INBOUND_IDLE_TIMEOUT,
@@ -126,8 +148,7 @@ impl RelayTransport {
         }
 
         // Use the new A2 endpoint-based connection which supports tls:// and tcp://
-        let (client, relay_rx) =
-            RelayClient::connect_with_endpoint(relay_endpoint, node_id, config).await?;
+        let (client, relay_rx) = I::connect_client(relay_endpoint, node_id, config).await?;
 
         let relay_connection_id =
             NEXT_RELAY_CONNECTION_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -158,6 +179,32 @@ impl RelayTransport {
             },
             relay_rx,
         ))
+    }
+
+    /// Private typed renewal entry; same connection core and error attribution.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn connect_secure_for_read<I: RelayReadItem>(
+        relay_endpoint: &str,
+        relay_region: &str,
+        node_id: &str,
+        peers: Arc<PeerManager>,
+        relay_ticket: Option<String>,
+        allow_insecure_plaintext: bool,
+        ca_cert_path: Option<String>,
+    ) -> Result<(Self, mpsc::Receiver<I>)> {
+        Self::connect_in_region_for_read::<I>(
+            relay_endpoint,
+            relay_region,
+            node_id,
+            peers,
+            relay_ticket,
+            allow_insecure_plaintext,
+            ca_cert_path,
+        )
+        .await
+        .map_err(|e| {
+            DaemonError::Relay(format!("failed to connect to relay {relay_endpoint}: {e}"))
+        })
     }
 
     /// Attach the auth ticket metadata so the supervisor can schedule the
@@ -407,11 +454,22 @@ impl RelayTransport {
     /// `crate::relay_runtime::RelaySupervisor`).
     pub async fn run_inbound(
         self,
-        mut relay_rx: mpsc::Receiver<RelayMessage>,
+        relay_rx: mpsc::Receiver<RelayMessage>,
         inbound_tx: mpsc::Sender<ReceivedEncryptedPacket>,
         relay_selection: Option<Arc<tokio::sync::RwLock<RelaySelectionDiagnostics>>>,
     ) -> Result<()> {
-        while let Some(message) = relay_rx.recv().await {
+        self.run_inbound_for_read(relay_rx, inbound_tx, relay_selection)
+            .await
+    }
+
+    pub(crate) async fn run_inbound_for_read<I: RelayReadItem>(
+        self,
+        mut relay_rx: mpsc::Receiver<I>,
+        inbound_tx: mpsc::Sender<ReceivedEncryptedPacket>,
+        relay_selection: Option<Arc<tokio::sync::RwLock<RelaySelectionDiagnostics>>>,
+    ) -> Result<()> {
+        while let Some(delivery) = relay_rx.recv().await {
+            let (message, original_read) = delivery.into_parts();
             match message {
                 RelayMessage::Closed { reason } => {
                     let reason_label = relay_close_reason_label(reason);
@@ -538,7 +596,7 @@ impl RelayTransport {
                             udp_transport_owner: None,
                             network_generation: Some(self.peers.current_network_generation_sync()),
                             profile_sampled,
-                            udp_received: None,
+                            udp_received: original_read.map(|read| read.completed_at()),
                             transport_queue_send_started: Some(transport_queue_send_started),
                             wire_bytes: data,
                         })

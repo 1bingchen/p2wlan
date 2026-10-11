@@ -44,11 +44,24 @@ impl RelayClient {
         Self::connect_to_addr_with_config(addr, node_id, config).await
     }
 
+    #[allow(dead_code)] // Preserved private legacy entry; all modes share the original TCP core.
     pub(super) async fn connect_to_addr_with_config(
         addr: SocketAddr,
         node_id: &str,
         config: RelayClientConfig,
     ) -> Result<(Self, mpsc::Receiver<RelayMessage>)> {
+        let (client, rx) =
+            Self::connect_to_addr_with_read_options(addr, node_id, config, ReadOptions::legacy())
+                .await?;
+        Ok((client, rx.into_legacy()?))
+    }
+
+    pub(super) async fn connect_to_addr_with_read_options(
+        addr: SocketAddr,
+        node_id: &str,
+        config: RelayClientConfig,
+        options: ReadOptions,
+    ) -> Result<(Self, ReadInput)> {
         debug!("Connecting to relay server at {}", addr);
 
         let stream = tokio::time::timeout(
@@ -76,7 +89,9 @@ impl RelayClient {
 
         // Channels
         let (cmd_tx, mut cmd_rx) = mpsc::channel::<ClientCommand>(config.cmd_queue_capacity);
-        let (msg_tx, msg_rx) = mpsc::channel::<RelayMessage>(config.inbound_queue_capacity);
+        let (msg_tx, msg_rx) = options.channel(config.inbound_queue_capacity);
+        #[cfg(test)]
+        let read_witness = options.witness();
         let (reg_tx, reg_rx) = oneshot::channel::<Result<()>>();
         let (close_tx, close_rx) = watch::channel(false);
         // Shared close-reason attribution shared by both background tasks.
@@ -349,6 +364,7 @@ impl RelayClient {
                 }
 
                 // Read payload
+                let mut frame_read = None;
                 if payload_len > 0 {
                     if buf.len() < FRAME_HEADER_SIZE + payload_len {
                         buf.resize(FRAME_HEADER_SIZE + payload_len, 0);
@@ -372,7 +388,11 @@ impl RelayClient {
                         }
                     };
                     match read_payload_res {
-                        Ok(true) => {}
+                        Ok(true) => {
+                            if msg_type == MSG_RECEIVED {
+                                frame_read = msg_tx_clone.capture_data_read();
+                            }
+                        }
                         Ok(false) => break,
                         Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
                             if let Some(tx) = reg_tx.take() {
@@ -405,6 +425,12 @@ impl RelayClient {
                         let frame = Frame::new(MSG_RECEIVED, payload.to_vec());
                         match frame.parse_forward_payload() {
                             Ok((src, data)) => {
+                                #[cfg(test)]
+                                if let (Some(witness), Some(read)) =
+                                    (&read_witness, frame_read.as_ref())
+                                {
+                                    witness.observe_once(read).await;
+                                }
                                 // Preserve every encrypted data frame while
                                 // applying bounded backpressure.  A
                                 // try_send/full close here silently discards
@@ -412,10 +438,13 @@ impl RelayClient {
                                 // must wait for the dataplane consumer just
                                 // like the TLS client does.
                                 if msg_tx_clone
-                                    .send(RelayMessage::Data {
-                                        from_node: src.to_string(),
-                                        data: data.to_vec(),
-                                    })
+                                    .send_data(
+                                        RelayMessage::Data {
+                                            from_node: src.to_string(),
+                                            data: data.to_vec(),
+                                        },
+                                        frame_read,
+                                    )
                                     .await
                                     .is_err()
                                 {

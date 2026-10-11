@@ -49,6 +49,7 @@ pub mod gateway_mapping;
 pub mod incarnation;
 pub mod netenv;
 mod network_outbound;
+mod overlay_requests;
 pub(crate) mod path_commit;
 pub mod peer;
 pub mod port_mapping;

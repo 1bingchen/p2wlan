@@ -39,6 +39,7 @@
 use std::collections::VecDeque;
 use std::path::PathBuf;
 
+use crate::overlay_requests::{fire_pending_bursts, send_overlay_payloads};
 use crate::transport::{OverlayIngress, OverlayIngressDelivery, OverlayIngressEvent};
 use p2pnet_tun::mock::MockTunController;
 
@@ -78,23 +79,9 @@ struct OverlayStats {
     last_seq: u64,
 }
 
-/// One nonce this daemon sent in a fresh overlay request.
-struct SentOverlayNonce {
-    peer_id: String,
-    generation: u64,
-    seq: u32,
-    sent_at: Instant,
-}
-
-/// One successfully injected burst request. The existing burst container keeps
-/// these exact identities after the smaller periodic nonce registry evicts them.
-#[derive(Clone, Copy)]
-struct InjectedOverlayBurstRequest {
-    nonce: u64,
-    seq: u32,
-    generation: u64,
-    sent_at: Instant,
-}
+/// Existing diagnostic views retain the same immutable canonical request.
+type SentOverlayNonce = Arc<crate::overlay_requests::CanonicalOverlayRequest>;
+type InjectedOverlayBurstRequest = SentOverlayNonce;
 
 /// Strict-Direct requests can arrive just before this endpoint commits its own
 /// Direct state or publishes the DPLPMTUD business budget. Preserve the request
@@ -131,105 +118,6 @@ struct OverlayBurst {
 
 /// How long a burst may wait for its echoes before being reported incomplete.
 const OVERLAY_BURST_TIMEOUT: Duration = Duration::from_secs(20);
-
-/// Fire the armed burst of one peer: inject `burst_size` fresh business
-/// payloads and register every nonce (bounded registry + burst state).
-#[allow(clippy::too_many_arguments)]
-async fn fire_pending_bursts(
-    controller: &MockTunController,
-    peers: &Arc<PeerManager>,
-    local_vip: &str,
-    overlay_any_path: bool,
-    udp_transport: Option<&Arc<RwLock<Option<UdpTransport>>>>,
-    burst_size: usize,
-    next_nonce: &mut u64,
-    next_seq: &mut u32,
-    sent_nonces: &mut HashMap<u64, SentOverlayNonce>,
-    nonce_order: &mut VecDeque<u64>,
-    bursts: &mut HashMap<String, OverlayBurst>,
-) {
-    let generation = peers.current_network_generation_sync();
-    let virtual_ips: HashMap<String, String> = peers
-        .committed_business_path_snapshots_sync()
-        .into_iter()
-        .filter(|peer| {
-            peer.is_online_in_generation(generation)
-                && peer.active_path().is_some()
-                && (overlay_any_path
-                    || peer.active_path() == Some(crate::peer::NetworkPath::Direct))
-        })
-        .map(|peer| (peer.peer_id, peer.virtual_ip))
-        .collect();
-    let targets: Vec<(String, String)> = bursts
-        .iter()
-        .filter(|(_, burst)| burst.armed && burst.fired_at.is_none())
-        .filter_map(|(peer_id, _)| {
-            virtual_ips
-                .get(peer_id)
-                .cloned()
-                .map(|vip| (peer_id.clone(), vip))
-        })
-        .collect();
-    for (peer_id, virtual_ip) in targets {
-        if !overlay_any_path && !overlay_direct_business_budget_ready(udp_transport, &peer_id).await
-        {
-            continue;
-        }
-        let mut nonces = Vec::with_capacity(burst_size);
-        for _ in 0..burst_size {
-            *next_nonce = next_nonce.wrapping_add(1);
-            *next_seq = next_seq.wrapping_add(1);
-            let payload = build_overlay_payload(OVERLAY_DIRECTION_REQUEST, *next_nonce, *next_seq);
-            let Some(packet) =
-                build_udp_overlay_packet(local_vip, &virtual_ip, 39286, 39287, &payload)
-            else {
-                continue;
-            };
-            let nonce = *next_nonce;
-            let seq = *next_seq;
-            let sent_at = Instant::now();
-            if controller.inject(packet).await.is_ok() {
-                // This loop awaits its send cycle before polling ingress again.
-                // Register only an actual successful injection; a fast echo can
-                // queue meanwhile, but cannot be handled before this insertion.
-                sent_nonces.insert(
-                    nonce,
-                    SentOverlayNonce {
-                        peer_id: peer_id.clone(),
-                        generation,
-                        seq,
-                        sent_at,
-                    },
-                );
-                nonce_order.push_back(nonce);
-                while nonce_order.len() > OVERLAY_NONCE_CAP {
-                    if let Some(oldest) = nonce_order.pop_front() {
-                        sent_nonces.remove(&oldest);
-                    }
-                }
-                nonces.push(InjectedOverlayBurstRequest {
-                    nonce,
-                    seq,
-                    generation,
-                    sent_at,
-                });
-            }
-        }
-        if let Some(burst) = bursts.get_mut(&peer_id) {
-            burst.nonces = nonces.clone();
-            burst.sent = nonces.len() as u64;
-            burst.fired_at = Some(Instant::now());
-        }
-        info!(
-            event = "overlay_burst_sent",
-            peer = %peer_id,
-            sent = burst_size,
-            injected = nonces.len(),
-            "overlay_burst_sent peer={peer_id} sent={burst_size} injected={}",
-            nonces.len()
-        );
-    }
-}
 
 /// Report bursts whose echoes did not all return within the timeout (a
 /// structured failure the harness can gate on) and drop them.
@@ -784,102 +672,6 @@ fn overlay_validation_target_ready(
         peer.active_path(),
         overlay_any_path,
     )
-}
-
-/// Inject one payload per target peer into the production dataplane.
-///
-/// In the default strict-direct mode only peers in `ConnectionState::Direct`
-/// are targeted, so the evidence always rides a confirmed Direct path.  In
-/// `any_path` mode targets peers only after the production state machine owns
-/// a confirmed Relay or Direct active path. This keeps the harness out of the
-/// startup queue while still allowing Relay to provide the availability proof
-/// before a UDP punch succeeds.
-///
-/// Every sent nonce is recorded in the bounded registry so a later echo can be
-/// matched to THIS daemon's own request (peer + generation + validity).
-#[allow(clippy::too_many_arguments)]
-async fn send_overlay_payloads(
-    controller: &MockTunController,
-    peers: &Arc<PeerManager>,
-    local_vip: &str,
-    overlay_any_path: bool,
-    udp_transport: Option<&Arc<RwLock<Option<UdpTransport>>>>,
-    next_nonce: &mut u64,
-    next_seq: &mut u32,
-    stats: &mut OverlayStats,
-    sent_nonces: &mut HashMap<u64, SentOverlayNonce>,
-    nonce_order: &mut VecDeque<u64>,
-) -> u64 {
-    let mut sent = 0u64;
-    let generation = peers.current_network_generation_sync();
-    let committed_peers = peers.committed_business_path_snapshots_sync();
-    for peer in committed_peers {
-        // This independent harness must measure loss only after the production
-        // path state machine owns a confirmed path. Injecting synthetic traffic
-        // while the peer is merely online pushes it into the bounded startup
-        // queue and can expire before Relay confirmation; that tests startup
-        // timing rather than the zero-loss Direct/Relay dataplane contract.
-        if !overlay_validation_target_ready(&peer, generation, overlay_any_path) {
-            continue;
-        }
-        let virtual_ip = peer.virtual_ip.clone();
-        let peer_id = peer.peer_id.clone();
-        // The strict Direct acceptance profile is a make-before-break proof:
-        // its first Direct business packet must not race ahead of the forced
-        // encrypted Relay confirmation.  This is an authoritative manager
-        // read, not a second path state machine and not a timing sleep.  The
-        // Relay-availability profile intentionally allows Relay immediately.
-        if !overlay_any_path
-            && peer.active_path() == Some(crate::peer::NetworkPath::Direct)
-            && !peers
-                .is_relay_peer_confirmed_for_generation(&peer_id, generation)
-                .await
-        {
-            continue;
-        }
-        if !overlay_any_path
-            && peer.active_path() == Some(crate::peer::NetworkPath::Direct)
-            && !overlay_direct_business_budget_ready(udp_transport, &peer_id).await
-        {
-            continue;
-        }
-        *next_nonce = next_nonce.wrapping_add(1);
-        *next_seq = next_seq.wrapping_add(1);
-        let payload = build_overlay_payload(OVERLAY_DIRECTION_REQUEST, *next_nonce, *next_seq);
-        let Some(packet) = build_udp_overlay_packet(local_vip, &virtual_ip, 39286, 39287, &payload)
-        else {
-            continue;
-        };
-        let sent_at = Instant::now();
-        if controller.inject(packet).await.is_ok() {
-            // The same task handles ingress only after this awaited send cycle.
-            // Failed injections leave no matchable entry or eviction side effect.
-            sent_nonces.insert(
-                *next_nonce,
-                SentOverlayNonce {
-                    peer_id: peer_id.clone(),
-                    generation,
-                    seq: *next_seq,
-                    sent_at,
-                },
-            );
-            nonce_order.push_back(*next_nonce);
-            while nonce_order.len() > OVERLAY_NONCE_CAP {
-                if let Some(oldest) = nonce_order.pop_front() {
-                    sent_nonces.remove(&oldest);
-                }
-            }
-            sent += 1;
-            stats.last_seq = u64::from(*next_seq);
-            info!(
-                "{OVERLAY_EVIDENCE_PREFIX}_sent peer={peer_id} dst_ip={virtual_ip} seq={} nonce={} len={} generation={generation}",
-                *next_seq,
-                *next_nonce,
-                payload.len() + 28,
-            );
-        }
-    }
-    sent
 }
 
 enum OverlayVerdict {
@@ -1561,6 +1353,10 @@ mod ack01_exact_injection_tests {
     use super::*;
     use p2pnet_tun::VirtualInterface;
 
+    mod b1_canonical_request_tests {
+        include!("overlay_validate/b1_canonical_request_tests.rs");
+    }
+
     const PEER: &str = "peer-ack01";
     const LOCAL_VIP: &str = "10.20.0.1";
     const PEER_VIP: &str = "10.20.0.2";
@@ -1736,6 +1532,39 @@ mod ack01_exact_injection_tests {
             })
             .await
             .expect("bounded real burst injection/read must complete");
+            self.tun = Some(tun);
+            assert_eq!(self.bursts[PEER].sent, count as u64);
+            requests
+        }
+
+        async fn inject_and_read_burst_at_for_test(
+            &mut self,
+            count: usize,
+            created_at: Instant,
+        ) -> Vec<(u64, u32)> {
+            self.arm_burst();
+            let mut tun = self.tun.take().expect("mock TUN stays open");
+            let (_, requests) = tokio::time::timeout(Duration::from_secs(1), async {
+                tokio::join!(
+                    crate::overlay_requests::fire_pending_bursts_at_for_test(
+                        &self.controller,
+                        &self.peers,
+                        LOCAL_VIP,
+                        true,
+                        None,
+                        count,
+                        &mut self.next_nonce,
+                        &mut self.next_seq,
+                        &mut self.sent_nonces,
+                        &mut self.nonce_order,
+                        &mut self.bursts,
+                        created_at,
+                    ),
+                    Self::read_requests(&mut tun, count),
+                )
+            })
+            .await
+            .expect("bounded real aged burst injection/read must complete");
             self.tun = Some(tun);
             assert_eq!(self.bursts[PEER].sent, count as u64);
             requests
@@ -1921,27 +1750,13 @@ mod ack01_exact_injection_tests {
     #[tokio::test]
     async fn successful_request_expired_ttl_cannot_confirm_or_complete_burst() {
         let mut fixture = Fixture::new().await;
-        let requests = fixture.inject_and_read_burst(1).await;
-        let (nonce, seq) = requests[0];
         // Only the original request's age is controlled. Injection/read/CRC,
         // peer identity, generation and the open 20s burst window stay real.
         let expired = Instant::now()
             .checked_sub(OVERLAY_NONCE_TTL + Duration::from_secs(1))
             .expect("test Instant must support a past request timestamp");
-        fixture
-            .sent_nonces
-            .get_mut(&nonce)
-            .expect("actual injection registered")
-            .sent_at = expired;
-        let burst_request = fixture
-            .bursts
-            .get_mut(PEER)
-            .expect("actual burst fired")
-            .nonces
-            .iter_mut()
-            .find(|request| request.nonce == nonce)
-            .expect("actual successful burst request retained");
-        burst_request.sent_at = expired;
+        let requests = fixture.inject_and_read_burst_at_for_test(1, expired).await;
+        let (nonce, seq) = requests[0];
         assert!(expired.elapsed() > OVERLAY_NONCE_TTL);
         assert!(
             fixture.bursts[PEER]

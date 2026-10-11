@@ -124,11 +124,11 @@ impl Drop for RendezvousClientGuard {
 }
 
 impl RelayTransport {
-    fn with_rendezvous(
+    fn with_rendezvous<I: RelayReadItem>(
         mut self,
-        mut primary_rx: mpsc::Receiver<RelayMessage>,
+        mut primary_rx: mpsc::Receiver<I>,
         plan: Arc<RelayRendezvousPlan>,
-    ) -> (Self, mpsc::Receiver<RelayMessage>) {
+    ) -> (Self, mpsc::Receiver<I>) {
         if plan.candidates.len() < 2 {
             return (self, primary_rx);
         }
@@ -145,9 +145,9 @@ impl RelayTransport {
         let primary_tx = tx.clone();
         let primary_task = tokio::spawn(async move {
             while let Some(message) = primary_rx.recv().await {
-                let closed = matches!(message, RelayMessage::Closed { .. });
+                let closed = matches!(message.message(), RelayMessage::Closed { .. });
                 let forward = match weak.upgrade() {
-                    Some(pool) => pool.observe(&primary_endpoint, &message),
+                    Some(pool) => pool.observe(&primary_endpoint, message.message()),
                     None => return,
                 };
                 if forward && primary_tx.send(message).await.is_err() {
@@ -163,9 +163,12 @@ impl RelayTransport {
             // Auxiliary senders keep the merged channel open; preserve primary
             // EOF explicitly so the supervisor still owns reconnect and renewal.
             let _ = primary_tx
-                .send(RelayMessage::Closed {
-                    reason: p2pnet_relay::RelayCloseReason::ServerEof,
-                })
+                .send(
+                    RelayMessage::Closed {
+                        reason: p2pnet_relay::RelayCloseReason::ServerEof,
+                    }
+                    .into(),
+                )
                 .await;
             if let Some(pool) = weak.upgrade() {
                 pool.stop();
@@ -202,7 +205,7 @@ impl RelayTransport {
                             .as_ref()
                             .map(|(_, expiry)| *expiry)
                             .filter(|expiry| *expiry > 0);
-                        let (transport, rx) = RelayTransport::connect_in_region(
+                        let (transport, rx) = RelayTransport::connect_in_region_for_read::<I>(
                             &candidate.endpoint,
                             &candidate.region,
                             &plan.node_id,
@@ -250,11 +253,11 @@ impl RelayTransport {
                             }
                             message = input.recv() => {
                                 let Some(message) = message else { break; };
-                                if matches!(message, RelayMessage::Closed { .. }) { break; }
+                                if matches!(message.message(), RelayMessage::Closed { .. }) { break; }
                                 // Auxiliary RTT is not the selected connection's RTT.
-                                if matches!(message, RelayMessage::Pong { .. }) { continue; }
+                                if matches!(message.message(), RelayMessage::Pong { .. }) { continue; }
                                 let forward = match weak.upgrade() {
-                                    Some(pool) => pool.observe(&candidate.endpoint, &message),
+                                    Some(pool) => pool.observe(&candidate.endpoint, message.message()),
                                     None => return,
                                 };
                                 if forward && tx.send(message).await.is_err() { return; }
@@ -279,11 +282,11 @@ impl RelayTransport {
         (self, rx)
     }
 
-    pub(crate) async fn handoff_rendezvous(
+    pub(crate) async fn handoff_rendezvous<I: RelayReadItem>(
         &self,
         replacement: Self,
-        rx: mpsc::Receiver<RelayMessage>,
-    ) -> (Self, mpsc::Receiver<RelayMessage>) {
+        rx: mpsc::Receiver<I>,
+    ) -> (Self, mpsc::Receiver<I>) {
         match &self.rendezvous {
             Some(pool) => {
                 // Fully cancel old reconnects before any replacement auxiliary

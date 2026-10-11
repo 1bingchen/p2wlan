@@ -257,6 +257,12 @@ impl RelayClient {
     }
 }
 
+mod read_origin;
+#[cfg(test)]
+use read_origin::OriginalRelayReadWitness;
+pub use read_origin::{OriginalRelayDelivery, OriginalRelayFrameRead};
+use read_origin::{ReadInput, ReadOptions};
+
 mod commands;
 mod connect;
 mod legacy_tcp;

@@ -37,12 +37,61 @@ impl RelayClient {
         node_id: &str,
         config: RelayClientConfig,
     ) -> Result<(Self, mpsc::Receiver<RelayMessage>)> {
+        let (client, rx) =
+            Self::connect_config_with_read_options(addr, node_id, config, ReadOptions::legacy())
+                .await?;
+        Ok((client, rx.into_legacy()?))
+    }
+
+    pub async fn connect_with_read_origin(
+        addr: &str,
+        node_id: &str,
+    ) -> Result<(Self, mpsc::Receiver<OriginalRelayDelivery>)> {
+        Self::connect_with_config_and_read_origin(addr, node_id, RelayClientConfig::default()).await
+    }
+
+    /// Opt in to opaque full application-frame read facts on the original address/TCP path.
+    pub async fn connect_with_config_and_read_origin(
+        addr: &str,
+        node_id: &str,
+        config: RelayClientConfig,
+    ) -> Result<(Self, mpsc::Receiver<OriginalRelayDelivery>)> {
+        let (client, rx) =
+            Self::connect_config_with_read_options(addr, node_id, config, ReadOptions::original())
+                .await?;
+        Ok((client, rx.into_original()?))
+    }
+
+    #[cfg(test)]
+    #[allow(dead_code)] // Library unit descendants only; no public test backdoor.
+    pub(super) async fn connect_with_config_and_read_origin_witness(
+        addr: &str,
+        node_id: &str,
+        config: RelayClientConfig,
+        witness: Arc<OriginalRelayReadWitness>,
+    ) -> Result<(Self, mpsc::Receiver<OriginalRelayDelivery>)> {
+        let (client, rx) = Self::connect_config_with_read_options(
+            addr,
+            node_id,
+            config,
+            ReadOptions::with_witness(witness),
+        )
+        .await?;
+        Ok((client, rx.into_original()?))
+    }
+
+    async fn connect_config_with_read_options(
+        addr: &str,
+        node_id: &str,
+        config: RelayClientConfig,
+        options: ReadOptions,
+    ) -> Result<(Self, ReadInput)> {
         config.validate()?;
         let socket_addr: SocketAddr = addr
             .parse()
             .map_err(|e| RelayError::ConnectFailed(format!("invalid address '{addr}': {e}")))?;
 
-        Self::connect_to_addr_with_config(socket_addr, node_id, config).await
+        Self::connect_to_addr_with_read_options(socket_addr, node_id, config, options).await
     }
 
     /// Connect, register, and wait for the server's confirmation.
@@ -73,6 +122,56 @@ impl RelayClient {
         node_id: &str,
         config: RelayClientConfig,
     ) -> Result<(Self, mpsc::Receiver<RelayMessage>)> {
+        let (client, rx) = Self::connect_endpoint_with_read_options(
+            endpoint,
+            node_id,
+            config,
+            ReadOptions::legacy(),
+        )
+        .await?;
+        Ok((client, rx.into_legacy()?))
+    }
+
+    /// Opt in to opaque full application-frame read facts on the original TCP/TLS path.
+    pub async fn connect_with_endpoint_and_read_origin(
+        endpoint: &str,
+        node_id: &str,
+        config: RelayClientConfig,
+    ) -> Result<(Self, mpsc::Receiver<OriginalRelayDelivery>)> {
+        let (client, rx) = Self::connect_endpoint_with_read_options(
+            endpoint,
+            node_id,
+            config,
+            ReadOptions::original(),
+        )
+        .await?;
+        Ok((client, rx.into_original()?))
+    }
+
+    #[cfg(test)]
+    #[allow(dead_code)] // Library unit descendants only; no public test backdoor.
+    pub(super) async fn connect_with_endpoint_and_read_origin_witness(
+        endpoint: &str,
+        node_id: &str,
+        config: RelayClientConfig,
+        witness: Arc<OriginalRelayReadWitness>,
+    ) -> Result<(Self, mpsc::Receiver<OriginalRelayDelivery>)> {
+        let (client, rx) = Self::connect_endpoint_with_read_options(
+            endpoint,
+            node_id,
+            config,
+            ReadOptions::with_witness(witness),
+        )
+        .await?;
+        Ok((client, rx.into_original()?))
+    }
+
+    async fn connect_endpoint_with_read_options(
+        endpoint: &str,
+        node_id: &str,
+        config: RelayClientConfig,
+        options: ReadOptions,
+    ) -> Result<(Self, ReadInput)> {
         config.validate()?;
 
         let parsed = crate::tls::parse_endpoint(endpoint, config.allow_insecure_plaintext)?;
@@ -106,7 +205,7 @@ impl RelayClient {
                 .await
                 .map_err(|_| RelayError::Timeout("TLS handshake timed out".into()))??;
 
-                Self::finish_connect_with_stream(tls_stream, node_id, config).await
+                Self::finish_connect_with_read_options(tls_stream, node_id, config, options).await
             }
             "tcp" => {
                 let stream = tokio::time::timeout(
@@ -122,7 +221,7 @@ impl RelayClient {
                 .map_err(|e| RelayError::ConnectFailed(e.to_string()))?;
 
                 stream.set_nodelay(true).ok();
-                Self::finish_connect_with_stream(stream, node_id, config).await
+                Self::finish_connect_with_read_options(stream, node_id, config, options).await
             }
             _ => Err(RelayError::TlsError(format!(
                 "unsupported scheme: {}",
@@ -132,11 +231,27 @@ impl RelayClient {
     }
 
     /// Internal helper: finish connection after transport is established.
+    #[allow(dead_code)] // Preserved legacy private fixture entry; production uses the shared mode core.
     pub(super) async fn finish_connect_with_stream<S>(
-        mut stream: S,
+        stream: S,
         node_id: &str,
         config: RelayClientConfig,
     ) -> Result<(Self, mpsc::Receiver<RelayMessage>)>
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    {
+        let (client, rx) =
+            Self::finish_connect_with_read_options(stream, node_id, config, ReadOptions::legacy())
+                .await?;
+        Ok((client, rx.into_legacy()?))
+    }
+
+    pub(super) async fn finish_connect_with_read_options<S>(
+        mut stream: S,
+        node_id: &str,
+        config: RelayClientConfig,
+        options: ReadOptions,
+    ) -> Result<(Self, ReadInput)>
     where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
     {
@@ -164,7 +279,9 @@ impl RelayClient {
 
         // Channels
         let (cmd_tx, mut cmd_rx) = mpsc::channel::<ClientCommand>(config.cmd_queue_capacity);
-        let (msg_tx, msg_rx) = mpsc::channel::<RelayMessage>(config.inbound_queue_capacity);
+        let (msg_tx, msg_rx) = options.channel(config.inbound_queue_capacity);
+        #[cfg(test)]
+        let read_witness = options.witness();
         let (reg_tx, reg_rx) = tokio::sync::oneshot::channel::<Result<()>>();
         let (close_tx, close_rx) = tokio::sync::watch::channel(false);
         // Shared close-reason attribution shared by both background tasks.
@@ -414,6 +531,7 @@ impl RelayClient {
                     break;
                 }
 
+                let mut frame_read = None;
                 if payload_len > 0 {
                     if buf.len() < FRAME_HEADER_SIZE + payload_len {
                         buf.resize(FRAME_HEADER_SIZE + payload_len, 0);
@@ -434,7 +552,11 @@ impl RelayClient {
                         changed = read_close_rx.changed() => { let _ = changed; Ok(false) }
                     };
                     match read_payload_res {
-                        Ok(true) => {}
+                        Ok(true) => {
+                            if msg_type == MSG_RECEIVED {
+                                frame_read = msg_tx_clone.capture_data_read();
+                            }
+                        }
                         Ok(false) => break,
                         Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
                             if let Some(tx) = reg_tx.take() {
@@ -465,6 +587,12 @@ impl RelayClient {
                         let frame = Frame::new(MSG_RECEIVED, payload.to_vec());
                         match frame.parse_forward_payload() {
                             Ok((src, data)) => {
+                                #[cfg(test)]
+                                if let (Some(witness), Some(read)) =
+                                    (&read_witness, frame_read.as_ref())
+                                {
+                                    witness.observe_once(read).await;
+                                }
                                 // Preserve every frame while applying bounded
                                 // backpressure.  `try_send` here used to
                                 // close the read task as soon as the local
@@ -476,10 +604,13 @@ impl RelayClient {
                                 // the relay's own bounded queue then provides
                                 // the next backpressure boundary.
                                 if msg_tx_clone
-                                    .send(RelayMessage::Data {
-                                        from_node: src.to_string(),
-                                        data: data.to_vec(),
-                                    })
+                                    .send_data(
+                                        RelayMessage::Data {
+                                            from_node: src.to_string(),
+                                            data: data.to_vec(),
+                                        },
+                                        frame_read,
+                                    )
                                     .await
                                     .is_err()
                                 {

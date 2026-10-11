@@ -709,3 +709,5 @@ fn close_reason_first_writer_wins_for_write_failure() {
         RelayCloseReason::LocalShutdown
     );
 }
+
+mod original_read_origin;

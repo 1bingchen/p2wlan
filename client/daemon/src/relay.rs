@@ -9,7 +9,9 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use p2pnet_relay::{RelayClient, RelayClientConfig, RelayMessage};
+use p2pnet_relay::{
+    OriginalRelayDelivery, OriginalRelayFrameRead, RelayClient, RelayClientConfig, RelayMessage,
+};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, Mutex};
 use tokio::task::JoinSet;
@@ -24,6 +26,9 @@ use crate::transport::{EncryptedPeerPacket, ReceivedEncryptedPacket};
 
 const RELAY_INBOUND_IDLE_TIMEOUT: Duration = Duration::from_secs(20);
 const RELAY_TICKET_REFRESH_MARGIN_SECS: i64 = 60;
+
+mod read_origin;
+pub(crate) use read_origin::RelayReadItem;
 
 include!("relay/core.rs");
 include!("relay/transport.rs");

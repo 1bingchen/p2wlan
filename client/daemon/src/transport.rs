@@ -148,7 +148,7 @@ pub enum ResponderSessionConfirmation {
 
 struct PendingOutboundPacket {
     queued_at: Instant,
-    packet: OutboundPacket,
+    packet: crate::request_carriage::RawRequestDelivery,
 }
 
 #[derive(Clone)]
@@ -532,6 +532,9 @@ pub struct WireGuardTransport {
     resource_capture: Option<Arc<crate::dataplane_resources::ResourceCapture>>,
     #[cfg(test)]
     resource_queue_gate: Option<Arc<ResourceQueueTestGate>>,
+    #[cfg(test)]
+    request_handoff_probe:
+        Option<Arc<crate::request_carriage::test_probe::RequestHandoffArgumentProbe>>,
     /// Default-disabled evidence owner; never session/path authority.
     #[allow(dead_code)]
     rx_business_capture: Option<Arc<crate::business_evidence::CaptureOwner>>,
@@ -559,7 +562,7 @@ pub struct WireGuardTransport {
     /// send.  Parking plaintext while a path is unavailable means a queued
     /// business packet can never hold the emit lock, occupy a counter, or be
     /// overtaken on the wire by a higher-counter control packet.
-    outbound_tx: mpsc::Sender<OutboundPacket>,
+    outbound_tx: crate::request_carriage::RawOutboundSink,
     /// Shared structural outbound-loss counters (terminal drops + send
     /// failures), wired by the daemon to the peer manager's map so `/status`
     /// reports the transport-level session queue loss together with the

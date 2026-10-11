@@ -586,9 +586,10 @@ impl WireGuardTransport {
 
     pub(in crate::transport) async fn queue_pending_outbound(
         &self,
-        packet: OutboundPacket,
+        packet: impl Into<crate::request_carriage::RawRequestDelivery> + Send,
         reason: &'static str,
     ) {
+        let packet = packet.into();
         let peer_id = packet.peer_id.clone();
         let ingress_lock = self.outbound_ingress_lock(&peer_id).await;
         let _ingress_guard = ingress_lock.lock().await;
@@ -600,9 +601,10 @@ impl WireGuardTransport {
     /// lock prevents a live producer from racing an in-flight session flush.
     pub(in crate::transport) async fn queue_pending_outbound_locked(
         &self,
-        packet: OutboundPacket,
+        packet: impl Into<crate::request_carriage::RawRequestDelivery> + Send,
         reason: &'static str,
     ) {
+        let packet = packet.into();
         let now = Instant::now();
         let peer_id = packet.peer_id.clone();
         let packet_len = packet.packet.len();
@@ -679,8 +681,9 @@ impl WireGuardTransport {
     /// otherwise hand the packet to the network-outbound worker immediately.
     pub(in crate::transport) async fn forward_raw_outbound(
         &self,
-        mut packet: OutboundPacket,
+        packet: impl Into<crate::request_carriage::RawRequestDelivery> + Send,
     ) -> Result<()> {
+        let mut packet = packet.into();
         let peer_id = packet.peer_id.clone();
         let profiler = global_dataplane_profiler();
         let sampled = packet.trace.as_ref().map(|trace| trace.sampled);
@@ -850,9 +853,20 @@ impl WireGuardTransport {
     /// holding the lock through the actual send.  A parked packet therefore
     /// never holds the emit lock, never occupies a WireGuard counter, and can
     /// never be overtaken on the wire by a higher-counter control packet.
-    pub async fn run_outbound(
+    pub async fn run_outbound(&self, outbound_rx: mpsc::Receiver<OutboundPacket>) -> Result<()> {
+        self.run_outbound_inner(outbound_rx.into()).await
+    }
+
+    pub(crate) async fn run_outbound_with_request_carriage(
         &self,
-        mut outbound_rx: mpsc::Receiver<OutboundPacket>,
+        outbound_rx: mpsc::Receiver<crate::request_carriage::RawRequestDelivery>,
+    ) -> Result<()> {
+        self.run_outbound_inner(outbound_rx.into()).await
+    }
+
+    async fn run_outbound_inner(
+        &self,
+        mut outbound_rx: crate::request_carriage::RawOutboundReceiver,
     ) -> Result<()> {
         while let Some(mut packet) = outbound_rx.recv().await {
             let profiler = global_dataplane_profiler();

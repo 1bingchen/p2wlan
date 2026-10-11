@@ -80,7 +80,7 @@ impl Daemon {
             let (tun, controller) =
                 p2pnet_tun::mock::MockTunDevice::new_pair(&interface_name, mtu, &local_vip);
             let (dataplane, outbound_rx, inbound_tx) =
-                DataPlane::new_bidirectional(tun, peers.clone());
+                DataPlane::new_bidirectional_with_request_carriage(tun, peers.clone());
             let mut dataplane = dataplane
                 .with_acl(self.acl.clone(), self.config.node.node_id.clone())
                 .with_overlay_cidr(&self.config.network.cidr)
@@ -90,7 +90,9 @@ impl Daemon {
             let outbound_transport = transport.clone();
             self.task_manager
                 .spawn_result("wireguard-outbound", true, async move {
-                    outbound_transport.run_outbound(outbound_rx).await
+                    outbound_transport
+                        .run_outbound_with_request_carriage(outbound_rx)
+                        .await
                 })
                 .await;
 

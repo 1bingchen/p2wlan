@@ -15,12 +15,13 @@ pub(super) struct PeerWorkContext {
 /// Append before any authority/slot/accounting await. The synchronous
 /// generation mirror binds the FIFO; it never authorizes physical delivery.
 pub(super) fn append_ingress(
-    packet: OutboundPacket,
+    packet: impl Into<RawRequestDelivery>,
     pending: &mut HashMap<String, PeerPendingQueue>,
     ctx: &PeerWorkContext,
     probe_kick: &mut u64,
     probe_kick_tx: &watch::Sender<u64>,
 ) {
+    let packet = packet.into();
     let peer_id = packet.peer_id.clone();
     let generation = ctx.peers.current_network_generation_sync();
     let entry = pending

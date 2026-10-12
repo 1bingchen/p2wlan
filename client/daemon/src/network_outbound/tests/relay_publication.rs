@@ -520,7 +520,7 @@ async fn b19_original_fanout_first_full_with_other_unknown() {
     });
     let udps = RwLock::new(None);
     let relays = RwLock::new(Some(first.transport().clone()));
-    let mut send = Box::pin(encrypt_then_send_with_deadline(
+    let pending_send = encrypt_then_send_with_deadline(
         f.delivery.clone(),
         &transport,
         &f.peers,
@@ -531,7 +531,12 @@ async fn b19_original_fanout_first_full_with_other_unknown() {
         true,
         Some(Instant::now() + Duration::from_secs(1)),
         None,
-    ));
+    );
+    // Force the first Pending before writer enqueue; retain the deadline above.
+    let mut send = Box::pin(async move {
+        tokio::task::yield_now().await;
+        pending_send.await
+    });
     assert!(
         budget
             .step(poll_fn(|cx| Poll::Ready(matches!(
@@ -540,7 +545,15 @@ async fn b19_original_fanout_first_full_with_other_unknown() {
             ))))
             .await
     );
-    budget.step(full_rx).await.unwrap();
+    budget
+        .step(async {
+            tokio::select! {
+                biased;
+                full = full_rx => full.unwrap(),
+                _ = &mut send => panic!("B19 original caller completed before first FULL"),
+            }
+        })
+        .await;
     let capture = budget.step(capture_rx).await.unwrap();
     let branches = capture.branches().unwrap();
     assert_eq!(branches.len(), 2);

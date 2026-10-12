@@ -78,6 +78,42 @@ impl RelayRendezvous {
         routes.clients.values().cloned().collect()
     }
 
+    // One original selection and one routes lock. Metadata allocation failure
+    // keeps this exact business vector; it never performs a second selection.
+    fn send_clients_with_origins(
+        &self,
+        peer: &str,
+    ) -> (
+        Vec<Arc<RelayClient>>,
+        Option<Vec<send_origin::SelectedRelayWriter>>,
+    ) {
+        let routes = self.routes.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some((endpoint, client)) = routes.peers.get(peer).and_then(|endpoint| {
+            routes
+                .clients
+                .get(endpoint)
+                .map(|client| (endpoint, client))
+        }) {
+            let clients = vec![client.clone()];
+            let origins = send_origin::SelectedRelayWriter::single(endpoint, client);
+            return (clients, origins);
+        }
+        // HashMap::iter and values visit the same entries in the same order.
+        // Do not add a fanout limit or keep additional strong client owners.
+        let clients: Vec<_> = routes.clients.values().cloned().collect();
+        let mut origins = Vec::new();
+        if origins.try_reserve_exact(clients.len()).is_err() {
+            return (clients, None);
+        }
+        for (endpoint, client) in &routes.clients {
+            let Some(origin) = send_origin::SelectedRelayWriter::capture(endpoint, client) else {
+                return (clients, None);
+            };
+            origins.push(origin);
+        }
+        (clients, Some(origins))
+    }
+
     fn observe(&self, endpoint: &str, message: &RelayMessage) -> bool {
         let mut routes = self.routes.lock().unwrap_or_else(|p| p.into_inner());
         match message {

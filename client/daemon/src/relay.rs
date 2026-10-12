@@ -29,6 +29,9 @@ const RELAY_TICKET_REFRESH_MARGIN_SECS: i64 = 60;
 
 mod read_origin;
 pub(crate) use read_origin::RelayReadItem;
+mod send_origin;
+#[allow(unused_imports)] // Staged neutral finish kind for the next integration.
+pub(crate) use send_origin::{RelayCaptureOutcome, RelaySendCapture};
 
 include!("relay/core.rs");
 include!("relay/transport.rs");

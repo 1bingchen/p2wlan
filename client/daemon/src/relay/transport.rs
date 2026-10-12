@@ -315,7 +315,7 @@ impl RelayTransport {
 
     /// Send a single encrypted packet through the relay.
     pub async fn send_packet(&self, packet: &EncryptedPeerPacket) -> Result<()> {
-        self.send_packet_inner(packet, None).await
+        self.send_packet_inner(packet, None, None).await
     }
 
     /// Send a control packet whose expectation must be installed at the relay
@@ -328,14 +328,26 @@ impl RelayTransport {
     where
         F: FnOnce(Instant) -> bool + Send + 'static,
     {
-        self.send_packet_inner(packet, Some(Box::new(write_boundary)))
+        self.send_packet_inner(packet, Some(Box::new(write_boundary)), None)
             .await
+    }
+
+    // Staged neutral adapter. Canonical request/attempt and emit ownership are
+    // deliberately not supplied by this interface.
+    #[allow(dead_code)]
+    pub(crate) async fn send_packet_with_origin(
+        &self,
+        packet: &EncryptedPeerPacket,
+        origin: Arc<RelaySendCapture>,
+    ) -> Result<()> {
+        self.send_packet_inner(packet, None, Some(origin)).await
     }
 
     async fn send_packet_inner(
         &self,
         packet: &EncryptedPeerPacket,
         write_boundary: Option<Box<dyn FnOnce(Instant) -> bool + Send + 'static>>,
+        origin: Option<Arc<RelaySendCapture>>,
     ) -> Result<()> {
         debug!(
             event = "relay_outbound_write_submitted",
@@ -349,36 +361,70 @@ impl RelayTransport {
             relay_endpoint = %self.relay_endpoint,
             "opaque encrypted frame submitted to the relay client's bounded command queue"
         );
-        let clients = self
-            .rendezvous
-            .as_ref()
-            .map(|pool| pool.send_clients(&packet.peer_id))
-            .unwrap_or_else(|| vec![self.client.clone()]);
+        let clients = if let Some(origin) = origin.as_ref() {
+            let (clients, selected) = self
+                .rendezvous
+                .as_ref()
+                .map(|pool| pool.send_clients_with_origins(&packet.peer_id))
+                .unwrap_or_else(|| {
+                    (
+                        vec![self.client.clone()],
+                        send_origin::SelectedRelayWriter::single(
+                            &self.relay_endpoint,
+                            &self.client,
+                        ),
+                    )
+                });
+            origin.configure(
+                packet,
+                selected,
+                self.relay_connection_id,
+                Arc::downgrade(&self.write_boundaries_live),
+            );
+            clients
+        } else {
+            self.rendezvous
+                .as_ref()
+                .map(|pool| pool.send_clients(&packet.peer_id))
+                .unwrap_or_else(|| vec![self.client.clone()])
+        };
         let boundary = Arc::new(std::sync::Mutex::new((write_boundary, None::<bool>)));
         let send_result = if clients.len() == 1 {
-            guarded_relay_write(
+            guarded_relay_write_with_origin(
                 &clients[0],
                 packet,
                 self.write_boundaries_live.clone(),
                 boundary,
+                origin.as_ref().and_then(|capture| capture.branch(0)),
             )
             .await
         } else {
             let mut writes = JoinSet::new();
-            for client in clients {
+            for (index, client) in clients.into_iter().enumerate() {
                 let live = self.write_boundaries_live.clone();
                 let boundary = boundary.clone();
                 let packet = packet.clone();
+                let write_origin = origin.as_ref().and_then(|capture| capture.branch(index));
                 writes.spawn(async move {
+                    let timeout_origin = write_origin.clone();
                     match timeout(
                         Duration::from_secs(1),
-                        guarded_relay_write(&client, &packet, live, boundary),
+                        guarded_relay_write_with_origin(
+                            &client,
+                            &packet,
+                            live,
+                            boundary,
+                            write_origin,
+                        ),
                     )
                     .await
                     {
                         Ok(result) => result,
                         Err(_) => {
                             client.abort();
+                            if let Some(origin) = timeout_origin {
+                                origin.note_unknown();
+                            }
                             Err(p2pnet_relay::RelayError::WriterStoppedBeforeWrite)
                         }
                     }
@@ -648,4 +694,49 @@ async fn guarded_relay_write(
             accepted
         })
         .await
+}
+
+// None delegates to the unmodified original guarded writer. Opt-in observation
+// only appends finite atomic/OnceLock bookkeeping to the existing hook/result.
+async fn guarded_relay_write_with_origin(
+    client: &RelayClient,
+    packet: &EncryptedPeerPacket,
+    live: Arc<std::sync::Mutex<bool>>,
+    boundary: SharedRelayWriteBoundary,
+    origin: Option<send_origin::RelayWriteObserver>,
+) -> std::result::Result<(), p2pnet_relay::RelayError> {
+    let Some(origin) = origin else {
+        return guarded_relay_write(client, packet, live, boundary).await;
+    };
+    let permit = packet.room_authorization.clone();
+    let prewrite = origin.clone();
+    let observer = origin.clone();
+    let result = client
+        .send_data_with_write_boundary_and_observer(
+            &packet.peer_id,
+            &packet.wire_bytes,
+            move |sent_at| {
+                let live = live.lock().unwrap_or_else(|p| p.into_inner());
+                if !*live || permit.as_ref().is_some_and(|p| !p.is_valid()) {
+                    return false;
+                }
+                let mut boundary = boundary.lock().unwrap_or_else(|p| p.into_inner());
+                if let Some(accepted) = boundary.1 {
+                    if accepted {
+                        prewrite.note_handed();
+                    }
+                    return accepted;
+                }
+                let accepted = boundary.0.take().is_none_or(|hook| hook(sent_at));
+                boundary.1 = Some(accepted);
+                if accepted {
+                    prewrite.note_handed();
+                }
+                accepted
+            },
+            move |fact| observer.observe(fact),
+        )
+        .await;
+    origin.note_result(&result);
+    result
 }

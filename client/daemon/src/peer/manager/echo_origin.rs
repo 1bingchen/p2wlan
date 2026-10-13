@@ -193,7 +193,7 @@ impl PeerManager {
         } else if let (Some(read), Some(id), Some(endpoint)) = (
             input.source().original_relay_read(),
             input.source().relay_connection_id(),
-            input.source().relay_endpoint(),
+            input.source().relay_reader_endpoint(),
         ) {
             let slot = input
                 .relay()

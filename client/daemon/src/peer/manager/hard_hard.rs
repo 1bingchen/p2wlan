@@ -484,6 +484,13 @@ impl PeerManager {
         self.hard_hard_winners.lock().await
     }
 
+    #[cfg(test)]
+    pub(crate) async fn hold_hard_hard_session_writer_for_test(
+        &self,
+    ) -> tokio::sync::MutexGuard<'_, HashMap<(String, String), HardHardSessionRecord>> {
+        self.hard_hard_sessions.lock().await
+    }
+
     /// Admit the one expected reciprocal response after the remote candidate
     /// epoch advances.  A fresh response is allowed to move the session's
     /// remote-candidate fence by exactly one epoch; the socket identity is

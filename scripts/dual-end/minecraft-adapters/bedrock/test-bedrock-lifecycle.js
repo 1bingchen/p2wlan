@@ -1,0 +1,28 @@
+'use strict'
+const test = require('node:test'); const assert = require('node:assert/strict')
+const dgram = require('node:dgram'); const { once } = require('node:events')
+const fs = require('node:fs'); const os = require('node:os'); const path = require('node:path')
+const { spawn } = require('node:child_process')
+const { fixture } = require('./fixture-input')
+for (const mode of ['connect-timeout', 'startup-cancel', 'long-connect-timeout']) test(`native owned UDP ${mode}: one handshake, no retry or leaked child`, { timeout: 5000 }, async t => {
+  const socket = dgram.createSocket('udp4'); socket.bind(0, '127.0.0.1'); await once(socket, 'listening')
+  t.after(() => socket.close())
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'bedrock-lifecycle-'))
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }))
+  const f = fixture(directory, socket.address().port)
+  f.config.connect_timeout_ms = mode === 'long-connect-timeout' ? 1800 : 100; f.save()
+  const child = spawn(process.execPath, [path.join(__dirname, 'bedrock-adapter.js'), '--config', f.configPath], { stdio: ['pipe', 'pipe', 'pipe'] })
+  t.after(() => { if (child.exitCode === null) child.kill('SIGKILL') })
+  const datagrams = []; const output = []; const diagnostics = []
+  socket.on('message', data => { datagrams.push(data); if (mode === 'startup-cancel') child.kill('SIGTERM') })
+  child.stdout.on('data', b => output.push(b)); child.stderr.on('data', b => diagnostics.push(b))
+  child.stdin.end(JSON.stringify(f.envelope))
+  const timer = setTimeout(() => child.kill('SIGKILL'), 2500)
+  const [code, signal] = await once(child, 'exit'); clearTimeout(timer)
+  assert.equal(signal, null, Buffer.concat(diagnostics).toString()); assert.equal(code, 0, Buffer.concat(diagnostics).toString())
+  assert.equal(datagrams.length, 1)
+  assert.equal(datagrams[0][0], 5) // actual OpenConnectionRequest1, not a status ping
+  const rows = Buffer.concat(output).toString().trim().split('\n').map(JSON.parse)
+  assert.equal(rows.length, 1); assert.equal(rows[0].type, 'finish')
+  assert.equal(rows[0].termination, mode === 'startup-cancel' ? 'interrupted' : 'adapter_error')
+})

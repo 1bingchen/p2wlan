@@ -1430,6 +1430,37 @@ impl WireGuardTransport {
         }
     }
 
+    pub(crate) async fn pause_worker_loss_for_test(
+        &self,
+        point: super::WorkerLossPoint,
+        deadline: Option<Instant>,
+    ) {
+        if let Some(gate) = self.resource_queue_gate.as_ref() {
+            gate.pause_worker_loss(point, deadline).await;
+        }
+    }
+
+    pub(crate) async fn observe_worker_loss_for_test(
+        &self,
+        observed: super::WorkerLossObservation,
+    ) {
+        if let Some(gate) = self.resource_queue_gate.as_ref() {
+            gate.observe_loss(observed).await;
+        }
+    }
+
+    pub(crate) fn abort_worker_loss_children_for_test(&self) -> bool {
+        self.resource_queue_gate
+            .as_ref()
+            .is_some_and(|gate| gate.children_abort_requested())
+    }
+
+    pub(crate) fn observe_worker_loss_join_for_test(&self, id: tokio::task::Id) {
+        if let Some(gate) = self.resource_queue_gate.as_ref() {
+            gate.note_joined(id);
+        }
+    }
+
     pub(super) async fn expire_pending_responder_for_test(&self, peer_id: &str, token: &str) {
         let mut sessions = self.sessions.lock().await;
         sessions

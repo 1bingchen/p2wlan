@@ -93,6 +93,11 @@ impl PhysicalSendPublication {
             .map(|_| id)
             .map_err(|_| PublicationFailure::Contended)
     }
+    #[cfg(test)]
+    pub(crate) fn original_reopen_is_occupied_for_test(&self) -> bool {
+        // Calls the original owner/CAS, without a source or phase factory.
+        matches!(self.open(), Err(PublicationFailure::Occupied))
+    }
     fn terminal(&self, id: u64, terminal: PhysicalPublicationState) -> bool {
         self.phase
             .compare_exchange(

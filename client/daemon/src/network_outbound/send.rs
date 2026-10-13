@@ -423,6 +423,13 @@ pub(super) async fn encrypt_then_send_with_deadline(
     );
     #[cfg(test)]
     prepare_relay_capture_for_test(&encrypted, &mut physical_attempt);
+    #[cfg(test)]
+    transport
+        .pause_worker_loss_for_test(
+            crate::transport::WorkerLossPoint::BeforePhysicalHandoff,
+            admission_deadline,
+        )
+        .await;
     let outcome = send_encrypted_packet_bounded_with_origin(
         &encrypted,
         peers,
@@ -1304,3 +1311,7 @@ mod relay_actor_legacy_full_tests;
 #[cfg(test)]
 #[path = "tests/relay_actor_drain.rs"]
 mod relay_actor_drain_tests;
+
+#[cfg(test)]
+#[path = "tests/relay_actor_loss.rs"]
+mod relay_actor_loss_tests;

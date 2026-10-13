@@ -667,6 +667,14 @@ where
                 .max_capacity()
                 .saturating_sub(self.outbound_tx.capacity()) as u64,
         );
+        // The routed Vec remains this future's local owner while reserve
+        // waits. This observation ends before synchronous channel handoff;
+        // it does not cover queued packets or change admission/deadlines.
+        let admission_wait_lease = crate::dataplane_resources::OwnedBufferLease::observe(
+            self.resource_capture(),
+            crate::dataplane_resources::BufferStage::DataplaneAdmissionWait,
+            &routed.packet,
+        );
         let slot = self
             .outbound_tx
             .reserve()
@@ -686,6 +694,7 @@ where
             );
             return Ok(());
         }
+        drop(admission_wait_lease);
         slot.send(RawRequestDelivery::routed(routed, binding))
             .map_err(|_| DaemonError::Network("tracked outbound sink mismatch".to_string()))?;
         if let Some(auth) = self.room_authorization.as_ref() {

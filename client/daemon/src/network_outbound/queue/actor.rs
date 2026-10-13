@@ -577,6 +577,10 @@ mod tests;
 #[path = "../tests/resource_capture_queue.rs"]
 mod resource_capture_tests;
 
+#[cfg(test)]
+#[path = "../tests/resource_capture_active_queue.rs"]
+mod resource_capture_active_queue_tests;
+
 pub(super) fn report_shutdown_unknown(
     queue: &PeerPendingQueue,
     peer_id: &str,

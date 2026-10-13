@@ -45,7 +45,17 @@ pub(super) async fn encrypt_then_send_with_deadline(
     stopping: Option<&AtomicBool>,
 ) -> EncryptSendOutcome {
     let packet = packet.into();
+    let original_buffer_lease = crate::dataplane_resources::OwnedBufferLease::observe(
+        transport.resource_capture(),
+        crate::dataplane_resources::BufferStage::ActiveOriginal,
+        &packet.packet,
+    );
     let retry_packet = packet.clone();
+    let _retry_buffer_lease = crate::dataplane_resources::OwnedBufferLease::observe(
+        transport.resource_capture(),
+        crate::dataplane_resources::BufferStage::RetryPlaintext,
+        &retry_packet.packet,
+    );
     if let Some(capture) = transport.resource_capture() {
         let _ = capture.observe_vec(
             crate::dataplane_resources::VecSite::TxRetryCopy,
@@ -67,6 +77,11 @@ pub(super) async fn encrypt_then_send_with_deadline(
     // across its exact nonblocking UDP syscall, which is the revocation/path
     // replacement linearization point.
     let preparation_retry = retry_packet.clone();
+    let preparation_buffer_lease = crate::dataplane_resources::OwnedBufferLease::observe(
+        transport.resource_capture(),
+        crate::dataplane_resources::BufferStage::PreparationPlaintext,
+        &preparation_retry.packet,
+    );
     if let Some(capture) = transport.resource_capture() {
         let _ = capture.observe_vec(
             crate::dataplane_resources::VecSite::TxPreparationCopy,
@@ -91,6 +106,10 @@ pub(super) async fn encrypt_then_send_with_deadline(
     // cancellation may abandon an allocated counter, but its ciphertext has
     // never been handed off, so only the original plaintext can be retried.
     let prepare = async {
+        // These move-only leases are owned by the same preparation future as
+        // the corresponding buffers, including cancellation before encryption.
+        let original_buffer_lease = original_buffer_lease;
+        let _preparation_buffer_lease = preparation_buffer_lease;
         let emit_lock_started = Instant::now();
         let emit_guard = Arc::new(transport.acquire_outbound_emit_guard(&packet.peer_id).await);
         let emit_guard_acquired = Instant::now();
@@ -109,7 +128,13 @@ pub(super) async fn encrypt_then_send_with_deadline(
             lock_wait_ms = emit_lock_wait_ms,
             "business packet acquired its per-peer WireGuard counter-ordering lock"
         );
-        let (encrypted, direct_business_plan, force_relay, physical_preparation) = {
+        let (
+            encrypted,
+            direct_business_plan,
+            force_relay,
+            physical_preparation,
+            serialized_buffer_lease,
+        ) = {
             let epoch_gate = peers.network_epoch_gate();
             let epoch_gate_wait_started = Instant::now();
             let _epoch_guard = epoch_gate.lock().await;
@@ -298,6 +323,14 @@ pub(super) async fn encrypt_then_send_with_deadline(
                     });
                 }
             };
+            // The original plaintext has been consumed by the crypto call.
+            // Bind the returned wire owner before any further awaited work.
+            drop(original_buffer_lease);
+            let serialized_buffer_lease = crate::dataplane_resources::OwnedBufferLease::observe(
+                transport.resource_capture(),
+                crate::dataplane_resources::BufferStage::SerializedWire,
+                &result.wire_bytes,
+            );
             let physical_preparation =
                 result.prepare_physical_publication(peers, transport, current_generation);
             if let Some(trace) = sampled_trace.as_ref() {
@@ -327,6 +360,7 @@ pub(super) async fn encrypt_then_send_with_deadline(
                 direct_business_plan,
                 force_relay,
                 physical_preparation,
+                serialized_buffer_lease,
             )
         };
         Ok((
@@ -337,9 +371,10 @@ pub(super) async fn encrypt_then_send_with_deadline(
             emit_lock_started,
             emit_guard_acquired,
             physical_preparation,
+            serialized_buffer_lease,
         ))
     };
-    let (emit_guard, encrypted, direct_business_plan, force_relay, emit_lock_started, emit_guard_acquired, physical_preparation) =
+    let (emit_guard, encrypted, direct_business_plan, force_relay, emit_lock_started, emit_guard_acquired, physical_preparation, _serialized_buffer_lease) =
         match timeout(preparation_bound, prepare).await {
             Ok(Ok(prepared)) => prepared,
             Ok(Err(outcome)) => return outcome,
@@ -1176,6 +1211,10 @@ mod tests;
 #[cfg(test)]
 #[path = "tests/resource_capture_send.rs"]
 mod resource_capture_tests;
+
+#[cfg(test)]
+#[path = "tests/resource_capture_active_buffers.rs"]
+mod resource_capture_active_buffers_tests;
 
 #[cfg(test)]
 #[path = "tests/request_carriage_send.rs"]

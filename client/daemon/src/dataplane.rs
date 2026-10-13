@@ -33,3 +33,8 @@ mod tests {
 mod room_connectivity_tests {
     include!("dataplane/room_connectivity_tests.rs");
 }
+
+#[cfg(test)]
+mod resource_capture_admission_wait_tests {
+    include!("dataplane/resource_capture_admission_wait_tests.rs");
+}

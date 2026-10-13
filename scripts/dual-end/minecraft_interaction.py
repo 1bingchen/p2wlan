@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Strict, offline block-placement evidence reducer; no game adapter is included.
+"""Strict, offline block-placement evidence reducer; adapters execute separately.
 
 Local request nonces are experiment identities, never invented wire echoes.
 The v1 correlation contract requires an isolated scene and a different target

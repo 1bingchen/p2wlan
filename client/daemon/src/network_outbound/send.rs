@@ -1292,3 +1292,7 @@ fn prepare_relay_capture_for_test<G>(
         hook(capture, packet);
     }
 }
+
+#[cfg(test)]
+#[path = "tests/relay_actor_publication.rs"]
+mod relay_actor_publication_tests;

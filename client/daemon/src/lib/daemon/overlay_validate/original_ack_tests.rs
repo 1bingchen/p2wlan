@@ -456,3 +456,15 @@ async fn b28_runtime_vip_relay_stale_session_rejects_old_ack_then_new_a_is_fresh
     )
     .await
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pr209_actual_asymmetric_direct_request_uses_verified_return_path_and_native_once(
+) -> Result<(), String> {
+    fixture::exercise_asymmetric_endpoint().await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pr209_actual_asymmetric_echo_rejects_revoked_and_compat_return_then_new_canonical_recovers(
+) -> Result<(), String> {
+    fixture::exercise_asymmetric_invalidation().await
+}

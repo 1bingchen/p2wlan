@@ -39,6 +39,11 @@ mod publication_order;
 #[path = "runtime_vip.rs"]
 mod runtime_vip;
 pub(super) use runtime_vip::RuntimeVipCase;
+#[path = "asymmetric_endpoint.rs"]
+mod asymmetric_endpoint;
+pub(super) use asymmetric_endpoint::{
+    exercise_asymmetric_endpoint, exercise_asymmetric_invalidation,
+};
 const NODE_A: &str = "original-ack-a";
 const NODE_B: &str = "original-ack-b";
 const VIP_A: &str = "10.20.0.1";
@@ -111,6 +116,7 @@ impl Budget {
 struct Task {
     label: &'static str,
     handle: Option<JoinHandle<Check>>,
+    graceful: bool,
 }
 
 #[derive(Default)]
@@ -126,6 +132,19 @@ impl Owners {
         self.tasks.push(Task {
             label,
             handle: Some(tokio::spawn(future)),
+            graceful: false,
+        });
+    }
+
+    fn spawn_graceful(
+        &mut self,
+        label: &'static str,
+        future: impl Future<Output = Check> + Send + 'static,
+    ) {
+        self.tasks.push(Task {
+            label,
+            handle: Some(tokio::spawn(future)),
+            graceful: true,
         });
     }
 
@@ -134,8 +153,10 @@ impl Owners {
             let _ = stop.send(true);
         }
         for task in &self.tasks {
-            if let Some(handle) = &task.handle {
-                handle.abort();
+            if !task.graceful {
+                if let Some(handle) = &task.handle {
+                    handle.abort();
+                }
             }
         }
         // Cancel owned converters before intentionally closing their native
@@ -155,7 +176,7 @@ impl Owners {
                     task.handle.take();
                     match result {
                         Ok(Ok(())) => {}
-                        Err(error) if error.is_cancelled() => {}
+                        Err(error) if error.is_cancelled() && !task.graceful => {}
                         other => failures
                             .push(format!("{}: unexpected owned join {other:?}", task.label)),
                     }
@@ -240,6 +261,57 @@ impl Endpoint {
         budget: Budget,
         keep_bootstrap_vip: bool,
     ) -> Result<Self, String> {
+        Self::create_inner(
+            node,
+            vip,
+            remote_node,
+            remote_vip,
+            path,
+            hub,
+            owners,
+            budget,
+            keep_bootstrap_vip,
+            false,
+        )
+        .await
+    }
+
+    async fn create_for_validation(
+        node: &'static str,
+        vip: &'static str,
+        remote_node: &'static str,
+        remote_vip: &'static str,
+        owners: &mut Owners,
+        budget: Budget,
+    ) -> Result<Self, String> {
+        Self::create_inner(
+            node,
+            vip,
+            remote_node,
+            remote_vip,
+            PathKind::Direct,
+            None,
+            owners,
+            budget,
+            false,
+            true,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn create_inner(
+        node: &'static str,
+        vip: &'static str,
+        remote_node: &'static str,
+        remote_vip: &'static str,
+        path: PathKind,
+        hub: Option<&str>,
+        owners: &mut Owners,
+        budget: Budget,
+        keep_bootstrap_vip: bool,
+        actual_validation: bool,
+    ) -> Result<Self, String> {
         let mut config =
             Config::generate_default("http://ctrl.test", "default").map_err(|e| e.to_string())?;
         config.node.node_id = node.to_string();
@@ -252,8 +324,18 @@ impl Endpoint {
             config.network.virtual_ip = vip.to_string();
         }
         config.relay.path_policy = PathPolicy::Auto;
+        let identity = if actual_validation {
+            let private = hex::decode(&config.node.private_key).map_err(|e| e.to_string())?;
+            let private: [u8; 32] = private
+                .try_into()
+                .map_err(|_| "actual Config private key length")?;
+            NodeIdentity::from_private_key(private)
+        } else {
+            NodeIdentity::generate()
+        };
         let peers = Arc::new(PeerManager::new(config));
         let (wireguard, _unused_outbound) = WireGuardTransport::new_with_request_carriage();
+        let (encrypted_tx, encrypted_rx) = mpsc::channel(16);
         let udp_transport = if path == PathKind::Direct {
             let udp = budget
                 .step(
@@ -267,6 +349,17 @@ impl Endpoint {
                 )
                 .await?
                 .map_err(|e| e.to_string())?;
+            let udp = if actual_validation {
+                udp.with_local_node_id(node)
+                    .with_wireguard_transport(wireguard.clone())
+                    .with_inbound_channel(encrypted_tx.clone())
+                    .with_dplpmtud_local_virtual_ip(
+                        vip.parse()
+                            .map_err(|e: std::net::AddrParseError| e.to_string())?,
+                    )
+            } else {
+                udp
+            };
             // This is the actual publication consumed by the actual single
             // reader, not a synthesized OriginalUdpIngressSource/fact.
             udp.set_inbound_publication_owner(if node == NODE_A { 28001 } else { 28002 });
@@ -317,7 +410,6 @@ impl Endpoint {
             }
             Ok(())
         });
-        let (encrypted_tx, encrypted_rx) = mpsc::channel(16);
         let (overlay_tx, overlay) = mpsc::channel(16);
         let (udp_publication, udp_updates) = watch::channel(udp_transport.clone());
         let inbound_wireguard = wireguard.clone();
@@ -358,7 +450,7 @@ impl Endpoint {
         }
         Ok(Self {
             node,
-            identity: NodeIdentity::generate(),
+            identity,
             vip,
             remote_node,
             remote_vip,

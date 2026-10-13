@@ -1,4 +1,4 @@
-"""Two run-owned DROP rules in one original, retained network namespace FD."""
+"""Two INPUT DROP rules in one original, retained target namespace FD."""
 from __future__ import annotations
 
 import copy
@@ -30,13 +30,13 @@ def open_namespace(name: str, original_daemon_pid: int) -> tuple[int, dict]:
 
 
 def decode_owned_rule(tokens: list[str]) -> dict:
-    if tokens[:2] != ["-A", "OUTPUT"]:
-        raise ValueError("owned rule moved outside OUTPUT")
+    if tokens[:2] != ["-A", "INPUT"]:
+        raise ValueError("owned rule moved outside INPUT")
     result, modules = {}, []
     for key, value in zip(tokens[2::2], tokens[3::2]):
         if key == "-m":
             modules.append(value)
-        elif key in ("-s", "-d", "-o", "-p", "--dport", "--sports", "--comment", "-j") and key not in result:
+        elif key in ("-s", "-d", "-i", "-p", "--dport", "--sports", "--comment", "-j") and key not in result:
             result[key] = str(ipaddress.ip_network(value)) if key in ("-s", "-d") else value
         else:
             raise ValueError("owned rule arguments changed")
@@ -53,30 +53,32 @@ class FaultOwner:
         if (not plan.get("preflight_all_absent") or namespace not in plan["namespaces"]
                 or namespace not in created_namespaces or re.fullmatch(r"[a-z0-9-]+", namespace) is None):
             raise ValueError("fault namespace was not created/admitted by this original run")
-        kernel = source["kernel"]
-        if (kernel["kind"] != "tun" or kernel["vip"] != source["virtual_ip"]
-                or kernel["route_to_peer"] != {"dst": target["virtual_ip"], "dev": kernel["ifname"], "prefsrc": source["virtual_ip"]}
-                or source["run_id"] != target["run_id"]):
-            raise ValueError("fault source no longer describes the original kernel TUN route")
+        for endpoint, peer in ((source, target), (target, source)):
+            kernel = endpoint["kernel"]
+            if (kernel["kind"] != "tun" or kernel["vip"] != endpoint["virtual_ip"]
+                    or kernel["route_to_peer"] != {"dst": peer["virtual_ip"], "dev": kernel["ifname"], "prefsrc": endpoint["virtual_ip"]}
+                    or source["run_id"] != target["run_id"]):
+                raise ValueError("fault endpoints no longer describe the original kernel TUN routes")
+        kernel = target["kernel"]
         self.runner = runner
         self.rules = []
         for protocol in ("udp", "tcp"):
             ports = PORTS[protocol]
             marker = "p2wlan-d03-" + entries[0]["run_nonce"] + "-" + protocol
             args = ["-s", source["virtual_ip"] + "/32", "-d", target["virtual_ip"] + "/32",
-                    "-o", kernel["ifname"], "-p", protocol, "-m", protocol, "--dport", str(ports[2]),
+                    "-i", kernel["ifname"], "-p", protocol, "-m", protocol, "--dport", str(ports[2]),
                     "-m", "multiport", "--sports", str(ports[0]) + "," + str(ports[1]),
                     "-m", "comment", "--comment", marker, "-j", "DROP"]
             self.rules.append({"protocol": protocol, "marker": marker, "args": args,
-                               "decoded": decode_owned_rule(["-A", "OUTPUT", *args])})
+                               "decoded": decode_owned_rule(["-A", "INPUT", *args])})
         # Validate fixed rule data before acquiring the native descriptor.
-        self.fd, pin = open_namespace(namespace, source["process_id"])
+        self.fd, pin = open_namespace(namespace, target["process_id"])
         self.origin = copy.deepcopy({"namespace": namespace, "namespace_identity": pin,
                                      "source": source, "target": target})
         self.registered = False
         self.closed = False
         self.evidence = {"origin": self.origin, "planned_rule_count": MAX_RULES,
-                         "scope": "original_namespace_application_flow_rules_only"}
+                         "scope": "original_target_namespace_application_input_flow_rules_only"}
 
     def command(self, args: list[str], deadline: float | None = None):
         if self.closed:
@@ -137,7 +139,7 @@ class FaultOwner:
         self.registered = True
         self.evidence["add_results"] = []
         for rule in self.rules:
-            result = self.command(["iptables", "-t", "filter", "-A", "OUTPUT", *rule["args"]])
+            result = self.command(["iptables", "-t", "filter", "-A", "INPUT", *rule["args"]])
             self.evidence["add_results"].append({"protocol": rule["protocol"], "returncode": result.returncode})
             if result.returncode != 0:
                 raise RuntimeError("original fault rule add failed")
@@ -167,7 +169,7 @@ class FaultOwner:
                     errors.append(rule["protocol"] + "_missing_before_clear")
                 continue
             try:
-                result = self.command(["iptables", "-t", "filter", "-D", "OUTPUT", *rule["args"]], deadline)
+                result = self.command(["iptables", "-t", "filter", "-D", "INPUT", *rule["args"]], deadline)
                 operations.append({"protocol": rule["protocol"], "returncode": result.returncode})
                 if result.returncode != 0:
                     errors.append(rule["protocol"] + "_delete_failed")

@@ -29,6 +29,12 @@ def source():
                        "route_to_peer": {"dst": "10.20.0.2", "dev": "owned-tun", "prefsrc": "10.20.0.1"}}}
 
 
+def target():
+    return {"process_id": 11, "run_id": "modelled-run", "virtual_ip": "10.20.0.2",
+            "kernel": {"kind": "tun", "ifname": "owned-target-tun", "ifindex": 8, "vip": "10.20.0.2",
+                       "route_to_peer": {"dst": "10.20.0.1", "dev": "owned-target-tun", "prefsrc": "10.20.0.2"}}}
+
+
 class FakeRules:
     """Explicit command model, not a substitute for CI kernel observation."""
     def __init__(self):
@@ -38,7 +44,7 @@ class FakeRules:
         self.fail_delete = None
         self.timeout_after_add = None
         self.snapshot_override = None
-        self.foreign = "[5:55] -A OUTPUT -m comment --comment foreign-preserve -j ACCEPT"
+        self.foreign = "[5:55] -A INPUT -m comment --comment foreign-preserve -j ACCEPT"
 
     def __call__(self, argv, **kwargs):
         self.calls.append((argv, kwargs))
@@ -46,8 +52,8 @@ class FakeRules:
         if command[0] == "iptables-save":
             if self.snapshot_override is not None:
                 return subprocess.CompletedProcess(argv, 0, self.snapshot_override, "")
-            lines = ["*filter", ":OUTPUT ACCEPT [0:0]", self.foreign]
-            lines.extend(f'[{row["packets"]}:{row["bytes"]}] -A OUTPUT ' + shlex.join(row["args"])
+            lines = ["*filter", ":INPUT ACCEPT [0:0]", self.foreign]
+            lines.extend(f'[{row["packets"]}:{row["bytes"]}] -A INPUT ' + shlex.join(row["args"])
                          for row in self.rows.values())
             return subprocess.CompletedProcess(argv, 0, "\n".join([*lines, "COMMIT"]) + "\n", "")
         action = command[3]
@@ -74,8 +80,8 @@ def model_owner(runner=None, plan=None):
     fd = os.open(os.devnull, os.O_RDONLY)
     try:
         with patch("linux_tun_fault.open_namespace", return_value=(fd, {"device": 1, "inode": 2})):
-            owner = fault.FaultOwner("owned-a", plan or {"preflight_all_absent": True, "namespaces": ["owned-a"]},
-                                     ["owned-a"], source(), {"virtual_ip": "10.20.0.2", "run_id": "modelled-run"},
+            owner = fault.FaultOwner("owned-b", plan or {"preflight_all_absent": True, "namespaces": ["owned-b"]},
+                                     ["owned-b"], source(), target(),
                                      entries(), runner=runner)
     except BaseException:
         os.close(fd)
@@ -84,6 +90,43 @@ def model_owner(runner=None, plan=None):
 
 
 class RuleControls(unittest.TestCase):
+    def test_model_original_target_pid_pins_descriptor_before_exact_input_rules(self):
+        fd = os.open(os.devnull, os.O_RDONLY)
+        runner = FakeRules()
+        try:
+            with patch("linux_tun_fault.open_namespace", return_value=(fd, {"device": 1, "inode": 2})) as opened:
+                owner = fault.FaultOwner("owned-b", {"preflight_all_absent": True, "namespaces": ["owned-b"]},
+                                         ["owned-b"], source(), target(), entries(), runner=runner)
+                opened.assert_called_once_with("owned-b", target()["process_id"])
+            owner.install()
+            frozen = copy.deepcopy(owner.origin)
+        finally:
+            if "owner" in locals():
+                cleanup = owner.cleanup(time.monotonic() + 20)
+            else:
+                os.close(fd)
+        self.assertTrue(cleanup["complete"])
+        self.assertEqual(frozen["source"], source())
+        self.assertEqual(frozen["target"], target())
+        self.assertTrue(all(argv[7] == "INPUT" for argv, _ in runner.calls if argv[3] == "iptables"))
+
+    def test_model_old_output_hook_with_same_marker_is_rejected_before_cleanup(self):
+        owner, runner = model_owner()
+        error = None
+        try:
+            owner.install()
+            args = shlex.join(owner.rules[0]["args"])
+            runner.snapshot_override = "*filter\n:OUTPUT ACCEPT [0:0]\n[0:0] -A OUTPUT " + args + "\nCOMMIT\n"
+            owner.read_rules()
+        except Exception as caught:
+            error = caught
+        finally:
+            runner.snapshot_override = None
+            cleanup = owner.cleanup(time.monotonic() + 20)
+        self.assertTrue(cleanup["complete"])
+        self.assertIsInstance(error, ValueError)
+        self.assertEqual(runner.rows, {})
+
     def test_model_exact_rules_include_both_old_and_fresh_ports_then_absence_and_fd_close(self):
         owner, runner = model_owner()
         saved_foreign = runner.foreign
@@ -111,12 +154,14 @@ class RuleControls(unittest.TestCase):
             ports = contract.PORTS[record["-p"]]
             self.assertEqual(record["--sports"], f"{ports[0]},{ports[1]}")
             self.assertEqual(record["--dport"], str(ports[2]))
+            self.assertEqual(record["-i"], target()["kernel"]["ifname"])
+            self.assertNotIn("-o", record)
         for argv, kwargs in runner.calls:
             self.assertEqual(argv[:3], ["nsenter", f"--net=/proc/self/fd/{owner.fd}", "--"])
             self.assertEqual(kwargs["pass_fds"], (owner.fd,))
             self.assertLessEqual(kwargs["timeout"], 20)
             self.assertNotIn("-F", argv)
-            self.assertNotIn("owned-a", argv)
+            self.assertNotIn("owned-b", argv)
         with self.assertRaises(OSError):
             os.fstat(owner.fd)
         with patch("linux_tun_fault.os.close", side_effect=AssertionError("closed descriptor reused")):
@@ -223,20 +268,20 @@ class RuleControls(unittest.TestCase):
     def test_unowned_namespace_is_rejected_before_native_descriptor_open(self):
         with patch("linux_tun_fault.open_namespace", side_effect=AssertionError("native open on foreign namespace")):
             with self.assertRaises(ValueError):
-                fault.FaultOwner("foreign-ns", {"preflight_all_absent": True, "namespaces": ["owned-a"]},
-                                 ["owned-a"], source(), {"virtual_ip": "10.20.0.2", "run_id": "modelled-run"}, entries())
+                fault.FaultOwner("foreign-ns", {"preflight_all_absent": True, "namespaces": ["owned-b"]},
+                                 ["owned-b"], source(), target(), entries())
 
     def test_model_save_option_and_module_order_are_normalized_but_exact_identity_stays(self):
         owner, runner = model_owner()
         failure = None
         try:
             owner.install()
-            lines = ["*filter", ":OUTPUT ACCEPT [0:0]"]
+            lines = ["*filter", ":INPUT ACCEPT [0:0]"]
             for rule in owner.rules:
                 tokens = rule["args"]
                 pairs = [tokens[i:i + 2] for i in range(0, len(tokens), 2)]
                 swapped = [v for pair in reversed(pairs) for v in pair]
-                lines.append("[0:0] -A OUTPUT " + shlex.join(swapped))
+                lines.append("[0:0] -A INPUT " + shlex.join(swapped))
             runner.snapshot_override = "\n".join([*lines, "COMMIT"])
             observed = owner.read_rules()
         except BaseException as caught:
@@ -256,11 +301,11 @@ class RuleControls(unittest.TestCase):
             try:
                 owner.install()
                 args = shlex.join(owner.rules[0]["args"])
-                rule = "[0:0] -A OUTPUT " + args
-                body = ("[bad:0] -A OUTPUT " + args if grammar == "bad_counter" else
-                        "-A OUTPUT " + args if grammar == "missing_counter" else
+                rule = "[0:0] -A INPUT " + args
+                body = ("[bad:0] -A INPUT " + args if grammar == "bad_counter" else
+                        "-A INPUT " + args if grammar == "missing_counter" else
                         rule + "\n" + rule if grammar == "duplicate" else
-                        "[0:0] -A OUTPUT -m comment --comment foreign " + args if grammar == "second_owned_comment" else
+                        "[0:0] -A INPUT -m comment --comment foreign " + args if grammar == "second_owned_comment" else
                         rule + " --comment" if grammar == "dangling_comment" else
                         rule + "\nCOMMIT" if grammar == "duplicate_footer" else rule)
                 runner.snapshot_override = ("*filter\nCOMMIT\n" + body if grammar == "counter_after_footer" else

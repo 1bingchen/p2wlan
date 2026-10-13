@@ -271,7 +271,7 @@ def exercise(lab: EvidenceLab, groups: OwnedGroups, report: dict, out: Path,
             measure(lab, groups, entry, out, snapshots)
             report["application"] = summarize(report["manifest"])
     else:
-        fault = FaultOwner(lab.ns("a"), report["owned_resources"], lab.namespaces,
+        fault = FaultOwner(lab.ns("b"), report["owned_resources"], lab.namespaces,
                            snapshots["a1"], snapshots["b1"], report["manifest"])
         fault_slot.append(fault)
         report["fault"] = fault.evidence

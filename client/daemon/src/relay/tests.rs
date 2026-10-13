@@ -721,3 +721,6 @@ mod original_read_origin {
 
 #[path = "tests/original_reader_identity.rs"]
 mod original_reader_identity;
+
+#[path = "tests/common_original_origin.rs"]
+mod common_original_origin;

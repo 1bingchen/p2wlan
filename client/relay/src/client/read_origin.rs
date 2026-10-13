@@ -3,7 +3,6 @@
 
 use super::{ClientCommand, RelayClient, RelayMessage};
 use crate::error::{RelayError, Result};
-#[cfg(test)]
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::mpsc;
@@ -13,11 +12,18 @@ use tokio::sync::mpsc;
 pub struct OriginalRelayFrameRead {
     completed_at: Instant,
     reader: mpsc::WeakSender<ClientCommand>,
+    requested_endpoint: Arc<str>,
 }
 
 impl OriginalRelayFrameRead {
     pub fn completed_at(&self) -> Instant {
         self.completed_at
+    }
+
+    /// The exact requested endpoint captured for this original connection.
+    /// This is neither a current route nor the outer daemon publication.
+    pub fn requested_endpoint(&self) -> &str {
+        &self.requested_endpoint
     }
 
     /// Compare the original command allocation without storing a strong owner.
@@ -59,10 +65,10 @@ impl From<RelayMessage> for OriginalRelayDelivery {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum ReadMode {
     Legacy,
-    Original,
+    Original { requested_endpoint: Arc<str> },
 }
 
 pub(super) struct ReadOptions {
@@ -79,17 +85,21 @@ impl ReadOptions {
             witness: None,
         }
     }
-    pub(super) fn original() -> Self {
+    pub(super) fn original(endpoint: &str) -> Self {
         Self {
-            mode: ReadMode::Original,
+            mode: ReadMode::Original {
+                requested_endpoint: Arc::from(endpoint),
+            },
             #[cfg(test)]
             witness: None,
         }
     }
     #[cfg(test)]
-    pub(super) fn with_witness(witness: Arc<OriginalRelayReadWitness>) -> Self {
+    pub(super) fn with_witness(endpoint: &str, witness: Arc<OriginalRelayReadWitness>) -> Self {
         Self {
-            mode: ReadMode::Original,
+            mode: ReadMode::Original {
+                requested_endpoint: Arc::from(endpoint),
+            },
             witness: Some(witness),
         }
     }
@@ -102,17 +112,18 @@ impl ReadOptions {
         capacity: usize,
         client: &mpsc::Sender<ClientCommand>,
     ) -> (ReadOutput, ReadInput) {
-        match self.mode {
+        match &self.mode {
             ReadMode::Legacy => {
                 let (tx, rx) = mpsc::channel(capacity);
                 (ReadOutput::Legacy(tx), ReadInput::Legacy(rx))
             }
-            ReadMode::Original => {
+            ReadMode::Original { requested_endpoint } => {
                 let (tx, rx) = mpsc::channel(capacity);
                 (
                     ReadOutput::Original {
                         tx,
                         reader: client.downgrade(),
+                        requested_endpoint: requested_endpoint.clone(),
                     },
                     ReadInput::Original(rx),
                 )
@@ -127,6 +138,7 @@ pub(super) enum ReadOutput {
     Original {
         tx: mpsc::Sender<OriginalRelayDelivery>,
         reader: mpsc::WeakSender<ClientCommand>,
+        requested_endpoint: Arc<str>,
     },
 }
 
@@ -160,9 +172,14 @@ impl ReadOutput {
     pub(super) fn capture_data_read(&self) -> Option<OriginalRelayFrameRead> {
         match self {
             Self::Legacy(_) => None,
-            Self::Original { reader, .. } => Some(OriginalRelayFrameRead {
+            Self::Original {
+                reader,
+                requested_endpoint,
+                ..
+            } => Some(OriginalRelayFrameRead {
                 completed_at: Instant::now(),
                 reader: reader.clone(),
+                requested_endpoint: requested_endpoint.clone(),
             }),
         }
     }

@@ -1,6 +1,4 @@
-<p align="center">
-  <img src="assets/readme/hero.webp" width="100%" alt="P2WLAN — 让异地设备像在同一局域网中一样互联" />
-</p>
+
 
 <div align="center">
   <h1>P2WLAN</h1>
@@ -11,7 +9,6 @@
     <a href="README.md"><strong>简体中文</strong></a>
     · <a href="README.en.md">English</a>
   </p>
-
   <p>
     <a href="https://github.com/yhan-sun/p2wlan/releases"><strong>下载正式发布版</strong></a>
     · <a href="#快速开始">快速开始</a>
@@ -34,6 +31,9 @@
     <a href="https://trendshift.io/repositories/239992"><img src="https://trendshift.io/api/badge/trendshift/repositories/239992/weekly?language=Rust" width="250" height="55" alt="P2WLAN · Trendshift Rust 周榜" /></a>
   </p>
 </div>
+<p align="center">
+  <img src="assets/readme/hero.webp" width="100%" alt="P2WLAN — 让异地设备像在同一局域网中一样互联" />
+</p>
 
 ## P2WLAN 是什么
 

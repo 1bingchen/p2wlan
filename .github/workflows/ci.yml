@@ -208,6 +208,7 @@ jobs:
         run: |
           python3 scripts/dual-end/test_minecraft_interaction.py
           python3 scripts/dual-end/test_minecraft_interaction_summary.py
+          python3 scripts/dual-end/test_minecraft_interaction_runner.py
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
         with:
           node-version: "22.16.0"

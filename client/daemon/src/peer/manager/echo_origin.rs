@@ -29,9 +29,10 @@ impl PeerManager {
         {
             return Err(Stale(CreditStale::Generation));
         }
-        if input.local_vip() != self.config.network.virtual_ip
-            || !crate::request_carriage::in_original_window(input.read_at(), Instant::now())
-        {
+        // The native REQUEST entrance checks the destination against its
+        // resolved runtime VIP before sealing this input. Manager Config is
+        // the construction-time bootstrap, not a second current VIP owner.
+        if !crate::request_carriage::in_original_window(input.read_at(), Instant::now()) {
             return Err(Stale(CreditStale::OriginalWindow));
         }
         let connections = self

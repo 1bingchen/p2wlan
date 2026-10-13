@@ -36,6 +36,9 @@ mod echo_transfer;
 pub(super) use echo_transfer::EchoCase;
 #[path = "publication_order.rs"]
 mod publication_order;
+#[path = "runtime_vip.rs"]
+mod runtime_vip;
+pub(super) use runtime_vip::RuntimeVipCase;
 const NODE_A: &str = "original-ack-a";
 const NODE_B: &str = "original-ack-b";
 const VIP_A: &str = "10.20.0.1";
@@ -58,6 +61,7 @@ pub(super) enum Scenario {
     Identity(IdentityCase),
     EchoTransfer(EchoCase),
     PublicationOrder,
+    RuntimeVip(RuntimeVipCase),
 }
 
 fn require(condition: bool, reason: &str) -> Check {
@@ -234,11 +238,19 @@ impl Endpoint {
         hub: Option<&str>,
         owners: &mut Owners,
         budget: Budget,
+        keep_bootstrap_vip: bool,
     ) -> Result<Self, String> {
         let mut config =
             Config::generate_default("http://ctrl.test", "default").map_err(|e| e.to_string())?;
         config.node.node_id = node.to_string();
-        config.network.virtual_ip = vip.to_string();
+        if keep_bootstrap_vip {
+            require(
+                config.network.virtual_ip == "10.20.0.1" && config.network.virtual_ip != vip,
+                "runtime VIP fixture must retain the actual different default manager Config",
+            )?;
+        } else {
+            config.network.virtual_ip = vip.to_string();
+        }
         config.relay.path_policy = PathPolicy::Auto;
         let peers = Arc::new(PeerManager::new(config));
         let (wireguard, _unused_outbound) = WireGuardTransport::new_with_request_carriage();
@@ -605,18 +617,38 @@ struct ActualDelivery {
     source: Option<OriginalOverlayIngressSource>,
 }
 
-async fn actual_delivery(
+async fn actual_overlay_delivery(
     endpoint: &mut Endpoint,
     budget: Budget,
-) -> Result<ActualDelivery, String> {
-    let delivery = budget
+) -> Result<OverlayIngressDelivery, String> {
+    budget
         .step(
             "actual authenticated overlay queue",
             endpoint.overlay.recv(),
         )
         .await?
-        .ok_or("actual overlay queue ended before delivery")?;
+        .ok_or_else(|| "actual overlay queue ended before delivery".to_string())
+}
+
+async fn actual_delivery(
+    endpoint: &mut Endpoint,
+    budget: Budget,
+) -> Result<ActualDelivery, String> {
+    let delivery = actual_overlay_delivery(endpoint, budget).await?;
     actual_delivery_from(endpoint, delivery, budget).await
+}
+
+// The original WG actor publishes this authenticated feed before its separate
+// TUN-facing queue handoff. Wrong runtime destinations reach the native
+// entrance with this real source, but are correctly rejected by DataPlane
+// before Tun.write. This helper makes no TUN-injection or completed-drop claim.
+async fn actual_rx_delivery_without_tun(
+    endpoint: &mut Endpoint,
+    budget: Budget,
+) -> Result<ActualDelivery, String> {
+    let delivery = actual_overlay_delivery(endpoint, budget).await?;
+    let (event, source) = delivery.into_parts();
+    require_actual_delivery_source(endpoint, ActualDelivery { event, source })
 }
 
 async fn actual_delivery_from(
@@ -636,11 +668,19 @@ async fn actual_delivery_from(
         written == event.packet,
         "overlay feed and actual TUN write disagree",
     )?;
+    require_actual_delivery_source(endpoint, ActualDelivery { event, source })
+}
+
+fn require_actual_delivery_source(
+    endpoint: &Endpoint,
+    delivery: ActualDelivery,
+) -> Result<ActualDelivery, String> {
     require(
-        event.peer_id == endpoint.remote_node,
+        delivery.event.peer_id == endpoint.remote_node,
         "actual authenticated remote node changed",
     )?;
-    let original = source
+    let original = delivery
+        .source
         .as_ref()
         .ok_or("actual successful decrypt did not retain its original source")?;
     require(
@@ -662,7 +702,7 @@ async fn actual_delivery_from(
         original.network_generation() == Some(endpoint.peers.current_network_generation_sync()),
         "actual reader/decrypt generation changed",
     )?;
-    Ok(ActualDelivery { event, source })
+    Ok(delivery)
 }
 
 async fn actual_send(
@@ -1155,6 +1195,9 @@ async fn exercise_rounds(
         a.node == NODE_A && b.node == NODE_B,
         "actual fixture endpoint roles changed",
     )?;
+    if let Scenario::RuntimeVip(case) = scenario {
+        return runtime_vip::exercise_runtime_vip(a, b, path, case, budget).await;
+    }
     if scenario == Scenario::Contention {
         return contention::exercise_conflicts(a, b, path, budget).await;
     }
@@ -1242,6 +1285,18 @@ async fn exercise_rounds(
 }
 
 pub(super) async fn exercise(path: PathKind, scenario: Scenario) -> Check {
+    exercise_with_runtime_vip(path, scenario, false).await
+}
+
+pub(super) async fn exercise_bootstrap_runtime_vip(path: PathKind, scenario: Scenario) -> Check {
+    exercise_with_runtime_vip(path, scenario, true).await
+}
+
+async fn exercise_with_runtime_vip(
+    path: PathKind,
+    scenario: Scenario,
+    keep_bootstrap_vip: bool,
+) -> Check {
     let budget = if scenario == Scenario::Lifecycle(LifecycleCase::OriginalWindow) {
         Budget::with_total(Duration::from_secs(19))
     } else {
@@ -1260,26 +1315,33 @@ pub(super) async fn exercise(path: PathKind, scenario: Scenario) -> Check {
         } else {
             None
         };
+        let (vip_a, vip_b) = if keep_bootstrap_vip {
+            ("10.20.0.2", "10.20.0.3")
+        } else {
+            (VIP_A, VIP_B)
+        };
         let mut a = Endpoint::create(
             NODE_A,
-            VIP_A,
+            vip_a,
             NODE_B,
-            VIP_B,
+            vip_b,
             path,
             hub.as_deref(),
             &mut owners,
             budget,
+            keep_bootstrap_vip,
         )
         .await?;
         let mut b = Endpoint::create(
             NODE_B,
-            VIP_B,
+            vip_b,
             NODE_A,
-            VIP_A,
+            vip_a,
             path,
             hub.as_deref(),
             &mut owners,
             budget,
+            keep_bootstrap_vip,
         )
         .await?;
         let (session_a, session_b, a_key, b_key) = session_pair_for(&a.identity, &b.identity)?;

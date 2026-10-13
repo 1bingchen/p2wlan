@@ -178,6 +178,24 @@ async fn handle_native_overlay_ack(
         crate::peer::NetworkPath::Direct => "direct",
         crate::peer::NetworkPath::Relay => "relay",
     };
+    let ingress = match receipt.path {
+        crate::peer::NetworkPath::Direct => "direct".to_string(),
+        crate::peer::NetworkPath::Relay => format!(
+            "relay:{}",
+            source
+                .as_ref()
+                .and_then(|source| source.relay_endpoint())
+                .unwrap_or_default()
+        ),
+    };
+    // Compatibility evidence is emitted only after the original owner has
+    // committed this exact ACK. A REQUEST/rejection/duplicate never logs it.
+    info!(
+        native_original_ack = true,
+        "{OVERLAY_EVIDENCE_PREFIX}_verified peer={} src_ip={} seq={} nonce={:#x} len={} ingress={} verified_round_trips={}",
+        ack.peer_id, ack.source_vip, ack.seq, ack.nonce,
+        event.packet.len(), ingress, stats.verified_round_trips,
+    );
     let scope = format!("peer:{}:{}", ack.peer_id, receipt.generation);
     let newly_confirmed = timeline.emit_first_scoped(
         &scope,

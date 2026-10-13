@@ -15,7 +15,6 @@ pub(crate) struct OriginalEchoInput {
     udp: Weak<RwLock<Option<crate::udp::UdpTransport>>>,
     relay: Weak<RwLock<Option<crate::relay::RelayTransport>>>,
     peer_id: String,
-    local_vip: String,
     target_vip: String,
     generation: u64,
     read_at: Instant,
@@ -37,9 +36,6 @@ impl OriginalEchoInput {
     }
     pub(crate) fn peer_id(&self) -> &str {
         &self.peer_id
-    }
-    pub(crate) fn local_vip(&self) -> &str {
-        &self.local_vip
     }
     pub(crate) fn target_vip(&self) -> &str {
         &self.target_vip
@@ -84,7 +80,6 @@ impl OriginalEchoInput {
             udp: Arc::downgrade(udp),
             relay: Arc::downgrade(relay),
             peer_id: request.peer_id,
-            local_vip: request.local_vip,
             target_vip: request.source_vip,
             generation,
             read_at,

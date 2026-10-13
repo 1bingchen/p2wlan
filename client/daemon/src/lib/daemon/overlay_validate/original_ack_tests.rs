@@ -8,7 +8,10 @@ use std::result::Result;
 #[path = "original_ack_tests/fixture.rs"]
 mod fixture;
 
-use fixture::{exercise, EchoCase, IdentityCase, LifecycleCase, PathKind, Scenario};
+use fixture::{
+    exercise, exercise_bootstrap_runtime_vip, EchoCase, IdentityCase, LifecycleCase, PathKind,
+    RuntimeVipCase, Scenario,
+};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn b28_fresh_direct_original_request_echo_commits_native_once() -> Result<(), String> {
@@ -374,4 +377,82 @@ async fn b28_relay_actual_previous_key_cannot_borrow_current_echo_then_active_re
 async fn b28_actual_ack_before_observable_full_cannot_inherit_later_publication(
 ) -> Result<(), String> {
     exercise(PathKind::Direct, Scenario::PublicationOrder).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn b28_runtime_vip_direct_fresh_marker_once_and_source_rejection() -> Result<(), String> {
+    exercise_bootstrap_runtime_vip(
+        PathKind::Direct,
+        Scenario::RuntimeVip(RuntimeVipCase::FreshMarkerOnce),
+    )
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn b28_runtime_vip_direct_wrong_request_destination_including_bootstrap_is_rejected(
+) -> Result<(), String> {
+    exercise_bootstrap_runtime_vip(
+        PathKind::Direct,
+        Scenario::RuntimeVip(RuntimeVipCase::WrongRequestDestination),
+    )
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn b28_runtime_vip_direct_stale_generation_rejects_old_ack_then_new_a_is_fresh(
+) -> Result<(), String> {
+    exercise_bootstrap_runtime_vip(
+        PathKind::Direct,
+        Scenario::Lifecycle(LifecycleCase::Generation),
+    )
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn b28_runtime_vip_direct_stale_session_rejects_old_ack_then_new_a_is_fresh(
+) -> Result<(), String> {
+    exercise_bootstrap_runtime_vip(
+        PathKind::Direct,
+        Scenario::Lifecycle(LifecycleCase::SessionReplace),
+    )
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn b28_runtime_vip_relay_fresh_marker_once_and_source_rejection() -> Result<(), String> {
+    exercise_bootstrap_runtime_vip(
+        PathKind::Relay,
+        Scenario::RuntimeVip(RuntimeVipCase::FreshMarkerOnce),
+    )
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn b28_runtime_vip_relay_wrong_request_destination_including_bootstrap_is_rejected(
+) -> Result<(), String> {
+    exercise_bootstrap_runtime_vip(
+        PathKind::Relay,
+        Scenario::RuntimeVip(RuntimeVipCase::WrongRequestDestination),
+    )
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn b28_runtime_vip_relay_stale_generation_rejects_old_ack_then_new_a_is_fresh(
+) -> Result<(), String> {
+    exercise_bootstrap_runtime_vip(
+        PathKind::Relay,
+        Scenario::Lifecycle(LifecycleCase::Generation),
+    )
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn b28_runtime_vip_relay_stale_session_rejects_old_ack_then_new_a_is_fresh(
+) -> Result<(), String> {
+    exercise_bootstrap_runtime_vip(
+        PathKind::Relay,
+        Scenario::Lifecycle(LifecycleCase::SessionReplace),
+    )
+    .await
 }

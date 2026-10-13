@@ -644,6 +644,7 @@ impl RelayTransport {
                             profile_sampled,
                             udp_received: original_read.as_ref().map(|read| read.completed_at()),
                             original_relay_read: original_read,
+                            original_udp_read: None,
                             transport_queue_send_started: Some(transport_queue_send_started),
                             wire_bytes: data,
                         })

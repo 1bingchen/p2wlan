@@ -49,6 +49,7 @@ pub(super) struct EncryptedOverlayOrigin {
     received_at: Option<Instant>,
     queue_send_started: Option<Instant>,
     original_relay_read: Option<p2pnet_relay::OriginalRelayFrameRead>,
+    original_udp_read: Option<crate::udp::OriginalUdpIngressSource>,
 }
 
 impl EncryptedOverlayOrigin {
@@ -65,6 +66,7 @@ impl EncryptedOverlayOrigin {
             received_at: packet.udp_received,
             queue_send_started: packet.transport_queue_send_started,
             original_relay_read: packet.original_relay_read.clone(),
+            original_udp_read: packet.original_udp_read.clone(),
         }
     }
 
@@ -130,6 +132,10 @@ impl OriginalOverlayIngressSource {
 
     pub(crate) fn queue_send_started(&self) -> Option<Instant> {
         self.envelope.queue_send_started
+    }
+
+    pub(crate) fn original_udp_read(&self) -> Option<&crate::udp::OriginalUdpIngressSource> {
+        self.envelope.original_udp_read.as_ref()
     }
 
     pub(crate) fn original_relay_read(&self) -> Option<&p2pnet_relay::OriginalRelayFrameRead> {

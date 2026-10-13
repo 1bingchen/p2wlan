@@ -1,3 +1,12 @@
+/// Read outcome from the original membership/capability owners.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PeerDplpmtudCapability {
+    Unknown,
+    Contended,
+    Unsupported,
+    Supported,
+}
+
 impl PeerManager {
     /// Whether startup/live candidate gathering may advertise extrapolated
     /// server-reflexive endpoints.  Keep this accessor in the core manager
@@ -151,6 +160,35 @@ impl PeerManager {
         next.insert(peer_id.to_string(), peer_session_generation);
         self.dplpmtud_capability_tx.send_replace(Arc::new(next));
         self.notify_direct_business_budget_changed();
+    }
+
+    /// A staged policy snapshot, never a current-owner permission. The caller
+    /// must hold the peer's original emit and network epoch through use: the
+    /// production capability publisher owns emit; membership publishers own
+    /// epoch. Read this before taking UDP registry/publication guards.
+    /// Tokio watch has no try_borrow; its short immutable-map read remains here,
+    /// outside those UDP guards. The membership mutex itself is try-only.
+    pub(crate) fn try_peer_dplpmtud_capability(&self, peer_id: &str) -> PeerDplpmtudCapability {
+        let membership = match self.peer_membership.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::WouldBlock) => return PeerDplpmtudCapability::Contended,
+            Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+        };
+        let Some(generation) = membership.active_generation(peer_id) else {
+            return PeerDplpmtudCapability::Unknown;
+        };
+        drop(membership);
+        if self.peer_supports_dplpmtud_sync(peer_id, generation) {
+            PeerDplpmtudCapability::Supported
+        } else {
+            PeerDplpmtudCapability::Unsupported
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_peer_membership_held_for_test<R>(&self, operation: impl FnOnce() -> R) -> R {
+        let _guard = self.peer_membership.lock().unwrap();
+        operation()
     }
 
     pub(crate) fn peer_supports_dplpmtud_sync(

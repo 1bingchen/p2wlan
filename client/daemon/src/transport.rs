@@ -327,6 +327,8 @@ pub struct ReceivedEncryptedPacket {
     /// Original concrete Relay reader identity, never a current-owner grant.
     /// Cloning this immutable fact retains only a Weak reference to its client.
     pub(crate) original_relay_read: Option<p2pnet_relay::OriginalRelayFrameRead>,
+    /// Exact original UDP reader; Weak provenance, not current-owner authority.
+    pub(crate) original_udp_read: Option<crate::udp::OriginalUdpIngressSource>,
 }
 
 // Socket handles and historical reader facts are not packet identity.

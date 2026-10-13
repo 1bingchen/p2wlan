@@ -24,10 +24,21 @@ pub(crate) struct UdpFullSendFact {
     syscall_completed: Instant,
     publication_owner: Option<u64>,
     fence: UdpSendFence,
+    // Only managed captured sends pay this allocation; do not enlarge every
+    // canonical request's inline physical-publication cell by a full token.
+    managed_token: Option<Box<crate::dplpmtud::DirectBusinessSendToken>>,
     wire: (usize, Option<u64>, u64),
 }
 #[allow(dead_code)] // Immutable evidence access, not final ownership/ACK authority.
 impl UdpFullSendFact {
+    pub(crate) fn original_managed_token(
+        &self,
+    ) -> Option<&crate::dplpmtud::DirectBusinessSendToken> {
+        self.managed_token.as_deref()
+    }
+    pub(super) fn belongs_to_registry(&self, transport: &UdpTransport) -> bool {
+        Weak::ptr_eq(&self.registry, &Arc::downgrade(&transport.socket_state))
+    }
     pub(crate) fn matches_wire(&self, wire: (usize, Option<u64>, u64)) -> bool {
         self.wire == wire
     }
@@ -91,8 +102,12 @@ impl UdpSendCapture {
         syscall_started: Instant,
         publication_owner: Option<u64>,
         fence: UdpSendFence,
+        managed_token: Option<&crate::dplpmtud::DirectBusinessSendToken>,
     ) {
-        if sent != packet.wire_bytes.len() || self.fact.is_some() {
+        if sent != packet.wire_bytes.len()
+            || self.fact.is_some()
+            || (fence == UdpSendFence::ManagedPublication) != managed_token.is_some()
+        {
             return;
         }
         let syscall_completed = Instant::now();
@@ -108,6 +123,7 @@ impl UdpSendCapture {
             syscall_completed,
             publication_owner,
             fence,
+            managed_token: managed_token.map(|token| Box::new(token.clone())),
             wire: (
                 packet.wire_bytes.len(),
                 crate::transport::wire_counter(&packet.wire_bytes),

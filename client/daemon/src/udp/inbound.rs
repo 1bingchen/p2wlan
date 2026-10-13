@@ -1764,6 +1764,10 @@ impl UdpTransport {
                 .send(ReceivedEncryptedPacket {
                     physical_ingress,
                     original_relay_read: None,
+                    original_udp_read: Some(ingress_origin::OriginalUdpIngressSource::capture(
+                        self, &socket, socket_index, publication_owner, network_generation,
+                        udp_received, transport_queue_send_started,
+                    )),
                     source: Some(source),
                     local_endpoint,
                     relay_endpoint: None,

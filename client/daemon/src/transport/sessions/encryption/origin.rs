@@ -20,11 +20,54 @@ pub(crate) struct OriginalEncryptionSource {
     owner: Weak<Mutex<HashMap<String, PeerTransportSessions>>>,
     peer_id: String,
     session_instance: u64,
+    original_role: crate::transport::OriginalSessionRole,
     authorized_peer_lifecycle: Option<PeerSessionGeneration>,
     encrypted_at: Instant,
 }
 
+/// Short original-registry guard, constructed only from real TX/RX sources.
+pub(crate) struct OriginalEchoSessionGuard<'a> {
+    sessions: tokio::sync::OwnedMutexGuard<HashMap<String, PeerTransportSessions>>,
+    source: &'a OriginalEncryptionSource,
+}
+impl OriginalEchoSessionGuard<'_> {
+    pub(crate) fn is_current(&self) -> bool {
+        self.sessions
+            .get(&self.source.peer_id)
+            .and_then(|peer| peer.active.as_ref())
+            .is_some_and(|active| {
+                active.session_instance == self.source.session_instance
+                    && active.authorized_peer_lifecycle == self.source.authorized_peer_lifecycle
+                    && !active.session.is_expired()
+            })
+    }
+}
+
 impl OriginalEncryptionSource {
+    /// Keep the actual session registry through the echo's synchronous boundary.
+    /// Even a registry writer outside emit cannot revoke these original facts.
+    pub(crate) fn try_original_echo_receive_session_guard<'a>(
+        &'a self,
+        rx: &crate::transport::OriginalSessionSource,
+    ) -> Option<OriginalEchoSessionGuard<'a>> {
+        use crate::transport::OriginalSessionRole;
+        if !self.owner.ptr_eq(&rx.owner)
+            || self.peer_id != rx.peer_id()
+            || self.original_role != OriginalSessionRole::Active
+            || rx.original_role() != OriginalSessionRole::Active
+            || self.session_instance != rx.session_instance()
+            || self.authorized_peer_lifecycle.is_none()
+            || self.authorized_peer_lifecycle != rx.authorized_peer_lifecycle()
+        {
+            return None;
+        }
+        let sessions = self.owner.upgrade()?.try_lock_owned().ok()?;
+        let guard = OriginalEchoSessionGuard {
+            sessions,
+            source: self,
+        };
+        guard.is_current().then_some(guard)
+    }
     pub(crate) fn try_copy_for_publication(
         &self,
     ) -> std::result::Result<Self, std::collections::TryReserveError> {
@@ -35,6 +78,7 @@ impl OriginalEncryptionSource {
             owner: self.owner.clone(),
             peer_id,
             session_instance: self.session_instance,
+            original_role: self.original_role,
             authorized_peer_lifecycle: self.authorized_peer_lifecycle,
             encrypted_at: self.encrypted_at,
         })
@@ -56,6 +100,7 @@ impl OriginalEncryptionSource {
             owner: Arc::downgrade(&transport.sessions),
             peer_id: peer_id.to_string(),
             session_instance: slot.session_instance,
+            original_role: crate::transport::OriginalSessionRole::Active,
             authorized_peer_lifecycle: slot.authorized_peer_lifecycle,
             encrypted_at,
         }
@@ -72,6 +117,10 @@ impl OriginalEncryptionSource {
 
     pub(crate) fn session_instance(&self) -> u64 {
         self.session_instance
+    }
+
+    pub(crate) fn original_role(&self) -> crate::transport::OriginalSessionRole {
+        self.original_role
     }
 
     pub(crate) fn authorized_peer_lifecycle(&self) -> Option<PeerSessionGeneration> {

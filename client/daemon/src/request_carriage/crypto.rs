@@ -42,6 +42,7 @@ impl WireGuardTransport {
                             packet,
                             binding,
                             source,
+                            echo_emit: None,
                         }
                     })
                 })
@@ -53,6 +54,7 @@ impl WireGuardTransport {
                         packet,
                         binding: None,
                         source: None,
+                        echo_emit: None,
                     })
                 })
         }
@@ -81,6 +83,7 @@ impl WireGuardTransport {
                             packet,
                             binding: binding.clone(),
                             source,
+                            echo_emit: None,
                         },
                         plaintext: RawRequestDelivery {
                             raw: plaintext,
@@ -121,6 +124,7 @@ impl WireGuardTransport {
                         packet,
                         binding: None,
                         source: None,
+                        echo_emit: None,
                     },
                     plaintext: RawRequestDelivery::from(plaintext),
                     session_lock_wait_us,

@@ -414,6 +414,14 @@ struct PathCommitIngress<'a> {
     token: crate::path_commit::PathCommitToken,
 }
 
+/// The successful original key's role, before any subsequent promotion.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OriginalSessionRole {
+    Active,
+    Pending,
+    Previous,
+}
+
 /// Immutable identity of the exact receive key which authenticated a packet.
 /// This is provenance, not a transferable current-owner or business-credit guard.
 #[derive(Clone)]
@@ -422,7 +430,7 @@ pub(crate) struct OriginalSessionSource {
     owner: Weak<Mutex<HashMap<String, PeerTransportSessions>>>,
     peer_id: String,
     session_instance: u64,
-    from_previous_session: bool,
+    original_role: OriginalSessionRole,
     authorized_peer_lifecycle: Option<PeerSessionGeneration>,
     authenticated_at: Instant,
 }
@@ -438,7 +446,11 @@ impl OriginalSessionSource {
     }
 
     pub(crate) fn is_previous_session(&self) -> bool {
-        self.from_previous_session
+        self.original_role == OriginalSessionRole::Previous
+    }
+
+    pub(crate) fn original_role(&self) -> OriginalSessionRole {
+        self.original_role
     }
 
     pub(crate) fn authorized_peer_lifecycle(&self) -> Option<PeerSessionGeneration> {
@@ -465,14 +477,14 @@ impl WireGuardTransport {
         &self,
         peer_id: &str,
         session_instance: u64,
-        from_previous_session: bool,
+        original_role: OriginalSessionRole,
         authorized_peer_lifecycle: Option<PeerSessionGeneration>,
     ) -> OriginalSessionSource {
         OriginalSessionSource {
             owner: Arc::downgrade(&self.sessions),
             peer_id: peer_id.to_string(),
             session_instance,
-            from_previous_session,
+            original_role,
             authorized_peer_lifecycle,
             authenticated_at: Instant::now(),
         }
@@ -534,6 +546,8 @@ impl InboundUdpTransport {
 /// Encrypts routed TUN packets with peer WireGuard sessions.
 #[derive(Clone)]
 pub struct WireGuardTransport {
+    #[cfg(test)]
+    previous_overlay_observer: Arc<std::sync::Mutex<Option<mpsc::Sender<OverlayIngressDelivery>>>>,
     resource_capture: Option<Arc<crate::dataplane_resources::ResourceCapture>>,
     #[cfg(test)]
     resource_queue_gate: Option<Arc<ResourceQueueTestGate>>,
@@ -631,15 +645,17 @@ mod accounting;
 mod direct_validation;
 mod dplpmtud;
 mod inbound;
+pub(crate) use inbound::OriginalOverlayIngressSource;
 mod relay_control;
 #[cfg(test)]
 mod resource_queue_test_gate;
 mod sessions;
 #[cfg(test)]
 pub(crate) use resource_queue_test_gate::ResourceQueueTestGate;
-#[allow(unused_imports)] // Staged encryption metadata API, before qualified send consumers.
+#[allow(unused_imports)] // Compatibility result types may be unused by a build.
 pub(crate) use sessions::{
-    EncryptedOutboundWithSource, OriginalEncryptionSource, SessionBoundEncryptionWithSource,
+    EncryptedOutboundWithSource, OriginalEchoSessionGuard, OriginalEncryptionSource,
+    OriginalOverlaySessionFailure, OriginalOverlaySessionGuard, SessionBoundEncryptionWithSource,
 };
 mod wire;
 use sessions::PeerTransportSessions;

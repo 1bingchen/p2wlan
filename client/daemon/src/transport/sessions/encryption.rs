@@ -2,7 +2,8 @@ use super::*;
 
 mod origin;
 pub(crate) use origin::{
-    EncryptedOutboundWithSource, OriginalEncryptionSource, SessionBoundEncryptionWithSource,
+    EncryptedOutboundWithSource, OriginalEchoSessionGuard, OriginalEncryptionSource,
+    SessionBoundEncryptionWithSource,
 };
 
 impl WireGuardTransport {

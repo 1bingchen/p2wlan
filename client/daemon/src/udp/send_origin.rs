@@ -24,6 +24,7 @@ pub(crate) struct UdpFullSendFact {
     syscall_completed: Instant,
     publication_owner: Option<u64>,
     fence: UdpSendFence,
+    original_direct_commit: Option<u64>,
     // Only managed captured sends pay this allocation; do not enlarge every
     // canonical request's inline physical-publication cell by a full token.
     managed_token: Option<Box<crate::dplpmtud::DirectBusinessSendToken>>,
@@ -75,6 +76,9 @@ impl UdpFullSendFact {
     pub(crate) fn fence(&self) -> UdpSendFence {
         self.fence
     }
+    pub(crate) fn original_direct_commit(&self) -> Option<u64> {
+        self.original_direct_commit
+    }
 }
 // Attempt-local storage borrowed by the cancellable inner future. No Arc,
 // queue, callback, task, duplicate mutable truth, or strong source keeper.
@@ -123,6 +127,15 @@ impl UdpSendCapture {
             syscall_completed,
             publication_owner,
             fence,
+            original_direct_commit: if fence == UdpSendFence::LegacyUnknown {
+                None
+            } else {
+                transport.peers.try_original_direct_send_commit(
+                    &packet.peer_id,
+                    transport.peers.current_network_generation_sync(),
+                    endpoint,
+                )
+            },
             managed_token: managed_token.map(|token| Box::new(token.clone())),
             wire: (
                 packet.wire_bytes.len(),

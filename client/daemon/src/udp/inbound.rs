@@ -195,6 +195,23 @@ impl UdpTransport {
             .await
     }
 
+    /// The real primary reader with an owned shutdown boundary for fixtures.
+    #[cfg(test)]
+    pub(crate) async fn run_original_reader_until_for_test(
+        self,
+        inbound_tx: mpsc::Sender<ReceivedEncryptedPacket>,
+        mut shutdown: watch::Receiver<bool>,
+    ) -> Result<()> {
+        self.run_inbound_socket_inner(
+            0,
+            self.socket.clone(),
+            inbound_tx,
+            Some(&mut shutdown),
+            None,
+        )
+        .await
+    }
+
     /// Run an inbound reader that stops when `shutdown_rx` turns true.
     ///
     /// Dedicated fresh-mapping punch sockets use this so a superseded punch

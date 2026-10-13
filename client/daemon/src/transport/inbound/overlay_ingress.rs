@@ -37,6 +37,7 @@ impl From<OverlayIngressEvent> for OverlayIngressDelivery {
     }
 }
 
+#[cfg_attr(test, derive(Clone))]
 pub(super) struct EncryptedOverlayOrigin {
     network_generation: Option<u64>,
     relay_endpoint: Option<String>,
@@ -82,12 +83,15 @@ impl EncryptedOverlayOrigin {
 }
 
 /// Original observations only; no current-owner or once-credit qualification.
+// Tests retain the same immutable original observation across rejected/fresh
+// final calls. Clone preserves roles/times/Weak identities and mints no fact.
+#[cfg_attr(test, derive(Clone))]
 pub(crate) struct OriginalOverlayIngressSource {
     session: OriginalSessionSource,
     envelope: EncryptedOverlayOrigin,
 }
 
-// S2 exposes immutable metadata; the production final-authority consumer is S3.
+// Immutable metadata is qualified separately by the original final owner.
 #[allow(dead_code)]
 impl OriginalOverlayIngressSource {
     pub(crate) fn session(&self) -> &OriginalSessionSource {

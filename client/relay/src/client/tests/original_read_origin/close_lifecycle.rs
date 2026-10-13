@@ -127,13 +127,24 @@ async fn original_close(path: ReaderPath, writer: bool) -> Check {
                 peer.client.close_signal.wait_site(site, true),
             )
             .await?;
-        require(
-            matches!(
-                peer.client.try_open_guard(),
-                Err(RelayClientOpenError::Closed)
-            ),
-            "published close became open",
-        )?;
+        budget
+            .step("published close releases original guard", async {
+                loop {
+                    // The published flag is visible before the publisher drops
+                    // its original gate. Contention is not proof of Closed.
+                    let open = peer.client.try_open_guard();
+                    match open {
+                        Err(RelayClientOpenError::Closed) => return Ok(()),
+                        Err(RelayClientOpenError::Contended) => drop(open),
+                        Ok(guard) => {
+                            drop(guard);
+                            return Err("published close became open".to_string());
+                        }
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await??;
         require(
             fact.belongs_to_client(&peer.client),
             "close changed historical read identity",

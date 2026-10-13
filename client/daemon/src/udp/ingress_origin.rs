@@ -21,7 +21,7 @@ pub(crate) struct OriginalUdpIngressSource {
     queue_send_started: Instant,
 }
 
-#[allow(dead_code)] // Original carriage is production; final consumer is staged.
+#[allow(dead_code)] // Immutable observation accessors may be diagnostic-only.
 impl OriginalUdpIngressSource {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn capture(
@@ -87,8 +87,105 @@ pub(crate) struct DirectOriginPublicationGuard<'a> {
     _publication: crate::dplpmtud::DirectBusinessPublicationGuard<'a>,
 }
 
-#[allow(dead_code)] // Final ACK transaction is deliberately not connected here.
+// Final ACK authority remains in the original peer-owner transaction.
 impl UdpTransport {
+    /// Sourced echo uses the original receiving socket and one publication
+    /// guard for both RX validation and TX. Caller holds emit, epoch and slot.
+    pub(crate) fn try_send_original_echo_on_receive_socket(
+        &self,
+        read: &OriginalUdpIngressSource,
+        generation: u64,
+        prepared: Option<&super::PreparedDirectBusinessSend>,
+        packet: &crate::transport::EncryptedPeerPacket,
+        endpoint: std::net::SocketAddr,
+        session: &crate::transport::OriginalEchoSessionGuard<'_>,
+    ) -> Result<usize, super::DirectBusinessUdpSendError> {
+        use super::DirectBusinessUdpSendError as Error;
+        let capability = self.peers.try_peer_dplpmtud_capability(&packet.peer_id);
+        if capability == crate::peer::PeerDplpmtudCapability::Contended {
+            return Err(Error::WouldBlock);
+        }
+        let guard = self
+            .try_original_direct_publication_guard(&packet.peer_id, generation, Some(read), None)
+            .map_err(|failure| match failure {
+                DirectOriginFailure::ContendedMembership
+                | DirectOriginFailure::ContendedSocket
+                | DirectOriginFailure::ContendedPublication => Error::WouldBlock,
+                _ => Error::StaleToken,
+            })?;
+        let socket = if read.socket_index >= DYNAMIC_SOCKET_INDEX_BASE
+            && read.socket_index != IPV6_SOCKET_INDEX
+        {
+            &guard
+                ._sockets
+                .as_ref()
+                .ok_or(Error::StaleToken)?
+                .dynamic
+                .get(&read.socket_index)
+                .ok_or(Error::StaleToken)?
+                .socket
+        } else if read.socket_index == IPV6_SOCKET_INDEX {
+            self.ipv6_socket.as_ref().ok_or(Error::StaleToken)?
+        } else {
+            self.active_sockets()
+                .get(read.socket_index)
+                .ok_or(Error::StaleToken)?
+        };
+        match prepared {
+            Some(prepared) => {
+                if !Arc::ptr_eq(socket, &prepared.socket)
+                    || prepared.endpoint != endpoint
+                    || prepared.token.path_identity.peer_id != packet.peer_id
+                    || prepared.token.path_identity.epoch.network_generation != generation
+                    || prepared.token.udp_publication_owner != read.publication_owner
+                    || !guard._publication.matches_original_token(&prepared.token)
+                {
+                    return Err(Error::StaleToken);
+                }
+                if packet.wire_bytes.len() > prepared.token.max_udp_datagram_size.0 as usize {
+                    return Err(Error::CiphertextTooLarge);
+                }
+            }
+            None => match capability {
+                crate::peer::PeerDplpmtudCapability::Unsupported => {}
+                crate::peer::PeerDplpmtudCapability::Supported
+                    if self
+                        .dplpmtud
+                        .direct_business_budget_entry(&packet.peer_id)
+                        .is_some_and(|entry| !entry.enforced) => {}
+                _ => return Err(Error::StaleToken),
+            },
+        }
+        if packet
+            .room_authorization
+            .as_ref()
+            .is_some_and(|permit| !permit.is_valid())
+        {
+            return Err(Error::StaleToken);
+        }
+        if !session.is_current() {
+            return Err(Error::StaleToken);
+        }
+        let sent = socket
+            .try_send_to(&packet.wire_bytes, endpoint)
+            .map_err(|error| {
+                if error.kind() == std::io::ErrorKind::WouldBlock {
+                    Error::WouldBlock
+                } else if super::is_local_packet_too_large(&error) {
+                    Error::LocalPacketTooLarge
+                } else {
+                    Error::Io(error.to_string())
+                }
+            })?;
+        if sent != packet.wire_bytes.len() {
+            return Err(Error::Short {
+                sent,
+                expected: packet.wire_bytes.len(),
+            });
+        }
+        Ok(sent)
+    }
+
     pub(crate) fn try_original_direct_publication_guard(
         &self,
         peer: &str,

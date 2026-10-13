@@ -1300,3 +1300,7 @@ mod relay_actor_publication_tests;
 #[cfg(test)]
 #[path = "tests/relay_actor_legacy_full.rs"]
 mod relay_actor_legacy_full_tests;
+
+#[cfg(test)]
+#[path = "tests/relay_actor_drain.rs"]
+mod relay_actor_drain_tests;

@@ -27,6 +27,7 @@ use crate::transport::{EncryptedPeerPacket, ReceivedEncryptedPacket};
 const RELAY_INBOUND_IDLE_TIMEOUT: Duration = Duration::from_secs(20);
 const RELAY_TICKET_REFRESH_MARGIN_SECS: i64 = 60;
 
+mod original_member;
 mod read_origin;
 pub(crate) use read_origin::RelayReadItem;
 mod send_origin;

@@ -894,3 +894,5 @@ fn b3_r09_caller_built_data_cannot_create_read_origin() -> Check {
         "public caller-built Data conversion must stay Unknown",
     )
 }
+
+mod close_lifecycle;

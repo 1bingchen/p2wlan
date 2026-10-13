@@ -17,6 +17,7 @@ struct Owners {
     servers: Vec<RelayServer>,
     transports: Vec<RelayTransport>,
     tasks: Vec<tokio::task::JoinHandle<crate::error::Result<()>>>,
+    expected_reader_close: bool,
 }
 
 impl Owners {
@@ -27,14 +28,17 @@ impl Owners {
         for task in &self.tasks {
             task.abort();
         }
-        for task in self.tasks.drain(..) {
+        for (index, task) in self.tasks.drain(..).enumerate() {
             let result = tokio::time::timeout_at(end, task)
                 .await
                 .map_err(|_| "original daemon task did not join within fixture end")?;
             require(
                 matches!(&result, Ok(Ok(())))
-                    || matches!(&result, Err(error) if error.is_cancelled()),
-                "original daemon task failed or panicked",
+                    || matches!(&result, Err(error) if error.is_cancelled())
+                    // Only the actual Relay converter (tasks after the first
+                    // decrypt worker) returns Relay on an intentional Closed.
+                    || (self.expected_reader_close && index > 0 && matches!(&result, Ok(Err(crate::error::DaemonError::Relay(_))))),
+                &format!("original daemon task {index} unexpected result: {result:?}"),
             )?;
         }
         for transport in &self.transports {
@@ -64,8 +68,15 @@ impl Drop for Owners {
     }
 }
 
+#[path = "original_reader_identity/lifecycle.rs"]
+mod lifecycle;
+
 #[tokio::test]
 async fn original_reader_same_publication_route_replacement_keeps_old_and_fresh_sources() -> Check {
+    original_reader_identity(lifecycle::Mode::Identity).await
+}
+
+async fn original_reader_identity(mode: lifecycle::Mode) -> Check {
     let end = tokio::time::Instant::now() + Duration::from_secs(2);
     let mut owners = Owners::default();
     let body = tokio::time::timeout_at(end, async {
@@ -176,6 +187,7 @@ async fn original_reader_same_publication_route_replacement_keeps_old_and_fresh_
             )));
 
         let mut sources = Vec::new();
+        let mut facts = Vec::new();
         for (sequence, destination) in [(1, "identity-old"), (2, "identity-new")] {
             if sequence == 2 {
                 // Keep the old client allocated, deliberately: its liveness
@@ -256,43 +268,91 @@ async fn original_reader_same_publication_route_replacement_keeps_old_and_fresh_
                 source.received_at() == Some(read.completed_at()),
                 "reader time was resampled",
             )?;
+            {
+                let routes = pool.routes.lock().unwrap();
+                let current = routes
+                    .clients
+                    .get(&common)
+                    .ok_or("current actual member missing")?;
+                require(
+                    read.belongs_to_client(current),
+                    "fresh source mismatched its actual member",
+                )?;
+                require(
+                    !read.belongs_to_client(&outer.client),
+                    "auxiliary read relabeled as primary",
+                )?;
+            }
+            if mode != lifecycle::Mode::Identity {
+                let encrypted = transport
+                    .encrypt_outbound(crate::dataplane::OutboundPacket {
+                        room_authorization: None,
+                        trace: None,
+                        peer_id: "identity-sender".into(),
+                        dst_ip: "10.20.0.2".into(),
+                        packet: packet.clone(),
+                    })
+                    .await
+                    .map_err(|e| e.to_string())?
+                    .ok_or("actual outgoing encryption missing")?;
+                let capture =
+                    RelaySendCapture::new(&encrypted).ok_or("capture allocation failed")?;
+                outer
+                    .send_packet_with_origin(&encrypted, capture.clone())
+                    .await
+                    .map_err(|e| e.to_string())?;
+                let RelayCaptureOutcome::Full(fact) = capture.finish() else {
+                    return Err("original write did not complete".into());
+                };
+                lifecycle::fresh(&outer, &fact, read, original_connection)?;
+                facts.push(fact);
+            }
+            sources.push(source);
+        }
+        {
             let routes = pool.routes.lock().unwrap();
             let current = routes
                 .clients
                 .get(&common)
-                .ok_or("current actual member missing")?;
-            require(
-                read.belongs_to_client(current),
-                "fresh source mismatched its actual member",
-            )?;
-            require(
-                !read.belongs_to_client(&outer.client),
-                "auxiliary read relabeled as primary",
-            )?;
-            sources.push(source);
-        }
-        let routes = pool.routes.lock().unwrap();
-        let current = routes
-            .clients
-            .get(&common)
-            .ok_or("replacement member missing")?;
-        let old_read = sources[0]
-            .original_relay_read()
-            .ok_or("retained original read missing")?;
-        require(
-            old_read.belongs_to_client(&old_client),
-            "historical old identity changed",
-        )?;
-        require(
-            !old_read.belongs_to_client(current),
-            "same endpoint/publication revived old reader",
-        )?;
-        require(
-            sources[1]
+                .ok_or("replacement member missing")?;
+            let old_read = sources[0]
                 .original_relay_read()
-                .is_some_and(|read| read.belongs_to_client(current)),
-            "fresh replacement reader failed positive control",
-        )?;
+                .ok_or("retained original read missing")?;
+            require(
+                old_read.belongs_to_client(&old_client),
+                "historical old identity changed",
+            )?;
+            require(
+                !old_read.belongs_to_client(current),
+                "same endpoint/publication revived old reader",
+            )?;
+            require(
+                sources[1]
+                    .original_relay_read()
+                    .is_some_and(|read| read.belongs_to_client(current)),
+                "fresh replacement reader failed positive control",
+            )?;
+        }
+        if mode != lifecycle::Mode::Identity {
+            owners.expected_reader_close = matches!(
+                mode,
+                lifecycle::Mode::Close | lifecycle::Mode::Replace | lifecycle::Mode::Stop
+            );
+            lifecycle::check(
+                &outer,
+                &sender,
+                &common,
+                &old_client,
+                &facts,
+                sources[0].original_relay_read().ok_or("old read missing")?,
+                sources[1]
+                    .original_relay_read()
+                    .ok_or("fresh read missing")?,
+                original_connection,
+                mode,
+                end,
+            )?;
+        }
         Ok::<(), String>(())
     })
     .await

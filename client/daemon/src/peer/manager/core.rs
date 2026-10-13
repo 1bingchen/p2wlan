@@ -1052,6 +1052,27 @@ impl PeerManager {
         self.connections.write().await
     }
 
+    #[cfg(test)]
+    pub(crate) async fn hold_local_nat_profile_writer_for_test(
+        &self,
+    ) -> tokio::sync::RwLockWriteGuard<'_, Option<NatProfile>> {
+        self.local_nat_profile.write().await
+    }
+
+    #[cfg(test)]
+    pub(crate) fn hard_hard_terminal_summaries_for_test(
+        &self,
+    ) -> Vec<crate::connection_timeline::HardHardTerminalSummary> {
+        let timeline = self
+            .timeline
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        timeline
+            .map(|timeline| timeline.snapshot().hard_hard_terminal_summaries)
+            .unwrap_or_default()
+    }
+
     /// Pause target snapshot preparation before its connection writer is queued.
     #[cfg(test)]
     pub(crate) async fn hold_local_interface_networks_writer_for_test(

@@ -1,7 +1,9 @@
 // Design draft: actual graceful actor shutdown, with genuine A1 full and A2 discard.
 // The bounded synchronous after-full barrier is a synthetic completion fault only.
 // It is not a worker-loss, partial TCP, finalowner or ACK control.
+use futures_util::FutureExt;
 use std::collections::{HashMap, VecDeque};
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -94,12 +96,9 @@ impl OriginalPipeline {
     }
 
     async fn join_forwarder(&mut self, budget: Budget) {
-        budget
-            .step(self.forward.as_mut().unwrap())
-            .await
-            .unwrap()
-            .unwrap();
+        let result = budget.step(self.forward.as_mut().unwrap()).await;
         drop(self.forward.take());
+        result.unwrap().unwrap();
     }
 
     fn close_availability(&mut self) {
@@ -107,13 +106,50 @@ impl OriginalPipeline {
     }
 
     async fn join_actor(&mut self, budget: Budget) {
-        budget.step(self.actor.as_mut().unwrap()).await.unwrap();
+        let result = budget.step(self.actor.as_mut().unwrap()).await;
         drop(self.actor.take());
+        result.unwrap();
+    }
+
+    async fn abort_and_join(
+        &mut self,
+        end: tokio::time::Instant,
+    ) -> (Result<(), String>, Result<(), String>) {
+        self.close_availability();
+        // Abort both original owners before awaiting either one. One common
+        // cleanup deadline cannot extend the existing positive-test budget.
+        if let Some(task) = self.forward.as_ref() {
+            task.abort();
+        }
+        if let Some(task) = self.actor.as_ref() {
+            task.abort();
+        }
+        let forward = join_aborted(&mut self.forward, end).await;
+        let actor = join_aborted(&mut self.actor, end).await;
+        (forward, actor)
     }
 
     async fn retire_relay(&self, budget: Budget) {
         let mut relay = budget.step(self.relays.write()).await;
         drop(relay.take());
+    }
+}
+
+async fn join_aborted<T>(
+    owner: &mut Option<JoinHandle<T>>,
+    end: tokio::time::Instant,
+) -> Result<(), String> {
+    let Some(task) = owner.as_mut() else {
+        return Ok(());
+    };
+    let joined = tokio::time::timeout_at(end, task)
+        .await
+        .map_err(|_| "original owner cleanup deadline exceeded".to_string())?;
+    drop(owner.take());
+    match joined {
+        Ok(_) => Ok(()),
+        Err(error) if error.is_cancelled() => Ok(()),
+        Err(error) => Err(format!("original owner panicked: {error}")),
     }
 }
 
@@ -307,134 +343,159 @@ async fn relay_c06_original_actor_graceful_drain_full_then_idle_worker_stopped()
         peers.clone(),
         fixture.transport().clone(),
     );
-    let client_count = fixture.client_count();
-    budget
-        .step(plane.read_and_route_once(&mut [0u8; 512]))
-        .await
-        .unwrap();
-    budget
-        .step(plane.read_and_route_once(&mut [0u8; 512]))
-        .await
-        .unwrap();
-    drop(plane);
-    pipeline.join_forwarder(budget).await;
-    budget.step(entered_rx).await.unwrap();
-    let capture = budget.step(capture_rx).await.unwrap();
-    assert!(capture.branches().unwrap()[0].original().is_some());
-    budget
-        .step(async {
-            loop {
-                let snapshot = resources.snapshot();
-                assert!(snapshot.valid);
-                assert_eq!(snapshot.gap_bits, 0);
-                if snapshot.fifo(QueueStage::ActorFifo).live_packets == 1 {
-                    assert!(snapshot.fifo_scope_observed(QueueStage::ActorFifo));
-                    assert_eq!(
-                        snapshot.fifo(QueueStage::ActorFifo).plaintext_len,
-                        second.original_packet().len() as u64
-                    );
-                    assert_eq!(
-                        snapshot
-                            .vec_site(VecSite::TxPreparationCopy)
-                            .materialization_ops,
-                        1
-                    );
-                    // These stable owners are blocked by the explicit full callback
-                    // barrier. ResourceSnapshot remains a non-atomic scoped read.
-                    assert!(!snapshot.coherent);
-                    break;
+    // Keep the original handles and completion release outside the caught body.
+    // Any failed prerequisite still releases the barrier and awaits the actual
+    // owners before the assertion is reported. Positive Budget stays 2s/1s.
+    let result = AssertUnwindSafe(async {
+        let client_count = fixture.client_count();
+        budget
+            .step(plane.read_and_route_once(&mut [0u8; 512]))
+            .await
+            .unwrap();
+        budget
+            .step(plane.read_and_route_once(&mut [0u8; 512]))
+            .await
+            .unwrap();
+        drop(plane);
+        pipeline.join_forwarder(budget).await;
+        budget.step(entered_rx).await.unwrap();
+        let capture = budget.step(capture_rx).await.unwrap();
+        assert!(capture.branches().unwrap()[0].original().is_some());
+        budget
+            .step(async {
+                loop {
+                    let snapshot = resources.snapshot();
+                    assert!(snapshot.valid);
+                    assert_eq!(snapshot.gap_bits, 0);
+                    if snapshot.fifo(QueueStage::ActorFifo).live_packets == 1 {
+                        assert!(snapshot.fifo_scope_observed(QueueStage::ActorFifo));
+                        assert_eq!(
+                            snapshot.fifo(QueueStage::ActorFifo).plaintext_len,
+                            second.original_packet().len() as u64
+                        );
+                        assert_eq!(
+                            snapshot
+                                .vec_site(VecSite::TxPreparationCopy)
+                                .materialization_ops,
+                            1
+                        );
+                        // These stable owners are blocked by the explicit full callback
+                        // barrier. ResourceSnapshot remains a non-atomic scoped read.
+                        assert!(!snapshot.coherent);
+                        break;
+                    }
+                    tokio::task::yield_now().await;
                 }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await;
-    assert_eq!(
-        first.physical_publication.state(),
-        PhysicalPublicationState::Open
-    );
-    assert_eq!(
-        second.physical_publication.state(),
-        PhysicalPublicationState::Idle
-    );
-    assert!(second.physical_publication.record().is_none());
-    pipeline.close_availability();
-    // This observes actual original receiver.close(), not a manufactured
-    // stopping value or a fixed number of yields. It does not claim that the
-    // following stopping.store is already visible to arbitrary threads: A2
-    // cannot be scheduled again after this actor has left its main loop, and
-    // the original final-drain spawn is ordered after stopping.store.
-    budget
+            })
+            .await;
+        assert_eq!(
+            first.physical_publication.state(),
+            PhysicalPublicationState::Open
+        );
+        assert_eq!(
+            second.physical_publication.state(),
+            PhysicalPublicationState::Idle
+        );
+        assert!(second.physical_publication.record().is_none());
+        pipeline.close_availability();
+        // This observes actual original receiver.close(), not a manufactured
+        // stopping value or a fixed number of yields. It does not claim that the
+        // following stopping.store is already visible to arbitrary threads: A2
+        // cannot be scheduled again after this actor has left its main loop, and
+        // the original final-drain spawn is ordered after stopping.store.
+        budget
         .step(
             crate::transport::actor_shutdown_test_support::wait_tracked_outbound_receiver_closed(
                 &transport,
             ),
         )
         .await;
-    assert!(!pipeline.actor.as_ref().unwrap().is_finished());
-    assert_eq!(
-        first.physical_publication.state(),
-        PhysicalPublicationState::Open
-    );
-    assert_eq!(
-        second.physical_publication.state(),
-        PhysicalPublicationState::Idle
-    );
+        assert!(!pipeline.actor.as_ref().unwrap().is_finished());
+        assert_eq!(
+            first.physical_publication.state(),
+            PhysicalPublicationState::Open
+        );
+        assert_eq!(
+            second.physical_publication.state(),
+            PhysicalPublicationState::Idle
+        );
+        release.release();
+        let frame = fixture.next_frame(budget).await;
+        let (destination, wire) = frame.parse_forward_payload().unwrap();
+        assert_eq!(destination, PEER);
+        assert_eq!(crate::transport::wire_counter(wire), Some(0));
+        assert_eq!(
+            remote.decrypt_from_bytes(wire).unwrap(),
+            first.original_packet()
+        );
+        pipeline.join_actor(budget).await;
+        let pointer = assert_canonical_full(&first, wire, instance, &fixture);
+        assert_eq!(
+            second.physical_publication.state(),
+            PhysicalPublicationState::Idle
+        );
+        assert!(second.physical_publication.record().is_none());
+        assert_eq!(Arc::strong_count(&second), 1);
+        let after_loss = budget.step(peers.outbound_loss_stats()).await;
+        assert_eq!(after_loss.drops.len(), 1);
+        let stopped = after_loss
+            .drops
+            .get(REASON_OUTBOUND_WORKER_STOPPED)
+            .unwrap();
+        assert_eq!(
+            (stopped.packets, stopped.bytes),
+            (1, second.original_packet().len() as u64)
+        );
+        let snapshot = resources.snapshot();
+        assert!(snapshot.valid);
+        assert_eq!(snapshot.gap_bits, 0);
+        assert_eq!(
+            snapshot
+                .vec_site(VecSite::TxPreparationCopy)
+                .materialization_ops,
+            1
+        );
+        assert_eq!(snapshot.fifo(QueueStage::ActorFifo).live_packets, 0);
+        assert_eq!(
+            snapshot.fifo(QueueStage::TaskOrUnjoinedFifo).live_packets,
+            0
+        );
+        assert_eq!(fixture.client_count(), client_count);
+        assert!(transport.try_acquire_outbound_emit_guard(PEER).is_some());
+        pipeline.retire_relay(budget).await;
+        fixture.finish_joined(budget).await;
+        assert_retired_history(&first, pointer);
+        assert_eq!(
+            second.physical_publication.state(),
+            PhysicalPublicationState::Idle
+        );
+        resources.finish();
+        let first_weak = Arc::downgrade(&first);
+        let second_weak = Arc::downgrade(&second);
+        drop(controller);
+        drop(first);
+        drop(second);
+        assert!(first_weak.upgrade().is_none());
+        assert!(second_weak.upgrade().is_none());
+    })
+    .catch_unwind()
+    .await;
     release.release();
-    let frame = fixture.next_frame(budget).await;
-    let (destination, wire) = frame.parse_forward_payload().unwrap();
-    assert_eq!(destination, PEER);
-    assert_eq!(crate::transport::wire_counter(wire), Some(0));
-    assert_eq!(
-        remote.decrypt_from_bytes(wire).unwrap(),
-        first.original_packet()
+    let cleanup_end = tokio::time::Instant::now() + Duration::from_secs(1);
+    let (forward, actor) = pipeline.abort_and_join(cleanup_end).await;
+    let server = fixture.abort_and_join_server(cleanup_end).await;
+    // Collect all three results first, so one failure never skips another join.
+    assert!(
+        forward.is_ok(),
+        "original forwarder cleanup failed: {forward:?}"
     );
-    pipeline.join_actor(budget).await;
-    let pointer = assert_canonical_full(&first, wire, instance, &fixture);
-    assert_eq!(
-        second.physical_publication.state(),
-        PhysicalPublicationState::Idle
+    assert!(actor.is_ok(), "original actor cleanup failed: {actor:?}");
+    assert!(
+        server.is_ok(),
+        "original fixture server cleanup failed: {server:?}"
     );
-    assert!(second.physical_publication.record().is_none());
-    assert_eq!(Arc::strong_count(&second), 1);
-    let after_loss = budget.step(peers.outbound_loss_stats()).await;
-    assert_eq!(after_loss.drops.len(), 1);
-    let stopped = after_loss
-        .drops
-        .get(REASON_OUTBOUND_WORKER_STOPPED)
-        .unwrap();
-    assert_eq!(
-        (stopped.packets, stopped.bytes),
-        (1, second.original_packet().len() as u64)
-    );
-    let snapshot = resources.snapshot();
-    assert!(snapshot.valid);
-    assert_eq!(snapshot.gap_bits, 0);
-    assert_eq!(
-        snapshot
-            .vec_site(VecSite::TxPreparationCopy)
-            .materialization_ops,
-        1
-    );
-    assert_eq!(snapshot.fifo(QueueStage::ActorFifo).live_packets, 0);
-    assert_eq!(
-        snapshot.fifo(QueueStage::TaskOrUnjoinedFifo).live_packets,
-        0
-    );
-    assert_eq!(fixture.client_count(), client_count);
-    assert!(transport.try_acquire_outbound_emit_guard(PEER).is_some());
-    pipeline.retire_relay(budget).await;
-    fixture.finish(budget).await;
-    assert_retired_history(&first, pointer);
-    assert_eq!(
-        second.physical_publication.state(),
-        PhysicalPublicationState::Idle
-    );
-    resources.finish();
-    let first_weak = Arc::downgrade(&first);
-    let second_weak = Arc::downgrade(&second);
-    drop(controller);
-    drop(first);
-    drop(second);
-    assert!(first_weak.upgrade().is_none());
-    assert!(second_weak.upgrade().is_none());
+    if let Err(panic) = result {
+        eprintln!("C06 failed body: original forwarder, actor and fixture server joined");
+        std::panic::resume_unwind(panic);
+    }
 }

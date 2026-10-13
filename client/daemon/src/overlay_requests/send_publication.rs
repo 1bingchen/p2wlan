@@ -1,10 +1,11 @@
 // Canonical physical facts. This is not final ACK or current-owner credit.
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{OnceLock, Weak};
+use std::sync::{Arc, OnceLock, Weak};
 use std::time::Instant;
 
 use super::CanonicalOverlayRequest;
 use crate::peer::PeerManager;
+use crate::relay::RelayFullSendFact;
 use crate::request_carriage::{in_original_window, RequestBindingState};
 use crate::transport::OriginalEncryptionSource;
 use crate::udp::UdpFullSendFact;
@@ -122,6 +123,7 @@ pub(crate) enum PhysicalInputQualification {
     Retired,
     UnknownOriginalAuthorization,
     UnknownUdpPublication,
+    UnknownRelayPublication,
 }
 
 // Prepared under the original encryption epoch, before any Open/Publishing CAS.
@@ -180,6 +182,25 @@ impl PreparedPhysicalPublication {
     }
 }
 
+enum PhysicalTransportFact {
+    Udp(UdpFullSendFact),
+    Relay(Arc<RelayFullSendFact>),
+}
+impl PhysicalTransportFact {
+    fn matches_wire(&self, wire: (usize, Option<u64>, u64), peer: &str) -> bool {
+        match self {
+            Self::Udp(fact) => fact.matches_wire(wire),
+            Self::Relay(fact) => fact.matches_wire(wire, peer),
+        }
+    }
+    fn source_is_live(&self) -> bool {
+        match self {
+            Self::Udp(fact) => fact.source_is_live(),
+            Self::Relay(fact) => fact.source_is_live(),
+        }
+    }
+}
+
 pub(crate) struct PhysicalSendRecord {
     request: Weak<CanonicalOverlayRequest>,
     attempt_id: u64,
@@ -187,7 +208,7 @@ pub(crate) struct PhysicalSendRecord {
     binding: RequestBindingState,
     encryption: OriginalEncryptionSource,
     encryption_generation: u64,
-    udp: UdpFullSendFact,
+    transport: PhysicalTransportFact,
 }
 #[allow(dead_code)] // Read-only staged evidence; final ACK qualification remains separate.
 impl PhysicalSendRecord {
@@ -200,8 +221,17 @@ impl PhysicalSendRecord {
     pub(crate) fn encryption_generation(&self) -> u64 {
         self.encryption_generation
     }
-    pub(crate) fn udp(&self) -> &UdpFullSendFact {
-        &self.udp
+    pub(crate) fn udp(&self) -> Option<&UdpFullSendFact> {
+        match &self.transport {
+            PhysicalTransportFact::Udp(fact) => Some(fact),
+            PhysicalTransportFact::Relay(_) => None,
+        }
+    }
+    pub(crate) fn relay(&self) -> Option<&RelayFullSendFact> {
+        match &self.transport {
+            PhysicalTransportFact::Relay(fact) => Some(fact),
+            PhysicalTransportFact::Udp(_) => None,
+        }
     }
     pub(crate) fn qualify(
         &self,
@@ -213,7 +243,7 @@ impl PhysicalSendRecord {
         }
         if self.peer_owner.upgrade().is_none()
             || !self.encryption.owner_is_live()
-            || !self.udp.source_is_live()
+            || !self.transport.source_is_live()
         {
             return PhysicalInputQualification::Retired;
         }
@@ -238,10 +268,16 @@ impl PhysicalSendRecord {
         if request.expected_target_lifecycle() != self.encryption.authorized_peer_lifecycle() {
             return PhysicalInputQualification::OriginalMismatch;
         }
-        if self.udp.publication_owner().is_none_or(|owner| owner == 0) {
-            return PhysicalInputQualification::UnknownUdpPublication;
+        match &self.transport {
+            PhysicalTransportFact::Relay(_) => PhysicalInputQualification::UnknownRelayPublication,
+            PhysicalTransportFact::Udp(fact) => {
+                if fact.publication_owner().is_none_or(|owner| owner == 0) {
+                    PhysicalInputQualification::UnknownUdpPublication
+                } else {
+                    PhysicalInputQualification::AcceptedInput
+                }
+            }
         }
-        PhysicalInputQualification::AcceptedInput
     }
 }
 
@@ -253,6 +289,18 @@ pub(crate) struct PhysicalRequestPublisher {
 }
 impl PhysicalRequestPublisher {
     pub(crate) fn publish(&mut self, udp: UdpFullSendFact) -> Result<(), PublicationFailure> {
+        self.publish_transport(PhysicalTransportFact::Udp(udp))
+    }
+    pub(crate) fn publish_relay(
+        &mut self,
+        relay: Arc<RelayFullSendFact>,
+    ) -> Result<(), PublicationFailure> {
+        self.publish_transport(PhysicalTransportFact::Relay(relay))
+    }
+    fn publish_transport(
+        &mut self,
+        transport: PhysicalTransportFact,
+    ) -> Result<(), PublicationFailure> {
         let Some(prepared) = self.prepared.take() else {
             return Err(PublicationFailure::Occupied);
         };
@@ -261,7 +309,7 @@ impl PhysicalRequestPublisher {
             .upgrade()
             .ok_or(PublicationFailure::Retired)?;
         let publication = &request.physical_publication;
-        if !udp.matches_wire(prepared.wire) {
+        if !transport.matches_wire(prepared.wire, prepared.encryption.peer_id()) {
             publication.terminal(self.id, PhysicalPublicationState::MetadataFailed);
             return Err(PublicationFailure::MetadataFailed);
         }
@@ -272,7 +320,7 @@ impl PhysicalRequestPublisher {
             binding: prepared.binding,
             encryption: prepared.encryption,
             encryption_generation: prepared.encryption_generation,
-            udp,
+            transport,
         };
         publication
             .phase
@@ -295,6 +343,15 @@ impl PhysicalRequestPublisher {
             Ordering::Release,
         );
         Ok(())
+    }
+    pub(crate) fn fail_metadata(&mut self) {
+        if let Some(prepared) = self.prepared.take() {
+            if let Some(request) = prepared.request.upgrade() {
+                request
+                    .physical_publication
+                    .terminal(self.id, PhysicalPublicationState::MetadataFailed);
+            }
+        }
     }
     pub(crate) fn finish(&mut self, definitely_not_handed: bool) {
         if let Some(prepared) = self.prepared.take() {
@@ -320,3 +377,7 @@ impl Drop for PhysicalRequestPublisher {
 #[cfg(test)]
 #[path = "send_publication/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "send_publication/relay_tests.rs"]
+mod relay_tests;

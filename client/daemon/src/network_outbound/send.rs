@@ -421,6 +421,8 @@ pub(super) async fn encrypt_then_send_with_deadline(
         &encrypted,
         crate::request_carriage::test_probe::HandoffArgumentPoint::SlowBoundedEntry,
     );
+    #[cfg(test)]
+    prepare_relay_capture_for_test(&encrypted, &mut physical_attempt);
     let outcome = send_encrypted_packet_bounded_with_origin(
         &encrypted,
         peers,
@@ -433,7 +435,7 @@ pub(super) async fn encrypt_then_send_with_deadline(
         complete_inner_ip_packet_len(&retry_packet.packet).unwrap_or(retry_packet.packet.len()),
         force_relay,
         window,
-        physical_attempt.capture(),
+        physical_attempt.slow_capture(),
     )
     .await;
     let transport_handoff_completed = Instant::now();
@@ -680,7 +682,7 @@ async fn send_encrypted_packet_bounded_with_origin(
     inner_ip_packet_len: usize,
     force_relay: bool,
     window: SendAdmissionWindow<'_>,
-    origin: Option<&mut crate::udp::UdpSendCapture>,
+    origin: Option<&mut super::physical_attempt::PhysicalSendCapture>,
 ) -> SendOutcome {
     // Capture the exact shared connection before entering the bounded send.
     // The same snapshot is passed into the send operation, so a supervisor
@@ -815,7 +817,7 @@ async fn send_encrypted_packet_once_with_origin(
     inner_ip_packet_len: usize,
     force_relay: bool,
     window: SendAdmissionWindow<'_>,
-    mut origin: Option<&mut crate::udp::UdpSendCapture>,
+    mut origin: Option<&mut super::physical_attempt::PhysicalSendCapture>,
 ) -> SendOutcome {
     let profiler = global_dataplane_profiler();
     // Take one path/generation snapshot atomically. Managed Direct keeps this
@@ -925,7 +927,7 @@ async fn send_encrypted_packet_once_with_origin(
                 Some(origin) => plan.udp.try_send_direct_business_packet_with_origin(
                     &plan.prepared,
                     packet,
-                    Some(origin),
+                    Some(origin.udp()),
                 ),
                 None => plan
                     .udp
@@ -1020,7 +1022,7 @@ async fn send_encrypted_packet_once_with_origin(
                 reason: "managed Direct became selected without a pre-encryption token".to_string(),
             };
         }
-        let direct_result = match origin {
+        let direct_result = match origin.as_deref_mut() {
             Some(origin) => {
                 send_direct_if_selected_with_origin(
                     packet,
@@ -1029,7 +1031,7 @@ async fn send_encrypted_packet_once_with_origin(
                     &selection,
                     udp_local_endpoint,
                     sampled,
-                    Some(origin),
+                    Some(origin.udp()),
                 )
                 .await
             }
@@ -1054,13 +1056,14 @@ async fn send_encrypted_packet_once_with_origin(
                 // carry this same ciphertext without replaying its counter.
                 if relay_peer_confirmed {
                     if let Some(relay) = relay {
-                        return send_via_relay(
+                        return send_original_relay_with_capture(
                             &relay,
                             packet,
                             peers,
                             generation,
                             relay_send_started,
                             sampled,
+                            origin.as_deref_mut(),
                         )
                         .await;
                     }
@@ -1094,13 +1097,14 @@ async fn send_encrypted_packet_once_with_origin(
     // connection or writer completion is not enough to admit a counter.
     if relay_peer_confirmed {
         if let Some(relay) = relay {
-            return send_via_relay(
+            return send_original_relay_with_capture(
                 &relay,
                 packet,
                 peers,
                 generation,
                 relay_send_started,
                 sampled,
+                origin,
             )
             .await;
         }
@@ -1180,3 +1184,111 @@ mod request_carriage_tests;
 #[cfg(test)]
 #[path = "tests/physical_publication.rs"]
 mod physical_publication_tests;
+
+#[cfg(test)]
+#[path = "tests/relay_publication.rs"]
+mod relay_publication_tests;
+
+async fn send_original_relay_with_capture(
+    relay: &RelayTransport,
+    packet: &EncryptedPeerPacket,
+    peers: &PeerManager,
+    generation: u64,
+    relay_send_started: &AtomicBool,
+    sampled: Option<bool>,
+    origin: Option<&mut super::physical_attempt::PhysicalSendCapture>,
+) -> SendOutcome {
+    match origin.and_then(|origin| origin.relay(packet)) {
+        Some(origin) => {
+            super::relay::send_via_relay_with_origin(
+                relay,
+                packet,
+                peers,
+                generation,
+                relay_send_started,
+                sampled,
+                Some(origin),
+            )
+            .await
+        }
+        None => {
+            send_via_relay(
+                relay,
+                packet,
+                peers,
+                generation,
+                relay_send_started,
+                sampled,
+            )
+            .await
+        }
+    }
+}
+
+// This original-caller setup seam exists only in test builds. The registry key
+// is the address of a live original A, never an Arc keeper; callbacks are removed
+// synchronously before the actual bounded future borrows its owner's storage.
+#[cfg(test)]
+type RelayCaptureSetupForTest = Box<
+    dyn FnOnce(
+            &mut super::physical_attempt::PhysicalSendCapture,
+            &crate::transport::EncryptedPeerPacket,
+        ) + Send
+        + 'static,
+>;
+#[cfg(test)]
+fn relay_capture_setups_for_test(
+) -> &'static std::sync::Mutex<HashMap<usize, RelayCaptureSetupForTest>> {
+    static SETUPS: std::sync::OnceLock<std::sync::Mutex<HashMap<usize, RelayCaptureSetupForTest>>> =
+        std::sync::OnceLock::new();
+    SETUPS.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+#[cfg(test)]
+struct RelayCaptureSetupGuardForTest(usize);
+#[cfg(test)]
+impl Drop for RelayCaptureSetupGuardForTest {
+    fn drop(&mut self) {
+        relay_capture_setups_for_test()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&self.0);
+    }
+}
+#[cfg(test)]
+fn install_relay_capture_setup_for_test(
+    request: &Arc<crate::overlay_requests::CanonicalOverlayRequest>,
+    hook: impl FnOnce(
+            &mut super::physical_attempt::PhysicalSendCapture,
+            &crate::transport::EncryptedPeerPacket,
+        ) + Send
+        + 'static,
+) -> RelayCaptureSetupGuardForTest {
+    let key = Arc::as_ptr(request) as usize;
+    assert!(relay_capture_setups_for_test()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .insert(key, Box::new(hook))
+        .is_none());
+    RelayCaptureSetupGuardForTest(key)
+}
+#[cfg(test)]
+fn prepare_relay_capture_for_test<G>(
+    packet: &EncryptedRequestDelivery,
+    owner: &mut PhysicalAttempt<G>,
+) {
+    let Some(request) = packet
+        .binding()
+        .and_then(|binding| binding.token().request())
+    else {
+        return;
+    };
+    let key = Arc::as_ptr(&request) as usize;
+    drop(request);
+    let hook = relay_capture_setups_for_test()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .remove(&key);
+    if let (Some(hook), Some(capture)) = (hook, owner.slow_capture()) {
+        hook(capture, packet);
+    }
+}

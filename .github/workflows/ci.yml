@@ -204,6 +204,10 @@ jobs:
           python3 scripts/dual-end/test-production-availability-parser.py
           bash -n scripts/dual-end/mini-air-smoke.sh
           bash -n scripts/nat-sim/nat-sim-smoke.sh
+      - name: Verify offline Minecraft evidence contracts
+        run: |
+          python3 scripts/dual-end/test_minecraft_interaction.py
+          python3 scripts/dual-end/test_minecraft_interaction_summary.py
       - name: Assert admin UI dependency boundary
         run: |
           test ! -e package.json

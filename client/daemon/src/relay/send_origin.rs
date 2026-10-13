@@ -548,14 +548,43 @@ pub(crate) mod publication_test_support {
             frame
         }
         pub(crate) async fn finish(mut self, budget: Budget) {
+            self.finish_joined(budget).await;
+        }
+        pub(crate) async fn finish_joined(&mut self, budget: Budget) {
             if let Some(transport) = self.transport.take() {
                 transport.abort_writer();
             }
             if let Some(stop) = self.stop.take() {
                 let _ = stop.send(());
             }
-            if let Some(task) = self.task.take() {
-                budget.step(task).await.unwrap();
+            if let Some(task) = self.task.as_mut() {
+                let result = budget.step(task).await;
+                drop(self.task.take());
+                result.unwrap();
+            }
+        }
+        pub(crate) async fn abort_and_join_server(
+            &mut self,
+            end: tokio::time::Instant,
+        ) -> std::result::Result<(), String> {
+            if let Some(transport) = self.transport.take() {
+                transport.abort_writer();
+            }
+            if let Some(stop) = self.stop.take() {
+                let _ = stop.send(());
+            }
+            let Some(task) = self.task.as_mut() else {
+                return Ok(());
+            };
+            task.abort();
+            let result = tokio::time::timeout_at(end, task)
+                .await
+                .map_err(|_| "original fixture server cleanup deadline exceeded".to_string())?;
+            drop(self.task.take());
+            match result {
+                Ok(()) => Ok(()),
+                Err(error) if error.is_cancelled() => Ok(()),
+                Err(error) => Err(format!("original fixture server panicked: {error}")),
             }
         }
     }

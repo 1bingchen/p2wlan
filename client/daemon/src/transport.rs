@@ -663,3 +663,7 @@ use sessions::PeerTransportSessions;
 pub(crate) use sessions::{
     SessionRollback, SessionRollbackIdentityMismatch, SessionRollbackRejection,
 };
+
+#[cfg(test)]
+#[path = "transport/tests/actor_shutdown_test_support.rs"]
+pub(crate) mod actor_shutdown_test_support;

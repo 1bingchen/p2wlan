@@ -432,6 +432,14 @@ pub(crate) use hard_hard_pair_validation::{HardHardValidationScope, HardHardVali
 
 mod diagnostics;
 
+mod ordinary_probe_cost;
+use ordinary_probe_cost::{OrdinaryProbeCall, OrdinaryProbeKind, OrdinaryProbeSocket};
+pub(crate) use ordinary_probe_cost::{OrdinaryProbeCost, OrdinaryProbeIdentity};
+mod ordinary_probe_task;
+#[cfg(test)]
+use ordinary_probe_cost::OrdinaryProbeTestStage;
+pub(crate) use ordinary_probe_task::OrdinaryProbeTask;
+
 mod dynamic_punch;
 mod hard_hard_measurement;
 pub(crate) use hard_hard_measurement::HardHardPreparedMeasurement;

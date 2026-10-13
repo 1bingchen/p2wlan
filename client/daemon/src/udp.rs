@@ -298,6 +298,9 @@ pub struct UdpTransport {
     probe_send_failure_hook: Arc<std::sync::Mutex<Option<ProbeSendFailureHook>>>,
     #[cfg(test)]
     probe_send_failure_hook_enabled: Arc<AtomicBool>,
+    /// Fixture-only ownership of this transport's original retransmit tasks.
+    #[cfg(test)]
+    probe_burst_capture_for_test: Option<Arc<ProbeBurstCaptureForTest>>,
     /// Per-transport one-shot ordinary fresh-mapping lifecycle barrier.
     /// Absent from production; it never supplies send authority or summaries.
     #[cfg(test)]

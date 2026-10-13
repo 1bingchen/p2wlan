@@ -507,6 +507,7 @@ async fn b19_original_fanout_first_full_with_other_unknown() {
     let (stall_packet, unused_prepared) = encrypt_existing(&f, &transport, budget).await;
     drop(unused_prepared);
     let (stalled_rx, release_tx, stall_task) = second.stall_writer((*stall_packet).clone());
+    eprintln!("B19 phase=fanout-stall-entered");
     budget.step(stalled_rx).await.unwrap();
     first.fanout_with(&second);
     let (full_tx, full_rx) = tokio::sync::oneshot::channel();
@@ -520,7 +521,7 @@ async fn b19_original_fanout_first_full_with_other_unknown() {
     });
     let udps = RwLock::new(None);
     let relays = RwLock::new(Some(first.transport().clone()));
-    let mut send = Box::pin(encrypt_then_send_with_deadline(
+    let pending_send = encrypt_then_send_with_deadline(
         f.delivery.clone(),
         &transport,
         &f.peers,
@@ -531,7 +532,13 @@ async fn b19_original_fanout_first_full_with_other_unknown() {
         true,
         Some(Instant::now() + Duration::from_secs(1)),
         None,
-    ));
+    );
+    // Force the first Pending before writer enqueue; retain the deadline above.
+    let mut send = Box::pin(async move {
+        tokio::task::yield_now().await;
+        pending_send.await
+    });
+    eprintln!("B19 phase=fanout-initial-send-pending");
     assert!(
         budget
             .step(poll_fn(|cx| Poll::Ready(matches!(
@@ -540,7 +547,17 @@ async fn b19_original_fanout_first_full_with_other_unknown() {
             ))))
             .await
     );
-    budget.step(full_rx).await.unwrap();
+    eprintln!("B19 phase=fanout-first-full-drive");
+    budget
+        .step(async {
+            tokio::select! {
+                biased;
+                full = full_rx => full.unwrap(),
+                _ = &mut send => panic!("B19 original caller completed before first FULL"),
+            }
+        })
+        .await;
+    eprintln!("B19 phase=fanout-capture");
     let capture = budget.step(capture_rx).await.unwrap();
     let branches = capture.branches().unwrap();
     assert_eq!(branches.len(), 2);
@@ -561,6 +578,7 @@ async fn b19_original_fanout_first_full_with_other_unknown() {
         first.transport().endpoint()
     );
     let pointer = record as *const _;
+    eprintln!("B19 phase=fanout-first-frame");
     let a = first.next_frame(budget).await;
     let wire = a.parse_forward_payload().unwrap().1;
     assert_eq!(crate::transport::wire_counter(wire), Some(1));
@@ -568,7 +586,9 @@ async fn b19_original_fanout_first_full_with_other_unknown() {
         remote.decrypt_from_bytes(wire).unwrap(),
         f.record.original_packet()
     );
+    eprintln!("B19 phase=fanout-release-before-join");
     release_tx.send(()).unwrap();
+    eprintln!("B19 phase=fanout-stall-owned-join");
     assert!(matches!(
         budget.step(stall_task).await.unwrap(),
         Err(crate::error::DaemonError::RelaySend {
@@ -576,8 +596,10 @@ async fn b19_original_fanout_first_full_with_other_unknown() {
             ..
         })
     ));
+    eprintln!("B19 phase=fanout-late-original-cell");
     budget.step(late_rx).await.unwrap();
     assert!(late_cell.original().is_some());
+    eprintln!("B19 phase=fanout-second-frame");
     let b = second.next_frame(budget).await;
     assert_eq!(b.parse_forward_payload().unwrap().1, wire);
     assert!(matches!(capture.finish(), RelayCaptureOutcome::Uncertain));
@@ -592,8 +614,57 @@ async fn b19_original_fanout_first_full_with_other_unknown() {
     assert!(record.udp().is_none());
     assert!(transport.try_acquire_outbound_emit_guard(PEER).is_some());
     drop(relays);
+    eprintln!("B19 phase=fanout-first-fixture-finish");
     first.finish(budget).await;
+    eprintln!("B19 phase=fanout-second-fixture-finish");
     second.finish(budget).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn b19_stall_writer_allows_runtime_sibling_progress() {
+    let budget = Budget::new();
+    let (f, transport, fixture, _remote) = admitted(WriterPath::General, budget).await;
+    let (packet, unused_prepared) = encrypt_existing(&f, &transport, budget).await;
+    drop(unused_prepared);
+    let (entered_rx, release_tx, stall_task) = fixture.stall_writer((*packet).clone());
+    eprintln!("B19 phase=stall-control-entered");
+    budget.step(entered_rx).await.unwrap();
+
+    let (marker_tx, marker_rx) = std::sync::mpsc::sync_channel(1);
+    // This owned observer always releases the callback before reporting.
+    // 250ms is strictly below the unchanged one-second stall barrier.
+    let observer = std::thread::spawn(move || {
+        let progressed = marker_rx.recv_timeout(Duration::from_millis(250)).is_ok();
+        let released = release_tx.send(()).is_ok();
+        (progressed, released)
+    });
+    let sibling = tokio::spawn(async move {
+        let _ = marker_tx.send(());
+    });
+
+    // The test's multithread block_on caller joins the bounded std observer.
+    // No release sender remains retained by cleanup after this join.
+    let (progressed, released) = observer.join().expect("B19 owned observer join");
+    eprintln!(
+        "B19 phase=stall-control-release-before-cleanup progressed={progressed} released={released}"
+    );
+    budget.step(sibling).await.unwrap();
+    let stall_outcome = budget.step(stall_task).await.unwrap();
+    fixture.finish(budget).await;
+
+    // Both Tokio handles and the fixture server are joined before assertions.
+    assert!(released, "B19 stall control release must precede cleanup");
+    assert!(
+        progressed,
+        "B19 runtime sibling must run while synthetic PREWRITE remains stalled"
+    );
+    assert!(matches!(
+        stall_outcome,
+        Err(crate::error::DaemonError::RelaySend {
+            error: p2pnet_relay::RelayError::WriteBoundaryRejected,
+            ..
+        })
+    ));
 }
 
 #[tokio::test]

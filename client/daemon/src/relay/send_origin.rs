@@ -608,11 +608,15 @@ pub(crate) mod publication_test_support {
             let task = tokio::spawn(async move {
                 relay
                     .send_packet_with_write_boundary(&packet, move |_| {
-                        let _ = entered_tx.send(());
-                        release_rx
-                            .recv_timeout(Duration::from_secs(1))
-                            .expect("explicit synthetic prewrite release");
-                        false
+                        // This cfg(test) callback retains the production write locks.
+                        // Hand off the runtime worker before notifying the test.
+                        tokio::task::block_in_place(|| {
+                            let _ = entered_tx.send(());
+                            release_rx
+                                .recv_timeout(Duration::from_secs(1))
+                                .expect("explicit synthetic prewrite release");
+                            false
+                        })
                     })
                     .await
             });

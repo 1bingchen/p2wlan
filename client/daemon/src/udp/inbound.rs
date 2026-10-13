@@ -1763,6 +1763,7 @@ impl UdpTransport {
             inbound_tx
                 .send(ReceivedEncryptedPacket {
                     physical_ingress,
+                    original_relay_read: None,
                     source: Some(source),
                     local_endpoint,
                     relay_endpoint: None,

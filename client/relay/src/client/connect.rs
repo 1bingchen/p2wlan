@@ -280,7 +280,7 @@ impl RelayClient {
         // Channels
         let (cmd_tx, mut cmd_rx) = mpsc::channel::<ClientCommand>(config.cmd_queue_capacity);
         let write_origin = cmd_tx.downgrade();
-        let (msg_tx, msg_rx) = options.channel(config.inbound_queue_capacity);
+        let (msg_tx, msg_rx) = options.channel(config.inbound_queue_capacity, &cmd_tx);
         #[cfg(test)]
         let read_witness = options.witness();
         let (reg_tx, reg_rx) = tokio::sync::oneshot::channel::<Result<()>>();

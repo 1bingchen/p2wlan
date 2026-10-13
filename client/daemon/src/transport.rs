@@ -324,9 +324,12 @@ pub struct ReceivedEncryptedPacket {
     pub wire_bytes: Vec<u8>,
     /// Opt-in historical reader carrier; None allocates no metadata.
     pub(crate) physical_ingress: Option<Arc<crate::business_evidence::PhysicalIngressContext>>,
+    /// Original concrete Relay reader identity, never a current-owner grant.
+    /// Cloning this immutable fact retains only a Weak reference to its client.
+    pub(crate) original_relay_read: Option<p2pnet_relay::OriginalRelayFrameRead>,
 }
 
-// The socket handle is an in-process lifetime guard, not packet identity.
+// Socket handles and historical reader facts are not packet identity.
 // Keep equality useful for transport tests without treating two envelopes
 // that carry the same wire bytes differently merely because one was queued
 // by a dynamic UDP reader.

@@ -95,6 +95,7 @@ impl S2OverlayCarriageHarness {
         self.encrypted_tx
             .send(ReceivedEncryptedPacket {
                 physical_ingress: None,
+                original_relay_read: None,
                 source: None,
                 local_endpoint: None,
                 relay_endpoint: Some(self.relay_endpoint.clone()),

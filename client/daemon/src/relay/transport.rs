@@ -642,7 +642,8 @@ impl RelayTransport {
                             udp_transport_owner: None,
                             network_generation: Some(self.peers.current_network_generation_sync()),
                             profile_sampled,
-                            udp_received: original_read.map(|read| read.completed_at()),
+                            udp_received: original_read.as_ref().map(|read| read.completed_at()),
+                            original_relay_read: original_read,
                             transport_queue_send_started: Some(transport_queue_send_started),
                             wire_bytes: data,
                         })

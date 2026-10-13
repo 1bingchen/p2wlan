@@ -39,3 +39,6 @@ mod traversal_context;
 
 #[path = "tests/candidate_validation_handover.rs"]
 mod candidate_validation_handover;
+
+#[path = "tests/capability_publication.rs"]
+mod capability_publication;

@@ -30,12 +30,14 @@ struct RelayRendezvous {
 impl RelayRendezvous {
     fn stop(&self) {
         #[cfg(test)]
-        self.stop_attempted.store(true, std::sync::atomic::Ordering::Release);
+        self.stop_attempted
+            .store(true, std::sync::atomic::Ordering::Release);
         {
             let mut routes = self.routes.lock().unwrap_or_else(|p| p.into_inner());
             // The original routes gate freezes membership and this sole stop
             // flag together for borrowed current-member qualification.
-            self.stopped.store(true, std::sync::atomic::Ordering::Release);
+            self.stopped
+                .store(true, std::sync::atomic::Ordering::Release);
             for client in routes.clients.values() {
                 client.abort();
             }
@@ -68,7 +70,11 @@ impl RelayRendezvous {
 
     fn remove_if_client(&self, endpoint: &str, original: &Arc<RelayClient>) {
         let mut routes = self.routes.lock().unwrap_or_else(|p| p.into_inner());
-        if !routes.clients.get(endpoint).is_some_and(|client| Arc::ptr_eq(client, original)) {
+        if !routes
+            .clients
+            .get(endpoint)
+            .is_some_and(|client| Arc::ptr_eq(client, original))
+        {
             return;
         }
         if let Some(client) = routes.clients.remove(endpoint) {

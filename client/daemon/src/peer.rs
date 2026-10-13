@@ -678,6 +678,7 @@ include!("peer/connection/nat_hint.rs");
 include!("peer/traversal_context.rs");
 include!("peer/manager/state.rs");
 include!("peer/manager/core.rs");
+include!("peer/manager/capability_publication.rs");
 include!("peer/manager/peers.rs");
 include!("peer/manager/candidates.rs");
 include!("peer/manager/path.rs");

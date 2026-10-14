@@ -5,3 +5,6 @@ include!("direct_runtime/peer_reflexive.rs");
 include!("direct_runtime/encrypted_validation.rs");
 include!("direct_runtime/c0_rendezvous.rs");
 include!("direct_runtime/probe_loop.rs");
+
+#[cfg(test)]
+include!("direct_runtime/original_validation_owned_test.rs");

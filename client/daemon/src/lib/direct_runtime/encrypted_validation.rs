@@ -282,9 +282,34 @@ async fn run_direct_validation_scheduler_with_worker_permits(
     local_virtual_ip: String,
     worker_permits: Arc<tokio::sync::Semaphore>,
 ) {
+    let mut workers = tokio::task::JoinSet::new();
+    run_direct_validation_scheduler_with_owned_workers(
+        observations,
+        udp,
+        peers,
+        transport,
+        local_virtual_ip,
+        worker_permits,
+        &mut workers,
+    )
+    .await;
+}
+
+// The caller retains the original sole JoinSet so a cfg-test cancellation can
+// await its real children after the scheduler future leaves scope. Production
+// cancellation still drops this same original owner as before.
+#[allow(clippy::too_many_arguments)]
+async fn run_direct_validation_scheduler_with_owned_workers(
+    observations: DirectValidationIngress,
+    udp: UdpTransport,
+    peers: Arc<PeerManager>,
+    transport: WireGuardTransport,
+    local_virtual_ip: String,
+    worker_permits: Arc<tokio::sync::Semaphore>,
+    workers: &mut tokio::task::JoinSet<()>,
+) {
     let mut pending_leases: std::collections::VecDeque<crate::udp::DirectValidationSessionLease> =
         std::collections::VecDeque::new();
-    let mut workers = tokio::task::JoinSet::new();
     loop {
         // A saturated worker pool cannot keep expired HH ownership in the
         // pending queue. Reap in this existing scheduler, without a timer task

@@ -554,3 +554,35 @@ pub(crate) async fn send_original_slow_for_test(
         EncryptSendOutcome::Sent
     )
 }
+
+/// Fixture entry into the original managed slow core, with genuine carriage.
+#[cfg(test)]
+pub(crate) async fn send_original_managed_for_test(
+    packet: RawRequestDelivery,
+    transport: &WireGuardTransport,
+    peers: &PeerManager,
+    udp: &RwLock<Option<UdpTransport>>,
+    relay: &RwLock<Option<RelayTransport>>,
+) -> bool {
+    let deadline = Instant::now() + OUTBOUND_SEND_TIMEOUT;
+    tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), async {
+        matches!(
+            send::encrypt_then_send_with_deadline(
+                packet,
+                transport,
+                peers,
+                peers.current_network_generation_sync(),
+                true,
+                udp,
+                relay,
+                false,
+                Some(deadline),
+                None,
+            )
+            .await,
+            EncryptSendOutcome::Sent
+        )
+    })
+    .await
+    .unwrap_or(false)
+}

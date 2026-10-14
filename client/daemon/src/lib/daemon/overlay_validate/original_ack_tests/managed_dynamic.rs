@@ -371,7 +371,10 @@ async fn replace_managed_reader(b: &mut Endpoint, owners: &mut Owners, budget: B
     Ok(())
 }
 
-pub(super) async fn exercise_publication(mode: PublicationMode, case: PublicationCase) -> Check {
+pub(in super::super) async fn exercise_publication(
+    mode: PublicationMode,
+    case: PublicationCase,
+) -> Check {
     let budget = Budget::new();
     let mut owners = Owners::default();
     let body = AssertUnwindSafe(tokio::time::timeout_at(budget.body_end(), async {

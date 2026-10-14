@@ -9,9 +9,225 @@ use std::result::Result;
 mod fixture;
 
 use fixture::{
-    exercise, exercise_bootstrap_runtime_vip, EchoCase, IdentityCase, LifecycleCase, PathKind,
-    RuntimeVipCase, Scenario,
+    exercise, exercise_bootstrap_runtime_vip, AckContentionCase, EchoCase, EchoContentionCase,
+    IdentityCase, LifecycleCase, PathKind, RuntimeVipCase, Scenario,
 };
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pr209_direct_native_request_contention_retains_original_before_tun_echo(
+) -> Result<(), String> {
+    exercise(
+        PathKind::Direct,
+        Scenario::RequestContention(AckContentionCase::Current),
+    )
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pr209_relay_native_request_contention_retains_original_before_tun_echo(
+) -> Result<(), String> {
+    exercise(
+        PathKind::Relay,
+        Scenario::RequestContention(AckContentionCase::Current),
+    )
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pr209_direct_native_request_contention_session_replacement_rejects_old_source(
+) -> Result<(), String> {
+    exercise(
+        PathKind::Direct,
+        Scenario::RequestContention(AckContentionCase::SessionReplaced),
+    )
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pr209_relay_native_request_contention_session_replacement_rejects_old_source(
+) -> Result<(), String> {
+    exercise(
+        PathKind::Relay,
+        Scenario::RequestContention(AckContentionCase::SessionReplaced),
+    )
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pr209_direct_native_request_contention_cancellation_injects_no_echo() -> Result<(), String>
+{
+    exercise(
+        PathKind::Direct,
+        Scenario::RequestContention(AckContentionCase::Cancelled),
+    )
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pr209_relay_native_request_contention_cancellation_injects_no_echo() -> Result<(), String>
+{
+    exercise(
+        PathKind::Relay,
+        Scenario::RequestContention(AckContentionCase::Cancelled),
+    )
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pr209_direct_native_request_contention_stops_at_original_read_window() -> Result<(), String>
+{
+    exercise(
+        PathKind::Direct,
+        Scenario::RequestContention(AckContentionCase::Deadline),
+    )
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pr209_relay_native_request_contention_stops_at_original_read_window() -> Result<(), String>
+{
+    exercise(
+        PathKind::Relay,
+        Scenario::RequestContention(AckContentionCase::Deadline),
+    )
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pr209_direct_native_ack_contention_retains_original_once_then_new_request(
+) -> Result<(), String> {
+    exercise(
+        PathKind::Direct,
+        Scenario::AckContention(AckContentionCase::Current),
+    )
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pr209_relay_native_ack_contention_retains_original_once_then_new_request(
+) -> Result<(), String> {
+    exercise(
+        PathKind::Relay,
+        Scenario::AckContention(AckContentionCase::Current),
+    )
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pr209_direct_native_ack_contention_session_replacement_rejects_old_once(
+) -> Result<(), String> {
+    exercise(
+        PathKind::Direct,
+        Scenario::AckContention(AckContentionCase::SessionReplaced),
+    )
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pr209_relay_native_ack_contention_session_replacement_rejects_old_once(
+) -> Result<(), String> {
+    exercise(
+        PathKind::Relay,
+        Scenario::AckContention(AckContentionCase::SessionReplaced),
+    )
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pr209_direct_native_ack_contention_cancellation_preserves_original_once(
+) -> Result<(), String> {
+    exercise(
+        PathKind::Direct,
+        Scenario::AckContention(AckContentionCase::Cancelled),
+    )
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pr209_relay_native_ack_contention_cancellation_preserves_original_once(
+) -> Result<(), String> {
+    exercise(
+        PathKind::Relay,
+        Scenario::AckContention(AckContentionCase::Cancelled),
+    )
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pr209_direct_native_ack_contention_stops_at_original_window() -> Result<(), String> {
+    exercise(
+        PathKind::Direct,
+        Scenario::AckContention(AckContentionCase::Deadline),
+    )
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pr209_relay_native_ack_contention_stops_at_original_window() -> Result<(), String> {
+    exercise(
+        PathKind::Relay,
+        Scenario::AckContention(AckContentionCase::Deadline),
+    )
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn original_echo_direct_session_contention_retries_current_source_once() -> Result<(), String>
+{
+    exercise(
+        PathKind::Direct,
+        Scenario::EchoContention(EchoContentionCase::Current),
+    )
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn original_echo_relay_session_contention_retries_current_source_once() -> Result<(), String>
+{
+    exercise(
+        PathKind::Relay,
+        Scenario::EchoContention(EchoContentionCase::Current),
+    )
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn original_echo_direct_session_contention_then_replacement_rejects_old_source(
+) -> Result<(), String> {
+    exercise(
+        PathKind::Direct,
+        Scenario::EchoContention(EchoContentionCase::SessionReplaced),
+    )
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn original_echo_relay_session_contention_then_replacement_rejects_old_source(
+) -> Result<(), String> {
+    exercise(
+        PathKind::Relay,
+        Scenario::EchoContention(EchoContentionCase::SessionReplaced),
+    )
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn original_echo_direct_session_contention_preserves_delivery_cutoff() -> Result<(), String> {
+    exercise(
+        PathKind::Direct,
+        Scenario::EchoContention(EchoContentionCase::Deadline),
+    )
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn original_echo_relay_session_contention_preserves_delivery_cutoff() -> Result<(), String> {
+    exercise(
+        PathKind::Relay,
+        Scenario::EchoContention(EchoContentionCase::Deadline),
+    )
+    .await
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn b28_fresh_direct_original_request_echo_commits_native_once() -> Result<(), String> {

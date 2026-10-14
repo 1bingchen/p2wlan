@@ -82,8 +82,22 @@ async fn handle_native_overlay_request(
     ) else {
         return Rejected(Credit::Unknown(Unknown::OriginalSource));
     };
-    if let Err(reason) = input.qualify_before_injection(&owners.wireguard) {
-        return Rejected(reason);
+    loop {
+        if !crate::request_carriage::in_original_window(input.read_at(), Instant::now()) {
+            return Rejected(Credit::Stale(Stale::OriginalWindow));
+        }
+        match input.qualify_before_injection(&owners.wireguard) {
+            Ok(()) => break,
+            Err(Credit::Contended(_)) => {
+                // Keep this original input before TUN injection. Qualification
+                // releases every guard; each paced attempt rechecks current
+                // owners and the unmodified original read deadline.
+                let wake = (input.read_at() + OVERLAY_NONCE_TTL)
+                    .min(Instant::now() + Duration::from_millis(20));
+                tokio::time::sleep_until(tokio::time::Instant::from_std(wake)).await;
+            }
+            Err(reason) => return Rejected(reason),
+        }
     }
     // The original read time is also the queue deadline. Readiness waits and
     // actor transfers cannot renew this immutable source's lifetime.

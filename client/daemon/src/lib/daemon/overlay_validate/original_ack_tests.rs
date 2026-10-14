@@ -468,3 +468,15 @@ async fn pr209_actual_asymmetric_echo_rejects_revoked_and_compat_return_then_new
 ) -> Result<(), String> {
     fixture::exercise_asymmetric_invalidation().await
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn r00_actual_common_canonical_native_fresh_duplicate_and_new_request() -> Result<(), String>
+{
+    fixture::exercise_common_native().await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn r00_same_outer_common_client_replacement_rejects_old_ack_then_new_request_recovers(
+) -> Result<(), String> {
+    fixture::exercise_common_replacement().await
+}

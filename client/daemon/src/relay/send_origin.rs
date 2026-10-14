@@ -94,6 +94,19 @@ impl RelayFullSendFact {
                     .is_some_and(|fact| fact.belongs_to_writer(&writer))
             })
     }
+    pub(super) fn matches_publication(
+        &self,
+        connection_id: u64,
+        live: &Arc<std::sync::Mutex<bool>>,
+    ) -> bool {
+        self.connection_id == connection_id && self.live.ptr_eq(&Arc::downgrade(live))
+    }
+    pub(super) fn matches_client(&self, client: &Arc<RelayClient>) -> bool {
+        self.writer.ptr_eq(&Arc::downgrade(client))
+            && self
+                .original()
+                .is_some_and(|fact| fact.belongs_to_writer(client))
+    }
     pub(crate) fn disposition(&self) -> RelayBranchDisposition {
         match self.disposition.load(Ordering::Acquire) {
             0 => RelayBranchDisposition::Unresolved,
@@ -676,6 +689,7 @@ pub(crate) mod publication_test_support {
             }),
             tasks: std::sync::Mutex::new(Vec::new()),
             stopped: AtomicBool::new(false),
+            stop_attempted: AtomicBool::new(false),
         })
     }
     pub(crate) fn closed_rendezvous(

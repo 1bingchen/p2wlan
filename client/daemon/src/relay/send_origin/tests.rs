@@ -240,6 +240,7 @@ fn pool(
         }),
         tasks: std::sync::Mutex::new(Vec::new()),
         stopped: AtomicBool::new(false),
+        stop_attempted: AtomicBool::new(false),
     })
 }
 fn relay_error(result: crate::error::Result<()>) -> RelayError {

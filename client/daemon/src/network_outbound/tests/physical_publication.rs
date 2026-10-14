@@ -872,3 +872,136 @@ async fn b17_record_rejects_other_genuine_a_with_same_peer_owner_g_l_and_ttl() {
     .await
     .unwrap();
 }
+
+#[tokio::test]
+async fn b26_managed_original_token_survives_same_revision_budget_replace_and_revoke() {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        let (f, transport, udp, receiver, mut remote) =
+            direct_fixture_with_compatibility_commit(false, false).await;
+        let udp = udp.with_dplpmtud_local_virtual_ip("10.20.0.1".parse().unwrap());
+        udp.set_inbound_publication_owner(817);
+        let endpoint = receiver.local_addr().unwrap();
+        install_managed_base(&f, &udp, endpoint).await;
+        let runtime = udp.dplpmtud_runtime();
+        let mut facts = Vec::new();
+        for smaller in [false, true] {
+            if smaller {
+                let old = facts
+                    .first()
+                    .and_then(crate::udp::UdpFullSendFact::original_managed_token)
+                    .unwrap();
+                // Existing explicit seam changes sizes without changing revision.
+                // The actual next prepared token/syscall must carry this value.
+                assert!(runtime.force_coherent_business_budget_for_test(
+                    PEER,
+                    crate::dplpmtud::UdpDatagramSize(old.max_udp_datagram_size.0 - 1)
+                ));
+                assert!(matches!(
+                    udp.try_original_direct_publication_guard(
+                        PEER,
+                        f.record.generation,
+                        None,
+                        facts.first()
+                    ),
+                    Err(crate::udp::DirectOriginFailure::Stale)
+                ));
+            }
+            let crate::udp::DirectBusinessBudgetGate::Ready(prepared) =
+                udp.prepare_direct_business_send(PEER, endpoint).await
+            else {
+                panic!("managed fixture must prepare")
+            };
+            let packet = transport
+                .encrypt_outbound(crate::dataplane::OutboundPacket {
+                    room_authorization: None,
+                    peer_id: PEER.into(),
+                    dst_ip: f.record.target_vip().into(),
+                    packet: f.record.original_packet().to_vec(),
+                    trace: None,
+                })
+                .await
+                .unwrap()
+                .unwrap();
+            let mut capture = crate::udp::UdpSendCapture::new();
+            assert_eq!(
+                udp.try_send_direct_business_packet_with_origin(
+                    &prepared,
+                    &packet,
+                    Some(&mut capture)
+                )
+                .unwrap(),
+                packet.wire_bytes.len()
+            );
+            assert_eq!(
+                receive_original(&receiver, &mut remote, &f).await,
+                packet.wire_bytes.len()
+            );
+            let fact = capture.take().unwrap();
+            assert_eq!(fact.original_managed_token(), Some(&prepared.token));
+            assert!(matches!(
+                udp.try_original_direct_publication_guard(
+                    "wrong-peer",
+                    f.record.generation,
+                    None,
+                    Some(&fact)
+                ),
+                Err(crate::udp::DirectOriginFailure::Stale)
+            ));
+            assert!(matches!(
+                udp.try_original_direct_publication_guard(
+                    PEER,
+                    f.record.generation + 1,
+                    None,
+                    Some(&fact)
+                ),
+                Err(crate::udp::DirectOriginFailure::Stale)
+            ));
+            assert!(udp
+                .try_original_direct_publication_guard(PEER, f.record.generation, None, Some(&fact))
+                .is_ok());
+            let held = runtime.try_original_business_publication_guard().unwrap();
+            assert!(matches!(
+                udp.try_original_direct_publication_guard(
+                    PEER,
+                    f.record.generation,
+                    None,
+                    Some(&fact)
+                ),
+                Err(crate::udp::DirectOriginFailure::ContendedPublication)
+            ));
+            drop(held);
+            facts.push(fact);
+        }
+        let old = facts[0].original_managed_token().unwrap();
+        let fresh = facts[1].original_managed_token().unwrap();
+        assert_eq!(old.budget_revision, fresh.budget_revision);
+        assert_ne!(old.max_udp_datagram_size, fresh.max_udp_datagram_size);
+        assert!(udp.invalidate_direct_business_budget(fresh));
+        assert!(matches!(
+            udp.try_original_direct_publication_guard(
+                PEER,
+                f.record.generation,
+                None,
+                Some(&facts[1])
+            ),
+            Err(crate::udp::DirectOriginFailure::Stale)
+        ));
+        assert_eq!(
+            facts[0].original_managed_token(),
+            Some(old),
+            "original token cannot inherit the replacement"
+        );
+        assert!(udp.clear_inbound_publication_owner_if_matches(817));
+        assert!(matches!(
+            udp.try_original_direct_publication_guard(
+                PEER,
+                f.record.generation,
+                None,
+                Some(&facts[1])
+            ),
+            Err(crate::udp::DirectOriginFailure::Stale)
+        ));
+    })
+    .await
+    .unwrap();
+}

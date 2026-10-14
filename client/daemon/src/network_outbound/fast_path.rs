@@ -61,6 +61,11 @@ pub(super) fn try_lan_direct_fast_path(
     ineligible: &mut HashMap<String, FastPathEligibilityToken>,
 ) -> FastPathAttempt {
     let packet = packet.into();
+    // A sourced echo needs the original receive fence at the final syscall.
+    // The general sender owns that boundary; the cache carries no RX source.
+    if packet.original_echo().is_some() {
+        return FastPathAttempt::Fallback(packet);
+    }
     let peer_id = packet.peer_id.as_str();
     let profiler = global_dataplane_profiler();
     // The legacy LAN specialization predates business-budget tokens. A

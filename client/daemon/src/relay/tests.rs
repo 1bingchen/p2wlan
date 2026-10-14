@@ -718,3 +718,12 @@ include!("tests/rendezvous.rs");
 mod original_read_origin {
     include!("tests/original_read_origin.rs");
 }
+
+#[path = "tests/original_reader_identity.rs"]
+mod original_reader_identity;
+
+#[path = "tests/common_original_origin.rs"]
+mod common_original_origin;
+
+#[path = "tests/common_fixture_support.rs"]
+mod common_fixture_support;

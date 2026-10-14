@@ -185,6 +185,8 @@ async fn receive_business_and_consent(
             encrypted
                 .send(ReceivedEncryptedPacket {
                     physical_ingress: None,
+                    original_udp_read: None,
+                    original_relay_read: None,
                     source: Some(source),
                     local_endpoint: Some(endpoint),
                     relay_endpoint: None,

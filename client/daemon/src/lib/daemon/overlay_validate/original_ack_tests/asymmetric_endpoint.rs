@@ -291,7 +291,7 @@ async fn exercise_asymmetric(with_invalidation: bool) -> Check {
     let budget = Budget::new();
     let mut owners = Owners::default();
     let mut sockets = Vec::new();
-    let body = AssertUnwindSafe(tokio::time::timeout_at(budget.body_end(), async {
+    let body = AssertUnwindSafe(tokio::time::timeout_at(budget.body_end(), Box::pin(async {
         let mut a = Endpoint::create_for_validation(NODE_A, VIP_A, NODE_B, VIP_B, &mut owners, budget).await?;
         let mut b = Endpoint::create_for_validation(NODE_B, VIP_B, NODE_A, VIP_A, &mut owners, budget).await?;
         let a_addr = a.local_udp().await?.ok_or("A original UDP missing")?;
@@ -345,7 +345,7 @@ async fn exercise_asymmetric(with_invalidation: bool) -> Check {
         require(a.stats.verified_round_trips == previous + 1,
             "new canonical asymmetric request did not add exactly one")
         }
-    })).catch_unwind().await;
+    }))).catch_unwind().await;
     let total = owners.tasks.len();
     let cleanup = owners.close(budget).await;
     let remaining = owners.tasks.iter().filter(|t| t.handle.is_some()).count();

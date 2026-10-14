@@ -604,7 +604,7 @@ async fn exercise(replacement: bool) -> Check {
     // Keep each original endpoint, including channel owners, alive until its
     // actual DataPlane and converter handles have been aborted and joined.
     let (mut a, mut b) = (None, None);
-    let body = AssertUnwindSafe(async {
+    let body = AssertUnwindSafe(Box::pin(async {
         let common = prepare(&mut owners, budget, &mut a, &mut b).await?;
         let (a, b) = (a.as_mut().unwrap(), b.as_mut().unwrap());
         if replacement {
@@ -612,7 +612,7 @@ async fn exercise(replacement: bool) -> Check {
         } else {
             native_rounds(a, b, &common, &mut phases, budget).await
         }
-    })
+    }))
     .catch_unwind();
     let result = tokio::time::timeout_at(budget.body_end(), body).await;
     let body_status = match &result {

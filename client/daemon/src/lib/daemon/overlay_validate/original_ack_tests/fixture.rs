@@ -1484,64 +1484,70 @@ async fn exercise_with_runtime_vip(
         Budget::new()
     };
     let mut owners = Owners::default();
-    let body = AssertUnwindSafe(tokio::time::timeout_at(budget.body_end(), async {
-        let hub = if path == PathKind::Relay {
-            let server = budget
-                .step("start actual Relay hub", RelayServer::start_random())
-                .await?
-                .map_err(|e| e.to_string())?;
-            let endpoint = format!("tcp://{}", server.addr);
-            owners.server = Some(server);
-            Some(endpoint)
-        } else {
-            None
-        };
-        let (vip_a, vip_b) = if keep_bootstrap_vip {
-            ("10.20.0.2", "10.20.0.3")
-        } else {
-            (VIP_A, VIP_B)
-        };
-        let mut a = Endpoint::create(
-            NODE_A,
-            vip_a,
-            NODE_B,
-            vip_b,
-            path,
-            hub.as_deref(),
-            &mut owners,
-            budget,
-            keep_bootstrap_vip,
-        )
-        .await?;
-        let mut b = Endpoint::create(
-            NODE_B,
-            vip_b,
-            NODE_A,
-            vip_a,
-            path,
-            hub.as_deref(),
-            &mut owners,
-            budget,
-            keep_bootstrap_vip,
-        )
-        .await?;
-        let (session_a, session_b, a_key, b_key) = session_pair_for(&a.identity, &b.identity)?;
-        let udp_a = a.local_udp().await?;
-        let udp_b = b.local_udp().await?;
-        a.install_peer(b_key, udp_b, session_a, path, budget)
+    // Keep the original body on the heap so nested native pipeline futures
+    // do not multiply their state on the unchanged test thread stack.
+    let body = AssertUnwindSafe(tokio::time::timeout_at(
+        budget.body_end(),
+        Box::pin(async {
+            let hub = if path == PathKind::Relay {
+                let server = budget
+                    .step("start actual Relay hub", RelayServer::start_random())
+                    .await?
+                    .map_err(|e| e.to_string())?;
+                let endpoint = format!("tcp://{}", server.addr);
+                owners.server = Some(server);
+                Some(endpoint)
+            } else {
+                None
+            };
+            let (vip_a, vip_b) = if keep_bootstrap_vip {
+                ("10.20.0.2", "10.20.0.3")
+            } else {
+                (VIP_A, VIP_B)
+            };
+            let mut a = Endpoint::create(
+                NODE_A,
+                vip_a,
+                NODE_B,
+                vip_b,
+                path,
+                hub.as_deref(),
+                &mut owners,
+                budget,
+                keep_bootstrap_vip,
+            )
             .await?;
-        b.install_peer(a_key, udp_a, session_b, path, budget)
+            let mut b = Endpoint::create(
+                NODE_B,
+                vip_b,
+                NODE_A,
+                vip_a,
+                path,
+                hub.as_deref(),
+                &mut owners,
+                budget,
+                keep_bootstrap_vip,
+            )
             .await?;
-        if scenario == Scenario::PublicationOrder {
-            require(
-                path == PathKind::Direct,
-                "publication causal fixture requires actual LAN",
-            )?;
-            publication_order::exercise_publication_order(&mut a, &mut b, &mut owners, budget).await
-        } else {
-            exercise_rounds(&mut a, &mut b, path, scenario, budget).await
-        }
-    }))
+            let (session_a, session_b, a_key, b_key) = session_pair_for(&a.identity, &b.identity)?;
+            let udp_a = a.local_udp().await?;
+            let udp_b = b.local_udp().await?;
+            a.install_peer(b_key, udp_b, session_a, path, budget)
+                .await?;
+            b.install_peer(a_key, udp_a, session_b, path, budget)
+                .await?;
+            if scenario == Scenario::PublicationOrder {
+                require(
+                    path == PathKind::Direct,
+                    "publication causal fixture requires actual LAN",
+                )?;
+                publication_order::exercise_publication_order(&mut a, &mut b, &mut owners, budget)
+                    .await
+            } else {
+                exercise_rounds(&mut a, &mut b, path, scenario, budget).await
+            }
+        }),
+    ))
     .catch_unwind()
     .await
     .map(|result| {

@@ -278,6 +278,20 @@ pub(super) async fn encrypt_then_send_with_deadline(
                 }
                 if let Err(reason) = peers.try_qualify_original_echo_input_in_epoch(transport, echo)
                 {
+                    if let crate::overlay_requests::OverlayCreditOutcome::Contended(site) = reason {
+                        // No encryption, counter allocation or handoff has
+                        // happened. Return the same sealed plaintext to its
+                        // existing FIFO, whose retry pacing and original
+                        // deadline remain authoritative. The next attempt
+                        // must qualify the original source again.
+                        return Err(EncryptSendOutcome::Retryable {
+                            packet: preparation_retry,
+                            reason_code: REASON_ORIGINAL_ECHO_SOURCE_CONTENDED,
+                            reason: format!(
+                                "original REQUEST source contended before encryption: {site:?}"
+                            ),
+                        });
+                    }
                     return Err(EncryptSendOutcome::Terminal {
                         packet: preparation_retry,
                         reason_code: "original_echo_source_rejected",

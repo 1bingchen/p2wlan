@@ -34,6 +34,9 @@ pub(super) use identity::IdentityCase;
 #[path = "echo_transfer.rs"]
 mod echo_transfer;
 pub(super) use echo_transfer::EchoCase;
+#[path = "echo_contention.rs"]
+mod echo_contention;
+pub(super) use echo_contention::EchoContentionCase;
 #[path = "publication_order.rs"]
 mod publication_order;
 #[path = "runtime_vip.rs"]
@@ -71,6 +74,7 @@ pub(super) enum Scenario {
     Lifecycle(LifecycleCase),
     Identity(IdentityCase),
     EchoTransfer(EchoCase),
+    EchoContention(EchoContentionCase),
     PublicationOrder,
     RuntimeVip(RuntimeVipCase),
 }
@@ -1419,6 +1423,9 @@ async fn exercise_rounds(
     }
     if let Scenario::EchoTransfer(case) = scenario {
         return echo_transfer::exercise_echo_transfer(a, b, path, case, budget).await;
+    }
+    if let Scenario::EchoContention(case) = scenario {
+        return echo_contention::exercise_echo_contention(a, b, path, case, budget).await;
     }
     let (request, echo, ack) = original_request_and_echo(a, b, path, budget).await?;
     if scenario == Scenario::MissingSource {

@@ -30,6 +30,8 @@ mod contention;
 pub(super) use ack_contention::AckContentionCase;
 #[path = "lifecycle.rs"]
 mod lifecycle;
+#[path = "request_contention.rs"]
+mod request_contention;
 pub(super) use lifecycle::LifecycleCase;
 #[path = "identity.rs"]
 mod identity;
@@ -75,6 +77,7 @@ pub(super) enum Scenario {
     NativeHandler,
     Contention,
     AckContention(AckContentionCase),
+    RequestContention(AckContentionCase),
     Lifecycle(LifecycleCase),
     Identity(IdentityCase),
     EchoTransfer(EchoCase),
@@ -1062,8 +1065,25 @@ async fn inject_actual_echo(
     let original = OriginalOverlayAck::parse_request(&request.event.packet, &request.event.peer_id)
         .ok_or("actual REQUEST before echo injection has invalid framing")?;
     let verified_before = b.stats.verified_round_trips;
+    let echoed = call_native_request(b, request, budget).await?;
+    require(
+        echoed == OriginalRequestEchoOutcome::Injected,
+        &format!("actual sourced REQUEST was not injected as original sealed echo: {echoed:?}"),
+    )?;
+    require(
+        b.stats.verified_round_trips == verified_before,
+        "receiving REQUEST falsely credited a remote roundtrip",
+    )?;
+    take_actual_echo(b, original, budget).await
+}
+
+async fn call_native_request(
+    b: &mut Endpoint,
+    request: ActualDelivery,
+    budget: Budget,
+) -> Result<OriginalRequestEchoOutcome, String> {
     let owners = b.sourced_owners();
-    let echoed = budget
+    budget
         .step(
             "actual sourced REQUEST handler and sealed real MockTun echo",
             handle_native_overlay_request(
@@ -1081,15 +1101,14 @@ async fn inject_actual_echo(
                 &mut b.pending,
             ),
         )
-        .await?;
-    require(
-        echoed == OriginalRequestEchoOutcome::Injected,
-        &format!("actual sourced REQUEST was not injected as original sealed echo: {echoed:?}"),
-    )?;
-    require(
-        b.stats.verified_round_trips == verified_before,
-        "receiving REQUEST falsely credited a remote roundtrip",
-    )?;
+        .await
+}
+
+async fn take_actual_echo(
+    b: &mut Endpoint,
+    original: OriginalOverlayAck,
+    budget: Budget,
+) -> Result<RawRequestDelivery, String> {
     require(
         b.pending.is_empty(),
         "fresh admitted original echo unexpectedly parked",
@@ -1422,6 +1441,9 @@ async fn exercise_rounds(
     if let Scenario::AckContention(case) = scenario {
         return ack_contention::exercise_native_ack_contention(a, b, path, case, budget).await;
     }
+    if let Scenario::RequestContention(case) = scenario {
+        return request_contention::exercise_request_contention(a, b, path, case, budget).await;
+    }
     if let Scenario::Lifecycle(case) = scenario {
         return lifecycle::exercise_lifecycle(a, b, path, case, budget).await;
     }
@@ -1525,6 +1547,7 @@ async fn exercise_with_runtime_vip(
         scenario,
         Scenario::Lifecycle(LifecycleCase::OriginalWindow)
             | Scenario::AckContention(AckContentionCase::Deadline)
+            | Scenario::RequestContention(AckContentionCase::Deadline)
     ) {
         Budget::with_total(Duration::from_secs(19))
     } else {

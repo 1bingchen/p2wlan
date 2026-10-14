@@ -31,6 +31,29 @@ async fn join_initial_validators(owners: &mut Owners, budget: Budget) -> Check {
     )
 }
 
+async fn join_recovery_validator(owners: &mut Owners, budget: Budget) -> Check {
+    let mut pending = owners.tasks.iter_mut().filter(|task| {
+        task.label == "original explicit encrypted validator" && task.handle.is_some()
+    });
+    let task = pending.next().ok_or("actual recovery validator missing")?;
+    require(
+        pending.next().is_none(),
+        "recovery acquired more than its one original validator",
+    )?;
+    let handle = task.handle.as_mut().unwrap();
+    let result = budget
+        .step(
+            "join actual recovery validator before new canonical",
+            handle,
+        )
+        .await?;
+    task.handle.take();
+    match result {
+        Ok(Ok(())) => Ok(()),
+        other => Err(format!("actual recovery validator join failed: {other:?}")),
+    }
+}
+
 async fn revoke_return(endpoint: &Endpoint, budget: Budget) -> Check {
     let generation = endpoint.peers.current_network_generation_sync();
     let life = endpoint
@@ -123,22 +146,54 @@ async fn reject_old_prewrite(
     )
 }
 
-async fn await_exact_recovery_budget(b: &Endpoint, endpoint: SocketAddr, budget: Budget) -> Check {
-    let udp = budget
-        .step("borrow actual recovery UDP", b.udp.read())
-        .await?
-        .as_ref()
-        .cloned()
-        .ok_or("recovery UDP missing")?;
+async fn await_exact_recovery_budget(
+    a: &Endpoint,
+    b: &Endpoint,
+    request_endpoint: SocketAddr,
+    return_endpoint: SocketAddr,
+    budget: Budget,
+) -> Check {
+    let (a_udp, b_udp) = budget
+        .step("borrow actual recovery UDP", async {
+            let a_udp = a.udp.read().await.as_ref().cloned();
+            let b_udp = b.udp.read().await.as_ref().cloned();
+            (a_udp, b_udp)
+        })
+        .await?;
+    let a_udp = a_udp.ok_or("A recovery UDP missing")?;
+    let b_udp = b_udp.ok_or("B recovery UDP missing")?;
     budget
         .step("current real revalidated DPL publication", async {
             loop {
-                if matches!(
-                    udp.prepare_direct_business_send(b.remote_node, endpoint)
-                        .await,
-                    DirectBusinessBudgetGate::Ready(_)
-                ) {
-                    return Ok(());
+                let a_ready = a_udp
+                    .prepare_direct_business_send(a.remote_node, request_endpoint)
+                    .await;
+                let b_ready = b_udp
+                    .prepare_direct_business_send(b.remote_node, return_endpoint)
+                    .await;
+                if let (
+                    DirectBusinessBudgetGate::Ready(a_prepared),
+                    DirectBusinessBudgetGate::Ready(b_prepared),
+                ) = (a_ready, b_ready)
+                {
+                    // BASE can publish Ready while the original worker is
+                    // still probing. Wait for both exact real paths to finish
+                    // before minting the one recovery REQUEST; do not retry a
+                    // REQUEST rejected by the unchanged native emit guard.
+                    let complete = |udp: &UdpTransport, prepared: &PreparedDirectBusinessSend| {
+                        udp.dplpmtud_runtime()
+                            .snapshot_for_path(&prepared.token.path_identity)
+                            .is_some_and(|snapshot| {
+                                snapshot.state == crate::dplpmtud::DplpmtudState::SearchComplete
+                                    && snapshot.budget_revision
+                                        == Some(prepared.token.budget_revision)
+                                    && snapshot.outstanding_probe.is_none()
+                                    && !snapshot.current_plpmtu_confirmation_pending
+                            })
+                    };
+                    if complete(&a_udp, &a_prepared) && complete(&b_udp, &b_prepared) {
+                        return Ok(());
+                    }
                 }
                 tokio::task::yield_now().await;
             }
@@ -275,7 +330,11 @@ pub(super) async fn exercise(
     }
     revoke_return(b, budget).await?;
     start_actual_validator(b, return_endpoint, owners, budget).await?;
-    await_exact_recovery_budget(b, return_endpoint, budget).await?;
+    await_exact_recovery_budget(a, b, request_endpoint, return_endpoint, budget).await?;
+    // DPL publication can precede the validator releasing its original emit
+    // guard. Join that actual owner before minting the next request; never
+    // retry a request rejected while the old worker still holds the guard.
+    join_recovery_validator(owners, budget).await?;
     asymmetric_round(
         a,
         b,
@@ -284,7 +343,8 @@ pub(super) async fn exercise(
         return_endpoint,
         budget,
     )
-    .await?;
+    .await
+    .map_err(|error| format!("asymmetric revalidation recovery/new canonical: {error}"))?;
     require(
         !old_request.native_ack_credited_for_test()
             && a.stats.verified_round_trips == rounds + 1

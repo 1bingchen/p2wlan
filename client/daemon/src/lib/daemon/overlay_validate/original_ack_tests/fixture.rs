@@ -958,7 +958,7 @@ async fn inject_actual_echo(
         .await?;
     require(
         echoed == OriginalRequestEchoOutcome::Injected,
-        "actual sourced REQUEST was not injected as original sealed echo",
+        &format!("actual sourced REQUEST was not injected as original sealed echo: {echoed:?}"),
     )?;
     require(
         b.stats.verified_round_trips == 0,

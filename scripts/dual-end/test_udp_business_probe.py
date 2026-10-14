@@ -6,6 +6,7 @@ from __future__ import annotations
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import replace
 import copy
+import errno
 import io
 import json
 import os
@@ -246,6 +247,8 @@ class LoopbackTests(unittest.TestCase):
         self.assertEqual(report["termination_reason"], "udp_receive_failed")
         self.assertEqual(report["responses_sent"], 1)
         self.assertEqual(report["received_datagrams"], 1)
+        self.assertIn("socket_error_errno", report)
+        self.assertIsNone(report["socket_error_errno"], "injected errno-less failure must remain unknown")
         with tempfile.TemporaryDirectory() as directory:
             output_path = Path(directory) / "echo-error.json"
             arguments = ["echo", "--bind-ip", config.bind[0], "--bind-port", str(config.bind[1]),
@@ -295,7 +298,37 @@ class AccountingTests(unittest.TestCase):
             report = probe.run_probe(config)
         result = summary.summarize([report])
         self.assertEqual(report["termination_reason"], "bind_failed")
+        self.assertEqual(report["socket_error_errno"], errno.EADDRINUSE)
         self.assertEqual(result["status_counts"]["not_sent"], 3)
+
+    def test_injected_send_errors_preserve_exception_errno_or_null_without_credit(self):
+        # Explicit injected exception controls, not real kernel send failures.
+        for error in (OSError(errno.EPERM, "injected permission failure"), OSError("injected errno unknown")):
+            with loopback_socket() as client, loopback_socket() as server:
+                config = config_for(client, server)
+                with patch.object(probe, "encode", side_effect=error):
+                    report = probe.run_probe(config, client)
+                server.setblocking(False)
+                with self.assertRaises(BlockingIOError):
+                    server.recvfrom(probe.MAX_DATAGRAM_BYTES)
+            summary.validate_report(report)
+            self.assertEqual([r["errno"] for r in report["requests"]], [error.errno] * config.count)
+            self.assertEqual([r["status"] for r in report["requests"]], ["send_error"] * config.count)
+            self.assertEqual([r["reason"] for r in report["requests"]], ["udp_send_failed"] * config.count)
+
+    def test_optional_errno_keeps_legacy_reports_valid_and_rejects_nonnumeric_claims(self):
+        original = self.report()
+        summary.validate_report(original)
+        value = copy.deepcopy(original)
+        value["socket_error_errno"] = None
+        value["requests"][0]["errno"] = None
+        summary.validate_report(value)
+        for mutate in (lambda r: r.update(socket_error_errno="EPERM"),
+                       lambda r: r["requests"][0].update(errno=True)):
+            value = copy.deepcopy(original)
+            mutate(value)
+            with self.assertRaises(ValueError):
+                summary.validate_report(value)
 
     def test_duration_deadline_after_scheduler_pause_does_not_send_overdue_requests(self):
         with loopback_socket() as client, loopback_socket() as server:

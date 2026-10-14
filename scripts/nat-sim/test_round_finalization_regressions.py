@@ -31,11 +31,22 @@ COMMANDS = r'''
       _round_context
       _round_fixed_windows
       candidate=$(($(_round_now) + 600))
-      if (( candidate < _ROUND_CAPTURE_END_MS )); then _ROUND_CAPTURE_END_MS=$candidate; fi
-      if [[ "$command" == RUN_COLLECTOR_CUTOFF ]]; then mode=cutoff; else mode=early; fi
-      if round_run_collector collector "$fixture_python" "$BASE_DIR/fixture-collector.py" \
-          "$ROUND_DIR" "$mode"; then rc=0; else rc=$?; fi
-      printf 'COLLECTOR:%s:%s:%s\n' "$rc" "$_ROUND_CAPTURE_END_MS" "$_ROUND_RESOURCE_END_MS" ;;
+      if (( _ROUND_CAPTURE_END_MS < candidate )); then candidate=$_ROUND_CAPTURE_END_MS; fi
+      if [[ "$command" == RUN_COLLECTOR_CUTOFF ]]; then
+        # This control exhausts the whole round's evidence window.
+        mode=cutoff
+        _ROUND_CAPTURE_END_MS=$candidate
+        if round_run_collector collector "$fixture_python" "$BASE_DIR/fixture-collector.py" \
+            "$ROUND_DIR" "$mode"; then rc=0; else rc=$?; fi
+      else
+        # An early collector owns a shorter subwindow. Its completed output
+        # must not shorten the original round fence used by both statuses.
+        mode=early
+        if ( _ROUND_CAPTURE_END_MS=$candidate
+          round_run_collector collector "$fixture_python" "$BASE_DIR/fixture-collector.py" \
+            "$ROUND_DIR" "$mode" ); then rc=0; else rc=$?; fi
+      fi
+      printf 'COLLECTOR:%s:%s:%s\n' "$rc" "$candidate" "$_ROUND_RESOURCE_END_MS" ;;
     EXIT7_DURING_CAPTURE)
       printf '%s\n' "$$" >"$ROUND_DIR/fixture-native-term-owner.pid"
       chmod 600 "$ROUND_DIR/fixture-native-term-owner.pid"

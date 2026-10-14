@@ -160,7 +160,22 @@ async fn handle_native_overlay_ack(
         relay: &owners.relay,
         room: &owners.room,
     };
-    let outcome = peers.try_commit_original_overlay_ack(&borrowed, &request, &ack, source.as_ref());
+    let outcome = loop {
+        let outcome =
+            peers.try_commit_original_overlay_ack(&borrowed, &request, &ack, source.as_ref());
+        if !matches!(outcome, OverlayCreditOutcome::Contended(_))
+            || !crate::request_carriage::in_original_window(request.sent_at, Instant::now())
+        {
+            break outcome;
+        }
+        // The synchronous transaction released every owner guard. Retain only
+        // this received ACK and canonical request while waiting; the next
+        // attempt requalifies all current owners before consuming once. No
+        // packet is resent and no source or deadline is replaced.
+        let wake =
+            (request.sent_at + OVERLAY_NONCE_TTL).min(Instant::now() + Duration::from_millis(20));
+        tokio::time::sleep_until(tokio::time::Instant::from_std(wake)).await;
+    };
     let OverlayCreditOutcome::Fresh(receipt) = outcome else {
         debug!(event = "overlay_native_ack_rejected", outcome = ?outcome,
             "original ACK did not commit native credit");

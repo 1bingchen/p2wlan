@@ -56,6 +56,9 @@ def read_report(path: Path) -> tuple[dict, str]:
 
 
 def validate_report(report: dict) -> Config:
+    for field in ("socket_error_errno", "last_send_error_errno"):
+        if report.get(field) is not None and type(report[field]) is not int:
+            raise ValueError("UDP socket errno must be a numeric observation or null")
     if (type(report.get("schema_version")) is not int or report["schema_version"] != SCHEMA_VERSION
             or report.get("scope") != SCOPE
             or report.get("role") != "probe" or report.get("clock") != "probe_process_monotonic_ns"):
@@ -101,6 +104,8 @@ def validate_report(report: dict) -> Config:
     for sequence, record in enumerate(records):
         if not isinstance(record, dict) or type(record.get("sequence")) is not int or record["sequence"] != sequence:
             raise ValueError("request sequence missing, duplicated, or reordered")
+        if record.get("errno") is not None and type(record["errno"]) is not int:
+            raise ValueError("UDP request errno must be a numeric observation or null")
         nonce_bytes(record.get("request_nonce"))
         if record["request_nonce"] in nonces:
             raise ValueError("duplicate request nonce")

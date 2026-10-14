@@ -2,7 +2,8 @@
 //!
 //! One Arc is retained by the existing periodic and burst views. Target life is
 //! an expectation from the original committed path, never actual-key auth-L.
-//! This module supplies no crypto/send receipt or final ACK authority.
+//! The original publication records historical send completion and this owner
+//! holds the sole native ACK once; PeerManager qualifies current authority.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -22,11 +23,19 @@ use crate::{
     OVERLAY_DIRECTION_REQUEST, OVERLAY_EVIDENCE_PREFIX, OVERLAY_NONCE_CAP,
 };
 
+mod ack_credit;
+mod echo_origin;
 mod send_publication;
+pub(crate) use ack_credit::{
+    OriginalOverlayAck, OverlayCreditLockSite, OverlayCreditOutcome, OverlayCreditReceipt,
+    OverlayCreditStale, OverlayCreditUnknown,
+};
+pub(crate) use echo_origin::{OriginalEchoInput, OriginalEchoPrewrite};
 #[cfg(test)]
 pub(crate) use send_publication::{PhysicalInputQualification, PhysicalPublicationState};
 pub(crate) use send_publication::{
-    PhysicalRequestPublisher, PhysicalSendPublication, PreparedPhysicalPublication,
+    PhysicalRequestPublisher, PhysicalSendPublication, PhysicalSendRecord,
+    PreparedPhysicalPublication,
 };
 
 #[derive(Clone)]
@@ -69,10 +78,11 @@ pub(crate) struct CanonicalOverlayRequest {
     target: OriginalTargetExpectation,
     original_packet: Box<[u8]>,
     injection_accepted: AtomicBool,
+    native_ack_credited: AtomicBool,
     pub(crate) physical_publication: PhysicalSendPublication,
 }
 
-// These immutable accessors are consumed by the next carriage step. They do
+// These immutable accessors support carriage and final qualification. They do
 // not qualify current ownership, TTL, actual crypto or a physical send.
 #[allow(dead_code)]
 impl CanonicalOverlayRequest {
@@ -110,6 +120,7 @@ impl CanonicalOverlayRequest {
 #[derive(Clone)]
 pub(crate) struct RequestSendToken {
     request: Weak<CanonicalOverlayRequest>,
+    echo: Option<Arc<OriginalEchoInput>>,
 }
 
 // Decoding only identifies the original record. The carriage consumer checks
@@ -122,6 +133,17 @@ impl RequestSendToken {
 
     pub(crate) fn request(&self) -> Option<Arc<CanonicalOverlayRequest>> {
         self.request.upgrade()
+    }
+
+    pub(crate) fn echo(&self) -> Option<&Arc<OriginalEchoInput>> {
+        self.echo.as_ref()
+    }
+
+    pub(crate) fn original_echo(input: OriginalEchoInput) -> Self {
+        Self {
+            request: Weak::new(),
+            echo: Some(Arc::new(input)),
+        }
     }
 }
 
@@ -168,10 +190,12 @@ async fn inject_request(
         // The actual random packet is copied once; the original Vec moves to TUN.
         original_packet: packet.clone().into_boxed_slice(),
         injection_accepted: AtomicBool::new(false),
+        native_ack_credited: AtomicBool::new(false),
         physical_publication: PhysicalSendPublication::new(),
     });
     let context = Box::new(RequestSendToken {
         request: Arc::downgrade(&request),
+        echo: None,
     });
     controller.inject_with_context(packet, context).await?;
     #[cfg(test)]

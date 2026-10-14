@@ -418,7 +418,12 @@ mod birthday_tests;
 mod core;
 
 mod business_mtu;
+mod ingress_origin;
 mod send_origin;
+#[allow(unused_imports)] // Staged source/guard consumers; no final credit yet.
+pub(crate) use ingress_origin::{
+    DirectOriginFailure, DirectOriginPublicationGuard, OriginalUdpIngressSource,
+};
 pub(crate) use send_origin::{UdpFullSendFact, UdpSendCapture, UdpSendFence};
 
 mod socket_registry;

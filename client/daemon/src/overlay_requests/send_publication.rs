@@ -42,27 +42,58 @@ fn state(word: u64) -> PhysicalPublicationState {
 pub(crate) struct PhysicalSendPublication {
     phase: AtomicU64,
     record: OnceLock<PhysicalSendRecord>,
+    recorded_observed_at: OnceLock<Instant>,
+    #[cfg(test)]
+    recorded_observation_hook: std::sync::Mutex<Option<Box<dyn FnOnce() + Send + 'static>>>,
 }
 impl PhysicalSendPublication {
     pub(super) fn new() -> Self {
         Self {
             phase: AtomicU64::new(0),
             record: OnceLock::new(),
+            recorded_observed_at: OnceLock::new(),
+            #[cfg(test)]
+            recorded_observation_hook: std::sync::Mutex::new(None),
         }
     }
-    #[allow(dead_code)] // Staged read-only state, not a business decision.
-    pub(crate) fn state(&self) -> PhysicalPublicationState {
-        state(self.phase.load(Ordering::Acquire))
+    /// Original producer observation only. Fixture callbacks must use a fixed
+    /// bounded wait; they cannot set the phase, record, or monotonic timestamp.
+    #[cfg(test)]
+    pub(crate) fn set_recorded_observation_hook_for_test(
+        &self,
+        hook: impl FnOnce() + Send + 'static,
+    ) {
+        *self.recorded_observation_hook.lock().unwrap() = Some(Box::new(hook));
     }
-    #[allow(dead_code)] // Single Acquire evidence access for the following stage.
+    #[allow(dead_code)] // Historical publication phase; not a current-owner business verdict.
+    pub(crate) fn state(&self) -> PhysicalPublicationState {
+        let phase = state(self.phase.load(Ordering::Acquire));
+        if phase == PhysicalPublicationState::Recorded && self.recorded_observed_at.get().is_none()
+        {
+            PhysicalPublicationState::Publishing
+        } else {
+            phase
+        }
+    }
+    #[allow(dead_code)] // Acquire historical evidence; final owner separately qualifies current guards.
     pub(crate) fn record(&self) -> Option<&PhysicalSendRecord> {
         let word = self.phase.load(Ordering::Acquire);
-        if state(word) != PhysicalPublicationState::Recorded {
+        if state(word) != PhysicalPublicationState::Recorded
+            || self.recorded_observed_at.get().is_none()
+        {
             return None;
         }
         self.record
             .get()
             .filter(|record| record.attempt_id == word >> 3)
+    }
+
+    /// A conservative upper bound observed after Recorded was published.
+    /// An original read before this observation cannot inherit a later Full.
+    pub(crate) fn recorded_observed_at(&self) -> Option<Instant> {
+        (self.state() == PhysicalPublicationState::Recorded)
+            .then(|| self.recorded_observed_at.get().copied())
+            .flatten()
     }
     fn open(&self) -> Result<u64, PublicationFailure> {
         let old = self.phase.load(Ordering::Acquire);
@@ -118,7 +149,7 @@ pub(crate) enum PublicationFailure {
     Exhausted,
     MetadataFailed,
 }
-#[allow(dead_code)] // Staged qualifier only; no final credit consumer yet.
+#[allow(dead_code)] // Compatibility intrinsic result; final guards are separate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PhysicalInputQualification {
     PendingInjection,
@@ -187,6 +218,9 @@ impl PreparedPhysicalPublication {
     }
 }
 
+// The UDP variant is a fixed-size immutable fact. Keep it inline so sealing
+// the original publication does not add a separate heap allocation.
+#[allow(clippy::large_enum_variant)]
 enum PhysicalTransportFact {
     Udp(UdpFullSendFact),
     Relay(Arc<RelayFullSendFact>),
@@ -215,7 +249,7 @@ pub(crate) struct PhysicalSendRecord {
     encryption_generation: u64,
     transport: PhysicalTransportFact,
 }
-#[allow(dead_code)] // Read-only staged evidence; final ACK qualification remains separate.
+#[allow(dead_code)] // Read-only intrinsic evidence; current-owner guards are separate.
 impl PhysicalSendRecord {
     pub(crate) fn attempt_id(&self) -> u64 {
         self.attempt_id
@@ -284,6 +318,37 @@ impl PhysicalSendRecord {
             }
         }
     }
+
+    /// Intrinsic original-input checks only. The final owner must additionally
+    /// freeze current lifecycle, session and transport publications.
+    pub(crate) fn matches_original_input(
+        &self,
+        request: &CanonicalOverlayRequest,
+        now: Instant,
+    ) -> bool {
+        std::ptr::eq(self.request.as_ptr(), request)
+            && self.peer_owner.ptr_eq(&request.target.owner)
+            && self.binding == RequestBindingState::RoutedExact
+            && request.injection_accepted()
+            && request.generation == self.encryption_generation
+            && request.peer_id == self.encryption.peer_id()
+            && request.expected_target_lifecycle().is_some()
+            && request.expected_target_lifecycle() == self.encryption.authorized_peer_lifecycle()
+            && in_original_window(request.sent_at, now)
+            && in_original_window(request.sent_at, self.encryption.encrypted_at())
+            && match &self.transport {
+                PhysicalTransportFact::Udp(fact) => {
+                    self.encryption.encrypted_at() <= fact.syscall_started()
+                        && fact.syscall_started() <= fact.syscall_completed()
+                        && in_original_window(request.sent_at, fact.syscall_completed())
+                }
+                PhysicalTransportFact::Relay(fact) => fact.original().is_some_and(|write| {
+                    self.encryption.encrypted_at() <= write.write_started_at()
+                        && write.write_started_at() <= write.completed_at()
+                        && in_original_window(request.sent_at, write.completed_at())
+                }),
+            }
+    }
 }
 
 // Sole attempt producer. Drop only cancels matching Open; it cannot overwrite a
@@ -347,6 +412,16 @@ impl PhysicalRequestPublisher {
             packed(self.id, PhysicalPublicationState::Recorded),
             Ordering::Release,
         );
+        // PhysicalAttempt already destroyed the inner send future and released
+        // emit. Fast caller also dropped epoch/slot; no current owner is leased.
+        #[cfg(test)]
+        {
+            let hook = publication.recorded_observation_hook.lock().unwrap().take();
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
+        let _ = publication.recorded_observed_at.set(Instant::now());
         Ok(())
     }
     pub(crate) fn fail_metadata(&mut self) {

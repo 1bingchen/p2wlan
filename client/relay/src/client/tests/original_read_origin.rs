@@ -796,6 +796,92 @@ async fn b3_r09_address_original_public_api_real_frames_unknown() -> Check {
 async fn b3_r09_endpoint_original_public_api_real_frames_unknown() -> Check {
     legacy_api(ReaderPath::Endpoint).await
 }
+
+async fn original_client_identity(path: ReaderPath) -> Check {
+    let budget = Budget::new();
+    let wire = received("p", b"original reader identity")?;
+    let mut peer =
+        SourcedPeer::connect(path, config(), vec![WireStep::Write(wire)], budget).await?;
+    let mut other = match SourcedPeer::connect(path, config(), Vec::new(), budget).await {
+        Ok(other) => other,
+        Err(error) => return peer.finish(Err(error)).await,
+    };
+    let mut retained = None;
+    let body = async {
+        let captured_at = peer.captured().await?;
+        peer.witness.release();
+        let (message, fact) = peer.next().await?.into_parts();
+        require(
+            message
+                == RelayMessage::Data {
+                    from_node: "p".into(),
+                    data: b"original reader identity".to_vec(),
+                },
+            "identity carrier changed the real Data payload",
+        )?;
+        let fact = fact.ok_or_else(|| "actual reader identity missing".to_string())?;
+        let before = peer.client.cmd_tx.strong_count();
+        require(
+            fact.completed_at() == captured_at,
+            "identity resampled read time",
+        )?;
+        require(
+            fact.belongs_to_client(&peer.client),
+            "same original client rejected",
+        )?;
+        require(
+            !fact.belongs_to_client(&other.client),
+            "different actual client accepted",
+        )?;
+        require(
+            peer.client.cmd_tx.strong_count() == before,
+            "identity comparison retained the original command sender",
+        )?;
+        // Close is deliberately independent of historical identity. This API
+        // cannot serve as the later synchronized current-owner qualification.
+        peer.client.abort();
+        require(
+            fact.belongs_to_client(&peer.client),
+            "close rewrote historical identity",
+        )?;
+        let copy = fact.clone();
+        require(
+            copy.completed_at() == captured_at && copy.belongs_to_client(&peer.client),
+            "immutable source clone changed its original time or client",
+        )?;
+        require(
+            peer.client.cmd_tx.strong_count() == before,
+            "immutable source clone retained the original command sender",
+        )?;
+        retained = Some(copy);
+        Ok(())
+    }
+    .await;
+    let result = peer.finish(body).await;
+    let result = combine(result, other.finish(Ok(())).await);
+    drop(peer);
+    drop(other);
+    combine(
+        result,
+        require(
+            retained
+                .as_ref()
+                .is_some_and(|fact| fact.reader_channel_retired()),
+            "retained read fact kept the old client command sender alive",
+        ),
+    )
+}
+
+#[tokio::test]
+async fn original_read_address_client_identity_is_weak_and_exact() -> Check {
+    original_client_identity(ReaderPath::Address).await
+}
+
+#[tokio::test]
+async fn original_read_endpoint_client_identity_is_weak_and_exact() -> Check {
+    original_client_identity(ReaderPath::Endpoint).await
+}
+
 #[test]
 fn b3_r09_caller_built_data_cannot_create_read_origin() -> Check {
     let message = RelayMessage::Data {
@@ -808,3 +894,5 @@ fn b3_r09_caller_built_data_cannot_create_read_origin() -> Check {
         "public caller-built Data conversion must stay Unknown",
     )
 }
+
+mod close_lifecycle;

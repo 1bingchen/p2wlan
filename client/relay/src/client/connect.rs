@@ -56,9 +56,13 @@ impl RelayClient {
         node_id: &str,
         config: RelayClientConfig,
     ) -> Result<(Self, mpsc::Receiver<OriginalRelayDelivery>)> {
-        let (client, rx) =
-            Self::connect_config_with_read_options(addr, node_id, config, ReadOptions::original())
-                .await?;
+        let (client, rx) = Self::connect_config_with_read_options(
+            addr,
+            node_id,
+            config,
+            ReadOptions::original(addr),
+        )
+        .await?;
         Ok((client, rx.into_original()?))
     }
 
@@ -74,7 +78,7 @@ impl RelayClient {
             addr,
             node_id,
             config,
-            ReadOptions::with_witness(witness),
+            ReadOptions::with_witness(addr, witness),
         )
         .await?;
         Ok((client, rx.into_original()?))
@@ -142,7 +146,7 @@ impl RelayClient {
             endpoint,
             node_id,
             config,
-            ReadOptions::original(),
+            ReadOptions::original(endpoint),
         )
         .await?;
         Ok((client, rx.into_original()?))
@@ -160,7 +164,7 @@ impl RelayClient {
             endpoint,
             node_id,
             config,
-            ReadOptions::with_witness(witness),
+            ReadOptions::with_witness(endpoint, witness),
         )
         .await?;
         Ok((client, rx.into_original()?))
@@ -280,11 +284,11 @@ impl RelayClient {
         // Channels
         let (cmd_tx, mut cmd_rx) = mpsc::channel::<ClientCommand>(config.cmd_queue_capacity);
         let write_origin = cmd_tx.downgrade();
-        let (msg_tx, msg_rx) = options.channel(config.inbound_queue_capacity);
+        let (msg_tx, msg_rx) = options.channel(config.inbound_queue_capacity, &cmd_tx);
         #[cfg(test)]
         let read_witness = options.witness();
         let (reg_tx, reg_rx) = tokio::sync::oneshot::channel::<Result<()>>();
-        let (close_tx, close_rx) = tokio::sync::watch::channel(false);
+        let (close_signal, close_rx) = close::RelayCloseSignal::new();
         // Shared close-reason attribution shared by both background tasks.
         let close_reason = Arc::new(std::sync::Mutex::new(RelayCloseReason::Unknown));
         let ping_expectations = new_ping_expectations(effective_idle_timeout(
@@ -293,7 +297,7 @@ impl RelayClient {
         ));
 
         // Write task
-        let write_close_tx = close_tx.clone();
+        let write_close_signal = close_signal.clone();
         let mut write_close_rx = close_rx.clone();
         let max_payload = config.max_frame_payload;
         let write_reason = close_reason.clone();
@@ -458,14 +462,14 @@ impl RelayClient {
                     }
                 }
             }
-            let _ = write_close_tx.send(true);
+            write_close_signal.publish_closed(close::ClosePublisher::GeneralWriter);
             debug!("Relay write task ended");
         });
 
         // Read task
         let msg_tx_clone = msg_tx.clone();
         let mut reg_tx = Some(reg_tx);
-        let read_close_tx = close_tx.clone();
+        let read_close_signal = close_signal.clone();
         let mut read_close_rx = close_rx.clone();
         let idle_timeout = effective_idle_timeout(config.idle_timeout, config.keepalive_interval);
         let registration_timeout = config.register_timeout;
@@ -695,8 +699,8 @@ impl RelayClient {
             }
 
             let reason = resolve_close_reason(&read_reason);
+            read_close_signal.publish_closed(close::ClosePublisher::GeneralReader);
             let _ = msg_tx_clone.try_send(RelayMessage::Closed { reason });
-            let _ = read_close_tx.send(true);
             debug!("Relay read task ended; close_reason={reason:?}");
         });
 
@@ -712,7 +716,13 @@ impl RelayClient {
             }
         }
 
-        Ok((Self { cmd_tx, close_tx }, msg_rx))
+        Ok((
+            Self {
+                cmd_tx,
+                close_signal,
+            },
+            msg_rx,
+        ))
     }
 }
 

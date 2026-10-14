@@ -77,7 +77,7 @@ impl WireGuardTransport {
                     let source = self.original_session_source(
                         peer_id,
                         active.session_instance,
-                        false,
+                        OriginalSessionRole::Active,
                         active.authorized_peer_lifecycle,
                     );
                     confirmed_active = Some((
@@ -140,7 +140,7 @@ impl WireGuardTransport {
                         let source = self.original_session_source(
                             peer_id,
                             pending.slot.session_instance,
-                            false,
+                            OriginalSessionRole::Pending,
                             pending.slot.authorized_peer_lifecycle,
                         );
                         promoted = Some((
@@ -249,7 +249,7 @@ impl WireGuardTransport {
                     let source = self.original_session_source(
                         peer_id,
                         previous.slot.session_instance,
-                        true,
+                        OriginalSessionRole::Previous,
                         previous.slot.authorized_peer_lifecycle,
                     );
                     return Ok(Some(DecryptedInboundWithSource {

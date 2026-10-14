@@ -33,6 +33,21 @@ async fn b17_udp_synthetic_short_and_actual_wrong_family_error_leave_capture_emp
             Instant::now(),
             None,
             UdpSendFence::LegacyUnknown,
+            None,
+        );
+        assert!(short.take().is_none());
+        // Incomplete staged metadata must not invent a managed full fact.
+        short.record_full_success(
+            &udp,
+            &udp.socket,
+            0,
+            endpoint,
+            32,
+            &packet,
+            Instant::now(),
+            Some(17),
+            UdpSendFence::ManagedPublication,
+            None,
         );
         assert!(short.take().is_none());
         let mut error = UdpSendCapture::new();

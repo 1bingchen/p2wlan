@@ -2,9 +2,12 @@ use super::*;
 
 mod decryption;
 mod encryption;
+mod overlay_credit;
 pub(crate) use encryption::{
-    EncryptedOutboundWithSource, OriginalEncryptionSource, SessionBoundEncryptionWithSource,
+    EncryptedOutboundWithSource, OriginalEchoSessionGuard, OriginalEncryptionSource,
+    SessionBoundEncryptionWithSource,
 };
+pub(crate) use overlay_credit::{OriginalOverlaySessionFailure, OriginalOverlaySessionGuard};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ResponderTokenDisposition {
@@ -299,6 +302,8 @@ impl WireGuardTransport {
             resource_queue_gate: None,
             #[cfg(test)]
             request_handoff_probe: None,
+            #[cfg(test)]
+            previous_overlay_observer: Arc::new(std::sync::Mutex::new(None)),
             rx_business_capture: None,
             wg_evidence_owner: crate::business_evidence::WgEvidenceOwnerId::allocate(),
             sessions: Arc::new(Mutex::new(HashMap::new())),

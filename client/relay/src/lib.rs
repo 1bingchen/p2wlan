@@ -61,7 +61,7 @@ pub use auth::{
 };
 pub use client::{
     OriginalRelayDelivery, OriginalRelayFrameRead, OriginalRelayWriteFact, RelayClient,
-    RelayCloseReason, RelayMessage,
+    RelayClientOpenError, RelayClientOpenGuard, RelayCloseReason, RelayMessage,
 };
 pub use error::{RelayError, RelayErrorCode, Result as RelayResult};
 pub use protocol::{Frame, MAX_PAYLOAD, VERSION as PROTOCOL_VERSION};

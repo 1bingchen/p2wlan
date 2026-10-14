@@ -216,6 +216,7 @@ async fn original_read_actual_daemon_queue_reuses_read_time_at_original_enqueue_
     .unwrap();
     assert_eq!(rb.max_capacity(), 1024);
     let expected_connection = b.connection_id();
+    let original_client = b.client.clone();
     let (tx, mut rx) = mpsc::channel(1024);
     let worker = tokio::spawn(b.run_inbound_for_read(rb, tx, None));
     let bytes = vec![4, 9, 8, 7, 6, 5, 4, 3, 2, 1];
@@ -252,6 +253,12 @@ async fn original_read_actual_daemon_queue_reuses_read_time_at_original_enqueue_
     assert!(received.physical_ingress.is_none());
     assert!(received.source.is_none());
     assert!(received.direct_socket.is_none());
+    assert!(received
+        .original_relay_read
+        .as_ref()
+        .is_some_and(
+            |read| read.belongs_to_client(&original_client) && read.completed_at() == read_at
+        ));
     worker.abort();
     let _ = worker.await;
     a.abort_writer();
@@ -291,6 +298,7 @@ async fn original_read_legacy_public_queue_keeps_unknown_read_fact() {
         .unwrap();
     assert_eq!(received.wire_bytes, bytes);
     assert!(received.udp_received.is_none());
+    assert!(received.original_relay_read.is_none());
     assert!(received.transport_queue_send_started.is_some());
     assert!(received.physical_ingress.is_none());
     assert!(received.source.is_none());

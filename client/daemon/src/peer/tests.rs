@@ -39,3 +39,9 @@ mod traversal_context;
 
 #[path = "tests/candidate_validation_handover.rs"]
 mod candidate_validation_handover;
+
+#[path = "tests/capability_publication.rs"]
+mod capability_publication;
+
+#[path = "tests/b28_direct_commit_sequence.rs"]
+mod b28_direct_commit_sequence;

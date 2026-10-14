@@ -29,7 +29,6 @@ impl PeerManager {
     ) -> Self {
         let (committed_business_path_change_tx, _) = tokio::sync::watch::channel(0);
         let (direct_first_deadline_change_tx, _) = tokio::sync::watch::channel(0);
-        let (dplpmtud_capability_tx, _) = tokio::sync::watch::channel(Arc::new(HashMap::new()));
         let (direct_business_budget_change_tx, _) = tokio::sync::watch::channel(0);
         let (ip_to_node_snapshot, _) =
             tokio::sync::watch::channel(Arc::new(HashMap::<String, String>::new()));
@@ -54,7 +53,7 @@ impl PeerManager {
             committed_business_paths: Arc::new(std::sync::Mutex::new(HashMap::new())),
             committed_business_path_change_tx,
             direct_first_deadline_change_tx,
-            dplpmtud_capability_tx,
+            dplpmtud_capability: DplpmtudCapabilityPublication::new(),
             direct_business_budget_change_tx,
             local_mtu_feedback_tx,
             local_mtu_feedback_limiter: Arc::new(std::sync::Mutex::new(
@@ -126,42 +125,6 @@ impl PeerManager {
     /// Return a handle to the authoritative active-path telemetry hub.
     pub fn telemetry_hub(&self) -> Arc<path_telemetry::PathTelemetryHub> {
         self.telemetry_hub.clone()
-    }
-
-    /// Remember a negotiated capability at the WireGuard peer-session scope.
-    /// The immutable watch value gives the business hot path a registry-free
-    /// read and remains valid across a UDP socket publication replacement.
-    pub(crate) fn mark_dplpmtud_capable_sync(
-        &self,
-        peer_id: &str,
-        peer_session_generation: PeerSessionGeneration,
-    ) {
-        let current = self.dplpmtud_capability_tx.borrow().clone();
-        if current.get(peer_id) == Some(&peer_session_generation) {
-            return;
-        }
-        let mut next = (*current).clone();
-        next.retain(|candidate, generation| {
-            self.peer_session_is_current_sync(candidate, *generation)
-        });
-        // This mirror is bounded by the authoritative live peer-session set,
-        // not by the smaller DPLPMTUD worker/publication cap. Evicting a live
-        // negotiated capability would incorrectly turn that modern peer into
-        // a legacy bypass while its old runtime entry still existed.
-        next.insert(peer_id.to_string(), peer_session_generation);
-        self.dplpmtud_capability_tx.send_replace(Arc::new(next));
-        self.notify_direct_business_budget_changed();
-    }
-
-    pub(crate) fn peer_supports_dplpmtud_sync(
-        &self,
-        peer_id: &str,
-        peer_session_generation: PeerSessionGeneration,
-    ) -> bool {
-        self.dplpmtud_capability_tx
-            .borrow()
-            .get(peer_id)
-            .is_some_and(|generation| *generation == peer_session_generation)
     }
 
     pub(crate) fn direct_business_budget_change_sender(&self) -> tokio::sync::watch::Sender<u64> {

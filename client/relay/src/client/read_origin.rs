@@ -1,7 +1,7 @@
 //! One selected original inbound queue and neutral full application-read facts.
 //! This is not transport authentication, a physical receipt, or ACK authority.
 
-use super::RelayMessage;
+use super::{ClientCommand, RelayClient, RelayMessage};
 use crate::error::{RelayError, Result};
 #[cfg(test)]
 use std::sync::Arc;
@@ -9,14 +9,28 @@ use std::time::Instant;
 use tokio::sync::mpsc;
 
 /// Opaque original full payload read. Only the original readers can capture it.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct OriginalRelayFrameRead {
     completed_at: Instant,
+    reader: mpsc::WeakSender<ClientCommand>,
 }
 
 impl OriginalRelayFrameRead {
     pub fn completed_at(&self) -> Instant {
         self.completed_at
+    }
+
+    /// Compare the original command allocation without storing a strong owner.
+    /// This historical identity does not prove the client is open or current.
+    pub fn belongs_to_client(&self, client: &RelayClient) -> bool {
+        self.reader
+            .upgrade()
+            .is_some_and(|reader| reader.same_channel(&client.cmd_tx))
+    }
+
+    #[cfg(test)]
+    pub(super) fn reader_channel_retired(&self) -> bool {
+        self.reader.upgrade().is_none()
     }
 }
 
@@ -83,7 +97,11 @@ impl ReadOptions {
     pub(super) fn witness(&self) -> Option<Arc<OriginalRelayReadWitness>> {
         self.witness.clone()
     }
-    pub(super) fn channel(&self, capacity: usize) -> (ReadOutput, ReadInput) {
+    pub(super) fn channel(
+        &self,
+        capacity: usize,
+        client: &mpsc::Sender<ClientCommand>,
+    ) -> (ReadOutput, ReadInput) {
         match self.mode {
             ReadMode::Legacy => {
                 let (tx, rx) = mpsc::channel(capacity);
@@ -91,7 +109,13 @@ impl ReadOptions {
             }
             ReadMode::Original => {
                 let (tx, rx) = mpsc::channel(capacity);
-                (ReadOutput::Original(tx), ReadInput::Original(rx))
+                (
+                    ReadOutput::Original {
+                        tx,
+                        reader: client.downgrade(),
+                    },
+                    ReadInput::Original(rx),
+                )
             }
         }
     }
@@ -100,7 +124,10 @@ impl ReadOptions {
 #[derive(Clone)]
 pub(super) enum ReadOutput {
     Legacy(mpsc::Sender<RelayMessage>),
-    Original(mpsc::Sender<OriginalRelayDelivery>),
+    Original {
+        tx: mpsc::Sender<OriginalRelayDelivery>,
+        reader: mpsc::WeakSender<ClientCommand>,
+    },
 }
 
 pub(super) enum ReadInput {
@@ -133,8 +160,9 @@ impl ReadOutput {
     pub(super) fn capture_data_read(&self) -> Option<OriginalRelayFrameRead> {
         match self {
             Self::Legacy(_) => None,
-            Self::Original(_) => Some(OriginalRelayFrameRead {
+            Self::Original { reader, .. } => Some(OriginalRelayFrameRead {
                 completed_at: Instant::now(),
+                reader: reader.clone(),
             }),
         }
     }
@@ -150,7 +178,7 @@ impl ReadOutput {
                 }
                 tx.send(message).await.map_err(|_| ())
             }
-            Self::Original(tx) => tx
+            Self::Original { tx, .. } => tx
                 .send(OriginalRelayDelivery { message, read })
                 .await
                 .map_err(|_| ()),
@@ -159,7 +187,7 @@ impl ReadOutput {
     pub(super) fn try_send(&self, message: RelayMessage) -> std::result::Result<(), ()> {
         match self {
             Self::Legacy(tx) => tx.try_send(message).map_err(|_| ()),
-            Self::Original(tx) => tx
+            Self::Original { tx, .. } => tx
                 .try_send(OriginalRelayDelivery::from(message))
                 .map_err(|_| ()),
         }

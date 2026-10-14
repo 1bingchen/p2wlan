@@ -315,7 +315,7 @@ impl RelayTransport {
 
     /// Send a single encrypted packet through the relay.
     pub async fn send_packet(&self, packet: &EncryptedPeerPacket) -> Result<()> {
-        self.send_packet_inner(packet, None, None).await
+        self.send_packet_inner(packet, None, None, None).await
     }
 
     /// Send a control packet whose expectation must be installed at the relay
@@ -328,7 +328,7 @@ impl RelayTransport {
     where
         F: FnOnce(Instant) -> bool + Send + 'static,
     {
-        self.send_packet_inner(packet, Some(Box::new(write_boundary)), None)
+        self.send_packet_inner(packet, Some(Box::new(write_boundary)), None, None)
             .await
     }
 
@@ -340,7 +340,23 @@ impl RelayTransport {
         packet: &EncryptedPeerPacket,
         origin: Arc<RelaySendCapture>,
     ) -> Result<()> {
-        self.send_packet_inner(packet, None, Some(origin)).await
+        self.send_packet_inner(packet, None, Some(origin), None)
+            .await
+    }
+
+    /// Sealed REQUEST source is revalidated at the original writer prewrite.
+    pub(crate) async fn send_packet_with_original_echo(
+        &self,
+        packet: &EncryptedPeerPacket,
+        echo: Arc<crate::overlay_requests::OriginalEchoPrewrite>,
+    ) -> Result<()> {
+        if !echo.matches_packet(packet) {
+            return Err(crate::error::DaemonError::RelaySend {
+                endpoint: self.relay_endpoint.clone(),
+                error: p2pnet_relay::RelayError::WriteBoundaryRejected,
+            });
+        }
+        self.send_packet_inner(packet, None, None, Some(echo)).await
     }
 
     async fn send_packet_inner(
@@ -348,6 +364,7 @@ impl RelayTransport {
         packet: &EncryptedPeerPacket,
         write_boundary: Option<Box<dyn FnOnce(Instant) -> bool + Send + 'static>>,
         origin: Option<Arc<RelaySendCapture>>,
+        echo: Option<Arc<crate::overlay_requests::OriginalEchoPrewrite>>,
     ) -> Result<()> {
         debug!(
             event = "relay_outbound_write_submitted",
@@ -396,6 +413,8 @@ impl RelayTransport {
                 self.write_boundaries_live.clone(),
                 boundary,
                 origin.as_ref().and_then(|capture| capture.branch(0)),
+                echo.clone(),
+                self.relay_connection_id,
             )
             .await
         } else {
@@ -405,6 +424,8 @@ impl RelayTransport {
                 let boundary = boundary.clone();
                 let packet = packet.clone();
                 let write_origin = origin.as_ref().and_then(|capture| capture.branch(index));
+                let echo = echo.clone();
+                let publication_id = self.relay_connection_id;
                 writes.spawn(async move {
                     let timeout_origin = write_origin.clone();
                     match timeout(
@@ -415,6 +436,8 @@ impl RelayTransport {
                             live,
                             boundary,
                             write_origin,
+                            echo,
+                            publication_id,
                         ),
                     )
                     .await
@@ -642,7 +665,9 @@ impl RelayTransport {
                             udp_transport_owner: None,
                             network_generation: Some(self.peers.current_network_generation_sync()),
                             profile_sampled,
-                            udp_received: original_read.map(|read| read.completed_at()),
+                            udp_received: original_read.as_ref().map(|read| read.completed_at()),
+                            original_relay_read: original_read,
+                            original_udp_read: None,
                             transport_queue_send_started: Some(transport_queue_send_started),
                             wire_bytes: data,
                         })
@@ -673,19 +698,46 @@ type SharedRelayWriteBoundary = Arc<
 >;
 
 async fn guarded_relay_write(
-    client: &RelayClient,
+    client: &Arc<RelayClient>,
     packet: &EncryptedPeerPacket,
     live: Arc<std::sync::Mutex<bool>>,
     boundary: SharedRelayWriteBoundary,
+    echo: Option<Arc<crate::overlay_requests::OriginalEchoPrewrite>>,
+    publication_id: u64,
 ) -> std::result::Result<(), p2pnet_relay::RelayError> {
+    let actual_client = Arc::downgrade(client);
+    let actual_live = live.clone();
     let permit = packet.room_authorization.clone();
     client
         .send_data_with_write_boundary(&packet.peer_id, &packet.wire_bytes, move |sent_at| {
-            let live = live.lock().unwrap_or_else(|p| p.into_inner());
+            let live = if echo.is_some() {
+                match live.try_lock() {
+                    Ok(guard) => guard,
+                    Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+                    Err(std::sync::TryLockError::WouldBlock) => return false,
+                }
+            } else {
+                live.lock().unwrap_or_else(|p| p.into_inner())
+            };
             if !*live || permit.as_ref().is_some_and(|p| !p.is_valid()) {
                 return false;
             }
-            let mut boundary = boundary.lock().unwrap_or_else(|p| p.into_inner());
+            if echo.as_ref().is_some_and(|echo| {
+                actual_client.upgrade().is_none_or(|client| {
+                    !echo.relay_prewrite_is_current(&client, publication_id, &actual_live)
+                })
+            }) {
+                return false;
+            }
+            let mut boundary = if echo.is_some() {
+                match boundary.try_lock() {
+                    Ok(guard) => guard,
+                    Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+                    Err(std::sync::TryLockError::WouldBlock) => return false,
+                }
+            } else {
+                boundary.lock().unwrap_or_else(|p| p.into_inner())
+            };
             if let Some(accepted) = boundary.1 {
                 return accepted;
             }
@@ -699,15 +751,19 @@ async fn guarded_relay_write(
 // None delegates to the unmodified original guarded writer. Opt-in observation
 // only appends finite atomic/OnceLock bookkeeping to the existing hook/result.
 async fn guarded_relay_write_with_origin(
-    client: &RelayClient,
+    client: &Arc<RelayClient>,
     packet: &EncryptedPeerPacket,
     live: Arc<std::sync::Mutex<bool>>,
     boundary: SharedRelayWriteBoundary,
     origin: Option<send_origin::RelayWriteObserver>,
+    echo: Option<Arc<crate::overlay_requests::OriginalEchoPrewrite>>,
+    publication_id: u64,
 ) -> std::result::Result<(), p2pnet_relay::RelayError> {
     let Some(origin) = origin else {
-        return guarded_relay_write(client, packet, live, boundary).await;
+        return guarded_relay_write(client, packet, live, boundary, echo, publication_id).await;
     };
+    let actual_client = Arc::downgrade(client);
+    let actual_live = live.clone();
     let permit = packet.room_authorization.clone();
     let prewrite = origin.clone();
     let observer = origin.clone();
@@ -716,11 +772,34 @@ async fn guarded_relay_write_with_origin(
             &packet.peer_id,
             &packet.wire_bytes,
             move |sent_at| {
-                let live = live.lock().unwrap_or_else(|p| p.into_inner());
+                let live = if echo.is_some() {
+                    match live.try_lock() {
+                        Ok(guard) => guard,
+                        Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+                        Err(std::sync::TryLockError::WouldBlock) => return false,
+                    }
+                } else {
+                    live.lock().unwrap_or_else(|p| p.into_inner())
+                };
                 if !*live || permit.as_ref().is_some_and(|p| !p.is_valid()) {
                     return false;
                 }
-                let mut boundary = boundary.lock().unwrap_or_else(|p| p.into_inner());
+                if echo.as_ref().is_some_and(|echo| {
+                    actual_client.upgrade().is_none_or(|client| {
+                        !echo.relay_prewrite_is_current(&client, publication_id, &actual_live)
+                    })
+                }) {
+                    return false;
+                }
+                let mut boundary = if echo.is_some() {
+                    match boundary.try_lock() {
+                        Ok(guard) => guard,
+                        Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+                        Err(std::sync::TryLockError::WouldBlock) => return false,
+                    }
+                } else {
+                    boundary.lock().unwrap_or_else(|p| p.into_inner())
+                };
                 if let Some(accepted) = boundary.1 {
                     if accepted {
                         prewrite.note_handed();

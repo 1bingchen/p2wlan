@@ -135,6 +135,11 @@ impl Daemon {
             let overlay_burst = self.config.network.overlay_burst;
             let overlay_timeline = self.timeline.clone();
             let shutdown_rx = self.shutdown_rx.clone();
+            let overlay_native_owners = SourcedOverlayOwners {
+                wireguard: self.transport.clone(),
+                relay: self.relay_transport.clone(),
+                room: self.control.room_authorization().await,
+            };
             self.task_manager
                 .spawn("overlay-validate", false, async move {
                     run_sourced_overlay_validate_loop(
@@ -149,6 +154,7 @@ impl Daemon {
                         overlay_timeline,
                         overlay_ingress_rx,
                         shutdown_rx,
+                        overlay_native_owners,
                     )
                     .await
                 })

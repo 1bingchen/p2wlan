@@ -68,6 +68,14 @@ impl RequestBinding {
         observed_at: Instant,
     ) -> Option<Self> {
         let token = RequestSendToken::from_read_context(context?)?;
+        if let Some(echo) = token.echo() {
+            let state = if echo.exact_input(peers, packet, observed_at) {
+                RequestBindingState::ReadExact
+            } else {
+                RequestBindingState::Invalid(RequestBindingFailure::OriginalBytes)
+            };
+            return Some(Self { token, state });
+        }
         // The temporary Arc is dropped synchronously before any route await.
         let state = match token.request() {
             None => RequestBindingState::Invalid(RequestBindingFailure::Retired),
@@ -98,6 +106,14 @@ impl RequestBinding {
         if self.state != RequestBindingState::ReadExact {
             return;
         }
+        if let Some(echo) = self.token.echo() {
+            self.state = if echo.exact_route(peers, packet, observed_at) {
+                RequestBindingState::RoutedExact
+            } else {
+                RequestBindingState::Invalid(RequestBindingFailure::RouteIdentity)
+            };
+            return;
+        }
         let failure = match self.token.request() {
             None => Some(RequestBindingFailure::Retired),
             Some(request) => {
@@ -121,7 +137,7 @@ impl RequestBinding {
         );
     }
 
-    #[allow(dead_code)] // Immutable staged source accessor.
+    #[allow(dead_code)] // Immutable source accessor; no current-owner verdict.
     pub(crate) fn token(&self) -> &RequestSendToken {
         &self.token
     }
@@ -130,7 +146,7 @@ impl RequestBinding {
         self.state
     }
 
-    /// A future receipt/credit transaction must still check current owners,
+    /// The final receipt/credit transaction must still check current owners,
     /// original A, actual B, ingress, physical completion and once state.
     #[allow(dead_code)] // Future transaction rechecks the same canonical owner.
     pub(crate) fn eligibility_at(&self, observed_at: Instant) -> RequestInputEligibility {
@@ -221,6 +237,12 @@ impl RawRequestDelivery {
     pub(crate) fn binding(&self) -> Option<&RequestBinding> {
         self.binding.as_ref()
     }
+
+    pub(crate) fn original_echo(&self) -> Option<&Arc<crate::overlay_requests::OriginalEchoInput>> {
+        self.binding
+            .as_ref()
+            .and_then(|binding| binding.token.echo())
+    }
 }
 
 impl Deref for RawRequestDelivery {
@@ -243,15 +265,45 @@ pub(crate) struct EncryptedRequestDelivery {
     packet: EncryptedPeerPacket,
     binding: Option<RequestBinding>,
     source: Option<OriginalEncryptionSource>,
+    echo_emit: Option<std::sync::Weak<tokio::sync::OwnedMutexGuard<()>>>,
 }
 
 impl EncryptedRequestDelivery {
+    pub(crate) fn bind_original_echo_emit(
+        &mut self,
+        guard: &Arc<tokio::sync::OwnedMutexGuard<()>>,
+    ) {
+        if self
+            .binding
+            .as_ref()
+            .is_some_and(|binding| binding.token.echo().is_some())
+        {
+            self.echo_emit = Some(Arc::downgrade(guard));
+        }
+    }
+
+    pub(crate) fn original_echo_prewrite(
+        &self,
+    ) -> Option<Arc<crate::overlay_requests::OriginalEchoPrewrite>> {
+        let echo = self.binding.as_ref()?.token.echo()?;
+        echo.prewrite(
+            self.source.as_ref()?,
+            self.echo_emit.as_ref()?.clone(),
+            &self.packet,
+        )
+    }
+
+    pub(crate) fn has_original_echo(&self) -> bool {
+        self.binding
+            .as_ref()
+            .is_some_and(|binding| binding.token.echo().is_some())
+    }
     #[allow(dead_code)] // Historical carriage accessor, no send/credit authority.
     pub(crate) fn binding(&self) -> Option<&RequestBinding> {
         self.binding.as_ref()
     }
 
-    #[allow(dead_code)] // Actual B retained for the next receipt stage.
+    #[allow(dead_code)] // Actual B is immutable; final current ownership is separate.
     pub(crate) fn source(&self) -> Option<&OriginalEncryptionSource> {
         self.source.as_ref()
     }

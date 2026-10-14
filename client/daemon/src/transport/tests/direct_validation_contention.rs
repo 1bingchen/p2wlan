@@ -32,6 +32,8 @@ async fn assert_validation_request_during_emit_contention(replace_session: bool)
     encrypted_tx
         .send(ReceivedEncryptedPacket {
             physical_ingress: None,
+            original_relay_read: None,
+            original_udp_read: None,
             source: Some(remote_socket.local_addr().unwrap()),
             local_endpoint: udp.local_addr().ok(),
             relay_endpoint: None,
@@ -225,6 +227,8 @@ async fn assert_ack_transaction_fences_rekey(expire_transaction: bool) {
     encrypted_tx
         .send(ReceivedEncryptedPacket {
             physical_ingress: None,
+            original_relay_read: None,
+            original_udp_read: None,
             source: Some(source),
             local_endpoint: udp.local_addr().ok(),
             relay_endpoint: None,

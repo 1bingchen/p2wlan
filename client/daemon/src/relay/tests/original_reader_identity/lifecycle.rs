@@ -150,14 +150,35 @@ pub(super) fn check(
             )?;
         }
         Mode::Close => {
-            current.abort();
+            // Keep this exact member registered while its original client
+            // closes; the real pool worker may otherwise remove it first.
             let member = outer
                 .try_original_member_guard(fresh_tx, new_read, id)
-                .map_err(|e| format!("closed still member: {e:?}"))?;
-            require(
-                matches!(member.try_open_guard(), Err(Failure::Closed)),
-                "closed member became open",
-            )?;
+                .map_err(|e| format!("member before close: {e:?}"))?;
+            current.abort();
+            loop {
+                require(
+                    tokio::time::Instant::now() < end,
+                    "closed member observation exceeded original end",
+                )?;
+                match member.try_open_guard() {
+                    Err(Failure::Closed) => {
+                        require(
+                            tokio::time::Instant::now() < end,
+                            "closed member observation exceeded original end",
+                        )?;
+                        break;
+                    }
+                    Err(Failure::ContendedClose) => {
+                        // Reader/writer shutdown can republish the same
+                        // terminal watch under its gate. Contention is never
+                        // success: observe Closed within the original end.
+                        std::thread::yield_now();
+                    }
+                    Err(error) => return Err(format!("closed member check failed: {error:?}")),
+                    Ok(_) => return Err("closed member became open".into()),
+                }
+            }
         }
         Mode::Retire => {
             outer.retire_write_boundaries();

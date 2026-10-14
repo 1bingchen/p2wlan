@@ -7,6 +7,42 @@ pub(crate) struct OriginalEchoPeerReadGuard<'a> {
     pub(crate) session: crate::transport::OriginalEchoSessionGuard<'a>,
 }
 
+impl OriginalEchoPeerReadGuard<'_> {
+    /// The retained original connection/session guards fence this observation
+    /// through the caller's syscall. It does not nominate the receive source.
+    pub(crate) fn verified_direct_return_local(
+        &self,
+        input: &OriginalEchoInput,
+        endpoint: SocketAddr,
+    ) -> Option<SocketAddr> {
+        let conn = self._connections.get(input.peer_id())?;
+        let validation = conn.path_state_machine.active_direct_validation()?;
+        let lifecycle = input.source().session().authorized_peer_lifecycle()?;
+        if !conn.direct_is_healthy_confirmed()
+            || conn.direct_generation != input.generation()
+            || validation.epoch
+                != PathEpoch::new(input.generation(), lifecycle, conn.remote_candidate_epoch())
+            || validation.owner_token.is_none()
+            || validation.request_id.is_none()
+            || validation.commit_endpoint() != Some(endpoint)
+            || conn.selected_direct_endpoint_for_consent(input.generation()) != Some(endpoint)
+        {
+            return None;
+        }
+        conn.candidate_pairs
+            .iter()
+            .find(|pair| {
+                pair.local_generation == input.generation()
+                    && pair.remote_candidate_epoch == validation.epoch.remote_candidate_epoch
+                    && pair.remote_endpoint == endpoint
+                    && pair.state == CandidatePairState::Selected
+                    && pair.selected_at.is_some()
+                    && !conn.is_overlay_candidate_pair(pair)
+            })?
+            .local_endpoint
+    }
+}
+
 pub(crate) struct OriginalEchoPeerWriteGuard<'a> {
     pub(crate) current: OriginalEchoPeerReadGuard<'a>,
     _owner: Arc<PeerManager>,
@@ -157,7 +193,7 @@ impl PeerManager {
         } else if let (Some(read), Some(id), Some(endpoint)) = (
             input.source().original_relay_read(),
             input.source().relay_connection_id(),
-            input.source().relay_endpoint(),
+            input.source().relay_reader_endpoint(),
         ) {
             let slot = input
                 .relay()

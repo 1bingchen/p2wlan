@@ -239,8 +239,9 @@ def run_probe(config: Config, supplied_socket: socket.socket | None = None) -> d
                     if written != len(wire):
                         raise OSError("short UDP send")
                     record.update(status="pending", reason="awaiting_echo")
-                except OSError:
+                except OSError as error:
                     record.update(status="send_error", reason="udp_send_failed",
+                                  errno=error.errno,
                                   completed_offset_ns=time.monotonic_ns() - started)
                 next_sequence += 1
             if all(record["status"] in ("success", "timeout", "send_error") for record in records):
@@ -270,7 +271,8 @@ def run_probe(config: Config, supplied_socket: socket.socket | None = None) -> d
                 break
     except KeyboardInterrupt:
         termination = "interrupted"
-    except OSError:
+    except OSError as error:
+        report["socket_error_errno"] = error.errno
         termination = "bind_failed" if sock is None else "udp_receive_failed"
     finally:
         elapsed = time.monotonic_ns() - started
@@ -330,8 +332,9 @@ def run_echo(config: Config, supplied_socket: socket.socket | None = None,
                             raise OSError("short UDP send")
                         report["responses_sent"] += 1
                         report["response_bytes"] += len(response)
-                    except OSError:
+                    except OSError as error:
                         report["send_errors"] += 1
+                        report["last_send_error_errno"] = error.errno
             report["receive_counts"][reason] += 1
             if len(seen) == config.count:
                 termination = "request_budget_exhausted"
@@ -340,7 +343,8 @@ def run_echo(config: Config, supplied_socket: socket.socket | None = None,
             termination = "receive_budget_exhausted"
     except KeyboardInterrupt:
         termination = "interrupted"
-    except OSError:
+    except OSError as error:
+        report["socket_error_errno"] = error.errno
         termination = "bind_failed" if sock is None else "udp_receive_failed"
     finally:
         report.update(elapsed_ns=time.monotonic_ns() - started, termination_reason=termination)

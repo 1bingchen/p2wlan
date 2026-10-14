@@ -39,6 +39,14 @@ mod publication_order;
 #[path = "runtime_vip.rs"]
 mod runtime_vip;
 pub(super) use runtime_vip::RuntimeVipCase;
+#[path = "asymmetric_endpoint.rs"]
+mod asymmetric_endpoint;
+pub(super) use asymmetric_endpoint::{
+    exercise_asymmetric_endpoint, exercise_asymmetric_invalidation,
+};
+#[path = "common_hub.rs"]
+mod common_hub;
+pub(super) use common_hub::{exercise_common_native, exercise_common_replacement};
 const NODE_A: &str = "original-ack-a";
 const NODE_B: &str = "original-ack-b";
 const VIP_A: &str = "10.20.0.1";
@@ -111,6 +119,7 @@ impl Budget {
 struct Task {
     label: &'static str,
     handle: Option<JoinHandle<Check>>,
+    graceful: bool,
 }
 
 #[derive(Default)]
@@ -126,6 +135,19 @@ impl Owners {
         self.tasks.push(Task {
             label,
             handle: Some(tokio::spawn(future)),
+            graceful: false,
+        });
+    }
+
+    fn spawn_graceful(
+        &mut self,
+        label: &'static str,
+        future: impl Future<Output = Check> + Send + 'static,
+    ) {
+        self.tasks.push(Task {
+            label,
+            handle: Some(tokio::spawn(future)),
+            graceful: true,
         });
     }
 
@@ -134,8 +156,10 @@ impl Owners {
             let _ = stop.send(true);
         }
         for task in &self.tasks {
-            if let Some(handle) = &task.handle {
-                handle.abort();
+            if !task.graceful {
+                if let Some(handle) = &task.handle {
+                    handle.abort();
+                }
             }
         }
         // Cancel owned converters before intentionally closing their native
@@ -155,7 +179,7 @@ impl Owners {
                     task.handle.take();
                     match result {
                         Ok(Ok(())) => {}
-                        Err(error) if error.is_cancelled() => {}
+                        Err(error) if error.is_cancelled() && !task.graceful => {}
                         other => failures
                             .push(format!("{}: unexpected owned join {other:?}", task.label)),
                     }
@@ -225,6 +249,7 @@ struct Endpoint {
     pending: VecDeque<PendingOverlayEcho>,
     next_nonce: u64,
     next_seq: u32,
+    common_encrypted_input: Option<mpsc::Sender<crate::transport::ReceivedEncryptedPacket>>,
 }
 
 impl Endpoint {
@@ -240,6 +265,60 @@ impl Endpoint {
         budget: Budget,
         keep_bootstrap_vip: bool,
     ) -> Result<Self, String> {
+        Self::create_inner(
+            node,
+            vip,
+            remote_node,
+            remote_vip,
+            path,
+            hub,
+            owners,
+            budget,
+            keep_bootstrap_vip,
+            false,
+            None,
+        )
+        .await
+    }
+
+    async fn create_for_validation(
+        node: &'static str,
+        vip: &'static str,
+        remote_node: &'static str,
+        remote_vip: &'static str,
+        owners: &mut Owners,
+        budget: Budget,
+    ) -> Result<Self, String> {
+        Self::create_inner(
+            node,
+            vip,
+            remote_node,
+            remote_vip,
+            PathKind::Direct,
+            None,
+            owners,
+            budget,
+            false,
+            true,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn create_inner(
+        node: &'static str,
+        vip: &'static str,
+        remote_node: &'static str,
+        remote_vip: &'static str,
+        path: PathKind,
+        hub: Option<&str>,
+        owners: &mut Owners,
+        budget: Budget,
+        keep_bootstrap_vip: bool,
+        actual_validation: bool,
+        common_hub: Option<&str>,
+    ) -> Result<Self, String> {
         let mut config =
             Config::generate_default("http://ctrl.test", "default").map_err(|e| e.to_string())?;
         config.node.node_id = node.to_string();
@@ -252,8 +331,18 @@ impl Endpoint {
             config.network.virtual_ip = vip.to_string();
         }
         config.relay.path_policy = PathPolicy::Auto;
+        let identity = if actual_validation {
+            let private = hex::decode(&config.node.private_key).map_err(|e| e.to_string())?;
+            let private: [u8; 32] = private
+                .try_into()
+                .map_err(|_| "actual Config private key length")?;
+            NodeIdentity::from_private_key(private)
+        } else {
+            NodeIdentity::generate()
+        };
         let peers = Arc::new(PeerManager::new(config));
         let (wireguard, _unused_outbound) = WireGuardTransport::new_with_request_carriage();
+        let (encrypted_tx, encrypted_rx) = mpsc::channel(16);
         let udp_transport = if path == PathKind::Direct {
             let udp = budget
                 .step(
@@ -267,6 +356,17 @@ impl Endpoint {
                 )
                 .await?
                 .map_err(|e| e.to_string())?;
+            let udp = if actual_validation {
+                udp.with_local_node_id(node)
+                    .with_wireguard_transport(wireguard.clone())
+                    .with_inbound_channel(encrypted_tx.clone())
+                    .with_dplpmtud_local_virtual_ip(
+                        vip.parse()
+                            .map_err(|e: std::net::AddrParseError| e.to_string())?,
+                    )
+            } else {
+                udp
+            };
             // This is the actual publication consumed by the actual single
             // reader, not a synthesized OriginalUdpIngressSource/fact.
             udp.set_inbound_publication_owner(if node == NODE_A { 28001 } else { 28002 });
@@ -276,22 +376,60 @@ impl Endpoint {
         };
         let mut relay_rx: Option<mpsc::Receiver<OriginalRelayDelivery>> = None;
         let relay_transport = if path == PathKind::Relay {
-            let (relay, rx) = budget
-                .step(
-                    "register original Relay reader",
-                    RelayTransport::connect_secure_for_read::<OriginalRelayDelivery>(
-                        hub.ok_or("missing actual Relay hub")?,
-                        "default",
-                        node,
-                        peers.clone(),
-                        None,
-                        true,
-                        None,
-                    ),
-                )
-                .await?
-                .map_err(|e| e.to_string())?;
-            owners.relays.push(relay.clone());
+            let (relay, rx) = if let Some(common) = common_hub {
+                let primary = hub.ok_or("missing actual primary Relay")?;
+                let preferred = if node == NODE_A { "one" } else { "two" };
+                let selected = budget
+                    .step(
+                        "select actual different primary and common Relay",
+                        crate::relay::select_relay_with_cooldowns_for_read::<OriginalRelayDelivery>(
+                            &[
+                                crate::relay::RelayCandidateConfig::legacy(format!(
+                                    "{preferred}@{primary}"
+                                )),
+                                crate::relay::RelayCandidateConfig::legacy(format!(
+                                    "common@{common}"
+                                )),
+                            ],
+                            &[preferred.into()],
+                            Duration::from_secs(1),
+                            node,
+                            peers.clone(),
+                            None,
+                            None,
+                            true,
+                            None,
+                            &HashMap::new(),
+                        ),
+                    )
+                    .await?;
+                let relay = selected
+                    .transport
+                    .ok_or("actual common Relay selection failed")?;
+                owners.relays.push(relay.clone());
+                let rx = selected
+                    .relay_rx
+                    .ok_or("actual common merged reader missing")?;
+                (relay, rx)
+            } else {
+                let (relay, rx) = budget
+                    .step(
+                        "register original Relay reader",
+                        RelayTransport::connect_secure_for_read::<OriginalRelayDelivery>(
+                            hub.ok_or("missing actual Relay hub")?,
+                            "default",
+                            node,
+                            peers.clone(),
+                            None,
+                            true,
+                            None,
+                        ),
+                    )
+                    .await?
+                    .map_err(|e| e.to_string())?;
+                owners.relays.push(relay.clone());
+                (relay, rx)
+            };
             relay_rx = Some(rx);
             Some(relay)
         } else {
@@ -317,9 +455,9 @@ impl Endpoint {
             }
             Ok(())
         });
-        let (encrypted_tx, encrypted_rx) = mpsc::channel(16);
         let (overlay_tx, overlay) = mpsc::channel(16);
         let (udp_publication, udp_updates) = watch::channel(udp_transport.clone());
+        let common_encrypted_input = common_hub.map(|_| encrypted_tx.clone());
         let inbound_wireguard = wireguard.clone();
         let inbound_peers = peers.clone();
         let evidence = InboundEvidenceFeed {
@@ -358,7 +496,7 @@ impl Endpoint {
         }
         Ok(Self {
             node,
-            identity: NodeIdentity::generate(),
+            identity,
             vip,
             remote_node,
             remote_vip,
@@ -381,6 +519,7 @@ impl Endpoint {
             pending: VecDeque::new(),
             next_nonce: 0x28_0000,
             next_seq: 28,
+            common_encrypted_input,
         })
     }
 
@@ -844,6 +983,7 @@ async fn inject_actual_echo(
 ) -> Result<RawRequestDelivery, String> {
     let original = OriginalOverlayAck::parse_request(&request.event.packet, &request.event.peer_id)
         .ok_or("actual REQUEST before echo injection has invalid framing")?;
+    let verified_before = b.stats.verified_round_trips;
     let owners = b.sourced_owners();
     let echoed = budget
         .step(
@@ -866,10 +1006,10 @@ async fn inject_actual_echo(
         .await?;
     require(
         echoed == OriginalRequestEchoOutcome::Injected,
-        "actual sourced REQUEST was not injected as original sealed echo",
+        &format!("actual sourced REQUEST was not injected as original sealed echo: {echoed:?}"),
     )?;
     require(
-        b.stats.verified_round_trips == 0,
+        b.stats.verified_round_trips == verified_before,
         "receiving REQUEST falsely credited a remote roundtrip",
     )?;
     require(

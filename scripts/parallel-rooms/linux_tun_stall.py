@@ -11,6 +11,9 @@ import time
 
 import linux_tun_stall_contract as contract
 
+PAUSED_SAMPLE_BUDGET_NS = 500_000_000
+CONT_RESERVE_NS = 100_000_000
+
 
 class NativeProcessIO:
     @staticmethod
@@ -128,11 +131,36 @@ def observe_probe_terminal(entry: dict, child, *, now=time.monotonic_ns) -> None
         entry.update(probe_terminal_observed_monotonic_ns=now(), observed_probe_exit=code)
 
 
+def collect_paused_samples(lab, owner, entry, probe, paused_samples: list, hold_end: int,
+                           *, now=time.monotonic_ns, sleep=time.sleep) -> None:
+    sampling_end = hold_end - CONT_RESERVE_NS
+    while len(paused_samples) < contract.MAX_SAMPLES:
+        sample_end = now() + PAUSED_SAMPLE_BUDGET_NS
+        # One sample includes four sequential diagnostic commands. Admit its
+        # entire bounded slot before CONT's reserve, rather than starting a
+        # partial two-end capture against the last few milliseconds of STOP.
+        if sample_end > sampling_end:
+            break
+        if owner.observe()["state"] != "T":
+            raise RuntimeError("stall_original_application_not_stopped_during_sample")
+        observe_probe_terminal(entry, probe, now=now)
+        paused_samples.append(sample(lab, sample_end))
+        if now() >= sample_end:
+            raise TimeoutError("stall_admitted_diagnostics_sample_deadline")
+        if owner.observe()["state"] != "T":
+            raise RuntimeError("stall_original_application_resumed_during_sample")
+        remaining = sampling_end - now()
+        if remaining > 0:
+            sleep(min(.15, remaining / 1_000_000_000))
+
+
 def measure(harness, lab, groups, report: dict, out: Path, snapshots: dict, slot: list) -> None:
     entries = report["manifest"]
     contract.validate_manifest(entries)
     details = report.setdefault("server_stall", {"keepalive_interval_secs": 1, "native_ack_wait_ms": 2000,
-                                                "default_keepalive_cycle_verified": False})
+                                                "default_keepalive_cycle_verified": False,
+                                                "paused_sample_budget_ns": PAUSED_SAMPLE_BUDGET_NS,
+                                                "cont_reserve_ns": CONT_RESERVE_NS})
     plan = {"entries": entries, "source_ip": snapshots["a1"]["virtual_ip"], "target_ip": snapshots["b1"]["virtual_ip"]}
     server_plan, ready, server_report = out / "echo-manifest.json", out / "echo-ready.json", out / "echo-report.json"
     harness.udp.write_report(server_plan, plan)
@@ -186,18 +214,9 @@ def measure(harness, lab, groups, report: dict, out: Path, snapshots: dict, slot
         if hold_end + 2_000_000_000 >= echo_end:
             raise TimeoutError("stall_original_echo_budget_cannot_fit_both_phases")
         probe, path, bind, target = start_probe(entries[0])
-        # Fixed sample capacity, one synchronous command slot, same hold end.
-        # Reserve the final 100ms for CONT instead of extending a blocked RPC.
-        while time.monotonic_ns() < hold_end - 100_000_000 and len(paused_samples) < contract.MAX_SAMPLES:
-            if owner.observe()["state"] != "T":
-                raise RuntimeError("stall_original_application_not_stopped_during_sample")
-            observe_probe_terminal(entries[0], probe)
-            paused_samples.append(sample(lab, hold_end - 100_000_000))
-            if owner.observe()["state"] != "T":
-                raise RuntimeError("stall_original_application_resumed_during_sample")
-            remaining = hold_end - 100_000_000 - time.monotonic_ns()
-            if remaining > 0:
-                time.sleep(min(.15, remaining / 1_000_000_000))
+        # Fixed capacity and bounded complete samples, with the original hold
+        # end and CONT reserve. Admitted failures remain in the evidence.
+        collect_paused_samples(lab, owner, entries[0], probe, paused_samples, hold_end)
         while time.monotonic_ns() < hold_end:
             time.sleep(min(.01, (hold_end - time.monotonic_ns()) / 1_000_000_000))
         if owner.observe()["state"] != "T":

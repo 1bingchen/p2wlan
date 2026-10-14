@@ -305,6 +305,63 @@ class EchoCodecControls(unittest.TestCase):
 
 
 class HarnessBoundaryControls(unittest.TestCase):
+    def test_paused_sampling_admits_complete_two_end_diagnostics_before_cont_reserve(self):
+        clock, calls, samples = Clock(), [], []
+        start, hold_end = clock.now(), clock.now() + contract.HOLD_NS
+        def rpc(name, *, deadline, projection=False):
+            begin = clock.now()
+            calls.append((name, projection, begin, int(deadline * 1_000_000_000)))
+            if begin + 90_000_000 > int(deadline * 1_000_000_000):
+                raise TimeoutError("original diagnostics phase deadline")
+            clock.sleep(.09)
+            return healthy_snapshot(begin, clock.now())[name] if projection else {}
+        lab = SimpleNamespace(status=rpc, _safe_status=lambda name, _status, **kw: rpc(name, projection=True, **kw))
+        owner = SimpleNamespace(observe=lambda: {"state": "T"})
+        probe = SimpleNamespace(poll=lambda: None)
+        stall.collect_paused_samples(lab, owner, {}, probe, samples, hold_end, now=clock.now, sleep=clock.sleep)
+        self.assertEqual(len(samples), 5)
+        self.assertEqual(len(calls), 20)
+        self.assertEqual(set(samples[-1]), {"a1", "b1"})
+        self.assertLessEqual(clock.now(), hold_end - 100_000_000)
+        self.assertTrue(all(end <= hold_end - 100_000_000 for _side, _projection, _begin, end in calls))
+        pause = {"stopped_monotonic_ns": start, "resume_requested_monotonic_ns": hold_end}
+        result = contract.health_evidence(healthy_snapshot(start - 200_000_000, start - 100_000_000), samples,
+                                         healthy_snapshot(hold_end + 100_000_000, hold_end + 200_000_000), pause)
+        self.assertTrue(result["both_original_paths_stable"])
+
+    def test_admitted_diagnostics_timeout_is_not_retried_or_dropped(self):
+        clock, samples, calls = Clock(), [], []
+        def failed_status(name, *, deadline):
+            calls.append((name, deadline))
+            raise TimeoutError("original diagnostics phase deadline")
+        lab = SimpleNamespace(status=failed_status)
+        with self.assertRaisesRegex(TimeoutError, "original diagnostics"):
+            stall.collect_paused_samples(lab, SimpleNamespace(observe=lambda: {"state": "T"}), {},
+                SimpleNamespace(poll=lambda: None), samples, clock.now()+contract.HOLD_NS,
+                now=clock.now, sleep=clock.sleep)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(samples, [])
+
+    def test_admitted_partial_peer_capture_remains_unacceptable(self):
+        clock, samples = Clock(), []
+        start, hold_end = clock.now(), clock.now()+contract.HOLD_NS
+        def projected(name, _status, *, deadline):
+            begin = clock.now()
+            clock.sleep(.1)
+            status = healthy_snapshot(begin, clock.now())[name]
+            if name == "b1":
+                status["peers"] = {"peer-b1": {"capture_error": "diagnostics_timeout"}}
+            return status
+        stall.collect_paused_samples(SimpleNamespace(status=lambda *_a, **_kw: {}, _safe_status=projected),
+            SimpleNamespace(observe=lambda: {"state": "T"}), {}, SimpleNamespace(poll=lambda: None),
+            samples, hold_end, now=clock.now, sleep=clock.sleep)
+        self.assertTrue(samples)
+        self.assertTrue(all("capture_error" in s["b1"]["peers"]["peer-b1"] for s in samples))
+        with self.assertRaisesRegex(ValueError, "selected_path_unknown"):
+            contract.health_evidence(healthy_snapshot(start-200_000_000, start-100_000_000), samples,
+                healthy_snapshot(hold_end+100_000_000, hold_end+200_000_000),
+                {"stopped_monotonic_ns": start, "resume_requested_monotonic_ns": hold_end})
+
     def test_original_probe_exit_observation_is_once_and_does_not_wait_or_retry(self):
         entry, clock = {}, Clock()
         codes = iter((None, 1, 1))

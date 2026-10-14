@@ -630,9 +630,14 @@ async fn run_overlay_validate_loop_inner<T>(
                             &peers, &timeline, &mut seen, &mut stats, &sent_nonces, &mut bursts).await;
                         continue;
                     }
-                    let _outcome = handle_native_overlay_request(event, source, owners, &udp_transport,
+                    let outcome = handle_native_overlay_request(event, source, owners, &udp_transport,
                         &peers, &controller, &local_vip, overlay_any_path, start_gate_released,
                         &mut seen, &mut stats, &mut pending_echoes).await;
+                    if !matches!(outcome, OriginalRequestEchoOutcome::Injected
+                        | OriginalRequestEchoOutcome::Queued | OriginalRequestEchoOutcome::DuplicateRequest) {
+                        debug!(event = "overlay_native_request_rejected", outcome = ?outcome,
+                            "original REQUEST did not enter the sealed echo path");
+                    }
                     continue;
                 }
                 handle_overlay_ingress(

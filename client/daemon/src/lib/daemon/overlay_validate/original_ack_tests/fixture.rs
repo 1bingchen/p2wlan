@@ -23,8 +23,11 @@ use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
 type Check = Result<(), String>;
+#[path = "ack_contention.rs"]
+mod ack_contention;
 #[path = "contention.rs"]
 mod contention;
+pub(super) use ack_contention::AckContentionCase;
 #[path = "lifecycle.rs"]
 mod lifecycle;
 pub(super) use lifecycle::LifecycleCase;
@@ -71,6 +74,7 @@ pub(super) enum Scenario {
     MissingSource,
     NativeHandler,
     Contention,
+    AckContention(AckContentionCase),
     Lifecycle(LifecycleCase),
     Identity(IdentityCase),
     EchoTransfer(EchoCase),
@@ -1415,6 +1419,9 @@ async fn exercise_rounds(
     if scenario == Scenario::Contention {
         return contention::exercise_conflicts(a, b, path, budget).await;
     }
+    if let Scenario::AckContention(case) = scenario {
+        return ack_contention::exercise_native_ack_contention(a, b, path, case, budget).await;
+    }
     if let Scenario::Lifecycle(case) = scenario {
         return lifecycle::exercise_lifecycle(a, b, path, case, budget).await;
     }
@@ -1514,7 +1521,11 @@ async fn exercise_with_runtime_vip(
     scenario: Scenario,
     keep_bootstrap_vip: bool,
 ) -> Check {
-    let budget = if scenario == Scenario::Lifecycle(LifecycleCase::OriginalWindow) {
+    let budget = if matches!(
+        scenario,
+        Scenario::Lifecycle(LifecycleCase::OriginalWindow)
+            | Scenario::AckContention(AckContentionCase::Deadline)
+    ) {
         Budget::with_total(Duration::from_secs(19))
     } else {
         Budget::new()

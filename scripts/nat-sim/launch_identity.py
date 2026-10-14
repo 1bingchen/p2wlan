@@ -122,7 +122,12 @@ def configuration_identity(argv: list[str], environment: dict[str, str], environ
     source, scope = "cli_and_controlled_environment", "argv_and_allowlisted_environment"
     digest = hashlib.sha256(canonical({"source": source, "scope": scope, "argv": argv,
         "environment": inputs, "config_file": file_identity, "excluded_inputs": sorted(excluded)})).hexdigest()
-    return {"source": source, "scope": scope, "sha256": digest, "argument_count": len(argv),
+    # Bind public projections to this exact original exec argument array,
+    # without exposing private config paths/values or changing its compound hash.
+    return {"source": source, "scope": scope, "sha256": digest,
+            "argv_sha256": hashlib.sha256(canonical(argv)).hexdigest(),
+            "startup_policy_flags": [arg for arg in argv if arg in {
+                "--prefer-direct", "--prefer-relay", "--relay-only"}], "argument_count": len(argv),
             "environment_keys": keys, "config_file": file_identity, "excluded_inputs": sorted(excluded)}
 
 
@@ -171,12 +176,24 @@ def role_component(role: str) -> str:
 
 def validate_configuration(value: object) -> None:
     keys = {"source", "scope", "sha256", "argument_count", "environment_keys", "config_file", "excluded_inputs"}
-    if (not isinstance(value, dict) or set(value) != keys
+    # Old non-policy launch evidence remains readable. New strict policy
+    # collectors separately require the original exec argv digest.
+    if (not isinstance(value, dict) or not keys <= set(value)
+            or set(value) - keys - {"argv_sha256", "startup_policy_flags"}
             or value["source"] != "cli_and_controlled_environment"
             or value["scope"] != "argv_and_allowlisted_environment"
             or not isinstance(value["sha256"], str) or not SHA256.fullmatch(value["sha256"])
             or type(value["argument_count"]) is not int or not 0 <= value["argument_count"] <= 256):
         raise ValueError("launch_configuration_identity_invalid")
+    if ("argv_sha256" in value and (not isinstance(value["argv_sha256"], str)
+                                   or not SHA256.fullmatch(value["argv_sha256"]))):
+        raise ValueError("launch_configuration_argv_identity_invalid")
+    if "startup_policy_flags" in value:
+        flags = value["startup_policy_flags"]
+        if (not isinstance(flags, list) or len(flags) > value["argument_count"]
+                or not all(isinstance(flag, str) and flag in {
+                    "--prefer-direct", "--prefer-relay", "--relay-only"} for flag in flags)):
+            raise ValueError("launch_configuration_policy_identity_invalid")
     names, excluded = value["environment_keys"], value["excluded_inputs"]
     if (not isinstance(names, list) or len(names) > 64
             or not all(isinstance(name, str) and re.fullmatch(r"[A-Z][A-Z0-9_]{0,127}", name) for name in names)

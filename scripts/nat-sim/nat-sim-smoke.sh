@@ -24,6 +24,12 @@ source "$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)/scripts/diagnostics-
 
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 source "$ROOT_DIR/scripts/nat-sim/baseline_gate.sh"
+# Explicit calibration input uses the existing product CLI. Resolve it before
+# reserving ports or starting any owned process; an unset input keeps legacy
+# harness semantics, including PREFER_RELAY=1 meaning --relay-only.
+STARTUP_POLICY=${STARTUP_POLICY:-}
+STARTUP_POLICY_FLAG=$(python3 "$ROOT_DIR/scripts/nat-sim/run-startup-policy-matrix.py" \
+  --daemon-flag "$STARTUP_POLICY" --legacy-prefer-relay "${PREFER_RELAY:-0}")
 # The standalone local control DB provisions only `default`; the real dual-end
 # harness uses NETWORK_ID explicitly and requires a provisioned test network.
 NETWORK_ID=${NETWORK_ID:-default}
@@ -1540,7 +1546,7 @@ for round in $(seq 1 "$ROUNDS"); do
   if [[ "$PREDICTED_CANDIDATES" == "0" ]]; then TRAVERSAL_FLAGS="$TRAVERSAL_FLAGS --disable-predicted-candidates"; fi
   if [[ "$BIRTHDAY_PROBING" == "0" ]]; then TRAVERSAL_FLAGS="$TRAVERSAL_FLAGS --disable-birthday-probing"; fi
   if [[ -n "$SOCKET_POOL" ]]; then TRAVERSAL_FLAGS="$TRAVERSAL_FLAGS --socket-pool $SOCKET_POOL"; fi
-  if [[ "${PREFER_RELAY:-0}" == "1" ]]; then TRAVERSAL_FLAGS="$TRAVERSAL_FLAGS --relay-only"; fi
+  if [[ -n "$STARTUP_POLICY_FLAG" ]]; then TRAVERSAL_FLAGS="$TRAVERSAL_FLAGS $STARTUP_POLICY_FLAG"; fi
   if [[ "$MODE" == "hard-hard" ]]; then
     # This independent entry isolates the existing planner-authorized
     # Hard<->Hard worker from the ordinary offer/punch lane. It does not force
@@ -1583,20 +1589,19 @@ for round in $(seq 1 "$ROUNDS"); do
   if (( PREPARE_DELAY_A_MS > 0 )); then
     python3 -c 'import sys,time; time.sleep(int(sys.argv[1]) / 1000)' "$PREPARE_DELAY_A_MS"
   fi
+  NODE_A_ARGS=(--config "$NODE_A_RUNTIME/config.json"
+    --control "http://127.0.0.1:$PORT" --network "$NETWORK_ID" --token-stdin
+    --device-name node-a --udp-bind 127.0.0.1:0 --stun "$STUN_A"
+    --fresh-mapping-harness-loopback --no-host-candidates
+    --diagnostics-bind 127.0.0.1:$DIAG_A_PORT --heartbeat-interval 5
+    $TRAVERSAL_FLAGS "${OVERLAY_FLAGS[@]}")
+  if [[ -n "$STARTUP_POLICY" ]]; then
+    python3 "$ROOT_DIR/scripts/nat-sim/run-startup-policy-matrix.py" \
+      --record-policy-input "$ROUND_DIR/node-a.startup-policy.json" \
+      --startup-policy "$STARTUP_POLICY" --role node-a -- "${NODE_A_ARGS[@]}"
+  fi
   printf '%s\n' "$TOKEN" | P2WLAN_DISABLE_TUN=1 P2WLAN_TEST_RUN_ID="$ROUND_RUN_ID" P2WLAN_EXPERIMENT_BASELINE_SHA="$EXPERIMENT_BASELINE_SHA" P2WLAN_EXPERIMENT_VARIANT="$EXPERIMENT_VARIANT" P2WLAN_EXPERIMENT_SCENARIO="$EXPERIMENT_SCENARIO" P2WLAN_EXPERIMENT_SEED="$NAT_SEED" P2WLAN_EXPERIMENT_SIGNAL_DELAY_MS="$SIGNAL_DELAY_A_MS" RUST_LOG="$NAT_SIM_RUST_LOG" "${DAEMON_A_CMD[@]}" \
-    --config "$NODE_A_RUNTIME/config.json" \
-    --control "http://127.0.0.1:$PORT" \
-    --network "$NETWORK_ID" \
-    --token-stdin \
-    --device-name node-a \
-    --udp-bind 127.0.0.1:0 \
-    --stun "$STUN_A" \
-    --fresh-mapping-harness-loopback \
-    --no-host-candidates \
-    --diagnostics-bind 127.0.0.1:$DIAG_A_PORT \
-    --heartbeat-interval 5 \
-    $TRAVERSAL_FLAGS \
-    "${OVERLAY_FLAGS[@]}" \
+    "${NODE_A_ARGS[@]}" \
     >"$ROUND_DIR/node-a.log" 2>&1 &
   NODE_A_PID=$!
   round_register_process node-a "$NODE_A_PID"
@@ -1615,20 +1620,19 @@ for round in $(seq 1 "$ROUNDS"); do
   if (( PREPARE_DELAY_B_MS > 0 )); then
     python3 -c 'import sys,time; time.sleep(int(sys.argv[1]) / 1000)' "$PREPARE_DELAY_B_MS"
   fi
+  NODE_B_ARGS=(--config "$NODE_B_RUNTIME/config.json"
+    --control "http://127.0.0.1:$PORT" --network "$NETWORK_ID" --token-stdin
+    --device-name node-b --udp-bind 127.0.0.1:0 --stun "$STUN_B"
+    --fresh-mapping-harness-loopback --no-host-candidates
+    --diagnostics-bind 127.0.0.1:$DIAG_B_PORT --heartbeat-interval 5
+    $TRAVERSAL_FLAGS "${OVERLAY_FLAGS[@]}")
+  if [[ -n "$STARTUP_POLICY" ]]; then
+    python3 "$ROOT_DIR/scripts/nat-sim/run-startup-policy-matrix.py" \
+      --record-policy-input "$ROUND_DIR/node-b.startup-policy.json" \
+      --startup-policy "$STARTUP_POLICY" --role node-b -- "${NODE_B_ARGS[@]}"
+  fi
   printf '%s\n' "$TOKEN" | P2WLAN_DISABLE_TUN=1 P2WLAN_TEST_RUN_ID="$ROUND_RUN_ID" P2WLAN_EXPERIMENT_BASELINE_SHA="$EXPERIMENT_BASELINE_SHA" P2WLAN_EXPERIMENT_VARIANT="$EXPERIMENT_VARIANT" P2WLAN_EXPERIMENT_SCENARIO="$EXPERIMENT_SCENARIO" P2WLAN_EXPERIMENT_SEED="$NAT_SEED" P2WLAN_EXPERIMENT_SIGNAL_DELAY_MS="$SIGNAL_DELAY_B_MS" RUST_LOG="$NAT_SIM_RUST_LOG" "${DAEMON_B_CMD[@]}" \
-    --config "$NODE_B_RUNTIME/config.json" \
-    --control "http://127.0.0.1:$PORT" \
-    --network "$NETWORK_ID" \
-    --token-stdin \
-    --device-name node-b \
-    --udp-bind 127.0.0.1:0 \
-    --stun "$STUN_B" \
-    --fresh-mapping-harness-loopback \
-    --no-host-candidates \
-    --diagnostics-bind 127.0.0.1:$DIAG_B_PORT \
-    --heartbeat-interval 5 \
-    $TRAVERSAL_FLAGS \
-    "${OVERLAY_FLAGS[@]}" \
+    "${NODE_B_ARGS[@]}" \
     >"$ROUND_DIR/node-b.log" 2>&1 &
   NODE_B_PID=$!
   round_register_process node-b "$NODE_B_PID"

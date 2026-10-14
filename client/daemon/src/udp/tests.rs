@@ -15,6 +15,9 @@ include!("tests/keepalive_shadow.rs");
 #[path = "tests/keepalive_idle.rs"]
 mod keepalive_idle;
 
+#[path = "tests/keepalive_business.rs"]
+mod keepalive_business;
+
 #[path = "tests/candidate_cleanup_scope.rs"]
 mod candidate_cleanup_scope;
 

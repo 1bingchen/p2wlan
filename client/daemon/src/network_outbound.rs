@@ -293,6 +293,8 @@ pub(crate) const REASON_DIRECT_BUSINESS_MALFORMED: &str = "direct_business_malfo
 
 pub(crate) const REASON_IPV6_BUDGET_BELOW_MINIMUM_MTU: &str = "ipv6_budget_below_minimum_mtu";
 
+pub(crate) const REASON_ORIGINAL_ECHO_SOURCE_CONTENDED: &str = "original_echo_source_contended";
+
 /// Outcome of handing one business packet to the network.
 enum SendOutcome {
     /// The packet was handed to the selected transport.
@@ -437,6 +439,9 @@ use physical_attempt::PhysicalAttempt;
 
 #[cfg(test)]
 mod test_support;
+
+#[cfg(test)]
+pub(crate) use queue::echo_queue_test_support::OriginalEchoQueueForTest;
 
 /// Test entry into the original bounded sender, using genuine carriage input.
 #[cfg(test)]

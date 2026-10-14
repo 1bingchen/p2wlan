@@ -556,6 +556,10 @@ pub(crate) async fn run_network_outbound_with_request_carriage(
     );
 }
 
+#[cfg(test)]
+#[path = "queue/echo_queue_test_support.rs"]
+pub(super) mod echo_queue_test_support;
+
 /// Deterministic actor scheduling only for the admission contention tests.
 /// The seed is transferred once into the existing actor-owned FIFO; it is
 /// never a second live queue and is absent from production builds.

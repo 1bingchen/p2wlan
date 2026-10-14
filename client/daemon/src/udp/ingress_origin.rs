@@ -91,6 +91,7 @@ pub(crate) struct DirectOriginPublicationGuard<'a> {
 impl UdpTransport {
     /// Sourced echo uses the original receiving socket and one publication
     /// guard for both RX validation and TX. Caller holds emit, epoch and slot.
+    #[allow(clippy::too_many_arguments)] // Retain original fences plus one copied local qualifier.
     pub(crate) fn try_send_original_echo_on_receive_socket(
         &self,
         read: &OriginalUdpIngressSource,
@@ -98,6 +99,7 @@ impl UdpTransport {
         prepared: Option<&super::PreparedDirectBusinessSend>,
         packet: &crate::transport::EncryptedPeerPacket,
         endpoint: std::net::SocketAddr,
+        verified_local: Option<std::net::SocketAddr>,
         session: &crate::transport::OriginalEchoSessionGuard<'_>,
     ) -> Result<usize, super::DirectBusinessUdpSendError> {
         use super::DirectBusinessUdpSendError as Error;
@@ -131,6 +133,9 @@ impl UdpTransport {
                 .get(read.socket_index)
                 .ok_or(Error::StaleToken)?
         };
+        if verified_local.is_some_and(|local| socket.local_addr().ok() != Some(local)) {
+            return Err(Error::StaleToken);
+        }
         match prepared {
             Some(prepared) => {
                 if !Arc::ptr_eq(socket, &prepared.socket)

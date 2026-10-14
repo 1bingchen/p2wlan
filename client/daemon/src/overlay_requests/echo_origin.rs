@@ -193,15 +193,22 @@ impl OriginalEchoPrewrite {
             .source
             .original_udp_read()
             .ok_or(Error::StaleToken)?;
-        if self.input.source.source() != Some(endpoint) {
-            return Err(Error::StaleToken);
-        }
+        let source = self.input.source.source().ok_or(Error::StaleToken)?;
+        let verified_local = if source == endpoint {
+            None // Preserve the existing equal-source compatibility scope.
+        } else {
+            Some(
+                peer.verified_direct_return_local(&self.input, endpoint)
+                    .ok_or(Error::StaleToken)?,
+            )
+        };
         udp.try_send_original_echo_on_receive_socket(
             read,
             self.input.generation,
             prepared,
             packet,
             endpoint,
+            verified_local,
             &peer.session,
         )
     }
@@ -242,7 +249,7 @@ impl OriginalEchoPrewrite {
         let (Some(read), Some(original_id), Some(endpoint)) = (
             self.input.source.original_relay_read(),
             self.input.source.relay_connection_id(),
-            self.input.source.relay_endpoint(),
+            self.input.source.relay_reader_endpoint(),
         ) else {
             return false;
         };

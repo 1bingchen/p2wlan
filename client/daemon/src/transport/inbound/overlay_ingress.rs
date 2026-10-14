@@ -102,8 +102,18 @@ impl OriginalOverlayIngressSource {
         self.envelope.network_generation
     }
 
+    /// The original outer selected transport endpoint, not an auxiliary reader.
     pub(crate) fn relay_endpoint(&self) -> Option<&str> {
         self.envelope.relay_endpoint.as_deref()
+    }
+
+    /// The original native reader's requested endpoint. No current route,
+    /// outer slot or replacement client can supply this historical metadata.
+    pub(crate) fn relay_reader_endpoint(&self) -> Option<&str> {
+        self.envelope
+            .original_relay_read
+            .as_ref()
+            .map(|read| read.requested_endpoint())
     }
 
     pub(crate) fn relay_connection_id(&self) -> Option<u64> {

@@ -37,7 +37,7 @@ pub(super) fn start_original_schedulers(
     let validation_udp = udp.clone();
     let validation_peers = peers.clone();
     let validation_wg = wireguard.clone();
-    owners.spawn_graceful(
+    owners.spawn_managed_graceful(
         "original validation scheduler and joined children",
         async move {
             crate::run_original_validation_scheduler_until_joined_for_test(
@@ -53,7 +53,7 @@ pub(super) fn start_original_schedulers(
     );
     let (stop, stopped) = watch::channel(false);
     owners.readers_stop.push(stop);
-    owners.spawn_graceful("original DPL scheduler and joined children", async move {
+    owners.spawn_managed_graceful("original DPL scheduler and joined children", async move {
         crate::run_dplpmtud_scheduler_until_cancelled(udp, peers, wireguard, stopped).await;
         Ok(())
     });

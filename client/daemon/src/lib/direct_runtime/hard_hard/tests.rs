@@ -4,6 +4,8 @@ mod hard_hard_tests {
     use tracing::instrument::WithSubscriber;
     use tracing_subscriber::prelude::*;
 
+    include!("tests/terminal_publication_contention.rs");
+
     #[test]
     fn hard_hard_payload_expiry_is_reported_as_stale_not_unpredictable() {
         let public_ip = "198.51.100.10".parse().unwrap();

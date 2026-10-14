@@ -56,9 +56,13 @@ impl RelayClient {
         node_id: &str,
         config: RelayClientConfig,
     ) -> Result<(Self, mpsc::Receiver<OriginalRelayDelivery>)> {
-        let (client, rx) =
-            Self::connect_config_with_read_options(addr, node_id, config, ReadOptions::original())
-                .await?;
+        let (client, rx) = Self::connect_config_with_read_options(
+            addr,
+            node_id,
+            config,
+            ReadOptions::original(addr),
+        )
+        .await?;
         Ok((client, rx.into_original()?))
     }
 
@@ -74,7 +78,7 @@ impl RelayClient {
             addr,
             node_id,
             config,
-            ReadOptions::with_witness(witness),
+            ReadOptions::with_witness(addr, witness),
         )
         .await?;
         Ok((client, rx.into_original()?))
@@ -142,7 +146,7 @@ impl RelayClient {
             endpoint,
             node_id,
             config,
-            ReadOptions::original(),
+            ReadOptions::original(endpoint),
         )
         .await?;
         Ok((client, rx.into_original()?))
@@ -160,7 +164,7 @@ impl RelayClient {
             endpoint,
             node_id,
             config,
-            ReadOptions::with_witness(witness),
+            ReadOptions::with_witness(endpoint, witness),
         )
         .await?;
         Ok((client, rx.into_original()?))

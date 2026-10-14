@@ -230,6 +230,9 @@ class RoundFinalizationRegressions(unittest.TestCase):
         self.assertEqual(value["collector"]["result"], "unknown")
         self.assertFalse(promoted_before_finish,
                          "B01_CUTOFF_COLLECTOR_CANONICAL: unknown cutoff output must remain staged")
+        terminal = self.read(fixture, "nat-evidence.json")
+        self.assertIsNone(terminal["collector_public_observations"])
+        self.assertFalse((fixture.round_dir / "collector-nat-evidence.json").exists())
 
     def test_early_collector_promotes_only_completed_output(self):
         fixture = self.fixture()
@@ -250,6 +253,20 @@ class RoundFinalizationRegressions(unittest.TestCase):
         self.assertEqual((json.loads(canonical_bytes), receipt["outputs"]),
                          (expected, [{"name": "nat-evidence.json", "captured_sha256": digest}]),
                          "B01_EARLY_COLLECTOR_PROMOTION: a completed bounded collector retains its output")
+        terminal = self.read(fixture, "nat-evidence.json")
+        hidden = fixture.round_dir / ".collector-nat-evidence.json"
+        public = fixture.round_dir / "collector-nat-evidence.json"
+        self.assertEqual(json.loads(public.read_bytes()), expected)
+        self.assertEqual(hidden.read_bytes(), public.read_bytes())
+        self.assertEqual(public.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(terminal["collector_public_observations"], {
+            "reference": public.name,
+            "sha256": hashlib.sha256(public.read_bytes()).hexdigest(),
+            "used_as_terminal": False,
+        })
+        self.assertEqual(terminal["result"], "fail")
+        self.assertIsNone(terminal["nat_terminal"])
+        self.assertEqual(terminal["decision"]["reason_code"], "harness:baseline_status_not_available")
 
     def test_explicit_round_init_before_first_spawn_tracks_all_actual_waits(self):
         fixture = self.fixture(explicit_init=True)

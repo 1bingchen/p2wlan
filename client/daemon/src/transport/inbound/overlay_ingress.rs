@@ -37,6 +37,7 @@ impl From<OverlayIngressEvent> for OverlayIngressDelivery {
     }
 }
 
+#[cfg_attr(test, derive(Clone))]
 pub(super) struct EncryptedOverlayOrigin {
     network_generation: Option<u64>,
     relay_endpoint: Option<String>,
@@ -48,6 +49,8 @@ pub(super) struct EncryptedOverlayOrigin {
     socket_index: Option<usize>,
     received_at: Option<Instant>,
     queue_send_started: Option<Instant>,
+    original_relay_read: Option<p2pnet_relay::OriginalRelayFrameRead>,
+    original_udp_read: Option<crate::udp::OriginalUdpIngressSource>,
 }
 
 impl EncryptedOverlayOrigin {
@@ -63,6 +66,8 @@ impl EncryptedOverlayOrigin {
             socket_index: packet.socket_index,
             received_at: packet.udp_received,
             queue_send_started: packet.transport_queue_send_started,
+            original_relay_read: packet.original_relay_read.clone(),
+            original_udp_read: packet.original_udp_read.clone(),
         }
     }
 
@@ -78,12 +83,15 @@ impl EncryptedOverlayOrigin {
 }
 
 /// Original observations only; no current-owner or once-credit qualification.
+// Tests retain the same immutable original observation across rejected/fresh
+// final calls. Clone preserves roles/times/Weak identities and mints no fact.
+#[cfg_attr(test, derive(Clone))]
 pub(crate) struct OriginalOverlayIngressSource {
     session: OriginalSessionSource,
     envelope: EncryptedOverlayOrigin,
 }
 
-// S2 exposes immutable metadata; the production final-authority consumer is S3.
+// Immutable metadata is qualified separately by the original final owner.
 #[allow(dead_code)]
 impl OriginalOverlayIngressSource {
     pub(crate) fn session(&self) -> &OriginalSessionSource {
@@ -94,8 +102,18 @@ impl OriginalOverlayIngressSource {
         self.envelope.network_generation
     }
 
+    /// The original outer selected transport endpoint, not an auxiliary reader.
     pub(crate) fn relay_endpoint(&self) -> Option<&str> {
         self.envelope.relay_endpoint.as_deref()
+    }
+
+    /// The original native reader's requested endpoint. No current route,
+    /// outer slot or replacement client can supply this historical metadata.
+    pub(crate) fn relay_reader_endpoint(&self) -> Option<&str> {
+        self.envelope
+            .original_relay_read
+            .as_ref()
+            .map(|read| read.requested_endpoint())
     }
 
     pub(crate) fn relay_connection_id(&self) -> Option<u64> {
@@ -128,5 +146,13 @@ impl OriginalOverlayIngressSource {
 
     pub(crate) fn queue_send_started(&self) -> Option<Instant> {
         self.envelope.queue_send_started
+    }
+
+    pub(crate) fn original_udp_read(&self) -> Option<&crate::udp::OriginalUdpIngressSource> {
+        self.envelope.original_udp_read.as_ref()
+    }
+
+    pub(crate) fn original_relay_read(&self) -> Option<&p2pnet_relay::OriginalRelayFrameRead> {
+        self.envelope.original_relay_read.as_ref()
     }
 }

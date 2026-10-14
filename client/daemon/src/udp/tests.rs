@@ -144,3 +144,6 @@ mod resource_capture;
 
 #[path = "tests/resource_capture_tx.rs"]
 mod resource_capture_tx;
+
+#[path = "tests/direct_origin.rs"]
+mod direct_origin;

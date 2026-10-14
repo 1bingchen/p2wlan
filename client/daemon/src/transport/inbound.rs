@@ -4,7 +4,10 @@ use crate::transport::wire::wire_receiver_index;
 
 mod overlay_ingress;
 use overlay_ingress::EncryptedOverlayOrigin;
-pub(crate) use overlay_ingress::OverlayIngressDelivery;
+pub(crate) use overlay_ingress::{OriginalOverlayIngressSource, OverlayIngressDelivery};
+
+#[cfg(test)]
+mod original_ack_observer;
 
 impl WireGuardTransport {
     /// Consume encrypted network packets, decrypt them, and emit raw inbound IP packets.
@@ -156,6 +159,8 @@ impl WireGuardTransport {
                 })) => {
                     let overlay_source =
                         overlay_origin.map(|origin| origin.authenticated(original_session_source));
+                    #[cfg(test)]
+                    let mut overlay_source = overlay_source;
                     let decrypt_completed = Instant::now();
                     if let Some(capture) = self.rx_business_capture.as_ref() {
                         let wire = match (
@@ -1341,6 +1346,19 @@ impl WireGuardTransport {
                                 drop(session_guard);
                             }
                         }
+                    }
+                    #[cfg(test)]
+                    if inbound.from_previous_session
+                        && is_overlay_payload_candidate(&inbound.packet)
+                    {
+                        self.observe_previous_overlay_for_test(
+                            &inbound,
+                            relay_endpoint.as_deref(),
+                            owns_direct_packet,
+                            source,
+                            packet_network_generation,
+                            overlay_source.take(),
+                        );
                     }
                     // Forward a decrypted overlay candidate to the independent
                     // overlay validation harness WITH its real ingress (derived

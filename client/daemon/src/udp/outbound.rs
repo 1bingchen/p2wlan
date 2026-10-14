@@ -1881,6 +1881,7 @@ impl UdpTransport {
                         started,
                         Some(publication_owner),
                         UdpSendFence::LanPublication,
+                        None,
                     );
                 }
                 result
@@ -1975,6 +1976,7 @@ impl UdpTransport {
                     started,
                     None,
                     UdpSendFence::LegacyUnknown,
+                    None,
                 );
             }
             result

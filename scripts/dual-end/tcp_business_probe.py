@@ -138,12 +138,12 @@ def run_probe(config: Config, supplied_socket: socket.socket | None = None) -> d
             record.update(status="pending", sent_offset_ns=sent - started, reason="awaiting_echo")
             try:
                 write_frame(sock, encode(config, record["sequence"], record["request_nonce"], REQUEST), deadline)
-            except TimeoutError:
-                record.update(status="timeout", reason="response_deadline")
+            except TimeoutError as error:
+                record.update(status="timeout", reason="response_deadline", errno=error.errno)
                 termination = "stream_deadline"
                 break
-            except OSError:
-                record.update(status="send_error", reason="tcp_send_failed")
+            except OSError as error:
+                record.update(status="send_error", reason="tcp_send_failed", errno=error.errno)
                 termination = "stream_failed"
                 break
             try:
@@ -163,18 +163,22 @@ def run_probe(config: Config, supplied_socket: socket.socket | None = None) -> d
                 else:
                     termination = "receive_budget_exhausted"
                     break
-            except TimeoutError:
-                record.update(status="timeout", reason="response_deadline")
+            except TimeoutError as error:
+                record.update(status="timeout", reason="response_deadline", errno=error.errno)
                 termination = "stream_deadline"
                 break
-            except (OSError, EOFError, ValueError):
+            except (OSError, EOFError, ValueError) as error:
+                if isinstance(error, OSError):
+                    record["errno"] = error.errno
                 termination = "stream_failed"
                 break
     except KeyboardInterrupt:
         termination = "interrupted"
-    except TimeoutError:
+    except TimeoutError as error:
+        report["socket_error_errno"] = error.errno
         termination = "connect_deadline"
-    except OSError:
+    except OSError as error:
+        report["socket_error_errno"] = error.errno
         termination = "bind_failed" if sock is None else "connect_failed"
     finally:
         elapsed = time.monotonic_ns() - started
@@ -231,11 +235,14 @@ def run_echo(config: Config, supplied_listener: socket.socket | None = None,
                     break
             else:
                 termination = "receive_budget_exhausted"
-    except TimeoutError:
+    except TimeoutError as error:
+        report["socket_error_errno"] = error.errno
         termination = "duration_deadline"
     except KeyboardInterrupt:
         termination = "interrupted"
-    except (OSError, EOFError, ValueError):
+    except (OSError, EOFError, ValueError) as error:
+        if isinstance(error, OSError):
+            report["socket_error_errno"] = error.errno
         termination = "bind_failed" if listener is None else "stream_failed"
     finally:
         if connection is not None:
@@ -252,6 +259,8 @@ def validate_probe(report: dict) -> list[dict]:
     attempts = report.get("connection_attempts")
     if report.get("evidence") != UNVERIFIED or type(attempts) is not int or attempts not in (0, 1):
         raise ValueError("TCP report changed missing evidence or retried connection")
+    if report.get("socket_error_errno") is not None and type(report["socket_error_errno"]) is not int:
+        raise ValueError("TCP socket errno must be a numeric observation or null")
     c = report["configuration"]
     config = Config((c["bind_ip"], c["bind_port"]), (c["target_ip"], c["target_port"]),
                     report["run_nonce"], report["round_nonce"], c["count"], c["interval_ms"],
@@ -265,6 +274,8 @@ def validate_probe(report: dict) -> list[dict]:
         raise ValueError("TCP report credits requests without an actual connect attempt")
     nonces = set()
     for i, record in enumerate(records):
+        if record.get("errno") is not None and type(record["errno"]) is not int:
+            raise ValueError("TCP request errno must be a numeric observation or null")
         nonce = record["request_nonce"]
         if len(nonce) != 32 or any(x not in "0123456789abcdef" for x in nonce) or nonce in nonces:
             raise ValueError("invalid or duplicated TCP request nonce")

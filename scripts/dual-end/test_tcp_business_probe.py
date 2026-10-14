@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Real local TCP controls; no kernel TUN or remote-device claim."""
 import copy
+import errno
 import socket
 import struct
 import threading
@@ -76,6 +77,7 @@ class TcpControls(unittest.TestCase):
             client.close()
         self.assertEqual([r["status"] for r in tool.validate_probe(report)], ["not_sent"] * 3)
         self.assertEqual(report["termination_reason"], "connect_failed")
+        self.assertEqual(report["socket_error_errno"], errno.ECONNREFUSED)
         self.assertEqual(report["connection_attempts"], 1)
 
     def test_actual_bind_failure_does_not_invent_a_connect_attempt(self):
@@ -86,6 +88,7 @@ class TcpControls(unittest.TestCase):
             occupied.close()
             listener.close()
         self.assertEqual(report["termination_reason"], "bind_failed")
+        self.assertEqual(report["socket_error_errno"], errno.EADDRINUSE)
         self.assertEqual(report["connection_attempts"], 0)
         self.assertEqual([r["status"] for r in tool.validate_probe(report)], ["not_sent"] * probe.count)
 
@@ -97,6 +100,7 @@ class TcpControls(unittest.TestCase):
             client.close()
             occupied.close()
         self.assertEqual(report["termination_reason"], "bind_failed")
+        self.assertEqual(report["socket_error_errno"], errno.EADDRINUSE)
         self.assertEqual(report["accepted_connections"], 0)
         self.assertNotIn("connection_attempts", report)
         self.assertEqual((report["send_errors"], report["responses_sent"]), (0, 0))
@@ -155,11 +159,28 @@ class TcpControls(unittest.TestCase):
             client.close()
         for mutate in (lambda r: r["evidence"].update(real_tun_verified=True),
                        lambda r: r["requests"].pop(),
-                       lambda r: r.update(connection_attempts=2)):
+                       lambda r: r.update(connection_attempts=2),
+                       lambda r: r.update(socket_error_errno="ECONNREFUSED"),
+                       lambda r: r["requests"][0].update(errno=True)):
             invalid = copy.deepcopy(report)
             mutate(invalid)
             with self.assertRaises(ValueError):
                 tool.validate_probe(invalid)
+
+    def test_legacy_errno_absence_and_unknown_null_remain_valid(self):
+        client, listener, probe, _ = self.fixture()
+        listener.close()
+        try:
+            report = tool.run_probe(probe, client)
+        finally:
+            client.close()
+        legacy = copy.deepcopy(report)
+        legacy.pop("socket_error_errno")
+        tool.validate_probe(legacy)
+        unknown = copy.deepcopy(legacy)
+        unknown["socket_error_errno"] = None
+        unknown["requests"][0]["errno"] = None
+        tool.validate_probe(unknown)
 
 
 if __name__ == "__main__":

@@ -589,10 +589,11 @@ pub(super) async fn encrypt_then_send_with_deadline(
             reason_code: REASON_DIRECT_BUDGET_STALE,
             reason,
         },
-        SendOutcome::RetryableLocalBackpressure { reason } => {
+        SendOutcome::RetryableLocalBackpressure { reason, socket } => {
             EncryptSendOutcome::RetryableLocalBackpressure {
                 packet: retry_packet,
                 reason,
+                socket,
             }
         }
         SendOutcome::LocalMtuFailure {
@@ -1012,6 +1013,7 @@ async fn send_encrypted_packet_once_with_origin(
                 Err(DirectBusinessUdpSendError::WouldBlock) => {
                     SendOutcome::RetryableLocalBackpressure {
                         reason: "exact UDP socket would block before handoff".to_string(),
+                        socket: Some(plan.prepared.socket.clone()),
                     }
                 }
                 Err(DirectBusinessUdpSendError::LocalPacketTooLarge) => {
@@ -1075,6 +1077,7 @@ async fn send_encrypted_packet_once_with_origin(
                 Err(DirectBusinessUdpSendError::WouldBlock) => {
                     SendOutcome::RetryableLocalBackpressure {
                         reason: "original echo receive/send publication contended".into(),
+                        socket: None,
                     }
                 }
                 Err(DirectBusinessUdpSendError::StaleToken) => SendOutcome::DirectBudgetStale {

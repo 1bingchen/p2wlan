@@ -828,6 +828,8 @@ pub(super) async fn flush_one_peer_until_stopped(
         stopping,
     };
     let mut flushed = 0usize;
+    let mut writable_retries = 0usize;
+    let mut writable_retry_deadline = None;
     while flushed < MAX_FLUSH_PER_PEER_PER_TICK && !queue.queue.is_empty() {
         let generation = peers.current_network_generation_sync();
         let expired = queue
@@ -984,7 +986,11 @@ pub(super) async fn flush_one_peer_until_stopped(
                 .await;
                 break;
             }
-            EncryptSendOutcome::RetryableLocalBackpressure { packet, reason } => {
+            EncryptSendOutcome::RetryableLocalBackpressure {
+                packet,
+                reason,
+                socket,
+            } => {
                 let next_backpressure_retries = local_backpressure_retries.saturating_add(1);
                 record_retry_and_repark(
                     &transport,
@@ -1005,10 +1011,36 @@ pub(super) async fn flush_one_peer_until_stopped(
                     Some("direct"),
                     Some(REASON_DIRECT_LOCAL_BACKPRESSURE),
                     Some(format!(
-                        "peer={peer_id} direct_budget_reroutes={direct_budget_reroutes} local_backpressure_retries={next_backpressure_retries} retry_after_ms={}",
+                        "peer={peer_id} direct_budget_reroutes={direct_budget_reroutes} local_backpressure_retries={next_backpressure_retries} retry_after_ms={} writable_retries={writable_retries}",
                         OUTBOUND_RETRY_DELAY.as_millis(),
                     )),
                 );
+                if let Some(socket) =
+                    socket.filter(|_| writable_retries < MAX_DIRECT_WRITABLE_RETRIES_PER_FLUSH)
+                {
+                    // Only the exact socket's readiness escapes the send
+                    // operation: ciphertext, emit/epoch guards and the old
+                    // budget token are already gone. Wake promptly instead
+                    // of rounding a brief WouldBlock up to a maintenance tick.
+                    // False positives share one bounded window and cannot
+                    // restart this FIFO's original delivery deadline.
+                    let retry_deadline = *writable_retry_deadline
+                        .get_or_insert_with(|| Instant::now() + OUTBOUND_RETRY_DELAY);
+                    let wait = queue
+                        .delivery_deadline
+                        .unwrap_or(retry_deadline)
+                        .min(retry_deadline)
+                        .saturating_duration_since(Instant::now());
+                    if !wait.is_zero()
+                        && matches!(timeout(wait, socket.writable()).await, Ok(Ok(())))
+                    {
+                        writable_retries += 1;
+                        queue.retry_after = None;
+                        // Start again from plaintext, revalidating generation,
+                        // path and budget and allocating a fresh counter.
+                        continue;
+                    }
+                }
                 break;
             }
             EncryptSendOutcome::Terminal {
@@ -1016,6 +1048,16 @@ pub(super) async fn flush_one_peer_until_stopped(
                 reason_code,
                 reason,
             } => {
+                // The head is outside the FIFO while preparation rechecks
+                // the original deadline. Keep its previous WouldBlock cause
+                // when that deadline expires inside the send attempt too.
+                let reason_code = if reason_code == REASON_OUTBOUND_DELIVERY_DEADLINE
+                    && local_backpressure_retries > 0
+                {
+                    REASON_DIRECT_LOCAL_BACKPRESSURE_DEADLINE
+                } else {
+                    reason_code
+                };
                 record_pending_residence(pending_residence, "tx_pending_residence_dropped_us");
                 record_terminal_drop(
                     &transport,
@@ -1356,6 +1398,10 @@ pub(super) async fn maintenance(
 #[cfg(test)]
 #[path = "tests/queue.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "tests/backpressure.rs"]
+mod backpressure_tests;
 
 #[cfg(test)]
 #[path = "tests/profiling.rs"]

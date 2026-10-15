@@ -698,6 +698,12 @@ async fn r00_same_outer_common_client_replacement_rejects_old_ack_then_new_reque
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn c01_original_network_hint_rebinds_and_rejects_old_ack_then_two_current_requests_are_fresh(
+) -> Result<(), String> {
+    fixture::exercise_network_change().await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pr212_actual_request_on_other_socket_returns_on_verified_direct_and_native_once(
 ) -> Result<(), String> {
     fixture::exercise_asymmetric_receive_socket().await

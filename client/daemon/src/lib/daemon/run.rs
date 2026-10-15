@@ -551,6 +551,8 @@ impl Daemon {
             shutdown_rx: self.shutdown_rx.clone(),
             android_network_change_rx: self.android_network_change_direct_rx.clone(),
             android_network_change_observed: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            #[cfg(test)]
+            original_owners_for_test: None,
         };
         self.task_manager
             .spawn_result("udp-direct", false, run_udp_direct_task(udp_direct_context))

@@ -202,6 +202,10 @@ jobs:
 
   existing_required_gates:
     name: Business MTU external required gates
+    needs:
+      - linux_validation
+      - production_e2e
+      - windows_validation
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 70

@@ -134,6 +134,10 @@ impl ResidencyLedger {
         if self.writers.fetch_add(1, Ordering::SeqCst) == u64::MAX {
             self.gap(RecordDisposition::CounterOverflow);
         }
+        // Publish writer entry through any following sampled atomic field.
+        // Reading a changed relaxed field then crossing the reader's Acquire
+        // fence makes this entry happen-before its final validation loads.
+        std::sync::atomic::fence(Ordering::Release);
         let old = previous.map_or(ResidencyTotals::default(), |(_, v)| v);
         let new = next.map_or(ResidencyTotals::default(), |(_, v)| v);
         match (previous, next) {

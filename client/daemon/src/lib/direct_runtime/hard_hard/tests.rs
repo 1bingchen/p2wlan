@@ -20,6 +20,7 @@ mod hard_hard_tests {
             first_punch_sent_at_ms: 0,
             last_punch_sent_at_ms: 0,
             measurement: crate::udp::HardHardMeasurementStats::default(),
+            ordinary_probe_summary: None,
         };
         let expires_at = 100 + crate::udp::FRESH_MAPPING_MODEL_MAX_AGE.as_millis() as u64;
         assert!(hard_hard_prediction_payload_at(&result, 10, expires_at).is_ok());

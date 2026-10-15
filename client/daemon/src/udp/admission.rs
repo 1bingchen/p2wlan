@@ -956,6 +956,66 @@ impl UdpTransport {
         require_exact_dynamic_owner: bool,
         live_recorder: Option<BirthdayLiveRecorder>,
     ) -> std::result::Result<ProbeSendResult, ProbeSendFailure> {
+        self.send_probe_on_socket_classified_observed(
+            socket_index,
+            socket,
+            peer_id,
+            peer_addr,
+            use_candidate,
+            purpose,
+            hard_hard_session_token,
+            require_exact_dynamic_owner,
+            live_recorder,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn send_ordinary_probe_classified_observed(
+        &self,
+        socket_index: usize,
+        socket: Arc<UdpSocket>,
+        peer_id: Option<&str>,
+        peer_addr: SocketAddr,
+        use_candidate: bool,
+        purpose: PendingProbePurpose,
+        require_exact_dynamic_owner: bool,
+        owner: &OrdinaryProbeCost,
+    ) -> std::result::Result<ProbeSendResult, ProbeSendFailure> {
+        let mut call = owner.begin_call();
+        let result = self
+            .send_probe_on_socket_classified_observed(
+                socket_index,
+                socket,
+                peer_id,
+                peer_addr,
+                use_candidate,
+                purpose,
+                None,
+                require_exact_dynamic_owner,
+                None,
+                Some(&mut call),
+            )
+            .await;
+        call.returned(&result);
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn send_probe_on_socket_classified_observed(
+        &self,
+        socket_index: usize,
+        socket: Arc<UdpSocket>,
+        peer_id: Option<&str>,
+        peer_addr: SocketAddr,
+        use_candidate: bool,
+        purpose: PendingProbePurpose,
+        hard_hard_session_token: Option<&str>,
+        require_exact_dynamic_owner: bool,
+        live_recorder: Option<BirthdayLiveRecorder>,
+        mut ordinary_call: Option<&mut OrdinaryProbeCall>,
+    ) -> std::result::Result<ProbeSendResult, ProbeSendFailure> {
         let mode = self.hard_hard_socket_mode(socket_index).await;
         let committed_ordinary = hard_hard_session_token.is_none()
             && mode
@@ -969,6 +1029,9 @@ impl UdpTransport {
                 )
                 .await;
         let hh2 = mode.is_some() && !committed_ordinary;
+        if let Some(call) = ordinary_call.as_mut() {
+            call.classify_domain(!hh2);
+        }
         if hh2
             && mode.as_ref().is_some_and(|mode| {
                 Some(mode.peer.as_str()) != peer_id
@@ -1289,6 +1352,25 @@ impl UdpTransport {
             send_lease
         };
 
+        let mut ordinary_primary = ordinary_call.as_mut().filter(|_| !hh2).map(|call| {
+            call.begin_operation(
+                OrdinaryProbeKind::Primary,
+                bytes.len(),
+                OrdinaryProbeSocket {
+                    index: socket_index,
+                    socket_ptr: Arc::as_ptr(&socket) as usize,
+                    local_endpoint: socket.local_addr().ok(),
+                    target: peer_addr,
+                    network_generation: generation,
+                },
+            )
+        });
+        #[cfg(test)]
+        if let Some(call) = ordinary_call.as_ref().filter(|_| !hh2) {
+            call.owner
+                .wait_at_gate(OrdinaryProbeTestStage::PrimaryAwait)
+                .await;
+        }
         let send_result = if hh2 {
             self.send_hh2_probe_datagram(
                 socket_index,
@@ -1313,9 +1395,13 @@ impl UdpTransport {
                     )
                 })
         };
-        let first_send_at_ms = match send_result {
-            Ok(_) => {
+        let (first_send_at_ms, primary_bytes_sent) = match send_result {
+            Ok(accepted) => {
                 let sent_at_ms = monotonic_millis();
+                if let Some(operation) = ordinary_primary.as_mut() {
+                    operation.complete(Some(accepted), sent_at_ms);
+                }
+                drop(ordinary_primary);
                 // This is the physical send commit point.  It must precede
                 // the test gate, diagnostics update, lease cleanup, and every
                 // other follow-up await so a cancelled worker cannot lose a
@@ -1329,15 +1415,31 @@ impl UdpTransport {
                     );
                 }
                 #[cfg(test)]
+                if let Some(call) = ordinary_call.as_ref().filter(|_| !hh2) {
+                    call.owner
+                        .wait_at_gate(OrdinaryProbeTestStage::PrimaryResult)
+                        .await;
+                }
+                #[cfg(test)]
                 wait_for_probe_post_send_gate_for_test().await;
-                Some(sent_at_ms)
+                (Some(sent_at_ms), accepted as u64)
             }
             Err(failure) => {
                 // The primary send failed, but the physical error must still
                 // survive a cancellation racing the pending-probe cleanup.
                 if failure.kind == ProbeSendFailureKind::PhysicalSend {
+                    if let Some(operation) = ordinary_primary.as_mut() {
+                        operation.complete(None, monotonic_millis());
+                    }
+                    drop(ordinary_primary);
                     if let Some(recorder) = live_recorder.as_ref() {
                         recorder.record_primary_error(bytes.len());
+                    }
+                    #[cfg(test)]
+                    if let Some(call) = ordinary_call.as_ref().filter(|_| !hh2) {
+                        call.owner
+                            .wait_at_gate(OrdinaryProbeTestStage::PrimaryResult)
+                            .await;
                     }
                     #[cfg(test)]
                     wait_for_probe_post_send_gate_for_test().await;
@@ -1364,24 +1466,52 @@ impl UdpTransport {
         }
 
         let mut datagrams_sent = 1u8;
-        let mut physical_bytes_sent = bytes.len() as u64;
+        let mut physical_bytes_sent = primary_bytes_sent;
         let mut physical_send_errors = 0u8;
         let mut physical_send_error_bytes = 0u64;
         if let Some(legacy_probe) = compat_legacy_probe.clone() {
+            #[cfg(not(test))]
+            let compatibility_addr = peer_addr;
+            #[cfg(test)]
+            let compatibility_addr = ordinary_call
+                .as_ref()
+                .map_or(peer_addr, |call| call.owner.compatibility_target(peer_addr));
+            let mut ordinary_compatibility = ordinary_call.as_mut().filter(|_| !hh2).map(|call| {
+                call.begin_operation(
+                    OrdinaryProbeKind::Compatibility,
+                    legacy_probe.len(),
+                    OrdinaryProbeSocket {
+                        index: socket_index,
+                        socket_ptr: Arc::as_ptr(&socket) as usize,
+                        local_endpoint: socket.local_addr().ok(),
+                        target: compatibility_addr,
+                        network_generation: generation,
+                    },
+                )
+            });
             match self
-                .send_probe_datagram(&socket, &legacy_probe, peer_addr)
+                .send_probe_datagram(&socket, &legacy_probe, compatibility_addr)
                 .await
             {
-                Ok(_) => {
+                Ok(accepted) => {
+                    if let Some(operation) = ordinary_compatibility.as_mut() {
+                        operation.complete(Some(accepted), monotonic_millis());
+                    }
+                    drop(ordinary_compatibility);
                     datagrams_sent = datagrams_sent.saturating_add(1);
-                    physical_bytes_sent =
-                        physical_bytes_sent.saturating_add(legacy_probe.len() as u64);
+                    physical_bytes_sent = physical_bytes_sent.saturating_add(accepted as u64);
                     if let Some(recorder) = live_recorder.as_ref() {
                         recorder.record_compatibility_success(
                             socket_index,
                             monotonic_millis(),
                             legacy_probe.len(),
                         );
+                    }
+                    #[cfg(test)]
+                    if let Some(call) = ordinary_call.as_ref().filter(|_| !hh2) {
+                        call.owner
+                            .wait_at_gate(OrdinaryProbeTestStage::CompatibilityResult)
+                            .await;
                     }
                     self.update_socket_diagnostics(socket_index, |metrics| {
                         metrics.probes_sent += 1
@@ -1411,11 +1541,21 @@ impl UdpTransport {
                     }
                 }
                 Err(err) => {
+                    if let Some(operation) = ordinary_compatibility.as_mut() {
+                        operation.complete(None, monotonic_millis());
+                    }
+                    drop(ordinary_compatibility);
                     physical_send_errors = physical_send_errors.saturating_add(1);
                     physical_send_error_bytes =
                         physical_send_error_bytes.saturating_add(legacy_probe.len() as u64);
                     if let Some(recorder) = live_recorder.as_ref() {
                         recorder.record_compatibility_error(legacy_probe.len());
+                    }
+                    #[cfg(test)]
+                    if let Some(call) = ordinary_call.as_ref().filter(|_| !hh2) {
+                        call.owner
+                            .wait_at_gate(OrdinaryProbeTestStage::CompatibilityResult)
+                            .await;
                     }
                     debug!(
                         "Failed to send compatibility legacy UDP punch probe to peer {} at {}: {}",

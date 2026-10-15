@@ -82,8 +82,22 @@ async fn handle_native_overlay_request(
     ) else {
         return Rejected(Credit::Unknown(Unknown::OriginalSource));
     };
-    if let Err(reason) = input.qualify_before_injection(&owners.wireguard) {
-        return Rejected(reason);
+    loop {
+        if !crate::request_carriage::in_original_window(input.read_at(), Instant::now()) {
+            return Rejected(Credit::Stale(Stale::OriginalWindow));
+        }
+        match input.qualify_before_injection(&owners.wireguard) {
+            Ok(()) => break,
+            Err(Credit::Contended(_)) => {
+                // Keep this original input before TUN injection. Qualification
+                // releases every guard; each paced attempt rechecks current
+                // owners and the unmodified original read deadline.
+                let wake = (input.read_at() + OVERLAY_NONCE_TTL)
+                    .min(Instant::now() + Duration::from_millis(20));
+                tokio::time::sleep_until(tokio::time::Instant::from_std(wake)).await;
+            }
+            Err(reason) => return Rejected(reason),
+        }
     }
     // The original read time is also the queue deadline. Readiness waits and
     // actor transfers cannot renew this immutable source's lifetime.
@@ -160,7 +174,22 @@ async fn handle_native_overlay_ack(
         relay: &owners.relay,
         room: &owners.room,
     };
-    let outcome = peers.try_commit_original_overlay_ack(&borrowed, &request, &ack, source.as_ref());
+    let outcome = loop {
+        let outcome =
+            peers.try_commit_original_overlay_ack(&borrowed, &request, &ack, source.as_ref());
+        if !matches!(outcome, OverlayCreditOutcome::Contended(_))
+            || !crate::request_carriage::in_original_window(request.sent_at, Instant::now())
+        {
+            break outcome;
+        }
+        // The synchronous transaction released every owner guard. Retain only
+        // this received ACK and canonical request while waiting; the next
+        // attempt requalifies all current owners before consuming once. No
+        // packet is resent and no source or deadline is replaced.
+        let wake =
+            (request.sent_at + OVERLAY_NONCE_TTL).min(Instant::now() + Duration::from_millis(20));
+        tokio::time::sleep_until(tokio::time::Instant::from_std(wake)).await;
+    };
     let OverlayCreditOutcome::Fresh(receipt) = outcome else {
         debug!(event = "overlay_native_ack_rejected", outcome = ?outcome,
             "original ACK did not commit native credit");

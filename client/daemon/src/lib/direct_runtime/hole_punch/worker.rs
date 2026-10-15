@@ -400,7 +400,7 @@ async fn spawn_hole_punch_task_with_lifecycle(
 
     let invocation_cancellation = session.cancellation_handle();
     tokio::spawn(async move {
-        let worker = async move {
+        let worker = Box::pin(async move {
             if peers.current_network_generation_sync() != network_generation
                 || !peers.peer_session_is_current_sync(&peer_id, peer_session_generation)
             {
@@ -1839,7 +1839,7 @@ async fn spawn_hole_punch_task_with_lifecycle(
                     }
                 }
             }
-        };
+        });
 
         if let Some(shutdown_rx) = invocation_shutdown_rx {
             tokio::select! {

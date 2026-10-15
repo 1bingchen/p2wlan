@@ -509,6 +509,26 @@ pub(crate) async fn run_network_outbound_with_request_carriage(
                             Some(format!("peer={failed_peer:?} accounting_complete=false old_task_fifo_unknown=true owner_released=true")));
                         warn!(event="outbound_peer_task_failed", peer_id=?failed_peer, error=%err,
                             "failed owner released; old task FIFO accounting remains unconfirmed");
+                        #[cfg(test)]
+                        {
+                            let actor = failed_peer.as_ref().and_then(|peer| pending.get(peer));
+                            let front = actor.and_then(|queue| queue.queue.front());
+                            let (front_token, front_len, front_capacity) = match front {
+                                Some(PendingPacket::Plain { packet, .. }) =>
+                                    (packet.binding().map(|binding| binding.token().clone()),
+                                     packet.packet.len(), packet.packet.capacity()),
+                                None => (None, 0, 0),
+                            };
+                            ctx.transport.observe_worker_loss_for_test(crate::transport::WorkerLossObservation {
+                                task_id: err.id(), cancelled: err.is_cancelled(),
+                                active_removed: failed_peer.as_ref().is_some_and(|peer| !flushing_peers.contains_key(peer)),
+                                actor_packets: actor.map_or(0, |queue| queue.queue.len()),
+                                front_token, front_len, front_capacity,
+                                generation: actor.and_then(|queue| queue.wait_generation),
+                                delivery_deadline: actor.and_then(|queue| queue.delivery_deadline),
+                                wait_deadline: actor.and_then(|queue| queue.wait_deadline),
+                            }).await;
+                        }
                         schedule_peer_work(&mut pending, &mut flush_tasks, &mut flushing_peers, &ctx);
                     }
                     None => {}
@@ -520,6 +540,12 @@ pub(crate) async fn run_network_outbound_with_request_carriage(
     // Do not cancel already-started physical work with a replayable timeout.
     outbound_rx.close();
     ctx.stopping.store(true, Ordering::Release);
+    #[cfg(test)]
+    if ctx.transport.abort_worker_loss_children_for_test() {
+        // Test-only cleanup is requested at this original JoinSet owner;
+        // the unchanged join loops below still await every original child.
+        flush_tasks.abort_all();
+    }
     while let Ok(packet) = outbound_rx.try_recv() {
         append_ingress(
             packet,
@@ -532,8 +558,12 @@ pub(crate) async fn run_network_outbound_with_request_carriage(
     while let Some(result) = flush_tasks.join_next().await {
         match result {
             Ok((peer_id, queue)) => merge_peer_work(&mut pending, peer_id, queue, &ctx),
-            Err(err) => warn!(event="outbound_peer_task_failed", error=%err,
-                "task failed during shutdown; accounting remains unconfirmed"),
+            Err(err) => {
+                #[cfg(test)]
+                ctx.transport.observe_worker_loss_join_for_test(err.id());
+                warn!(event="outbound_peer_task_failed", error=%err,
+                    "task failed during shutdown; accounting remains unconfirmed");
+            }
         }
     }
     // Reuse the same task owner for final discard/reporting. Every report has
@@ -555,6 +585,10 @@ pub(crate) async fn run_network_outbound_with_request_carriage(
         Some("all packet owners stopped; incomplete accounting is reported explicitly".to_string()),
     );
 }
+
+#[cfg(test)]
+#[path = "queue/echo_queue_test_support.rs"]
+pub(super) mod echo_queue_test_support;
 
 /// Deterministic actor scheduling only for the admission contention tests.
 /// The seed is transferred once into the existing actor-owned FIFO; it is
@@ -870,6 +904,13 @@ pub(super) async fn flush_one_peer_until_stopped(
         .await
         {
             EncryptSendOutcome::Sent => {
+                #[cfg(test)]
+                transport
+                    .pause_worker_loss_for_test(
+                        crate::transport::WorkerLossPoint::AfterRecordedSent,
+                        queue.delivery_deadline,
+                    )
+                    .await;
                 record_pending_residence(pending_residence, "tx_pending_residence_sent_us");
                 flushed = flushed.saturating_add(1);
             }

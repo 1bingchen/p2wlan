@@ -23,10 +23,15 @@ use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
 type Check = Result<(), String>;
+#[path = "ack_contention.rs"]
+mod ack_contention;
 #[path = "contention.rs"]
 mod contention;
+pub(super) use ack_contention::AckContentionCase;
 #[path = "lifecycle.rs"]
 mod lifecycle;
+#[path = "request_contention.rs"]
+mod request_contention;
 pub(super) use lifecycle::LifecycleCase;
 #[path = "identity.rs"]
 mod identity;
@@ -34,6 +39,9 @@ pub(super) use identity::IdentityCase;
 #[path = "echo_transfer.rs"]
 mod echo_transfer;
 pub(super) use echo_transfer::EchoCase;
+#[path = "echo_contention.rs"]
+mod echo_contention;
+pub(super) use echo_contention::EchoContentionCase;
 #[path = "publication_order.rs"]
 mod publication_order;
 #[path = "runtime_vip.rs"]
@@ -44,6 +52,9 @@ mod asymmetric_endpoint;
 pub(super) use asymmetric_endpoint::{
     exercise_asymmetric_endpoint, exercise_asymmetric_invalidation,
 };
+#[path = "network_change.rs"]
+mod network_change;
+pub(super) use network_change::exercise_network_change;
 #[path = "common_hub.rs"]
 mod common_hub;
 pub(super) use common_hub::{exercise_common_native, exercise_common_replacement};
@@ -65,9 +76,12 @@ pub(super) enum Scenario {
     MissingSource,
     NativeHandler,
     Contention,
+    AckContention(AckContentionCase),
+    RequestContention(AckContentionCase),
     Lifecycle(LifecycleCase),
     Identity(IdentityCase),
     EchoTransfer(EchoCase),
+    EchoContention(EchoContentionCase),
     PublicationOrder,
     RuntimeVip(RuntimeVipCase),
 }
@@ -250,6 +264,8 @@ struct Endpoint {
     next_nonce: u64,
     next_seq: u32,
     common_encrypted_input: Option<mpsc::Sender<crate::transport::ReceivedEncryptedPacket>>,
+    supervisor_publication: Option<UdpTransportPublication>,
+    supervisor_encrypted_input: Option<mpsc::Sender<crate::transport::ReceivedEncryptedPacket>>,
 }
 
 impl Endpoint {
@@ -319,6 +335,63 @@ impl Endpoint {
         actual_validation: bool,
         common_hub: Option<&str>,
     ) -> Result<Self, String> {
+        Self::create_inner_with_supervisor(
+            node,
+            vip,
+            remote_node,
+            remote_vip,
+            path,
+            hub,
+            owners,
+            budget,
+            keep_bootstrap_vip,
+            actual_validation,
+            common_hub,
+            false,
+        )
+        .await
+    }
+
+    async fn create_supervised(
+        node: &'static str,
+        vip: &'static str,
+        remote_node: &'static str,
+        remote_vip: &'static str,
+        owners: &mut Owners,
+        budget: Budget,
+    ) -> Result<Self, String> {
+        Self::create_inner_with_supervisor(
+            node,
+            vip,
+            remote_node,
+            remote_vip,
+            PathKind::Direct,
+            None,
+            owners,
+            budget,
+            false,
+            true,
+            None,
+            true,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn create_inner_with_supervisor(
+        node: &'static str,
+        vip: &'static str,
+        remote_node: &'static str,
+        remote_vip: &'static str,
+        path: PathKind,
+        hub: Option<&str>,
+        owners: &mut Owners,
+        budget: Budget,
+        keep_bootstrap_vip: bool,
+        actual_validation: bool,
+        common_hub: Option<&str>,
+        supervised: bool,
+    ) -> Result<Self, String> {
         let mut config =
             Config::generate_default("http://ctrl.test", "default").map_err(|e| e.to_string())?;
         config.node.node_id = node.to_string();
@@ -343,7 +416,8 @@ impl Endpoint {
         let peers = Arc::new(PeerManager::new(config));
         let (wireguard, _unused_outbound) = WireGuardTransport::new_with_request_carriage();
         let (encrypted_tx, encrypted_rx) = mpsc::channel(16);
-        let udp_transport = if path == PathKind::Direct {
+        let supervisor_encrypted_input = supervised.then(|| encrypted_tx.clone());
+        let udp_transport = if path == PathKind::Direct && !supervised {
             let udp = budget
                 .step(
                     "bind actual UDP",
@@ -456,7 +530,12 @@ impl Endpoint {
             Ok(())
         });
         let (overlay_tx, overlay) = mpsc::channel(16);
-        let (udp_publication, udp_updates) = watch::channel(udp_transport.clone());
+        let supervisor_publication = supervised.then(|| UdpTransportPublication::new(udp.clone()));
+        let (udp_publication, udp_updates) = if let Some(publication) = &supervisor_publication {
+            (publication.inner.updates.clone(), publication.subscribe())
+        } else {
+            watch::channel(udp_transport.clone())
+        };
         let common_encrypted_input = common_hub.map(|_| encrypted_tx.clone());
         let inbound_wireguard = wireguard.clone();
         let inbound_peers = peers.clone();
@@ -520,6 +599,8 @@ impl Endpoint {
             next_nonce: 0x28_0000,
             next_seq: 28,
             common_encrypted_input,
+            supervisor_publication,
+            supervisor_encrypted_input,
         })
     }
 
@@ -984,8 +1065,25 @@ async fn inject_actual_echo(
     let original = OriginalOverlayAck::parse_request(&request.event.packet, &request.event.peer_id)
         .ok_or("actual REQUEST before echo injection has invalid framing")?;
     let verified_before = b.stats.verified_round_trips;
+    let echoed = call_native_request(b, request, budget).await?;
+    require(
+        echoed == OriginalRequestEchoOutcome::Injected,
+        &format!("actual sourced REQUEST was not injected as original sealed echo: {echoed:?}"),
+    )?;
+    require(
+        b.stats.verified_round_trips == verified_before,
+        "receiving REQUEST falsely credited a remote roundtrip",
+    )?;
+    take_actual_echo(b, original, budget).await
+}
+
+async fn call_native_request(
+    b: &mut Endpoint,
+    request: ActualDelivery,
+    budget: Budget,
+) -> Result<OriginalRequestEchoOutcome, String> {
     let owners = b.sourced_owners();
-    let echoed = budget
+    budget
         .step(
             "actual sourced REQUEST handler and sealed real MockTun echo",
             handle_native_overlay_request(
@@ -1003,15 +1101,14 @@ async fn inject_actual_echo(
                 &mut b.pending,
             ),
         )
-        .await?;
-    require(
-        echoed == OriginalRequestEchoOutcome::Injected,
-        &format!("actual sourced REQUEST was not injected as original sealed echo: {echoed:?}"),
-    )?;
-    require(
-        b.stats.verified_round_trips == verified_before,
-        "receiving REQUEST falsely credited a remote roundtrip",
-    )?;
+        .await
+}
+
+async fn take_actual_echo(
+    b: &mut Endpoint,
+    original: OriginalOverlayAck,
+    budget: Budget,
+) -> Result<RawRequestDelivery, String> {
     require(
         b.pending.is_empty(),
         "fresh admitted original echo unexpectedly parked",
@@ -1341,6 +1438,12 @@ async fn exercise_rounds(
     if scenario == Scenario::Contention {
         return contention::exercise_conflicts(a, b, path, budget).await;
     }
+    if let Scenario::AckContention(case) = scenario {
+        return ack_contention::exercise_native_ack_contention(a, b, path, case, budget).await;
+    }
+    if let Scenario::RequestContention(case) = scenario {
+        return request_contention::exercise_request_contention(a, b, path, case, budget).await;
+    }
     if let Scenario::Lifecycle(case) = scenario {
         return lifecycle::exercise_lifecycle(a, b, path, case, budget).await;
     }
@@ -1349,6 +1452,9 @@ async fn exercise_rounds(
     }
     if let Scenario::EchoTransfer(case) = scenario {
         return echo_transfer::exercise_echo_transfer(a, b, path, case, budget).await;
+    }
+    if let Scenario::EchoContention(case) = scenario {
+        return echo_contention::exercise_echo_contention(a, b, path, case, budget).await;
     }
     let (request, echo, ack) = original_request_and_echo(a, b, path, budget).await?;
     if scenario == Scenario::MissingSource {
@@ -1437,70 +1543,81 @@ async fn exercise_with_runtime_vip(
     scenario: Scenario,
     keep_bootstrap_vip: bool,
 ) -> Check {
-    let budget = if scenario == Scenario::Lifecycle(LifecycleCase::OriginalWindow) {
+    let budget = if matches!(
+        scenario,
+        Scenario::Lifecycle(LifecycleCase::OriginalWindow)
+            | Scenario::AckContention(AckContentionCase::Deadline)
+            | Scenario::RequestContention(AckContentionCase::Deadline)
+    ) {
         Budget::with_total(Duration::from_secs(19))
     } else {
         Budget::new()
     };
     let mut owners = Owners::default();
-    let body = AssertUnwindSafe(tokio::time::timeout_at(budget.body_end(), async {
-        let hub = if path == PathKind::Relay {
-            let server = budget
-                .step("start actual Relay hub", RelayServer::start_random())
-                .await?
-                .map_err(|e| e.to_string())?;
-            let endpoint = format!("tcp://{}", server.addr);
-            owners.server = Some(server);
-            Some(endpoint)
-        } else {
-            None
-        };
-        let (vip_a, vip_b) = if keep_bootstrap_vip {
-            ("10.20.0.2", "10.20.0.3")
-        } else {
-            (VIP_A, VIP_B)
-        };
-        let mut a = Endpoint::create(
-            NODE_A,
-            vip_a,
-            NODE_B,
-            vip_b,
-            path,
-            hub.as_deref(),
-            &mut owners,
-            budget,
-            keep_bootstrap_vip,
-        )
-        .await?;
-        let mut b = Endpoint::create(
-            NODE_B,
-            vip_b,
-            NODE_A,
-            vip_a,
-            path,
-            hub.as_deref(),
-            &mut owners,
-            budget,
-            keep_bootstrap_vip,
-        )
-        .await?;
-        let (session_a, session_b, a_key, b_key) = session_pair_for(&a.identity, &b.identity)?;
-        let udp_a = a.local_udp().await?;
-        let udp_b = b.local_udp().await?;
-        a.install_peer(b_key, udp_b, session_a, path, budget)
+    // Keep the original body on the heap so nested native pipeline futures
+    // do not multiply their state on the unchanged test thread stack.
+    let body = AssertUnwindSafe(tokio::time::timeout_at(
+        budget.body_end(),
+        Box::pin(async {
+            let hub = if path == PathKind::Relay {
+                let server = budget
+                    .step("start actual Relay hub", RelayServer::start_random())
+                    .await?
+                    .map_err(|e| e.to_string())?;
+                let endpoint = format!("tcp://{}", server.addr);
+                owners.server = Some(server);
+                Some(endpoint)
+            } else {
+                None
+            };
+            let (vip_a, vip_b) = if keep_bootstrap_vip {
+                ("10.20.0.2", "10.20.0.3")
+            } else {
+                (VIP_A, VIP_B)
+            };
+            let mut a = Endpoint::create(
+                NODE_A,
+                vip_a,
+                NODE_B,
+                vip_b,
+                path,
+                hub.as_deref(),
+                &mut owners,
+                budget,
+                keep_bootstrap_vip,
+            )
             .await?;
-        b.install_peer(a_key, udp_a, session_b, path, budget)
+            let mut b = Endpoint::create(
+                NODE_B,
+                vip_b,
+                NODE_A,
+                vip_a,
+                path,
+                hub.as_deref(),
+                &mut owners,
+                budget,
+                keep_bootstrap_vip,
+            )
             .await?;
-        if scenario == Scenario::PublicationOrder {
-            require(
-                path == PathKind::Direct,
-                "publication causal fixture requires actual LAN",
-            )?;
-            publication_order::exercise_publication_order(&mut a, &mut b, &mut owners, budget).await
-        } else {
-            exercise_rounds(&mut a, &mut b, path, scenario, budget).await
-        }
-    }))
+            let (session_a, session_b, a_key, b_key) = session_pair_for(&a.identity, &b.identity)?;
+            let udp_a = a.local_udp().await?;
+            let udp_b = b.local_udp().await?;
+            a.install_peer(b_key, udp_b, session_a, path, budget)
+                .await?;
+            b.install_peer(a_key, udp_a, session_b, path, budget)
+                .await?;
+            if scenario == Scenario::PublicationOrder {
+                require(
+                    path == PathKind::Direct,
+                    "publication causal fixture requires actual LAN",
+                )?;
+                publication_order::exercise_publication_order(&mut a, &mut b, &mut owners, budget)
+                    .await
+            } else {
+                exercise_rounds(&mut a, &mut b, path, scenario, budget).await
+            }
+        }),
+    ))
     .catch_unwind()
     .await
     .map(|result| {

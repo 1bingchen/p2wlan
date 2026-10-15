@@ -1,6 +1,91 @@
 use probe_budget::{RelayBackoffHeartbeatReservation, RelayBackoffHeartbeatReservationRejection};
 
 #[cfg(test)]
+struct ProbeBurstHandlesForTest {
+    handles: [Option<tokio::task::JoinHandle<()>>; 6],
+    reserved: usize,
+}
+
+#[cfg(test)]
+impl Drop for ProbeBurstHandlesForTest {
+    fn drop(&mut self) {
+        for handle in self.handles.iter().flatten() {
+            handle.abort();
+        }
+    }
+}
+
+/// A fixed test owner, attached only to the exact fixture transport. It is
+/// absent from production and neither schedules nor suppresses any burst.
+#[cfg(test)]
+struct ProbeBurstCaptureForTest {
+    tasks: StdMutex<ProbeBurstHandlesForTest>,
+}
+
+#[cfg(test)]
+impl ProbeBurstCaptureForTest {
+    fn new() -> Self {
+        Self {
+            tasks: StdMutex::new(ProbeBurstHandlesForTest {
+                handles: std::array::from_fn(|_| None),
+                reserved: 0,
+            }),
+        }
+    }
+
+    fn reserve_before_spawn(&self) -> usize {
+        let mut tasks = self.tasks.lock().unwrap_or_else(|error| error.into_inner());
+        assert!(
+            tasks.reserved < tasks.handles.len(),
+            "test burst owner capacity exceeded before spawn"
+        );
+        let slot = tasks.reserved;
+        tasks.reserved += 1;
+        slot
+    }
+
+    fn handoff_after_spawn(&self, slot: usize, handle: tokio::task::JoinHandle<()>) {
+        let mut tasks = self.tasks.lock().unwrap_or_else(|error| error.into_inner());
+        tasks.handles[slot] = Some(handle);
+    }
+
+    async fn abort_and_join_until(&self, end: tokio::time::Instant) -> (usize, bool) {
+        let mut owned = {
+            let mut tasks = self.tasks.lock().unwrap_or_else(|error| error.into_inner());
+            std::mem::replace(
+                &mut *tasks,
+                ProbeBurstHandlesForTest {
+                    handles: std::array::from_fn(|_| None),
+                    reserved: 0,
+                },
+            )
+        };
+        for handle in owned.handles.iter().flatten() {
+            handle.abort();
+        }
+        let mut all_joined = true;
+        for slot in owned.handles.iter_mut().take(owned.reserved) {
+            let Some(handle) = slot.as_mut() else {
+                all_joined = false;
+                continue;
+            };
+            match tokio::time::timeout_at(end, handle).await {
+                Ok(result) => {
+                    // Take only after the original handle completed. Never
+                    // poll an already-ready JoinHandle again during cleanup.
+                    drop(slot.take());
+                    all_joined &= result.is_ok() || result.is_err_and(|error| error.is_cancelled());
+                }
+                Err(_) => all_joined = false,
+            }
+        }
+        // Unjoined handles remain abort-on-drop owned; they are a failed
+        // collection, not a claimed join or a new cleanup grace window.
+        (owned.reserved, all_joined)
+    }
+}
+
+#[cfg(test)]
 #[derive(Debug, Default)]
 struct ProbeSendFailureHook {
     fail_on_attempts: HashSet<usize>,
@@ -1560,7 +1645,12 @@ impl UdpTransport {
     ) {
         let peer_label = peer_id.unwrap_or_else(|| peer_addr.to_string());
         let diagnostics = self.socket_pool_diagnostics.clone();
-        tokio::spawn(async move {
+        #[cfg(test)]
+        let capture_slot = self
+            .probe_burst_capture_for_test
+            .as_ref()
+            .map(|capture| capture.reserve_before_spawn());
+        let handle = tokio::spawn(async move {
             for delay_ms in PUNCH_PROBE_RETRANSMIT_DELAYS_MS {
                 sleep(Duration::from_millis(delay_ms)).await;
                 match socket.send_to(&probe, peer_addr).await {
@@ -1585,6 +1675,15 @@ impl UdpTransport {
                 }
             }
         });
+        #[cfg(test)]
+        if let Some(slot) = capture_slot {
+            self.probe_burst_capture_for_test
+                .as_ref()
+                .unwrap()
+                .handoff_after_spawn(slot, handle);
+            return;
+        }
+        drop(handle);
     }
 
     async fn send_punch_ack_burst(

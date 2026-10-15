@@ -530,6 +530,12 @@ impl PeerManager {
                     reason.clone(),
                     local_endpoint,
                 );
+                // A missed consent sample records its real cost immediately,
+                // but the original selected path remains usable until the
+                // same threshold that retires the connection's Direct state.
+                if !threshold_reached && old_state == CandidatePairState::Selected {
+                    pair.state = old_state;
+                }
                 log_candidate_pair_state_changed(&peer_id, pair, old_state, &reason);
 
                 if threshold_reached {

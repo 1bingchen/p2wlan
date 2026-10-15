@@ -423,6 +423,9 @@ pub(crate) mod publication_test_support {
                 end: tokio::time::Instant::now() + Duration::from_secs(2),
             }
         }
+        pub(crate) fn original_end(self) -> tokio::time::Instant {
+            self.end
+        }
         pub(crate) async fn step<T>(&self, future: impl Future<Output = T>) -> T {
             let end = self
                 .end
@@ -431,6 +434,11 @@ pub(crate) mod publication_test_support {
                 .await
                 .expect("B19 bounded original caller prerequisite timeout")
         }
+    }
+    pub(crate) async fn ping_original_writer(
+        transport: &RelayTransport,
+    ) -> p2pnet_relay::RelayResult<()> {
+        transport.client.ping().await
     }
     pub(crate) struct Fixture {
         transport: Option<RelayTransport>,

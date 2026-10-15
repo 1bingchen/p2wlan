@@ -251,6 +251,7 @@ async fn repeated_direct_writable_false_positives_preserve_fifo_and_deadline() {
             packet,
             direct_budget_reroutes,
             local_backpressure_retries,
+            ..
         } = pending;
         assert_eq!(&packet.packet, expected);
         assert_eq!(*direct_budget_reroutes, 0);

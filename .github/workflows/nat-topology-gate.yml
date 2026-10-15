@@ -10,11 +10,20 @@ on:
       - "scripts/diagnostics-auth.sh"
       - "client/nat/**"
       - "client/daemon/**"
+      - "client/tun/**"
       - "client/relay/**"
       - "server/**"
       - "contracts/**"
       - "Cargo.toml"
       - "Cargo.lock"
+      # Close same-head network/CI prerequisites; regression checks read the dependency graph.
+      - ".github/workflows/**"
+      - "client/netbind/**"
+      - "client/wireguard/**"
+      - "scripts/dplpmtud/**"
+      - "docs/reference/networking.md"
+      - "scripts/mtu-smoke.sh"
+      - "scripts/quality/**"
   push:
     branches: [main]
     paths:
@@ -23,11 +32,20 @@ on:
       - "scripts/diagnostics-auth.sh"
       - "client/nat/**"
       - "client/daemon/**"
+      - "client/tun/**"
       - "client/relay/**"
       - "server/**"
       - "contracts/**"
       - "Cargo.toml"
       - "Cargo.lock"
+      # Close same-head network/CI prerequisites; regression checks read the dependency graph.
+      - ".github/workflows/**"
+      - "client/netbind/**"
+      - "client/wireguard/**"
+      - "scripts/dplpmtud/**"
+      - "docs/reference/networking.md"
+      - "scripts/mtu-smoke.sh"
+      - "scripts/quality/**"
   schedule:
     - cron: "23 18 * * *"
   workflow_dispatch:
@@ -48,6 +66,17 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  macos-clock:
+    name: macOS cross-process deadline controls
+    runs-on: macos-14
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Check native system Python clock boundaries
+        run: |
+          /usr/bin/python3 --version
+          /usr/bin/python3 -m unittest discover -s scripts/nat-sim -p 'test_monotonic_clock.py' -v
+
   unit:
     name: NAT simulator unit tests
     runs-on: ubuntu-24.04
@@ -79,7 +108,7 @@ jobs:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff
         with:
-          go-version: "1.26.6"
+          go-version-file: server/go.mod
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
       - name: Install smoke dependencies
         run: |
@@ -126,7 +155,7 @@ jobs:
           echo "relay_topology_head_sha=$actual_head_sha replica=${{ matrix.run }}/5"
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff
         with:
-          go-version: "1.26.6"
+          go-version-file: server/go.mod
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
       - name: Install smoke dependencies
         run: |
@@ -160,7 +189,7 @@ jobs:
           fetch-depth: 0
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff
         with:
-          go-version: "1.26.6"
+          go-version-file: server/go.mod
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
       - name: Install smoke dependencies
         run: |
@@ -182,7 +211,7 @@ jobs:
   required:
     name: NAT Topology Required
     if: always()
-    needs: [unit, direct, relay]
+    needs: [macos-clock, unit, direct, relay]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -245,6 +274,8 @@ jobs:
             --input-root "$RUNNER_TEMP/nat-topology-evidence" \
             --source-head-sha "${{ steps.identity.outputs.source_head_sha }}" \
             --workflow-sha "${{ steps.identity.outputs.workflow_sha }}" \
+            --github-run-id "$GITHUB_RUN_ID" \
+            --github-run-attempt "$GITHUB_RUN_ATTEMPT" \
             --output "$RUNNER_TEMP/nat-topology-aggregate.json"
 
       - name: Upload actual-execution NAT aggregate
@@ -258,6 +289,7 @@ jobs:
 
       - name: Enforce required topology results and aggregate
         env:
+          MACOS_CLOCK_RESULT: ${{ needs.macos-clock.result }}
           UNIT_RESULT: ${{ needs.unit.result }}
           DIRECT_RESULT: ${{ needs.direct.result }}
           RELAY_RESULT: ${{ needs.relay.result }}
@@ -267,6 +299,7 @@ jobs:
           AGGREGATE_OUTCOME: ${{ steps.aggregate.outcome }}
         run: |
           set -euo pipefail
+          test "$MACOS_CLOCK_RESULT" = "success"
           test "$UNIT_RESULT" = "success"
           test "$DIRECT_RESULT" = "success"
           test "$RELAY_RESULT" = "success"

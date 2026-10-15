@@ -256,6 +256,12 @@ jobs:
 
   existing_required_gates:
     name: DPLPMTUD external required gates
+    needs:
+      - contract
+      - dplpmtud_linux
+      - runtime_acceptance
+      - live_evidence
+      - dplpmtud_windows
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 70

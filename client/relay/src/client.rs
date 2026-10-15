@@ -288,4 +288,7 @@ mod connect;
 mod legacy_tcp;
 
 #[cfg(test)]
+pub(crate) mod original_workers_for_test;
+
+#[cfg(test)]
 mod tests;

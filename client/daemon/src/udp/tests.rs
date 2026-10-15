@@ -126,8 +126,12 @@ mod nat_ingress;
 #[path = "tests/fresh_mapping_failures.rs"]
 mod fresh_mapping_failures;
 
+#[path = "tests/fresh_mapping_success_cost.rs"]
+mod fresh_mapping_success_cost;
 #[path = "tests/fresh_mapping_summary.rs"]
 mod fresh_mapping_summary;
+#[path = "tests/ordinary_probe_cancellation.rs"]
+mod ordinary_probe_cancellation;
 
 #[path = "tests/business_receipts.rs"]
 mod business_receipts;

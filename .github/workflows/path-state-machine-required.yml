@@ -115,6 +115,9 @@ jobs:
 
   lifecycle_and_topology_gates:
     name: Existing lifecycle and topology gates
+    needs:
+      - rust_required
+      - windows_path_state_machine
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 55

@@ -1,3 +1,14 @@
+async fn resource_status(config_path: &Path) -> Result<(), String> {
+    let config = load_config(config_path)?;
+    let endpoint = diagnostics_endpoint(&config, "/resources");
+    let snapshot = fetch_status_at(&endpoint, &state_dir_for_config(config_path)).await?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&snapshot).map_err(|error| error.to_string())?
+    );
+    Ok(())
+}
+
 async fn status(config_path: &Path, json: bool) -> Result<(), String> {
     let config = load_config(config_path)?;
     match fetch_status_at(&status_url(&config), &state_dir_for_config(config_path)).await {

@@ -871,6 +871,7 @@ impl WireGuardTransport {
         self.run_outbound_inner(outbound_rx.into()).await
     }
 
+    #[cfg(test)] // Production daemon uses the common receiver; fixtures retain this typed entry.
     pub(crate) async fn run_outbound_with_request_carriage(
         &self,
         outbound_rx: mpsc::Receiver<crate::request_carriage::RawRequestDelivery>,
@@ -878,7 +879,7 @@ impl WireGuardTransport {
         self.run_outbound_inner(outbound_rx.into()).await
     }
 
-    async fn run_outbound_inner(
+    pub(crate) async fn run_outbound_inner(
         &self,
         mut outbound_rx: crate::request_carriage::RawOutboundReceiver,
     ) -> Result<()> {

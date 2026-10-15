@@ -209,7 +209,18 @@ where
         }
 
         let (result, instance_runtime) = match bind(ctx.udp_bind, ctx.peers.clone()).await {
-            Ok(binding) => {
+            Ok(mut binding) => {
+                if let Some(capture) = ctx.direct_validation_transport.resource_capture() {
+                    if binding
+                        .udp
+                        .attach_resource_capture(capture.clone())
+                        .is_err()
+                    {
+                        // Observation failure cannot change socket availability.
+                        // Keep the original transport and mark the missing scope.
+                        capture.unobserved_residency_exit();
+                    }
+                }
                 if let Some(receiver) = &ctx.android_network_change_rx {
                     if let Some(hint) = crate::android_network_change::take_latest(receiver).await {
                         record_android_network_change(
@@ -1815,7 +1826,19 @@ mod udp_direct_tests {
 
     #[tokio::test]
     async fn android_network_hint_rebinds_udp_once_and_supersedes_old_publication() {
-        let daemon = Daemon::new(Config::generate_default("https://ctrl.test", "net1").unwrap());
+        check_resource_capture_across_original_udp_rebind(false).await;
+    }
+
+    #[tokio::test]
+    async fn runtime_resource_capture_follows_both_original_udp_instances() {
+        check_resource_capture_across_original_udp_rebind(true).await;
+    }
+
+    async fn check_resource_capture_across_original_udp_rebind(observe: bool) {
+        let mut config = Config::generate_default("https://ctrl.test", "net1").unwrap();
+        config.diagnostics.enabled = observe;
+        config.diagnostics.resource_capture = observe;
+        let daemon = Daemon::new(config);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let (network_tx, network_rx) = broadcast::channel(8);
         let mut context = test_context(&daemon, shutdown_rx);
@@ -1859,6 +1882,15 @@ mod udp_direct_tests {
             .clone()
             .expect("replacement UDP transport must be published");
         assert_ne!(old_instance, new_transport.transport_instance_id());
+        for udp in [&old_transport, &new_transport] {
+            assert_eq!(udp.resource_capture().is_some(), observe);
+            if observe {
+                assert!(Arc::ptr_eq(
+                    udp.resource_capture().unwrap(),
+                    daemon.transport.resource_capture().unwrap(),
+                ));
+            }
+        }
         assert_eq!(
             daemon.peers.current_network_generation().await,
             generation_before + 1,

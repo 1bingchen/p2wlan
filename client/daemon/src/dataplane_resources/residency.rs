@@ -6,7 +6,8 @@ use super::{RecordDisposition, ResourceCapture};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub(crate) enum ResidencyStage {
     ChannelReserve,
     RawChannel,
@@ -23,7 +24,7 @@ impl ResidencyStage {
     pub(crate) const COUNT: usize = 10;
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Serialize)]
 pub(crate) struct ResidencyTotals {
     /// Real buffer owners; deep copies count separately from application packets.
     pub(crate) live_buffers: u64,

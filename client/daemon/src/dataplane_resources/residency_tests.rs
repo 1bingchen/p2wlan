@@ -1,5 +1,48 @@
 use super::*;
 
+#[test]
+fn runtime_resource_busy_and_damaged_readouts_keep_unavailable_values_null() {
+    let config = crate::config::DiagnosticsConfig {
+        enabled: true,
+        resource_capture: true,
+        ..Default::default()
+    };
+    let run = crate::dataplane_resources::RuntimeResourceCapture::from_config(&config).unwrap();
+    let capture = run.capture();
+    let bytes = vec![0; 32];
+    let lease = ResidencyLease::observe(capture, ResidencyStage::RawChannel, &bytes).unwrap();
+    // Deterministic writer-entry hold, using the real ledger's bounded reader.
+    capture.residency.writers.store(1, Ordering::SeqCst);
+    let busy = run.readout();
+    let owners = &busy["capture"]["observed_owner_residency"];
+    assert_eq!(owners["coherent"], false);
+    for key in [
+        "total",
+        "capacity_high_water_bytes",
+        "revision",
+        "clone_ops",
+        "cloned_len_bytes",
+    ] {
+        assert!(owners[key].is_null(), "busy {key} fabricated a measurement");
+    }
+    for stage in owners["stages"].as_array().unwrap() {
+        assert!(stage["totals"].is_null() && stage["scope_observed"].is_null());
+    }
+    capture.residency.writers.store(0, Ordering::SeqCst);
+    assert_eq!(
+        run.readout()["capture"]["observed_owner_residency"]["total"]["live_buffers"],
+        1
+    );
+    capture.residency.gap(RecordDisposition::CounterOverflow);
+    let damaged = run.readout();
+    let owners = &damaged["capture"]["observed_owner_residency"];
+    assert_eq!(owners["coherent"], true);
+    assert_eq!(owners["valid"], false);
+    assert!(owners["total"].is_null());
+    assert_ne!(owners["gap_bits"], 0);
+    drop(lease);
+}
+
 fn bytes(len: usize, capacity: usize) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(capacity);
     bytes.resize(len, 0x45);

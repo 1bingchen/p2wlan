@@ -3,8 +3,8 @@
 //! Vec operations and observed capacities are not allocator calls or RSS.
 //! Counters cover fixed sites; leases cover two plaintext FIFOs and explicitly
 //! observed buffers in the slow send. They do not cover the whole pipeline.
-//! The private opt-in readout is retained without wiring a default capture or
-//! status export. Its currently unused readout items are marked individually.
+//! A daemon may explicitly enable the authenticated, bounded runtime readout.
+//! Default instances retain no capture and never serialize per-packet data.
 
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -12,6 +12,8 @@ use std::time::Instant;
 
 mod owned_buffers;
 mod residency;
+mod runtime;
+pub(crate) use runtime::RuntimeResourceCapture;
 #[cfg(test)]
 mod tests;
 use owned_buffers::BufferCounters;
@@ -21,7 +23,8 @@ pub(crate) use residency::{ResidencyLease, ResidencySnapshot, ResidencyStage};
 const CAS_ATTEMPTS: usize = 8;
 const MAX_CAPTURE_BYTES: usize = 16 * 1024;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub(crate) enum VecSite {
     UdpReaderBuffer,
     UdpWireCopy,
@@ -93,7 +96,8 @@ impl VecOperation {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub(crate) enum QueueStage {
     ActorFifo,
     TaskOrUnjoinedFifo,
@@ -144,7 +148,7 @@ struct VecCounters {
     destination_capacity_observed_sum: AtomicU64,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize)]
 #[allow(dead_code)] // Private opt-in readout; no default status export.
 pub(crate) struct VecSiteSnapshot {
     pub(crate) materialization_ops: u64,
@@ -163,7 +167,7 @@ struct FifoCounters {
     vec_capacity: AtomicU64,
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Serialize)]
 #[allow(dead_code)] // Private opt-in readout; no default status export.
 pub(crate) struct FifoSnapshot {
     pub(crate) live_packets: u64,

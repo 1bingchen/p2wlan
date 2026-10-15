@@ -4,7 +4,8 @@ use super::{RecordDisposition, ResourceCapture};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub(crate) enum BufferStage {
     ActiveOriginal,
     RetryPlaintext,
@@ -30,7 +31,7 @@ pub(super) struct BufferCounters {
     pub(super) capacity: AtomicU64,
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Serialize)]
 pub(crate) struct BufferSnapshot {
     pub(crate) live_buffers: u64,
     pub(crate) len: u64,

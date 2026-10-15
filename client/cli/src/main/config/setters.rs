@@ -109,6 +109,15 @@ fn set_config_value(config: &mut Config, key: &str, value: &str) -> Result<(), S
                 config.network.socket_pool_size = count;
             }
         }
+        "resource-capture" => {
+            let enabled = value
+                .parse::<bool>()
+                .map_err(|_| "resource-capture 必须为 true 或 false".to_string())?;
+            config.diagnostics.resource_capture = enabled;
+            if enabled {
+                config.diagnostics.enabled = true;
+            }
+        }
         "diagnostics" => {
             let endpoint = parse_socket_addr(value, "diagnostics")?;
             if !endpoint.ip().is_loopback() {

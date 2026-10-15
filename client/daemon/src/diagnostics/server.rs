@@ -234,6 +234,19 @@ async fn handle_connection(mut stream: TcpStream, context: DiagnosticsContext) -
             let body = serde_json::to_string_pretty(&snapshot)?;
             write_response(&mut stream, 200, "application/json", &body, cors_origin).await?;
         }
+        ("GET", "/resources") => {
+            // Bounded atomics only: do not queue behind peer/session/UDP locks
+            // or include this independent read in /status revision semantics.
+            let body = context
+                .resource_capture
+                .as_ref()
+                .map_or_else(
+                    || serde_json::json!({"schema_version":1,"enabled":false,"capture":null}),
+                    |capture| capture.readout(),
+                )
+                .to_string();
+            write_response(&mut stream, 200, "application/json", &body, cors_origin).await?;
+        }
         ("GET", "/status") => {
             debug!(
                 event = "diagnostics_status_handler_entered",
@@ -511,7 +524,7 @@ fn is_public_endpoint(method: &str, path: &str) -> bool {
 fn is_supported_endpoint(method: &str, path: &str) -> bool {
     match (method, path) {
         ("GET", "/health" | "/status.version" | "/status.runtime" | "/status")
-        | ("GET", "/routes" | "/events" | "/peers" | "/logs/tail")
+        | ("GET", "/routes" | "/events" | "/peers" | "/logs/tail" | "/resources")
         | ("POST", "/speedtest" | "/shutdown" | "/routes/verify" | "/routes/repair") => true,
         ("GET", path) if path.starts_with("/status/peer/") => true,
         _ => false,

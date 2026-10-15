@@ -8,6 +8,8 @@
 | p2wlan account show | 显示当前账号身份 |
 | p2wlan up / down | 启动或停止虚拟网络 |
 | p2wlan status [--json] | 查看 daemon、设备和路径状态 |
+| p2wlan status --resources | 读取显式启用的软件缓冲观测 JSON；与 --json 互斥 |
+| p2wlan config set resource-capture true / false | 设置下一次 daemon 启动的软件缓冲观测开关，缺省关闭 |
 | p2wlan doctor | 输出结构化诊断摘要 |
 | p2wlan room list | 列出房间 |
 | p2wlan room connect ID | 连接房间 |

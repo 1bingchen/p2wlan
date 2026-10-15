@@ -39,3 +39,5 @@ pub(crate) use synchronized_punch_e2e::HARD_HARD_E2E_SERIAL;
 use daemon_e2e::{
     part03_establish_sessions, part03_outbound_transport, start_handshake_control_capture,
 };
+#[path = "tests/resource_runtime.rs"]
+mod resource_runtime;

@@ -200,11 +200,23 @@ async fn explicit_abort_and_drop_publish_original_close_without_receiver() -> Ch
             released?;
             require(before, "explicit abort crossed original open guard")
         })?;
+        // Other original reader/writer publishers may still briefly hold the
+        // same gate after abort has published. Contention is not Open or
+        // Closed: observe the actual terminal result within the original end.
+        let closed = budget
+            .step("actual abort releases original gate", async {
+                loop {
+                    let open = peer.client.try_open_guard();
+                    match open {
+                        Err(RelayClientOpenError::Contended) => drop(open),
+                        result => return result,
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await?;
         require(
-            matches!(
-                peer.client.try_open_guard(),
-                Err(RelayClientOpenError::Closed)
-            ),
+            matches!(closed, Err(RelayClientOpenError::Closed)),
             "actual abort did not close",
         )?;
         let shell = RelayClient::new_for_test();

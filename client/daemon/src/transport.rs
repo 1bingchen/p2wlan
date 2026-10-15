@@ -652,6 +652,8 @@ mod resource_queue_test_gate;
 mod sessions;
 #[cfg(test)]
 pub(crate) use resource_queue_test_gate::ResourceQueueTestGate;
+#[cfg(test)]
+pub(crate) use resource_queue_test_gate::{WorkerLossObservation, WorkerLossPoint};
 #[allow(unused_imports)] // Compatibility result types may be unused by a build.
 pub(crate) use sessions::{
     EncryptedOutboundWithSource, OriginalEchoSessionGuard, OriginalEncryptionSource,

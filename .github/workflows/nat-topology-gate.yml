@@ -72,16 +72,43 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - name: Check native system Python clock boundaries
         run: |
           /usr/bin/python3 --version
           /usr/bin/python3 -m unittest discover -s scripts/nat-sim -p 'test_monotonic_clock.py' -v
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: "3.11"
+      - name: Check final native capture through system Python
+        env:
+          P2WLAN_NAT_SIM_NATIVE_EVIDENCE_DIR: ${{ runner.temp }}/p2wlan-final-native-capture-fixture
+        run: |
+          set -euo pipefail
+          python --version
+          test -x /usr/bin/python3
+          command -v cc
+          python -B -m unittest discover -s scripts/nat-sim -p 'test_launch_native_udp.py' -v \
+            2>&1 | tee "$RUNNER_TEMP/p2wlan-final-native-capture.log"
+      - name: Preserve original native fixture artifacts and output
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: nat-final-native-capture-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/p2wlan-final-native-capture-fixture/
+            ${{ runner.temp }}/p2wlan-final-native-capture.log
+          if-no-files-found: error
+          retention-days: 14
 
   unit:
     name: NAT simulator unit tests
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - name: Run simulator parser and unit tests
         run: bash scripts/nat-sim/run-ci-topology.sh unit
       - name: Upload unit evidence

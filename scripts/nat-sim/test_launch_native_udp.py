@@ -1,7 +1,10 @@
 """Keep the real libc capture contract across the final native exec boundary."""
 import asyncio
+import hashlib
 import json
+import os
 from pathlib import Path
+import shutil
 import sys
 import unittest
 from unittest import mock
@@ -59,7 +62,30 @@ class FinalExecNativeUdpTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(observed["pid"], children[0].pid)
             self.assertEqual(children[0].returncode, 0)
         finally:
-            Fixture.tearDownClass()
+            try:
+                evidence = os.environ.get("P2WLAN_NAT_SIM_NATIVE_EVIDENCE_DIR")
+                if evidence:
+                    output = Path(evidence)
+                    output.mkdir(parents=True, exist_ok=False)
+                    artifacts = {}
+                    for name, path in {
+                        "actual-native-sender": Fixture.sender,
+                        "actual-udp-shim": Fixture.library,
+                        "native-sender.c": Fixture.root / "sender.c",
+                        "native-final-exec.json": record,
+                        "artifact-set.json": prepared / "artifact-set.json",
+                        "nat-trace.jsonl": case.trace_path,
+                    }.items():
+                        if path.is_file():
+                            self.assertLessEqual(path.stat().st_size, 16 * 1024 * 1024)
+                            shutil.copyfile(path, output / name)
+                            artifacts[name] = hashlib.sha256(path.read_bytes()).hexdigest()
+                    (output / "native-artifacts.json").write_text(json.dumps({
+                        "source": source, "artifacts_sha256": artifacts,
+                        "scope": "original C fixture and shim; not a Rust daemon binary",
+                    }, indent=2))
+            finally:
+                Fixture.tearDownClass()
 
 
 if __name__ == "__main__":

@@ -108,14 +108,20 @@ impl UdpTransport {
             return Err(Error::WouldBlock);
         }
         let guard = self
-            .try_original_direct_publication_guard(&packet.peer_id, generation, Some(read), None)
+            .try_original_direct_publication_guard_with_prepared(
+                &packet.peer_id,
+                generation,
+                Some(read),
+                None,
+                prepared,
+            )
             .map_err(|failure| match failure {
                 DirectOriginFailure::ContendedMembership
                 | DirectOriginFailure::ContendedSocket
                 | DirectOriginFailure::ContendedPublication => Error::WouldBlock,
                 _ => Error::StaleToken,
             })?;
-        let socket = if read.socket_index >= DYNAMIC_SOCKET_INDEX_BASE
+        let received_socket = if read.socket_index >= DYNAMIC_SOCKET_INDEX_BASE
             && read.socket_index != IPV6_SOCKET_INDEX
         {
             &guard
@@ -132,6 +138,13 @@ impl UdpTransport {
             self.active_sockets()
                 .get(read.socket_index)
                 .ok_or(Error::StaleToken)?
+        };
+        // RX remains independently qualified by the original reader guard.
+        // An authenticated asymmetric return follows its verified Direct
+        // pair, whose current socket and budget are fenced by that same guard.
+        let socket = match (verified_local, prepared) {
+            (Some(_), Some(prepared)) => &prepared.socket,
+            _ => received_socket,
         };
         if verified_local.is_some_and(|local| socket.local_addr().ok() != Some(local)) {
             return Err(Error::StaleToken);
@@ -198,6 +211,19 @@ impl UdpTransport {
         received: Option<&OriginalUdpIngressSource>,
         sent: Option<&UdpFullSendFact>,
     ) -> Result<DirectOriginPublicationGuard<'_>, DirectOriginFailure> {
+        self.try_original_direct_publication_guard_with_prepared(
+            peer, generation, received, sent, None,
+        )
+    }
+
+    fn try_original_direct_publication_guard_with_prepared(
+        &self,
+        peer: &str,
+        generation: u64,
+        received: Option<&OriginalUdpIngressSource>,
+        sent: Option<&UdpFullSendFact>,
+        prepared: Option<&super::PreparedDirectBusinessSend>,
+    ) -> Result<DirectOriginPublicationGuard<'_>, DirectOriginFailure> {
         if (received.is_none() && sent.is_none())
             || sent.is_some_and(|fact| fact.fence() == UdpSendFence::LegacyUnknown)
         {
@@ -222,6 +248,7 @@ impl UdpTransport {
         let dynamic = |index| index >= DYNAMIC_SOCKET_INDEX_BASE && index != IPV6_SOCKET_INDEX;
         let sockets = if received.is_some_and(|fact| dynamic(fact.socket_index))
             || sent.is_some_and(|fact| dynamic(fact.socket_index()))
+            || prepared.is_some_and(|prepared| dynamic(prepared.socket_index))
         {
             Some(
                 self.socket_state
@@ -264,6 +291,20 @@ impl UdpTransport {
                 || fact.network_generation != generation
                 || current_socket(fact.socket_index)
                     .is_none_or(|socket| !fact.belongs_to_socket(socket))
+            {
+                return Err(DirectOriginFailure::Stale);
+            }
+        }
+        if let Some(prepared) = prepared {
+            let token = &prepared.token;
+            if token.path_identity.peer_id != peer
+                || token.path_identity.epoch.network_generation != generation
+                || token.path_identity.socket.transport_instance_id != self.transport_instance_id()
+                || token.path_identity.socket.socket_index != prepared.socket_index
+                || token.path_identity.authenticated_remote_endpoint != prepared.endpoint
+                || prepared.socket.local_addr().ok() != Some(token.path_identity.local_endpoint)
+                || current_socket(prepared.socket_index)
+                    .is_none_or(|socket| !Arc::ptr_eq(socket, &prepared.socket))
             {
                 return Err(DirectOriginFailure::Stale);
             }

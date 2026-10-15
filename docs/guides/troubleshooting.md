@@ -9,6 +9,7 @@
 | 启动提示运行目录权限失败 | 客户端启动阶段、配置和日志目录属主、旧实例是否已退出、路径是否为默认用户目录及普通文件 | 不能据此判断 NAT 打洞失败，也不需要清空账号或网络配置 |
 | 本地 `/health` 正常但 `/status` 返回 401 | 诊断密钥文件的读取权限、对应实例的运行目录、是否有不同配置共用日志目录；刷新后确认是否恢复 | 不是 Control 登录到期，也不能据此判断数据面已断开 |
 | Direct 不通 | NAT profile、候选来源、UDP 防火墙、路径 reason code | STUN 成功不等于对端可入站 |
+| Direct 已建立但应用延迟忽高忽低 | 同一时间窗内的虚拟 IP 往返延迟、实际业务路径、出站发送失败和丢包计数、两端负载及应用服务端耗时 | Direct 只说明路径已确认，不能保证链路无抖动；应用卡顿也不能单独证明网络丢包 |
 | 只有 Relay | Relay TLS、audience/region、ticket、/readyz、撤权 feed | Relay 路径不说明 Direct 一定有缺陷 |
 | 虚拟 IP 可见但业务不通 | 本机路由、房间租约、数据面收发计数、目标应用监听和防火墙 | 加密 ACK 或在线人数不等于业务往返 |
 | 重启后状态错误 | daemon process/revision、网络 generation、peer session、房间授权 | 旧快照不能当作实时状态 |
@@ -20,6 +21,8 @@
     p2wlan doctor
     p2wlan route verify
     p2wlan logs -f
+
+排查直连延迟尖峰时，比较问题发生前后的 `status --json`，并将两端日志与应用卡顿时间对齐。`direct_business_local_backpressure` 表示本地发送尚未交付，发送端保留原始数据；只有实际 UDP socket 返回暂不可写时，才有界等待该 socket 的可写通知，发布身份争用仍使用原节奏重验。它不是 Direct 失效或 MTU 预算过期。持续阻塞超过原有交付期限时，`direct_business_local_backpressure_deadline_expired` 才计入终态丢包。应区分发送失败尝试与实际丢包，结合链路测量和应用服务端耗时判断原因。
 
 支持包上传必须由用户显式确认。上传前移除不必要的业务日志和环境文件，保留能解释问题的 reason code、版本、时间和脱敏状态。
 
@@ -35,4 +38,4 @@ Relay 关闭原因区分 `peer_closed`、`partial_frame`、`local_closed`、`con
 
 Windows 在身份校验前记录系统返回的子进程 PID，并使用原生进程查询区分正在运行、已退出和查询不可用。查询不可用会保留失败操作与 Win32 错误码；提前退出会报告 `DAEMON_EXITED_DURING_STARTUP`，并在 daemon 日志已有明确原因时显示对应的 Wintun、凭据或认证错误。排查时同时查看客户端启动日志和 daemon 日志；管理员权限本身不能证明后台进程已成功启动。
 
-选择手动 / 离线模式时可以不配置 Control 地址。启动参数校验失败会记录 `STARTUP_CONFIG_INVALID` 和无效参数名称，客户端提示检查启动配置；日志不回显该参数的原始值。daemon 的 `--relay` 接受 `[region@]tls://host:port`、`tcp://host:port` 和兼容的 `host:port` 格式，TLS 与明文传输仍受原有安全策略约束。
+图形客户端必须填写服务器地址并登录，不提供离线启动。缺少服务器地址或登录凭据时，先按提示完成登录；中继配置会自动获取。daemon 启动参数校验失败会记录 `STARTUP_CONFIG_INVALID` 和无效参数名称，客户端提示检查启动配置；日志不回显该参数的原始值。daemon 的 `--relay` 接受 `[region@]tls://host:port`、`tcp://host:port` 和兼容的 `host:port` 格式，TLS 与明文传输仍受原有安全策略约束。

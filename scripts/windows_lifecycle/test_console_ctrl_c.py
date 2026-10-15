@@ -249,6 +249,8 @@ class ConsoleCtrlCInjectorTests(unittest.TestCase):
                 self.assertEqual(native["request_id"], request, diagnostic)
                 self.assertIs(native["broadcast_succeeded"], False, diagnostic)
                 self.assertEqual(native["stage"], "attach_console", diagnostic)
+                self.assertEqual(type(native["native_error_code"]), int, diagnostic)
+                self.assertEqual(native["native_error_code"], 6, diagnostic)
                 self.assertTrue(native["detail"], diagnostic)
                 self.assertIsNone(target_process.poll(), diagnostic)
                 self.assertIsNone(phase_error, diagnostic)

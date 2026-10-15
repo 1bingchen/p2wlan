@@ -10,6 +10,7 @@ $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 $stage = 'initialize'
 $broadcastSucceeded = $false
+$nativeErrorCode = $null
 $detail = ''
 function Initialize-CtrlCDiagnosticDirectory {
     param([Parameter(Mandatory = $true)][string]$Directory)
@@ -136,7 +137,10 @@ function Initialize-CtrlCNativeMethods {
         [System.Reflection.TypeAttributes]'Public, Abstract, Sealed')
     $importConstructor = [System.Runtime.InteropServices.DllImportAttribute].GetConstructor(
         [Type[]]@([string]))
-    $lastError = [System.Runtime.InteropServices.DllImportAttribute].GetField('SetLastError')
+    $importFields = [System.Reflection.FieldInfo[]]@(
+        'EntryPoint', 'SetLastError', 'CallingConvention', 'CharSet', 'PreserveSig' |
+            ForEach-Object { [System.Runtime.InteropServices.DllImportAttribute].GetField($_) }
+    )
     $definitions = @(
         @{ Name = 'AttachConsole'; Parameters = [Type[]]@([uint32]) }
         @{ Name = 'FreeConsole'; Parameters = [Type[]]@() }
@@ -144,15 +148,15 @@ function Initialize-CtrlCNativeMethods {
         @{ Name = 'SetConsoleCtrlHandler'; Parameters = [Type[]]@([IntPtr], [bool]) }
     )
     foreach ($definition in $definitions) {
-        $method = $native.DefinePInvokeMethod($definition.Name, 'kernel32.dll',
+        $method = $native.DefineMethod($definition.Name,
             [System.Reflection.MethodAttributes]'Public, Static, HideBySig, PinvokeImpl',
             [System.Reflection.CallingConventions]::Standard, [bool],
-            [Type[]]$definition.Parameters,
-            [System.Runtime.InteropServices.CallingConvention]::Winapi,
-            [System.Runtime.InteropServices.CharSet]::None)
+            [Type[]]$definition.Parameters)
         $attribute = [System.Reflection.Emit.CustomAttributeBuilder]::new(
             $importConstructor, [object[]]@('kernel32.dll'),
-            [System.Reflection.FieldInfo[]]@($lastError), [object[]]@($true))
+            $importFields, [object[]]@($definition.Name, $true,
+                [System.Runtime.InteropServices.CallingConvention]::Winapi,
+                [System.Runtime.InteropServices.CharSet]::None, $true))
         $method.SetCustomAttribute($attribute)
         $method.SetImplementationFlags([System.Reflection.MethodImplAttributes]::PreserveSig)
     }
@@ -166,7 +170,8 @@ try {
     Write-InjectorPhase -Phase attach_console
     [void][P2WlanCtrlCInjector]::FreeConsole()
     if (-not [P2WlanCtrlCInjector]::AttachConsole([uint32]$ProcessId)) {
-        throw [System.ComponentModel.Win32Exception]::new([Runtime.InteropServices.Marshal]::GetLastWin32Error())
+        $nativeErrorCode = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+        throw [System.ComponentModel.Win32Exception]::new($nativeErrorCode)
     }
     Write-InjectorPhase -Phase attached_console
     # Attaching resets this process's handlers. Protect only the injector
@@ -174,13 +179,15 @@ try {
     $stage = 'protect_injector'
     Write-InjectorPhase -Phase protect_injector
     if (-not [P2WlanCtrlCInjector]::SetConsoleCtrlHandler([IntPtr]::Zero, $true)) {
-        throw [System.ComponentModel.Win32Exception]::new([Runtime.InteropServices.Marshal]::GetLastWin32Error())
+        $nativeErrorCode = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+        throw [System.ComponentModel.Win32Exception]::new($nativeErrorCode)
     }
     Write-InjectorPhase -Phase protected_injector
     $stage = 'broadcast_ctrl_c'
     Write-InjectorPhase -Phase broadcast_ctrl_c
     if (-not [P2WlanCtrlCInjector]::GenerateConsoleCtrlEvent(0, 0)) {
-        throw [System.ComponentModel.Win32Exception]::new([Runtime.InteropServices.Marshal]::GetLastWin32Error())
+        $nativeErrorCode = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+        throw [System.ComponentModel.Win32Exception]::new($nativeErrorCode)
     }
     $broadcastSucceeded = $true
     $exitCode = 0
@@ -198,6 +205,7 @@ Write-InjectorPhase -Phase write_native_evidence
     target_process_id = $ProcessId
     broadcast_succeeded = $broadcastSucceeded
     stage = $stage
+    native_error_code = $nativeErrorCode
     detail = $detail
 } | ConvertTo-Json | Set-Content -LiteralPath $EvidencePath -Encoding utf8
 Write-InjectorPhase -Phase native_evidence_written

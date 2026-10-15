@@ -51,6 +51,8 @@ pub(super) use runtime_vip::RuntimeVipCase;
 mod asymmetric_endpoint;
 pub(super) use asymmetric_endpoint::{
     exercise_asymmetric_endpoint, exercise_asymmetric_invalidation,
+    exercise_asymmetric_receive_socket, exercise_asymmetric_receive_socket_invalidation,
+    exercise_equal_remote_distinct_socket,
 };
 #[path = "common_hub.rs"]
 mod common_hub;
@@ -287,6 +289,7 @@ impl Endpoint {
             budget,
             keep_bootstrap_vip,
             false,
+            1,
             None,
         )
         .await
@@ -311,6 +314,7 @@ impl Endpoint {
             budget,
             false,
             true,
+            1,
             None,
         )
         .await
@@ -328,6 +332,7 @@ impl Endpoint {
         budget: Budget,
         keep_bootstrap_vip: bool,
         actual_validation: bool,
+        pool_count: usize,
         common_hub: Option<&str>,
     ) -> Result<Self, String> {
         let mut config =
@@ -367,6 +372,14 @@ impl Endpoint {
                 )
                 .await?
                 .map_err(|e| e.to_string())?;
+            let udp = if pool_count > 1 {
+                budget
+                    .step("bind actual owned pool", udp.with_socket_pool(pool_count))
+                    .await?
+                    .map_err(|e| e.to_string())?
+            } else {
+                udp
+            };
             let udp = if actual_validation {
                 udp.with_local_node_id(node)
                     .with_wireguard_transport(wireguard.clone())
@@ -489,14 +502,28 @@ impl Endpoint {
                 .map_err(|e| e.to_string())
         });
         if let Some(transport) = udp_transport {
-            let (stop, stopped) = watch::channel(false);
-            owners.readers_stop.push(stop);
-            owners.spawn("actual original UDP single reader", async move {
-                transport
-                    .run_original_reader_until_for_test(encrypted_tx, stopped)
-                    .await
+            for index in 0..transport.socket_count() {
+                let (stop, stopped) = watch::channel(false);
+                owners.readers_stop.push(stop);
+                let transport = transport.clone();
+                let encrypted_tx = encrypted_tx.clone();
+                owners.spawn("actual original UDP owned reader", async move {
+                    if index == 0 {
+                        transport
+                            .run_original_reader_until_for_test(encrypted_tx, stopped)
+                            .await
+                    } else {
+                        transport
+                            .run_original_indexed_reader_until_for_test(
+                                index,
+                                encrypted_tx,
+                                stopped,
+                            )
+                            .await
+                    }
                     .map_err(|e| e.to_string())
-            });
+                });
+            }
         } else if let (Some(transport), Some(rx)) = (relay_transport, relay_rx) {
             owners.spawn("actual original Relay queue converter", async move {
                 transport

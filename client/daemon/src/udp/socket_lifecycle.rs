@@ -99,6 +99,8 @@ pub(crate) struct ProvisionalSocketGuard {
     outcome: std::sync::Mutex<Option<CommitOutcome>>,
     #[allow(dead_code)]
     watcher: tokio::task::JoinHandle<()>,
+    #[cfg(test)]
+    watcher_joined: bool,
 }
 
 impl ProvisionalSocketGuard {
@@ -258,6 +260,8 @@ impl ProvisionalSocketGuard {
             finalize_ack: std::sync::Mutex::new(Some(finalize_ack)),
             outcome: std::sync::Mutex::new(None),
             watcher,
+            #[cfg(test)]
+            watcher_joined: false,
         }
     }
 
@@ -477,6 +481,29 @@ impl ProvisionalSocketGuard {
         .committed
     }
 
+    #[cfg(test)]
+    pub(crate) async fn join_original_watcher_for_test(
+        &mut self,
+    ) -> std::result::Result<(), tokio::task::JoinError> {
+        if self.watcher_joined {
+            return Ok(());
+        }
+        self.stop_tx.send_replace(true);
+        let result = (&mut self.watcher).await;
+        self.watcher_joined = true;
+        result
+    }
+
+    #[cfg(test)]
+    pub(super) fn signal_original_watcher_stop_for_test(&self) {
+        self.stop_tx.send_replace(true);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn original_watcher_joined_for_test(&self) -> bool {
+        self.watcher_joined
+    }
+
     /// Hand the committed socket to the peer's long-term ownership.
     ///
     /// Called only after the generation's durable handoff (the fresh mapping
@@ -605,6 +632,19 @@ impl std::fmt::Debug for ProvisionalSocketGuard {
     }
 }
 
+fn take_original_dynamic_attach_reader(
+    reader: &mut Option<tokio::task::JoinHandle<()>>,
+    #[cfg(test)] owner: Option<&mut super::original_dynamic_test::OriginalDynamicAttachForTest>,
+) -> Option<tokio::task::JoinHandle<()>> {
+    #[cfg(test)]
+    if let Some(owner) = owner {
+        if owner.reader.is_some() {
+            return owner.reader.take();
+        }
+    }
+    reader.take()
+}
+
 impl UdpTransport {
     /// Register a dedicated punch socket with the transport and return the
     /// cancellation-safe ownership guard for its generation.
@@ -645,6 +685,33 @@ impl UdpTransport {
         punch_generation: u64,
         cancellation: Option<&Arc<crate::PunchSessionCancellation>>,
     ) -> std::result::Result<ProvisionalSocketGuard, DynamicSocketAttachError> {
+        self.attach_original_dynamic_inner(
+            peer_id,
+            socket_index,
+            socket,
+            network_generation,
+            punch_generation,
+            cancellation,
+            #[cfg(test)]
+            None,
+        )
+        .await?
+        .ok_or(DynamicSocketAttachError::ReaderStartupFailed)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn attach_original_dynamic_inner(
+        &self,
+        peer_id: &str,
+        socket_index: usize,
+        socket: Arc<UdpSocket>,
+        network_generation: u64,
+        punch_generation: u64,
+        cancellation: Option<&Arc<crate::PunchSessionCancellation>>,
+        #[cfg(test)] mut test_owner: Option<
+            &mut super::original_dynamic_test::OriginalDynamicAttachForTest,
+        >,
+    ) -> std::result::Result<Option<ProvisionalSocketGuard>, DynamicSocketAttachError> {
         if self.inbound_channel().is_none() {
             return Err(DynamicSocketAttachError::NoInboundChannel);
         }
@@ -676,12 +743,19 @@ impl UdpTransport {
         // even when the entry was never inserted (the reader selects on it
         // while parked in recv_from), so a drop before the insert can never
         // leak a reader parked in `recv_from` forever.
-        let provisional_guard = ProvisionalSocketGuard::spawn(
+        let mut provisional_guard = Some(ProvisionalSocketGuard::spawn(
             self.clone(),
             socket_index,
             peer_id.to_string(),
             cancellation.cloned().unwrap_or_default(),
-        );
+        ));
+        #[cfg(test)]
+        if let Some(owner) = test_owner.as_deref_mut() {
+            // No await occurs after spawn before transfer into the outer
+            // fixture's original owner. Map insertion takes this same reader.
+            owner.reader = reader_handle.take();
+            owner.guard = provisional_guard.take();
+        }
 
         // The whole cap check, eviction selection, removal and insert run
         // under one lock acquisition.  Reader aborts for evicted sockets are
@@ -761,7 +835,12 @@ impl UdpTransport {
                                 authenticated_evidence: 0,
                                 phase: DynamicSocketPhase::Provisional,
                                 shutdown_tx,
-                                reader: reader_handle.take().expect("reader handle owned"),
+                                reader: take_original_dynamic_attach_reader(
+                                    &mut reader_handle,
+                                    #[cfg(test)]
+                                    test_owner.as_deref_mut(),
+                                )
+                                .expect("reader handle owned"),
                                 send_leases: Arc::new(DynamicSocketLeaseState::default()),
                             },
                         );
@@ -784,7 +863,12 @@ impl UdpTransport {
                             authenticated_evidence: 0,
                             phase: DynamicSocketPhase::Provisional,
                             shutdown_tx,
-                            reader: reader_handle.take().expect("reader handle owned"),
+                            reader: take_original_dynamic_attach_reader(
+                                &mut reader_handle,
+                                #[cfg(test)]
+                                test_owner.as_deref_mut(),
+                            )
+                            .expect("reader handle owned"),
                             send_leases: Arc::new(DynamicSocketLeaseState::default()),
                         },
                     );
@@ -792,9 +876,29 @@ impl UdpTransport {
                 }
             }
         };
+        #[cfg(test)]
+        if let Some(owner) = test_owner.as_deref_mut() {
+            owner.retired.extend(
+                evicted.drain(..).map(
+                    super::original_dynamic_test::OriginalDynamicRetirementForTest::from_entry,
+                ),
+            );
+        }
         if !capacity_ok {
             if let Some(reader) = reader_handle {
                 reader.abort();
+                #[cfg(test)]
+                {
+                    let _ = reader.await;
+                }
+            }
+            #[cfg(test)]
+            {
+                if let Some(owner) = test_owner.as_deref_mut() {
+                    owner.signal_stop();
+                } else if let Some(guard) = provisional_guard.as_mut() {
+                    let _ = guard.join_original_watcher_for_test().await;
+                }
             }
             // The guard's stop fires on drop; the watcher finds no entry (or
             // one that was never inserted) and no-ops.
@@ -825,8 +929,17 @@ impl UdpTransport {
             Ok(Ok(true))
         );
         if !reader_ready {
+            #[cfg(test)]
+            if let Some(owner) = test_owner.as_deref_mut() {
+                owner.signal_stop();
+                return Err(DynamicSocketAttachError::ReaderStartupFailed);
+            }
             self.detach_dynamic_socket_by_index(socket_index, "dynamic_reader_start_failed")
                 .await;
+            #[cfg(test)]
+            if let Some(guard) = provisional_guard.as_mut() {
+                let _ = guard.join_original_watcher_for_test().await;
+            }
             drop(provisional_guard);
             return Err(DynamicSocketAttachError::ReaderStartupFailed);
         }
@@ -844,7 +957,12 @@ impl UdpTransport {
         // The ownership guard already exists (created before the insert), so
         // from this point on the generation is always covered by the watcher,
         // even if the future is dropped at the very next await point.
-        Ok(provisional_guard)
+        match provisional_guard.take() {
+            Some(guard) => Ok(Some(guard)),
+            #[cfg(test)]
+            None if test_owner.is_some() => Ok(None),
+            None => Err(DynamicSocketAttachError::ReaderStartupFailed),
+        }
     }
 
     /// Remove a dynamic socket entry and stop its reader.
@@ -860,6 +978,22 @@ impl UdpTransport {
     /// anymore; the abort is a belt-and-braces for a reader stuck in
     /// `recv_from`.
     pub(super) async fn detach_dynamic_entry(&self, entry: DynamicPunchSocket, reason: &str) {
+        self.stop_original_dynamic_entry(&entry, reason).await;
+        #[cfg(test)]
+        {
+            if let Err(error) = entry.reader.await {
+                if error.is_panic() {
+                    std::panic::resume_unwind(error.into_panic());
+                }
+            }
+        }
+    }
+
+    pub(super) async fn stop_original_dynamic_entry(
+        &self,
+        entry: &DynamicPunchSocket,
+        reason: &str,
+    ) {
         let drained = tokio::time::timeout(
             DYNAMIC_SOCKET_LEASE_DRAIN_TIMEOUT,
             self.wait_for_detach_drain(entry.socket_index, &entry.send_leases),
@@ -927,21 +1061,25 @@ impl UdpTransport {
     /// instead of resolving to a dead socket.  Idempotent: a socket that was
     /// already detached (e.g. by the provisional watcher) is a no-op.
     pub(crate) async fn detach_dynamic_socket_by_index(&self, socket_index: usize, reason: &str) {
-        let entry = {
-            let mut state = self.socket_state.lock().await;
-            let Some(entry) = state.dynamic.remove(&socket_index) else {
-                return;
-            };
-            if state
-                .affinity
-                .get(&entry.peer_id)
-                .is_some_and(|pin| pin.socket_index == socket_index)
-            {
-                state.affinity.remove(&entry.peer_id);
-            }
-            entry
-        };
-        self.detach_dynamic_entry(entry, reason).await;
+        if let Some(entry) = self.remove_original_dynamic_entry(socket_index).await {
+            self.detach_dynamic_entry(entry, reason).await;
+        }
+    }
+
+    pub(super) async fn remove_original_dynamic_entry(
+        &self,
+        socket_index: usize,
+    ) -> Option<DynamicPunchSocket> {
+        let mut state = self.socket_state.lock().await;
+        let entry = state.dynamic.remove(&socket_index)?;
+        if state
+            .affinity
+            .get(&entry.peer_id)
+            .is_some_and(|pin| pin.socket_index == socket_index)
+        {
+            state.affinity.remove(&entry.peer_id);
+        }
+        Some(entry)
     }
 
     /// Detach only when the live entry is still the exact socket identity that

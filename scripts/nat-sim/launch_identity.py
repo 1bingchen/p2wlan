@@ -73,7 +73,8 @@ def write_new(path: Path, value: dict) -> None:
         stream.write(payload)
 
 
-def prepare_artifacts(base_dir: Path, binaries: dict[str, Path], source: dict) -> dict:
+def prepare_artifacts(base_dir: Path, binaries: dict[str, Path], source: dict,
+                      *, expected: dict | None = None) -> dict:
     """Copy completed builds once; every later exec uses these retained bytes."""
     validate_source(source)
     if not binaries or set(binaries) - COMPONENTS:
@@ -89,9 +90,25 @@ def prepare_artifacts(base_dir: Path, binaries: dict[str, Path], source: dict) -
         artifacts[component] = {"path": f"artifacts/{component}", "sha256": digest_file(target),
                                 "size_bytes": target.stat().st_size}
         validate_artifact(artifacts[component], component)
+        if expected is not None and artifacts[component] != expected[component]:
+            raise ValueError("launch_reused_artifact_changed_during_copy")
     result = {"schema_version": 1, "source": source, "artifacts": artifacts}
     write_new(base_dir / "artifact-set.json", result)
     return result
+
+
+def reuse_artifacts(base_dir: Path, artifact_set: Path, source: dict,
+                    required: set[str]) -> dict:
+    """Recheck one completed build before copying the same bytes for a fresh run."""
+    retained = load_object(artifact_set)
+    validate_artifact_set(retained)
+    if retained["source"] != source:
+        raise ValueError("launch_reused_source_mismatch")
+    if not required <= set(retained["artifacts"]):
+        raise ValueError("launch_reused_component_missing")
+    binaries = {name: verify_snapshot(artifact_set.parent, name, artifact)
+                for name, artifact in retained["artifacts"].items()}
+    return prepare_artifacts(base_dir, binaries, source, expected=retained["artifacts"])
 
 
 def configuration_identity(argv: list[str], environment: dict[str, str], environment_keys: list[str],
@@ -122,7 +139,12 @@ def configuration_identity(argv: list[str], environment: dict[str, str], environ
     source, scope = "cli_and_controlled_environment", "argv_and_allowlisted_environment"
     digest = hashlib.sha256(canonical({"source": source, "scope": scope, "argv": argv,
         "environment": inputs, "config_file": file_identity, "excluded_inputs": sorted(excluded)})).hexdigest()
-    return {"source": source, "scope": scope, "sha256": digest, "argument_count": len(argv),
+    # Bind public projections to this exact original exec argument array,
+    # without exposing private config paths/values or changing its compound hash.
+    return {"source": source, "scope": scope, "sha256": digest,
+            "argv_sha256": hashlib.sha256(canonical(argv)).hexdigest(),
+            "startup_policy_flags": [arg for arg in argv if arg in {
+                "--prefer-direct", "--prefer-relay", "--relay-only"}], "argument_count": len(argv),
             "environment_keys": keys, "config_file": file_identity, "excluded_inputs": sorted(excluded)}
 
 
@@ -171,12 +193,24 @@ def role_component(role: str) -> str:
 
 def validate_configuration(value: object) -> None:
     keys = {"source", "scope", "sha256", "argument_count", "environment_keys", "config_file", "excluded_inputs"}
-    if (not isinstance(value, dict) or set(value) != keys
+    # Old non-policy launch evidence remains readable. New strict policy
+    # collectors separately require the original exec argv digest.
+    if (not isinstance(value, dict) or not keys <= set(value)
+            or set(value) - keys - {"argv_sha256", "startup_policy_flags"}
             or value["source"] != "cli_and_controlled_environment"
             or value["scope"] != "argv_and_allowlisted_environment"
             or not isinstance(value["sha256"], str) or not SHA256.fullmatch(value["sha256"])
             or type(value["argument_count"]) is not int or not 0 <= value["argument_count"] <= 256):
         raise ValueError("launch_configuration_identity_invalid")
+    if ("argv_sha256" in value and (not isinstance(value["argv_sha256"], str)
+                                   or not SHA256.fullmatch(value["argv_sha256"]))):
+        raise ValueError("launch_configuration_argv_identity_invalid")
+    if "startup_policy_flags" in value:
+        flags = value["startup_policy_flags"]
+        if (not isinstance(flags, list) or len(flags) > value["argument_count"]
+                or not all(isinstance(flag, str) and flag in {
+                    "--prefer-direct", "--prefer-relay", "--relay-only"} for flag in flags)):
+            raise ValueError("launch_configuration_policy_identity_invalid")
     names, excluded = value["environment_keys"], value["excluded_inputs"]
     if (not isinstance(names, list) or len(names) > 64
             or not all(isinstance(name, str) and re.fullmatch(r"[A-Z][A-Z0-9_]{0,127}", name) for name in names)
@@ -229,9 +263,20 @@ def exec_launch(artifact_set: Path, component: str, record_path: Path, role: str
     snapshots = {name: verify_snapshot(artifact_set.parent, name, artifact)
                  for name, artifact in artifacts["artifacts"].items()}
     executable = snapshots[component]
-    # The shim has already exec'd this wrapper. Hash its final controlled
-    # environment here, and exec the declared artifact itself as the same PID.
+    # System interpreters may discard loader injection before reaching this
+    # recorder. Re-arm the explicitly requested capture from the verified
+    # snapshot immediately before the native exec and its environment digest.
     environment = os.environ.copy()
+    gateway = environment.get("P2WLAN_NAT_SIM_GATEWAY_PORT")
+    if component == "daemon" and gateway is not None:
+        if not 1 <= len(gateway) <= 5 or not gateway.isdecimal() or not 1 <= int(gateway) <= 65535:
+            raise ValueError("launch_udp_capture_gateway_invalid")
+        if "udp-shim" not in snapshots:
+            raise ValueError("launch_udp_capture_snapshot_missing")
+        import udp_egress
+        stats = environment.get("P2WLAN_NAT_SIM_EGRESS_STATS")
+        environment = udp_egress.environment(snapshots["udp-shim"], int(gateway),
+                                             Path(stats) if stats else None)
     configuration = configuration_identity(arguments, environment, environment_keys,
         config_file=config_file, stdin_authorization=stdin_authorization)
     record = {"schema_version": 1, "source": artifacts["source"], "role": role, "component": component,
@@ -343,6 +388,9 @@ def main(argv=None) -> int:
     preparing.add_argument("--base-dir", type=Path, required=True)
     preparing.add_argument("--source-file", type=Path, required=True)
     preparing.add_argument("--repository", type=Path, required=True)
+    preparing.add_argument("--reuse-artifact-set", type=Path)
+    preparing.add_argument("--require-component", choices=sorted(COMPONENTS),
+                           action="append", default=[])
     for component in sorted(COMPONENTS):
         preparing.add_argument(f"--{component}", type=Path)
     execution = commands.add_parser("exec")
@@ -364,7 +412,15 @@ def main(argv=None) -> int:
                 raise ValueError("launch_source_changed_during_build")
             binaries = {component: getattr(args, component.replace("-", "_")) for component in COMPONENTS
                         if getattr(args, component.replace("-", "_")) is not None}
-            prepare_artifacts(args.base_dir, binaries, source)
+            if args.reuse_artifact_set is not None:
+                if binaries:
+                    raise ValueError("launch_reuse_and_build_inputs_mixed")
+                reuse_artifacts(args.base_dir, args.reuse_artifact_set, source,
+                                set(args.require_component))
+            else:
+                if not set(args.require_component) <= set(binaries):
+                    raise ValueError("launch_component_missing")
+                prepare_artifacts(args.base_dir, binaries, source)
         else:
             arguments = args.arguments[1:] if args.arguments[:1] == ["--"] else args.arguments
             exec_launch(args.artifact_set, args.component, args.record, args.role, arguments, args.env_key,

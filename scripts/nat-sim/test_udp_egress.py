@@ -7,6 +7,7 @@ from pathlib import Path
 import socket
 import struct
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -97,6 +98,29 @@ class UdpEgressTests(unittest.IsolatedAsyncioTestCase):
     @classmethod
     def tearDownClass(cls):
         cls.temp.cleanup()
+
+    async def test_recorder_cli_keeps_intent_without_injecting_intermediate_python(self):
+        port = unused_port()
+        stats = self.root / "recorder.stats"
+        keys = ("DYLD_INSERT_LIBRARIES", "LD_PRELOAD",
+                "P2WLAN_NAT_SIM_GATEWAY_PORT", "P2WLAN_NAT_SIM_EGRESS_STATS")
+        code = "import json,os;print(json.dumps({'pid':os.getpid(),'env':{k:os.environ.get(k) for k in " + repr(keys) + "}}))"
+        child = await asyncio.create_subprocess_exec(
+            sys.executable, str(Path(udp_egress.__file__)), "--recorder",
+            "--library", str(self.library), "--port", str(port), "--stats", str(stats),
+            "--", sys.executable, "-c", code,
+            env=udp_egress.recorder_environment(os.environ),
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        try:
+            stdout, stderr = await asyncio.wait_for(child.communicate(), 15)
+            self.assertEqual(child.returncode, 0, stderr.decode())
+            observed = json.loads(stdout)
+            self.assertEqual(observed["pid"], child.pid)
+            self.assertEqual(observed["env"], dict(zip(keys, (None, None, str(port), str(stats.resolve())))))
+        finally:
+            if child.returncode is None:
+                child.kill()
+                await child.wait()
 
     async def asyncSetUp(self):
         self.nats = []

@@ -22,7 +22,7 @@ class ExecObserved(Exception):
     """Leave the same pre-exec record a successful exec would retain."""
 
 
-def write_valid_launch_evidence(base, source=SOURCE):
+def write_valid_launch_evidence(base, source=SOURCE, *, daemon_argv=None):
     """Emit real snapshots and typed records without starting service binaries."""
     launch = importlib.import_module("launch_identity")
     base.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -36,8 +36,9 @@ def write_valid_launch_evidence(base, source=SOURCE):
     with patch.dict(os.environ, {}, clear=True), patch.object(launch.os, "execve", side_effect=ExecObserved):
         for role in launch.REQUIRED_ROLES:
             try:
+                arguments = daemon_argv if role in {"node-a", "node-b"} and daemon_argv is not None else []
                 launch.exec_launch(base / "artifact-set.json", launch.role_component(role),
-                                   directory / f"{role}.json", role, [], [])
+                                   directory / f"{role}.json", role, arguments, [])
             except ExecObserved:
                 pass
     return launch.read_launch_evidence(base, source)
@@ -128,6 +129,43 @@ class LaunchIdentityTests(unittest.TestCase):
         reread = evidence["records"][0]["record"]
         self.assertEqual(reread["configuration"], record["configuration"])
         self.assertNotIn("generated-runtime-secret", json.dumps(evidence))
+
+    def test_original_exec_record_binds_private_argv_digest_and_preserves_compound_hash(self):
+        arguments = ["--config", "/private/synthetic-config.json", "--prefer-relay"]
+        record, call = self.emit_record(arguments=arguments, environment={"FLAG": "enabled"})
+        actual = call.args[1][1:]
+        self.assertEqual(actual, arguments)
+        configuration = record["configuration"]
+        self.assertEqual(configuration["argv_sha256"],
+                         hashlib.sha256(self.launch.canonical(actual)).hexdigest())
+        self.assertEqual(configuration["startup_policy_flags"], ["--prefer-relay"])
+        compound = {"source": configuration["source"], "scope": configuration["scope"],
+                    "argv": actual, "environment": {"FLAG": "enabled"},
+                    "config_file": configuration["config_file"],
+                    "excluded_inputs": configuration["excluded_inputs"]}
+        self.assertEqual(configuration["sha256"],
+                         hashlib.sha256(self.launch.canonical(compound)).hexdigest())
+        self.assertNotIn("/private/synthetic-config.json", self.record_path.read_text())
+        changed = self.launch.configuration_identity(
+            [*arguments[:-1], "--prefer-direct"], {"FLAG": "enabled"}, ["FLAG"])
+        self.assertEqual(changed["argument_count"], configuration["argument_count"])
+        self.assertNotEqual(changed["argv_sha256"], configuration["argv_sha256"])
+
+    def test_reader_accepts_legacy_config_and_rejects_malformed_optional_argv_digest(self):
+        original, _ = self.emit_record()
+        legacy = copy.deepcopy(original)
+        del legacy["configuration"]["argv_sha256"]
+        del legacy["configuration"]["startup_policy_flags"]
+        self.record_path.write_bytes(self.launch.canonical(legacy) + b"\n")
+        self.assertTrue(self.launch.read_launch_evidence(
+            self.base, SOURCE, ["node-a"])["valid"])
+        for value in (None, True, 123, "a" * 63, "A" * 64):
+            changed = copy.deepcopy(original)
+            changed["configuration"]["argv_sha256"] = value
+            self.record_path.write_bytes(self.launch.canonical(changed) + b"\n")
+            observed = self.launch.read_launch_evidence(self.base, SOURCE, ["node-a"])
+            self.assertFalse(observed["valid"], value)
+            self.assertIn("record_invalid_or_changed:node-a.json", observed["errors"])
 
     def test_present_configuration_content_is_hashed_without_persisting_plaintext(self):
         path = self.base / "config.json"

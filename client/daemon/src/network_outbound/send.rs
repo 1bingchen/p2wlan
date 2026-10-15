@@ -45,7 +45,17 @@ pub(super) async fn encrypt_then_send_with_deadline(
     stopping: Option<&AtomicBool>,
 ) -> EncryptSendOutcome {
     let packet = packet.into();
+    let original_buffer_lease = crate::dataplane_resources::OwnedBufferLease::observe(
+        transport.resource_capture(),
+        crate::dataplane_resources::BufferStage::ActiveOriginal,
+        &packet.packet,
+    );
     let retry_packet = packet.clone();
+    let _retry_buffer_lease = crate::dataplane_resources::OwnedBufferLease::observe(
+        transport.resource_capture(),
+        crate::dataplane_resources::BufferStage::RetryPlaintext,
+        &retry_packet.packet,
+    );
     if let Some(capture) = transport.resource_capture() {
         let _ = capture.observe_vec(
             crate::dataplane_resources::VecSite::TxRetryCopy,
@@ -67,6 +77,11 @@ pub(super) async fn encrypt_then_send_with_deadline(
     // across its exact nonblocking UDP syscall, which is the revocation/path
     // replacement linearization point.
     let preparation_retry = retry_packet.clone();
+    let preparation_buffer_lease = crate::dataplane_resources::OwnedBufferLease::observe(
+        transport.resource_capture(),
+        crate::dataplane_resources::BufferStage::PreparationPlaintext,
+        &preparation_retry.packet,
+    );
     if let Some(capture) = transport.resource_capture() {
         let _ = capture.observe_vec(
             crate::dataplane_resources::VecSite::TxPreparationCopy,
@@ -91,6 +106,10 @@ pub(super) async fn encrypt_then_send_with_deadline(
     // cancellation may abandon an allocated counter, but its ciphertext has
     // never been handed off, so only the original plaintext can be retried.
     let prepare = async {
+        // These move-only leases are owned by the same preparation future as
+        // the corresponding buffers, including cancellation before encryption.
+        let original_buffer_lease = original_buffer_lease;
+        let _preparation_buffer_lease = preparation_buffer_lease;
         let emit_lock_started = Instant::now();
         let emit_guard = Arc::new(transport.acquire_outbound_emit_guard(&packet.peer_id).await);
         let emit_guard_acquired = Instant::now();
@@ -109,7 +128,13 @@ pub(super) async fn encrypt_then_send_with_deadline(
             lock_wait_ms = emit_lock_wait_ms,
             "business packet acquired its per-peer WireGuard counter-ordering lock"
         );
-        let (encrypted, direct_business_plan, force_relay, physical_preparation) = {
+        let (
+            encrypted,
+            direct_business_plan,
+            force_relay,
+            physical_preparation,
+            serialized_buffer_lease,
+        ) = {
             let epoch_gate = peers.network_epoch_gate();
             let epoch_gate_wait_started = Instant::now();
             let _epoch_guard = epoch_gate.lock().await;
@@ -153,7 +178,14 @@ pub(super) async fn encrypt_then_send_with_deadline(
                 )
                 .await;
             let mut force_relay = false;
-            let direct_business_plan = if selection.path == Some(NetworkPath::Direct)
+            // A sealed Relay REQUEST echo must use its original Relay writer.
+            // Direct may have won since ingress, but cannot validate a Relay
+            // read as an original UDP read at its final write boundary.
+            let original_relay_echo = preparation_retry
+                .original_echo()
+                .is_some_and(|echo| echo.source().original_relay_read().is_some());
+            let direct_business_plan = if !original_relay_echo
+                && selection.path == Some(NetworkPath::Direct)
                 && selection.direct_confirmed
             {
                 match (udp, selection.direct_endpoint) {
@@ -335,6 +367,14 @@ pub(super) async fn encrypt_then_send_with_deadline(
                     });
                 }
             };
+            // The original plaintext has been consumed by the crypto call.
+            // Bind the returned wire owner before any further awaited work.
+            drop(original_buffer_lease);
+            let serialized_buffer_lease = crate::dataplane_resources::OwnedBufferLease::observe(
+                transport.resource_capture(),
+                crate::dataplane_resources::BufferStage::SerializedWire,
+                &result.wire_bytes,
+            );
             result.bind_original_echo_emit(&emit_guard);
             let physical_preparation =
                 result.prepare_physical_publication(peers, transport, current_generation);
@@ -365,6 +405,7 @@ pub(super) async fn encrypt_then_send_with_deadline(
                 direct_business_plan,
                 force_relay,
                 physical_preparation,
+                serialized_buffer_lease,
             )
         };
         Ok((
@@ -375,9 +416,10 @@ pub(super) async fn encrypt_then_send_with_deadline(
             emit_lock_started,
             emit_guard_acquired,
             physical_preparation,
+            serialized_buffer_lease,
         ))
     };
-    let (emit_guard, encrypted, direct_business_plan, force_relay, emit_lock_started, emit_guard_acquired, physical_preparation) =
+    let (emit_guard, encrypted, direct_business_plan, force_relay, emit_lock_started, emit_guard_acquired, physical_preparation, _serialized_buffer_lease) =
         match timeout(preparation_bound, prepare).await {
             Ok(Ok(prepared)) => prepared,
             Ok(Err(outcome)) => return outcome,
@@ -911,16 +953,30 @@ async fn send_encrypted_packet_once_with_origin(
             profiler.record(sampled, "tx_udp_transport_rwlock_hold_us", udp_read_hold);
         }
         let udp_local_endpoint = udp.as_ref().and_then(|udp| udp.local_addr().ok());
-        let selection = select_outbound_path(
-            packet,
-            peers,
-            prefer_direct,
-            relay_available,
-            relay_expected,
-            udp_local_endpoint,
-            force_relay,
-        )
-        .await;
+        let original_relay_echo = packet
+            .binding()
+            .and_then(|binding| binding.token().echo())
+            .is_some_and(|echo| echo.source().original_relay_read().is_some());
+        let selection = if original_relay_echo {
+            // Packet-specific return routing does not change the peer's
+            // committed Direct owner. Relay admission and the original
+            // reader/client/session prewrite fences still apply below.
+            PathSelection::relay(
+                "original_relay_echo_return",
+                "sealed Relay REQUEST echo retains its original return writer",
+            )
+        } else {
+            select_outbound_path(
+                packet,
+                peers,
+                prefer_direct,
+                relay_available,
+                relay_expected,
+                udp_local_endpoint,
+                force_relay,
+            )
+            .await
+        };
         // These authority/slot awaits still precede every syscall or writer
         // admission. After the check below, the physical operation owns its
         // existing terminal-aware timeout and is never externally replayed.
@@ -934,6 +990,7 @@ async fn send_encrypted_packet_once_with_origin(
             counter = ?crate::transport::wire_counter(&packet.wire_bytes),
             wire_fp = format_args!("{:016x}", crate::transport::wire_fingerprint(&packet.wire_bytes)),
             selected_path = ?selection.path,
+            reason_code = selection.reason_code,
             direct_confirmed = selection.direct_confirmed,
             relay_peer_confirmed,
             relay_connection_id = relay.as_ref().map(RelayTransport::connection_id),
@@ -1268,6 +1325,10 @@ mod tests;
 #[cfg(test)]
 #[path = "tests/resource_capture_send.rs"]
 mod resource_capture_tests;
+
+#[cfg(test)]
+#[path = "tests/resource_capture_active_buffers.rs"]
+mod resource_capture_active_buffers_tests;
 
 #[cfg(test)]
 #[path = "tests/request_carriage_send.rs"]

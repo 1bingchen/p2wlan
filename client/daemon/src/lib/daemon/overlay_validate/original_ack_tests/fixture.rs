@@ -23,6 +23,9 @@ use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
 type Check = Result<(), String>;
+#[path = "managed_dynamic.rs"]
+mod managed_dynamic;
+pub(super) use managed_dynamic::{exercise_publication, PublicationCase, PublicationMode};
 #[path = "ack_contention.rs"]
 mod ack_contention;
 #[path = "contention.rs"]
@@ -49,6 +52,8 @@ mod runtime_vip;
 pub(super) use runtime_vip::RuntimeVipCase;
 #[path = "asymmetric_endpoint.rs"]
 mod asymmetric_endpoint;
+#[path = "relay_return.rs"]
+mod relay_return;
 pub(super) use asymmetric_endpoint::{
     exercise_asymmetric_endpoint, exercise_asymmetric_invalidation,
     exercise_asymmetric_receive_socket, exercise_asymmetric_receive_socket_invalidation,
@@ -85,6 +90,7 @@ pub(super) enum Scenario {
     EchoTransfer(EchoCase),
     EchoContention(EchoContentionCase),
     PublicationOrder,
+    RelayEchoAfterDirect,
     RuntimeVip(RuntimeVipCase),
 }
 
@@ -141,6 +147,9 @@ struct Task {
 #[derive(Default)]
 struct Owners {
     tasks: Vec<Task>,
+    graceful_tasks: Vec<Task>,
+    dynamic_guards: Vec<managed_dynamic::DynamicGuardOwner>,
+    retired_dynamic: Vec<managed_dynamic::DynamicRetiredOwner>,
     readers_stop: Vec<watch::Sender<bool>>,
     relays: Vec<RelayTransport>,
     server: Option<RelayServer>,
@@ -161,6 +170,18 @@ impl Owners {
         future: impl Future<Output = Check> + Send + 'static,
     ) {
         self.tasks.push(Task {
+            label,
+            handle: Some(tokio::spawn(future)),
+            graceful: true,
+        });
+    }
+
+    fn spawn_managed_graceful(
+        &mut self,
+        label: &'static str,
+        future: impl Future<Output = Check> + Send + 'static,
+    ) {
+        self.graceful_tasks.push(Task {
             label,
             handle: Some(tokio::spawn(future)),
             graceful: true,
@@ -206,6 +227,35 @@ impl Owners {
                 )),
             }
         }
+        // These original schedulers own child JoinSets. Their real shutdown
+        // must finish before their outer handles can count as joined.
+        for task in &mut self.graceful_tasks {
+            let Some(handle) = task.handle.as_mut() else {
+                continue;
+            };
+            match tokio::time::timeout_at(budget.end, &mut *handle).await {
+                Ok(Ok(Ok(()))) => {
+                    task.handle.take();
+                }
+                Ok(other) => {
+                    task.handle.take();
+                    failures.push(format!(
+                        "{}: unexpected graceful join {other:?}",
+                        task.label
+                    ));
+                }
+                Err(_) => {
+                    handle.abort();
+                    failures.push(format!(
+                        "{}: graceful join exceeded unchanged fixture end",
+                        task.label
+                    ));
+                }
+            }
+        }
+        if let Err(error) = managed_dynamic::close_dynamic_owners(self, budget).await {
+            failures.push(error);
+        }
         if let Some(server) = self.server.take() {
             if tokio::time::timeout_at(budget.end, server.shutdown())
                 .await
@@ -237,12 +287,21 @@ impl Drop for Owners {
         }
         // Unwinding fallback is cancellation only. The explicit close above,
         // never this Drop, is the fixture's owned-join success evidence.
+        for task in &self.graceful_tasks {
+            if let Some(handle) = &task.handle {
+                handle.abort();
+            }
+        }
     }
 }
 
 struct Endpoint {
     node: &'static str,
     identity: NodeIdentity,
+    publication_mode: Option<PublicationMode>,
+    dynamic_publication: Option<managed_dynamic::DynamicSocketDescriptor>,
+    validation_ingress: Option<crate::DirectValidationIngress>,
+    encrypted: mpsc::Sender<crate::transport::ReceivedEncryptedPacket>,
     vip: &'static str,
     remote_node: &'static str,
     remote_vip: &'static str,
@@ -326,6 +385,38 @@ impl Endpoint {
     }
 
     #[allow(clippy::too_many_arguments)]
+    async fn create_with_publication(
+        node: &'static str,
+        vip: &'static str,
+        remote_node: &'static str,
+        remote_vip: &'static str,
+        path: PathKind,
+        hub: Option<&str>,
+        owners: &mut Owners,
+        budget: Budget,
+        publication_mode: Option<PublicationMode>,
+        keep_bootstrap_vip: bool,
+    ) -> Result<Self, String> {
+        Self::create_inner_with_publication(
+            node,
+            vip,
+            remote_node,
+            remote_vip,
+            path,
+            hub,
+            owners,
+            budget,
+            keep_bootstrap_vip,
+            false,
+            1,
+            None,
+            publication_mode,
+            false,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
     async fn create_inner(
         node: &'static str,
         vip: &'static str,
@@ -340,7 +431,7 @@ impl Endpoint {
         pool_count: usize,
         common_hub: Option<&str>,
     ) -> Result<Self, String> {
-        Self::create_inner_with_supervisor(
+        Self::create_inner_with_publication(
             node,
             vip,
             remote_node,
@@ -353,6 +444,7 @@ impl Endpoint {
             actual_validation,
             pool_count,
             common_hub,
+            None,
             false,
         )
         .await
@@ -366,7 +458,7 @@ impl Endpoint {
         owners: &mut Owners,
         budget: Budget,
     ) -> Result<Self, String> {
-        Self::create_inner_with_supervisor(
+        Self::create_inner_with_publication(
             node,
             vip,
             remote_node,
@@ -379,13 +471,14 @@ impl Endpoint {
             true,
             1,
             None,
+            None,
             true,
         )
         .await
     }
 
     #[allow(clippy::too_many_arguments)]
-    async fn create_inner_with_supervisor(
+    async fn create_inner_with_publication(
         node: &'static str,
         vip: &'static str,
         remote_node: &'static str,
@@ -398,6 +491,7 @@ impl Endpoint {
         actual_validation: bool,
         pool_count: usize,
         common_hub: Option<&str>,
+        publication_mode: Option<PublicationMode>,
         supervised: bool,
     ) -> Result<Self, String> {
         let mut config =
@@ -412,7 +506,7 @@ impl Endpoint {
             config.network.virtual_ip = vip.to_string();
         }
         config.relay.path_policy = PathPolicy::Auto;
-        let identity = if actual_validation {
+        let identity = if actual_validation || publication_mode.is_some() {
             let private = hex::decode(&config.node.private_key).map_err(|e| e.to_string())?;
             let private: [u8; 32] = private
                 .try_into()
@@ -424,46 +518,63 @@ impl Endpoint {
         let peers = Arc::new(PeerManager::new(config));
         let (wireguard, _unused_outbound) = WireGuardTransport::new_with_request_carriage();
         let (encrypted_tx, encrypted_rx) = mpsc::channel(16);
+        let validation_ingress = (publication_mode == Some(PublicationMode::ManagedPrimary))
+            .then(|| crate::DirectValidationIngress::with_peer_manager(peers.clone()));
         let supervisor_encrypted_input = supervised.then(|| encrypted_tx.clone());
-        let udp_transport = if path == PathKind::Direct && !supervised {
-            let udp = budget
-                .step(
-                    "bind actual UDP",
-                    UdpTransport::bind(
-                        "127.0.0.1:0"
-                            .parse()
-                            .map_err(|e: std::net::AddrParseError| e.to_string())?,
-                        peers.clone(),
-                    ),
-                )
-                .await?
-                .map_err(|e| e.to_string())?;
-            let udp = if pool_count > 1 {
-                budget
-                    .step("bind actual owned pool", udp.with_socket_pool(pool_count))
-                    .await?
-                    .map_err(|e| e.to_string())?
-            } else {
-                udp
-            };
-            let udp = if actual_validation {
-                udp.with_local_node_id(node)
-                    .with_wireguard_transport(wireguard.clone())
-                    .with_inbound_channel(encrypted_tx.clone())
-                    .with_dplpmtud_local_virtual_ip(
-                        vip.parse()
-                            .map_err(|e: std::net::AddrParseError| e.to_string())?,
+        let udp_transport =
+            if (path == PathKind::Direct || (actual_validation && hub.is_some())) && !supervised {
+                let udp = budget
+                    .step(
+                        "bind actual UDP",
+                        UdpTransport::bind(
+                            "127.0.0.1:0"
+                                .parse()
+                                .map_err(|e: std::net::AddrParseError| e.to_string())?,
+                            peers.clone(),
+                        ),
                     )
+                    .await?
+                    .map_err(|e| e.to_string())?;
+                let udp = if pool_count > 1 {
+                    budget
+                        .step("bind actual owned pool", udp.with_socket_pool(pool_count))
+                        .await?
+                        .map_err(|e| e.to_string())?
+                } else {
+                    udp
+                };
+                let udp = if actual_validation {
+                    udp.with_local_node_id(node)
+                        .with_wireguard_transport(wireguard.clone())
+                        .with_inbound_channel(encrypted_tx.clone())
+                        .with_dplpmtud_local_virtual_ip(
+                            vip.parse()
+                                .map_err(|e: std::net::AddrParseError| e.to_string())?,
+                        )
+                } else {
+                    udp
+                };
+                // This is the actual publication consumed by the actual single
+                // reader, not a synthesized OriginalUdpIngressSource/fact.
+                udp.set_inbound_publication_owner(if node == NODE_A { 28001 } else { 28002 });
+                let mut udp = udp.with_inbound_channel(encrypted_tx.clone());
+                if let Some(ingress) = validation_ingress.as_ref() {
+                    let ingress = ingress.clone();
+                    udp = udp
+                        .with_local_node_id(node)
+                        .with_wireguard_transport(wireguard.clone())
+                        .with_dplpmtud_local_virtual_ip(
+                            vip.parse()
+                                .map_err(|e: std::net::AddrParseError| e.to_string())?,
+                        )
+                        .with_validation_admission_trigger(Arc::new(move |observation| {
+                            ingress.submit(observation)
+                        }));
+                }
+                Some(udp)
             } else {
-                udp
+                None
             };
-            // This is the actual publication consumed by the actual single
-            // reader, not a synthesized OriginalUdpIngressSource/fact.
-            udp.set_inbound_publication_owner(if node == NODE_A { 28001 } else { 28002 });
-            Some(udp)
-        } else {
-            None
-        };
         let mut relay_rx: Option<mpsc::Receiver<OriginalRelayDelivery>> = None;
         let relay_transport = if path == PathKind::Relay {
             let (relay, rx) = if let Some(common) = common_hub {
@@ -573,6 +684,16 @@ impl Endpoint {
                 .map_err(|e| e.to_string())
         });
         if let Some(transport) = udp_transport {
+            if let Some(ingress) = validation_ingress.as_ref() {
+                managed_dynamic::start_original_schedulers(
+                    transport.clone(),
+                    peers.clone(),
+                    wireguard.clone(),
+                    ingress.clone(),
+                    vip,
+                    owners,
+                );
+            }
             for index in 0..transport.socket_count() {
                 let (stop, stopped) = watch::channel(false);
                 owners.readers_stop.push(stop);
@@ -595,10 +716,12 @@ impl Endpoint {
                     .map_err(|e| e.to_string())
                 });
             }
-        } else if let (Some(transport), Some(rx)) = (relay_transport, relay_rx) {
+        }
+        if let (Some(transport), Some(rx)) = (relay_transport, relay_rx) {
+            let relay_encrypted = encrypted_tx.clone();
             owners.spawn("actual original Relay queue converter", async move {
                 transport
-                    .run_inbound_for_read(rx, encrypted_tx, None)
+                    .run_inbound_for_read(rx, relay_encrypted, None)
                     .await
                     .map_err(|e| e.to_string())
             });
@@ -606,6 +729,10 @@ impl Endpoint {
         Ok(Self {
             node,
             identity,
+            publication_mode,
+            dynamic_publication: None,
+            validation_ingress,
+            encrypted: encrypted_tx,
             vip,
             remote_node,
             remote_vip,
@@ -652,6 +779,13 @@ impl Endpoint {
     }
 
     async fn local_udp(&self) -> Result<Option<SocketAddr>, String> {
+        if let Some(dynamic) = self.dynamic_publication.as_ref() {
+            return dynamic
+                .socket
+                .local_addr()
+                .map(Some)
+                .map_err(|e| e.to_string());
+        }
         self.udp
             .read()
             .await
@@ -692,7 +826,11 @@ impl Endpoint {
                     .replace_session_for_lifecycle(self.remote_node, session, lifecycle),
             )
             .await?;
-        if path == PathKind::Direct {
+        if path == PathKind::Direct
+            && self.publication_mode != Some(PublicationMode::ManagedPrimary)
+            && (self.publication_mode != Some(PublicationMode::DynamicLan)
+                || self.dynamic_publication.is_some())
+        {
             let endpoint = remote_udp.ok_or("actual opposite UDP endpoint missing")?;
             let local = self
                 .local_udp()
@@ -782,7 +920,7 @@ impl Endpoint {
                     ));
                 }
             }
-        } else {
+        } else if path == PathKind::Relay {
             let relay = self
                 .relay
                 .read()
@@ -961,6 +1099,21 @@ async fn actual_send(
     path: PathKind,
     budget: Budget,
 ) -> Check {
+    if endpoint.publication_mode == Some(PublicationMode::ManagedPrimary) {
+        let sent = budget
+            .step(
+                "original managed slow core",
+                crate::network_outbound::send_original_managed_for_test(
+                    delivery,
+                    &endpoint.wireguard,
+                    &endpoint.peers,
+                    &endpoint.udp,
+                    &endpoint.relay,
+                ),
+            )
+            .await?;
+        return require(sent, "original managed core did not report actual Sent");
+    }
     let sent = budget
         .step(
             "original WG encryption and network slow send core",
@@ -1005,11 +1158,6 @@ async fn mint_actual(
         "actual minter did not inject exactly one registered peer request",
     )?;
     endpoint.stats.sent = endpoint.stats.sent.saturating_add(count);
-    let record = endpoint
-        .sent
-        .get(&endpoint.next_nonce)
-        .cloned()
-        .ok_or("actual successful minter did not retain canonical")?;
     let routed = budget
         .step(
             "actual tracked DataPlane route queue",
@@ -1021,6 +1169,13 @@ async fn mint_actual(
         .binding()
         .and_then(|binding| binding.token().request())
         .ok_or("actual minter -> TUN -> DataPlane lost the original canonical token")?;
+    // Other original targets may advance a nonce before an invalid VIP is
+    // skipped. Only the actual carried successful record identifies this A.
+    let record = endpoint
+        .sent
+        .get(&carried.nonce)
+        .cloned()
+        .ok_or("actual successful minter did not retain carried canonical")?;
     require(
         Arc::ptr_eq(&record, &carried),
         "route rebound the original canonical Arc",
@@ -1605,7 +1760,7 @@ async fn exercise_with_runtime_vip(
             } else {
                 (VIP_A, VIP_B)
             };
-            let mut a = Endpoint::create(
+            let mut a = Endpoint::create_inner(
                 NODE_A,
                 vip_a,
                 NODE_B,
@@ -1615,9 +1770,12 @@ async fn exercise_with_runtime_vip(
                 &mut owners,
                 budget,
                 keep_bootstrap_vip,
+                scenario == Scenario::RelayEchoAfterDirect,
+                1,
+                None,
             )
             .await?;
-            let mut b = Endpoint::create(
+            let mut b = Endpoint::create_inner(
                 NODE_B,
                 vip_b,
                 NODE_A,
@@ -1627,6 +1785,9 @@ async fn exercise_with_runtime_vip(
                 &mut owners,
                 budget,
                 keep_bootstrap_vip,
+                scenario == Scenario::RelayEchoAfterDirect,
+                1,
+                None,
             )
             .await?;
             let (session_a, session_b, a_key, b_key) = session_pair_for(&a.identity, &b.identity)?;
@@ -1636,7 +1797,9 @@ async fn exercise_with_runtime_vip(
                 .await?;
             b.install_peer(a_key, udp_a, session_b, path, budget)
                 .await?;
-            if scenario == Scenario::PublicationOrder {
+            if scenario == Scenario::RelayEchoAfterDirect {
+                relay_return::exercise_relay_return(&mut a, &mut b, &mut owners, budget).await
+            } else if scenario == Scenario::PublicationOrder {
                 require(
                     path == PathKind::Direct,
                     "publication causal fixture requires actual LAN",

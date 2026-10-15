@@ -84,7 +84,7 @@ fn owned_return_identity(endpoint: &Endpoint, remote: SocketAddr) -> bool {
         && identity.commit_endpoint() == Some(remote)
 }
 
-async fn start_actual_validator(
+pub(super) async fn start_actual_validator(
     endpoint: &Endpoint,
     target: SocketAddr,
     owners: &mut Owners,
@@ -126,7 +126,11 @@ async fn start_actual_validator(
         .await?
 }
 
-async fn start_actual_dpl(endpoint: &Endpoint, owners: &mut Owners, budget: Budget) -> Check {
+pub(super) async fn start_actual_dpl(
+    endpoint: &Endpoint,
+    owners: &mut Owners,
+    budget: Budget,
+) -> Check {
     let udp = budget
         .step("borrow original DPL UDP", endpoint.udp.read())
         .await?
@@ -144,7 +148,7 @@ async fn start_actual_dpl(endpoint: &Endpoint, owners: &mut Owners, budget: Budg
     Ok(())
 }
 
-async fn require_real_budget(endpoint: &Endpoint, budget: Budget) -> Check {
+pub(super) async fn require_real_budget(endpoint: &Endpoint, budget: Budget) -> Check {
     let udp = budget
         .step("borrow actual managed publication", endpoint.udp.read())
         .await?

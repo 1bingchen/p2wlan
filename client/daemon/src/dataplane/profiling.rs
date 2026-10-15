@@ -1070,27 +1070,26 @@ mod profiling_tests {
     #[test]
     fn p10_tail_event_logging_is_rate_limited_but_counted() {
         let profiler = DataplaneProfiler::new();
-        record_tail(
-            &profiler,
-            "peer-a",
-            false,
-            1,
-            DataplaneTailMetrics::default(),
-        );
-        profiler.last_tail_event_us.store(
-            profiler.started_at.elapsed().as_micros() as u64,
-            Ordering::Relaxed,
-        );
-        record_tail(
-            &profiler,
-            "peer-b",
-            false,
-            1,
-            DataplaneTailMetrics::default(),
-        );
+        // Two peers at the same instant must share the original limiter.
+        // Raw uptime can be zero; writing it into the encoded timestamp would
+        // reset the "never emitted" sentinel instead of testing suppression.
+        for peer in ["peer-a", "peer-b"] {
+            profiler.record_tail_event_at(
+                "tx",
+                peer,
+                "lan_direct",
+                Duration::from_millis(6),
+                DataplaneTailMetrics::default(),
+                false,
+                1,
+                0,
+            );
+        }
 
         assert_eq!(profiler.tail_event_count(), 2);
         assert_eq!(profiler.tail_event_records().len(), 1);
+        assert_eq!(profiler.tail_events_emitted.load(Ordering::Relaxed), 1);
+        assert_eq!(profiler.tail_events_suppressed.load(Ordering::Relaxed), 1);
     }
 
     #[test]

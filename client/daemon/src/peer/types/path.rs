@@ -137,7 +137,7 @@ impl PathSelection {
         }
     }
 
-    pub(super) fn relay(reason_code: &'static str, reason: impl Into<String>) -> Self {
+    pub(crate) fn relay(reason_code: &'static str, reason: impl Into<String>) -> Self {
         Self {
             path: Some(NetworkPath::Relay),
             direct_endpoint: None,

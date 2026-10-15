@@ -1,5 +1,108 @@
 use super::*;
 
+#[test]
+fn pure_buffer_leases_follow_actual_clone_move_and_finish_without_pipeline_claim() {
+    let capture = ResourceCapture::new([0xb1; 16]);
+    let original = destination(13, 128);
+    assert!(OwnedBufferLease::observe(None, BufferStage::ActiveOriginal, &original).is_none());
+    for stage in [
+        BufferStage::ActiveOriginal,
+        BufferStage::RetryPlaintext,
+        BufferStage::PreparationPlaintext,
+        BufferStage::SerializedWire,
+        BufferStage::DataplaneAdmissionWait,
+    ] {
+        assert!(!capture.snapshot().buffer_scope_observed(stage));
+    }
+    let lease =
+        OwnedBufferLease::observe(Some(&capture), BufferStage::ActiveOriginal, &original).unwrap();
+    let copied = original.clone();
+    let copied_lease =
+        OwnedBufferLease::observe(Some(&capture), BufferStage::RetryPlaintext, &copied).unwrap();
+    let moved = lease;
+    capture.finish();
+    assert!(OwnedBufferLease::observe(
+        Some(&capture),
+        BufferStage::PreparationPlaintext,
+        &original
+    )
+    .is_none());
+    let live = capture.snapshot();
+    assert_eq!(
+        live.buffer(BufferStage::ActiveOriginal),
+        BufferSnapshot {
+            live_buffers: 1,
+            len: original.len() as u64,
+            capacity: original.capacity() as u64,
+        }
+    );
+    assert_eq!(
+        live.buffer(BufferStage::RetryPlaintext),
+        BufferSnapshot {
+            live_buffers: 1,
+            len: copied.len() as u64,
+            capacity: copied.capacity() as u64,
+        }
+    );
+    drop(moved);
+    drop(original);
+    assert_eq!(
+        capture.snapshot().buffer(BufferStage::ActiveOriginal),
+        BufferSnapshot::default()
+    );
+    assert_eq!(
+        capture
+            .snapshot()
+            .buffer(BufferStage::RetryPlaintext)
+            .live_buffers,
+        1
+    );
+    drop(copied_lease);
+    drop(copied);
+    let ended = capture.snapshot();
+    assert!(ended.valid);
+    assert!(ended.ended);
+    assert!(!ended.coherent);
+    assert!(ended.buffer_scope_observed(BufferStage::ActiveOriginal));
+    assert!(ended.buffer_scope_observed(BufferStage::RetryPlaintext));
+    assert!(!ended.active_attempt_bytes_measured);
+    assert!(!ended.total_pipeline_bytes_measured);
+    assert!(!ended.allocator_alloc_calls_measured);
+    assert!(!ended.allocator_free_calls_measured);
+    assert_eq!(
+        ended.buffer(BufferStage::RetryPlaintext),
+        BufferSnapshot::default()
+    );
+}
+
+#[test]
+fn pure_empty_buffer_owner_and_damaged_gauge_remain_distinct_from_missing_coverage() {
+    let capture = ResourceCapture::new([0xb2; 16]);
+    let bytes = Vec::new();
+    let lease =
+        OwnedBufferLease::observe(Some(&capture), BufferStage::SerializedWire, &bytes).unwrap();
+    assert_eq!(
+        capture.snapshot().buffer(BufferStage::SerializedWire),
+        BufferSnapshot {
+            live_buffers: 1,
+            len: 0,
+            capacity: 0,
+        }
+    );
+    capture.buffers[BufferStage::SerializedWire.index()]
+        .live_buffers
+        .store(0, Ordering::Relaxed);
+    drop(lease);
+    let invalid = capture.snapshot();
+    assert!(invalid.buffer_scope_observed(BufferStage::SerializedWire));
+    assert!(!invalid.valid);
+    assert_ne!(
+        invalid.gap_bits & RecordDisposition::GaugeUnderflow.gap_bit(),
+        0
+    );
+    assert_eq!(invalid.buffer(BufferStage::SerializedWire).live_buffers, 0);
+}
+
 fn destination(len: usize, capacity: usize) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(capacity);
     bytes.resize(len, 7);

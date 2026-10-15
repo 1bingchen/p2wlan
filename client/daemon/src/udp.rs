@@ -467,3 +467,10 @@ pub(crate) use punch_pacing::hard_hard_first_wave_pacing_margin;
 use punch_pacing::HardHardProbePacer;
 
 mod punch_reports;
+
+#[cfg(test)]
+mod original_dynamic_test;
+#[cfg(test)]
+pub(crate) use original_dynamic_test::{
+    OriginalDynamicAttachForTest, OriginalDynamicRetirementForTest,
+};

@@ -220,6 +220,18 @@ case "$PROFILE" in
       -s "$ROOT_DIR/scripts/nat-sim" \
       -p 'test_monotonic_clock.py' \
       -v 2>&1 | tee "${ARTIFACT_DIR}-clock.log"
+    python3 -B -m unittest discover \
+      -s "$ROOT_DIR/scripts/nat-sim" \
+      -p 'test_launch_identity.py' \
+      -v 2>&1 | tee "${ARTIFACT_DIR}-launch.log"
+    python3 -B -m unittest discover \
+      -s "$ROOT_DIR/scripts/nat-sim" \
+      -p 'test_startup*.py' \
+      -v 2>&1 | tee "${ARTIFACT_DIR}-startup.log"
+    python3 -B -m unittest discover \
+      -s "$ROOT_DIR/scripts/nat-sim" \
+      -p 'test_udp_egress*.py' \
+      -v 2>&1 | tee "${ARTIFACT_DIR}-egress.log"
     ;;
   direct)
     run_single_attempt \

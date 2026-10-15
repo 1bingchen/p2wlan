@@ -1048,6 +1048,16 @@ pub(super) async fn flush_one_peer_until_stopped(
                 reason_code,
                 reason,
             } => {
+                // The head is outside the FIFO while preparation rechecks
+                // the original deadline. Keep its previous WouldBlock cause
+                // when that deadline expires inside the send attempt too.
+                let reason_code = if reason_code == REASON_OUTBOUND_DELIVERY_DEADLINE
+                    && local_backpressure_retries > 0
+                {
+                    REASON_DIRECT_LOCAL_BACKPRESSURE_DEADLINE
+                } else {
+                    reason_code
+                };
                 record_pending_residence(pending_residence, "tx_pending_residence_dropped_us");
                 record_terminal_drop(
                     &transport,

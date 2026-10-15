@@ -223,6 +223,24 @@ async fn prepare_asymmetric_echo(
             == Some(return_endpoint),
         "current consent selected an unverified raw source",
     )?;
+    let transport = b
+        .udp
+        .read()
+        .await
+        .as_ref()
+        .cloned()
+        .ok_or("current B UDP missing")?;
+    if transport.socket_count() == 2 {
+        let read = request
+            .source
+            .as_ref()
+            .and_then(|source| source.original_udp_read())
+            .ok_or("actual distinct REQUEST reader source missing")?;
+        require(
+            read.socket_index() == 1,
+            "REQUEST did not actually enter the second pool socket",
+        )?;
+    }
     let echo = inject_actual_echo(b, request, budget).await?;
     Ok((canonical, echo))
 }
@@ -280,22 +298,37 @@ async fn asymmetric_round(
 }
 
 pub(in super::super) async fn exercise_asymmetric_endpoint() -> Check {
-    exercise_asymmetric(false).await
+    exercise_asymmetric(false, false).await
 }
 
 pub(in super::super) async fn exercise_asymmetric_invalidation() -> Check {
-    exercise_asymmetric(true).await
+    exercise_asymmetric(true, false).await
 }
 
-async fn exercise_asymmetric(with_invalidation: bool) -> Check {
+pub(in super::super) async fn exercise_asymmetric_receive_socket() -> Check {
+    exercise_asymmetric(false, true).await
+}
+
+pub(in super::super) async fn exercise_asymmetric_receive_socket_invalidation() -> Check {
+    exercise_asymmetric(true, true).await
+}
+
+async fn exercise_asymmetric(with_invalidation: bool, distinct_receive: bool) -> Check {
     let budget = Budget::new();
     let mut owners = Owners::default();
     let mut sockets = Vec::new();
     let body = AssertUnwindSafe(tokio::time::timeout_at(budget.body_end(), Box::pin(async {
         let mut a = Endpoint::create_for_validation(NODE_A, VIP_A, NODE_B, VIP_B, &mut owners, budget).await?;
-        let mut b = Endpoint::create_for_validation(NODE_B, VIP_B, NODE_A, VIP_A, &mut owners, budget).await?;
+        let mut b = Endpoint::create_inner(NODE_B, VIP_B, NODE_A, VIP_A, PathKind::Direct,
+            None, &mut owners, budget, false, true, if distinct_receive { 2 } else { 1 }, None).await?;
         let a_addr = a.local_udp().await?.ok_or("A original UDP missing")?;
         let b_addr = b.local_udp().await?.ok_or("B original UDP missing")?;
+        let b_receive = if distinct_receive {
+            let transport = b.udp.read().await.as_ref().cloned().ok_or("B pool missing")?;
+            transport.socket_for_inbound_peer_index(NODE_A, 1).await
+                .ok_or("B actual pool reader missing")?.local_addr().map_err(|e| e.to_string())?
+        } else { b_addr };
+        require(!distinct_receive || b_receive != b_addr, "distinct RX and verified TX sockets collapsed")?;
         let front = Arc::new(budget.step("bind proxy front", UdpSocket::bind("127.0.0.1:0")).await?
             .map_err(|e| e.to_string())?);
         let back = Arc::new(budget.step("bind proxy back", UdpSocket::bind("127.0.0.1:0")).await?
@@ -313,12 +346,12 @@ async fn exercise_asymmetric(with_invalidation: bool) -> Check {
                     got = front.recv_from(&mut from_front) => {
                         let (len, source) = got.map_err(|e| e.to_string())?;
                         require(source == a_addr, "front got non-original A source")?;
-                        let sent = back.send_to(&from_front[..len], b_addr).await.map_err(|e| e.to_string())?;
+                        let sent = back.send_to(&from_front[..len], b_receive).await.map_err(|e| e.to_string())?;
                         require(sent == len, "proxy short REQUEST write")?;
                     }
                     got = back.recv_from(&mut from_back) => {
                         let (len, source) = got.map_err(|e| e.to_string())?;
-                        require(source == b_addr, "back got non-original B source")?;
+                        require(source == b_addr || source == b_receive, "back got non-original B source")?;
                         let sent = front.send_to(&from_back[..len], a_addr).await.map_err(|e| e.to_string())?;
                         require(sent == len, "proxy short ACK write")?;
                     }
@@ -336,6 +369,12 @@ async fn exercise_asymmetric(with_invalidation: bool) -> Check {
         start_actual_dpl(&b, &mut owners, budget).await?;
         require_real_budget(&a, budget).await?;
         require_real_budget(&b, budget).await?;
+        if distinct_receive {
+            let pair = b.peers.direct_commit_pair_snapshot_sync(b.remote_node)
+                .ok_or("initial independent return pair absent")?;
+            require(pair.local_endpoint == Some(b_addr),
+                "initial verified return did not remain on primary before the actual other-socket REQUEST")?;
+        }
         if with_invalidation {
             invalidation::exercise(&mut a, &mut b, front_addr, back_addr, a_addr, &mut owners, budget).await
         } else {
@@ -383,5 +422,147 @@ async fn exercise_asymmetric(with_invalidation: bool) -> Check {
         (Ok(()), Ok(())) => Ok(()),
         (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
         (Err(error), Err(cleanup)) => Err(format!("{error}; cleanup: {cleanup}")),
+    }
+}
+
+pub(in super::super) async fn exercise_equal_remote_distinct_socket() -> Check {
+    let budget = Budget::new();
+    let mut owners = Owners::default();
+    let mut sockets = Vec::new();
+    let body = AssertUnwindSafe(tokio::time::timeout_at(
+        budget.body_end(),
+        Box::pin(async {
+            let mut a =
+                Endpoint::create_for_validation(NODE_A, VIP_A, NODE_B, VIP_B, &mut owners, budget)
+                    .await?;
+            let mut b = Endpoint::create_inner(
+                NODE_B,
+                VIP_B,
+                NODE_A,
+                VIP_A,
+                PathKind::Direct,
+                None,
+                &mut owners,
+                budget,
+                false,
+                true,
+                2,
+                None,
+            )
+            .await?;
+            let a_addr = a.local_udp().await?.ok_or("A real UDP missing")?;
+            let b_primary = b.local_udp().await?.ok_or("B primary missing")?;
+            let b_udp = b
+                .udp
+                .read()
+                .await
+                .as_ref()
+                .cloned()
+                .ok_or("B current UDP missing")?;
+            let receive_socket = b_udp
+                .socket_for_inbound_peer_index(NODE_A, 1)
+                .await
+                .ok_or("B second original socket missing")?;
+            let b_receive = receive_socket.local_addr().map_err(|e| e.to_string())?;
+            require(b_receive != b_primary, "equal-remote RX and TX collapsed")?;
+            sockets.push((Arc::downgrade(&receive_socket), b_receive));
+            drop(receive_socket);
+            let (sa, sb, ak, bk) = session_pair_for(&a.identity, &b.identity)?;
+            register_noise_peer(&a, bk, sa, b_receive, budget).await?;
+            register_noise_peer(&b, ak, sb, a_addr, budget).await?;
+            start_actual_validator(&b, a_addr, &mut owners, budget).await?;
+            start_actual_validator(&a, b_receive, &mut owners, budget).await?;
+            start_actual_dpl(&a, &mut owners, budget).await?;
+            start_actual_dpl(&b, &mut owners, budget).await?;
+            require_real_budget(&a, budget).await?;
+            require_real_budget(&b, budget).await?;
+            require(
+                b.peers
+                    .direct_commit_pair_snapshot_sync(NODE_A)
+                    .is_some_and(|pair| pair.local_endpoint == Some(b_primary)),
+                "equal-remote verified TX was not independently committed on primary",
+            )?;
+            for _ in 0..2 {
+                let (canonical, request) = mint_actual(&mut a, budget).await?;
+                actual_send(&a, request, PathKind::Direct, budget).await?;
+                let received = actual_delivery(&mut b, budget).await?;
+                let source = received
+                    .source
+                    .as_ref()
+                    .ok_or("real equal-remote source missing")?;
+                require(
+                    source.source() == Some(a_addr),
+                    "equal-remote REQUEST source changed",
+                )?;
+                require(
+                    source
+                        .original_udp_read()
+                        .is_some_and(|read| read.socket_index() == 1),
+                    "equal-remote REQUEST did not enter the actual second reader",
+                )?;
+                require(
+                    owned_return_identity(&b, a_addr),
+                    "equal-remote verified return absent",
+                )?;
+                let echo = inject_actual_echo(&mut b, received, budget).await?;
+                let sent = budget
+                    .step(
+                        "real equal-remote sealed echo",
+                        crate::network_outbound::send_original_for_test(
+                            echo.clone(),
+                            &b.wireguard,
+                            &b.peers,
+                            b.peers.current_network_generation_sync(),
+                            true,
+                            &b.udp,
+                            &b.relay,
+                            false,
+                        ),
+                    )
+                    .await?;
+                assert!(
+                    sent,
+                    "independently verified equal-remote return must use its committed TX socket"
+                );
+                let ack = actual_delivery(&mut a, budget).await?;
+                native_fresh(&mut a, &canonical, ack, PathKind::Direct, budget).await?;
+                let credited = a.stats.verified_round_trips;
+                let duplicate =
+                    repeat_actual_echo(&mut a, &b, echo, PathKind::Direct, budget).await?;
+                native_handler(&mut a, duplicate, budget).await?;
+                require(
+                    a.stats.verified_round_trips == credited
+                        && canonical.native_ack_credited_for_test(),
+                    "equal-remote duplicate added native credit",
+                )?;
+            }
+            Ok(())
+        }),
+    ))
+    .catch_unwind()
+    .await;
+    let total = owners.tasks.len();
+    let cleanup = owners.close(budget).await;
+    let remaining = owners
+        .tasks
+        .iter()
+        .filter(|task| task.handle.is_some())
+        .count();
+    cleanup?;
+    for (socket, addr) in sockets {
+        require(
+            socket.upgrade().is_none(),
+            "equal-remote reader retained its socket after owned joins",
+        )?;
+        tokio::time::timeout_at(budget.end, UdpSocket::bind(addr))
+            .await
+            .map_err(|_| "equal-remote port rebind exceeded original end")?
+            .map_err(|error| error.to_string())?;
+    }
+    eprintln!("pr212_equal_remote_owned_cleanup_complete joined={}/{} remaining_handles={} original_end_unchanged=true", total - remaining, total, remaining);
+    match body {
+        Ok(Ok(result)) => result,
+        Ok(Err(_)) => Err("equal-remote body exceeded original fixture end".into()),
+        Err(panic) => std::panic::resume_unwind(panic),
     }
 }

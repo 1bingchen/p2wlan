@@ -34,12 +34,27 @@ impl FreshMappingProbeStopCause {
     }
 }
 
+/// Success facts from returned primary/compatibility calls only. These counters
+/// exclude retransmit/ACK workers and calls dropped before returning. Observed
+/// timestamps describe primary sends, not the last compatibility datagram.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct FreshMappingProbeSuccessCost {
+    pub(crate) datagrams: u64,
+    pub(crate) bytes: u64,
+    pub(crate) first_observed_primary_at_ms: Option<u64>,
+    pub(crate) last_observed_primary_at_ms: Option<u64>,
+    pub(crate) missing_primary_timestamps: u64,
+    pub(crate) first_socket_index: Option<usize>,
+    pub(crate) multiple_socket_indices: bool,
+}
+
 /// Local, fixed-size completed-call summary. It creates no send authority.
 /// Successful primary count has the same saturating-u32 semantics as `sent`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct FreshMappingProbeSummary {
     pub(crate) logical_calls_attempted: u64,
     pub(crate) successful_primary_sends: u32,
+    pub(crate) success_cost: FreshMappingProbeSuccessCost,
     pub(crate) first_failure: Option<ProbeSendFailureKind>,
     pub(crate) failures: FreshMappingProbeFailureCounts,
     pub(crate) physical_send_errors: u64,
@@ -106,6 +121,38 @@ impl FreshMappingProbeSummary {
             Some(value) => self.successful_primary_sends = value,
             None => self.counters_saturated = true,
         }
+        let cost = &mut self.success_cost;
+        add_fresh_mapping_probe_counter(
+            &mut cost.datagrams,
+            u64::from(result.datagrams_sent),
+            &mut self.counters_saturated,
+        );
+        add_fresh_mapping_probe_counter(
+            &mut cost.bytes,
+            result.physical_bytes_sent,
+            &mut self.counters_saturated,
+        );
+        if let Some(at) = result.first_send_at_ms {
+            cost.first_observed_primary_at_ms = Some(
+                cost.first_observed_primary_at_ms
+                    .map_or(at, |old| old.min(at)),
+            );
+            cost.last_observed_primary_at_ms = Some(
+                cost.last_observed_primary_at_ms
+                    .map_or(at, |old| old.max(at)),
+            );
+        } else {
+            add_fresh_mapping_probe_counter(
+                &mut cost.missing_primary_timestamps,
+                1,
+                &mut self.counters_saturated,
+            );
+        }
+        if let Some(index) = cost.first_socket_index {
+            cost.multiple_socket_indices |= index != result.socket_index;
+        } else {
+            cost.first_socket_index = Some(result.socket_index);
+        }
         // An accepted primary may coexist with a failed compatibility copy.
         // It remains one successful primary, regardless of datagrams_sent.
         self.record_physical_error_cost(
@@ -133,7 +180,7 @@ impl FreshMappingProbeSummary {
 
     fn diagnostic_fields(&self) -> String {
         format!(
-            "first_failure={} logical_calls_attempted={} successful_primary_sends={} physical_send_errors={} physical_send_error_bytes={} outer_stop={} counters_saturated={}",
+            "first_failure={} logical_calls_attempted={} successful_primary_sends={} physical_send_errors={} physical_send_error_bytes={} outer_stop={} counters_saturated={} returned_call_success_cost={:?} scope=completed_primary_compatibility_calls_only",
             self.first_failure.map_or("none", ProbeSendFailureKind::label),
             self.logical_calls_attempted,
             self.successful_primary_sends,
@@ -141,6 +188,7 @@ impl FreshMappingProbeSummary {
             self.physical_send_error_bytes,
             self.outer_stop.map_or("none", FreshMappingProbeStopCause::label),
             self.counters_saturated,
+            self.success_cost,
         )
     }
 }

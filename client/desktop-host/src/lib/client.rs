@@ -78,6 +78,12 @@ impl DesktopHostClient {
                 .send()
                 .await
                 .map_err(|error| {
+                    #[cfg(test)]
+                    eprintln!(
+                        "diagnostics_test_transport_failure connect={} timeout={} error={error:?}",
+                        error.is_connect(),
+                        error.is_timeout(),
+                    );
                     DesktopHostError::new(
                         DesktopHostErrorKind::DaemonUnavailable,
                         "Daemon status endpoint is unreachable",

@@ -193,9 +193,31 @@ async fn run_peer_reflexive_signal_loop_with_worker_permits(
     punch_deduplicator: PunchAttemptDeduplicator,
     worker_permits: Arc<tokio::sync::Semaphore>,
 ) {
+    let mut workers = tokio::task::JoinSet::new();
+    run_peer_reflexive_signal_loop_with_owned_workers(
+        ingress,
+        control,
+        udp,
+        peers,
+        punch_deduplicator,
+        worker_permits,
+        &mut workers,
+    )
+    .await;
+}
+
+// Production retains its original sole owner and drop behavior; cfg tests drain it.
+async fn run_peer_reflexive_signal_loop_with_owned_workers(
+    ingress: PeerReflexiveIngress,
+    control: ControlClient,
+    udp: UdpTransport,
+    peers: Arc<PeerManager>,
+    punch_deduplicator: PunchAttemptDeduplicator,
+    worker_permits: Arc<tokio::sync::Semaphore>,
+    workers: &mut tokio::task::JoinSet<()>,
+) {
     let slots: PeerReflexiveSignalSlots = Arc::new(Mutex::new(HashMap::new()));
     let work_available = Arc::new(tokio::sync::Notify::new());
-    let mut workers = tokio::task::JoinSet::new();
 
     loop {
         tokio::select! {

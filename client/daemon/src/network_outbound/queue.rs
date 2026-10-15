@@ -509,6 +509,26 @@ pub(crate) async fn run_network_outbound_with_request_carriage(
                             Some(format!("peer={failed_peer:?} accounting_complete=false old_task_fifo_unknown=true owner_released=true")));
                         warn!(event="outbound_peer_task_failed", peer_id=?failed_peer, error=%err,
                             "failed owner released; old task FIFO accounting remains unconfirmed");
+                        #[cfg(test)]
+                        {
+                            let actor = failed_peer.as_ref().and_then(|peer| pending.get(peer));
+                            let front = actor.and_then(|queue| queue.queue.front());
+                            let (front_token, front_len, front_capacity) = match front {
+                                Some(PendingPacket::Plain { packet, .. }) =>
+                                    (packet.binding().map(|binding| binding.token().clone()),
+                                     packet.packet.len(), packet.packet.capacity()),
+                                None => (None, 0, 0),
+                            };
+                            ctx.transport.observe_worker_loss_for_test(crate::transport::WorkerLossObservation {
+                                task_id: err.id(), cancelled: err.is_cancelled(),
+                                active_removed: failed_peer.as_ref().is_some_and(|peer| !flushing_peers.contains_key(peer)),
+                                actor_packets: actor.map_or(0, |queue| queue.queue.len()),
+                                front_token, front_len, front_capacity,
+                                generation: actor.and_then(|queue| queue.wait_generation),
+                                delivery_deadline: actor.and_then(|queue| queue.delivery_deadline),
+                                wait_deadline: actor.and_then(|queue| queue.wait_deadline),
+                            }).await;
+                        }
                         schedule_peer_work(&mut pending, &mut flush_tasks, &mut flushing_peers, &ctx);
                     }
                     None => {}
@@ -520,6 +540,12 @@ pub(crate) async fn run_network_outbound_with_request_carriage(
     // Do not cancel already-started physical work with a replayable timeout.
     outbound_rx.close();
     ctx.stopping.store(true, Ordering::Release);
+    #[cfg(test)]
+    if ctx.transport.abort_worker_loss_children_for_test() {
+        // Test-only cleanup is requested at this original JoinSet owner;
+        // the unchanged join loops below still await every original child.
+        flush_tasks.abort_all();
+    }
     while let Ok(packet) = outbound_rx.try_recv() {
         append_ingress(
             packet,
@@ -532,8 +558,12 @@ pub(crate) async fn run_network_outbound_with_request_carriage(
     while let Some(result) = flush_tasks.join_next().await {
         match result {
             Ok((peer_id, queue)) => merge_peer_work(&mut pending, peer_id, queue, &ctx),
-            Err(err) => warn!(event="outbound_peer_task_failed", error=%err,
-                "task failed during shutdown; accounting remains unconfirmed"),
+            Err(err) => {
+                #[cfg(test)]
+                ctx.transport.observe_worker_loss_join_for_test(err.id());
+                warn!(event="outbound_peer_task_failed", error=%err,
+                    "task failed during shutdown; accounting remains unconfirmed");
+            }
         }
     }
     // Reuse the same task owner for final discard/reporting. Every report has
@@ -798,6 +828,8 @@ pub(super) async fn flush_one_peer_until_stopped(
         stopping,
     };
     let mut flushed = 0usize;
+    let mut writable_retries = 0usize;
+    let mut writable_retry_deadline = None;
     while flushed < MAX_FLUSH_PER_PEER_PER_TICK && !queue.queue.is_empty() {
         let generation = peers.current_network_generation_sync();
         let expired = queue
@@ -874,6 +906,13 @@ pub(super) async fn flush_one_peer_until_stopped(
         .await
         {
             EncryptSendOutcome::Sent => {
+                #[cfg(test)]
+                transport
+                    .pause_worker_loss_for_test(
+                        crate::transport::WorkerLossPoint::AfterRecordedSent,
+                        queue.delivery_deadline,
+                    )
+                    .await;
                 record_pending_residence(pending_residence, "tx_pending_residence_sent_us");
                 flushed = flushed.saturating_add(1);
             }
@@ -947,7 +986,11 @@ pub(super) async fn flush_one_peer_until_stopped(
                 .await;
                 break;
             }
-            EncryptSendOutcome::RetryableLocalBackpressure { packet, reason } => {
+            EncryptSendOutcome::RetryableLocalBackpressure {
+                packet,
+                reason,
+                socket,
+            } => {
                 let next_backpressure_retries = local_backpressure_retries.saturating_add(1);
                 record_retry_and_repark(
                     &transport,
@@ -968,10 +1011,36 @@ pub(super) async fn flush_one_peer_until_stopped(
                     Some("direct"),
                     Some(REASON_DIRECT_LOCAL_BACKPRESSURE),
                     Some(format!(
-                        "peer={peer_id} direct_budget_reroutes={direct_budget_reroutes} local_backpressure_retries={next_backpressure_retries} retry_after_ms={}",
+                        "peer={peer_id} direct_budget_reroutes={direct_budget_reroutes} local_backpressure_retries={next_backpressure_retries} retry_after_ms={} writable_retries={writable_retries}",
                         OUTBOUND_RETRY_DELAY.as_millis(),
                     )),
                 );
+                if let Some(socket) =
+                    socket.filter(|_| writable_retries < MAX_DIRECT_WRITABLE_RETRIES_PER_FLUSH)
+                {
+                    // Only the exact socket's readiness escapes the send
+                    // operation: ciphertext, emit/epoch guards and the old
+                    // budget token are already gone. Wake promptly instead
+                    // of rounding a brief WouldBlock up to a maintenance tick.
+                    // False positives share one bounded window and cannot
+                    // restart this FIFO's original delivery deadline.
+                    let retry_deadline = *writable_retry_deadline
+                        .get_or_insert_with(|| Instant::now() + OUTBOUND_RETRY_DELAY);
+                    let wait = queue
+                        .delivery_deadline
+                        .unwrap_or(retry_deadline)
+                        .min(retry_deadline)
+                        .saturating_duration_since(Instant::now());
+                    if !wait.is_zero()
+                        && matches!(timeout(wait, socket.writable()).await, Ok(Ok(())))
+                    {
+                        writable_retries += 1;
+                        queue.retry_after = None;
+                        // Start again from plaintext, revalidating generation,
+                        // path and budget and allocating a fresh counter.
+                        continue;
+                    }
+                }
                 break;
             }
             EncryptSendOutcome::Terminal {
@@ -979,6 +1048,16 @@ pub(super) async fn flush_one_peer_until_stopped(
                 reason_code,
                 reason,
             } => {
+                // The head is outside the FIFO while preparation rechecks
+                // the original deadline. Keep its previous WouldBlock cause
+                // when that deadline expires inside the send attempt too.
+                let reason_code = if reason_code == REASON_OUTBOUND_DELIVERY_DEADLINE
+                    && local_backpressure_retries > 0
+                {
+                    REASON_DIRECT_LOCAL_BACKPRESSURE_DEADLINE
+                } else {
+                    reason_code
+                };
                 record_pending_residence(pending_residence, "tx_pending_residence_dropped_us");
                 record_terminal_drop(
                     &transport,
@@ -1319,6 +1398,10 @@ pub(super) async fn maintenance(
 #[cfg(test)]
 #[path = "tests/queue.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "tests/backpressure.rs"]
+mod backpressure_tests;
 
 #[cfg(test)]
 #[path = "tests/profiling.rs"]

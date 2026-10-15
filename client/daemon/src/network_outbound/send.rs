@@ -496,6 +496,13 @@ pub(super) async fn encrypt_then_send_with_deadline(
     );
     #[cfg(test)]
     prepare_relay_capture_for_test(&encrypted, &mut physical_attempt);
+    #[cfg(test)]
+    transport
+        .pause_worker_loss_for_test(
+            crate::transport::WorkerLossPoint::BeforePhysicalHandoff,
+            admission_deadline,
+        )
+        .await;
     let outcome = send_encrypted_packet_bounded_with_origin(
         &encrypted,
         peers,
@@ -617,10 +624,11 @@ pub(super) async fn encrypt_then_send_with_deadline(
             reason_code: REASON_DIRECT_BUDGET_STALE,
             reason,
         },
-        SendOutcome::RetryableLocalBackpressure { reason } => {
+        SendOutcome::RetryableLocalBackpressure { reason, socket } => {
             EncryptSendOutcome::RetryableLocalBackpressure {
                 packet: retry_packet,
                 reason,
+                socket,
             }
         }
         SendOutcome::LocalMtuFailure {
@@ -1040,6 +1048,7 @@ async fn send_encrypted_packet_once_with_origin(
                 Err(DirectBusinessUdpSendError::WouldBlock) => {
                     SendOutcome::RetryableLocalBackpressure {
                         reason: "exact UDP socket would block before handoff".to_string(),
+                        socket: Some(plan.prepared.socket.clone()),
                     }
                 }
                 Err(DirectBusinessUdpSendError::LocalPacketTooLarge) => {
@@ -1103,6 +1112,7 @@ async fn send_encrypted_packet_once_with_origin(
                 Err(DirectBusinessUdpSendError::WouldBlock) => {
                     SendOutcome::RetryableLocalBackpressure {
                         reason: "original echo receive/send publication contended".into(),
+                        socket: None,
                     }
                 }
                 Err(DirectBusinessUdpSendError::StaleToken) => SendOutcome::DirectBudgetStale {
@@ -1442,3 +1452,7 @@ mod relay_actor_legacy_full_tests;
 #[cfg(test)]
 #[path = "tests/relay_actor_drain.rs"]
 mod relay_actor_drain_tests;
+
+#[cfg(test)]
+#[path = "tests/relay_actor_loss.rs"]
+mod relay_actor_loss_tests;

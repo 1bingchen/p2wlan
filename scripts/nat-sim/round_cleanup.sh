@@ -6,7 +6,7 @@
 
 _round_tool() { python3 "$ROOT_DIR/scripts/nat-sim/round_finalization.py" "$@"; }
 # Clock reads share the receipt monotonic domain without loading the publisher.
-_round_now() { python3 -c 'import time; print(time.monotonic_ns() // 1_000_000)'; }
+_round_now() { python3 "$ROOT_DIR/scripts/nat-sim/monotonic_clock.py"; }
 
 _round_context() {
   [[ -n "${ROUND_DIR:-}" && -d "$ROUND_DIR" ]] || return 1

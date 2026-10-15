@@ -22,9 +22,10 @@ struct Owners {
 
 impl Owners {
     async fn close(&mut self, end: tokio::time::Instant) -> Check {
-        for transport in &self.transports {
-            transport.abort_writer();
-        }
+        // Join the fixture's readers before publishing cleanup-only Closed.
+        // Otherwise a real reader can finish with local_shutdown between
+        // abort_writer and task.abort on a multithreaded runtime. Unexpected
+        // errors that completed before teardown must still fail this fixture.
         for task in &self.tasks {
             task.abort();
         }
@@ -42,6 +43,7 @@ impl Owners {
             )?;
         }
         for transport in &self.transports {
+            transport.abort_writer();
             if let Some(pool) = &transport.rendezvous {
                 tokio::time::timeout_at(end, pool.shutdown())
                     .await

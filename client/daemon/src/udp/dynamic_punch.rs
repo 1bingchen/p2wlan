@@ -172,7 +172,7 @@ fn primary_mapping_tail_after_gap(
 }
 
 fn ordered_mapping_request_timeout(
-    stun_timeout: Duration,
+    per_sample_cap: Duration,
     started_ms: u64,
     now_ms: u64,
     remaining_requests: usize,
@@ -180,13 +180,11 @@ fn ordered_mapping_request_timeout(
     let remaining_ms = FRESH_MAPPING_MEASURE_BUDGET
         .as_millis()
         .saturating_sub(u128::from(now_ms.saturating_sub(started_ms)));
-    let timeout = stun_timeout
-        .min(FRESH_MAPPING_STUN_TIMEOUT)
-        .min(Duration::from_millis(
-            remaining_ms
-                .checked_div(remaining_requests as u128)?
-                .min(u128::from(u64::MAX)) as u64,
-        ));
+    let timeout = per_sample_cap.min(Duration::from_millis(
+        remaining_ms
+            .checked_div(remaining_requests as u128)?
+            .min(u128::from(u64::MAX)) as u64,
+    ));
     (!timeout.is_zero()).then_some(timeout)
 }
 
@@ -328,7 +326,7 @@ impl UdpTransport {
         self.measure_ordered_mapping_requests_with_primary_fallback(
             requests,
             None,
-            stun_timeout,
+            stun_timeout.min(FRESH_MAPPING_STUN_TIMEOUT),
             keep_measuring,
         )
         .await
@@ -337,6 +335,9 @@ impl UdpTransport {
     /// A failed early grid observation may spend the remaining SAME budget on
     /// a primary-socket tail. It never retries an attempted pair, adds requests,
     /// discards unknown sends, or grants shared-allocator evidence on a gap.
+    /// The configured sample cap is also divided over the remaining requests
+    /// within the original absolute deadline. Hard/Hard may use that spare
+    /// time for a slow observer; ordinary fresh mapping keeps its 350 ms cap.
     pub(super) async fn measure_ordered_mapping_requests_with_primary_fallback(
         &self,
         requests: &[(Arc<UdpSocket>, SocketAddr)],
@@ -554,6 +555,7 @@ impl UdpTransport {
     ///
     /// The dedicated socket stays attached for the peer, so a successful
     /// Direct path continues to use it (and only it) as the data socket.
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn run_fresh_mapping_generation(
         &self,
@@ -575,6 +577,49 @@ impl UdpTransport {
             cancellation,
             false,
             None,
+        )
+        .await
+    }
+
+    pub(crate) fn ordinary_probe_cost(
+        &self,
+        session_id: u64,
+        network_generation: u64,
+        peer_session_generation: PeerSessionGeneration,
+        recovery_epoch: u64,
+    ) -> OrdinaryProbeCost {
+        OrdinaryProbeCost::new(OrdinaryProbeIdentity {
+            transport_instance: self.transport_instance_id,
+            session_id,
+            network_generation,
+            peer_session_generation,
+            recovery_epoch,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn run_fresh_mapping_generation_observed(
+        &self,
+        peer_id: &str,
+        observers: &[SocketAddr],
+        stun_timeout: Duration,
+        stable_targets: &[SocketAddr],
+        probe_interval: Duration,
+        attempts: u32,
+        cancellation: Option<&Arc<crate::PunchSessionCancellation>>,
+        ordinary_cost: &OrdinaryProbeCost,
+    ) -> FreshMappingOutcome {
+        self.run_fresh_mapping_generation_internal_observed(
+            peer_id,
+            observers,
+            stun_timeout,
+            stable_targets,
+            probe_interval,
+            attempts,
+            cancellation,
+            false,
+            None,
+            Some(ordinary_cost),
         )
         .await
     }
@@ -626,6 +671,35 @@ impl UdpTransport {
         measure_only: bool,
         scheduled_send: Option<(u64, u64)>,
     ) -> FreshMappingOutcome {
+        self.run_fresh_mapping_generation_internal_observed(
+            peer_id,
+            observers,
+            stun_timeout,
+            stable_targets,
+            probe_interval,
+            attempts,
+            cancellation,
+            measure_only,
+            scheduled_send,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn run_fresh_mapping_generation_internal_observed(
+        &self,
+        peer_id: &str,
+        observers: &[SocketAddr],
+        stun_timeout: Duration,
+        stable_targets: &[SocketAddr],
+        probe_interval: Duration,
+        attempts: u32,
+        cancellation: Option<&Arc<crate::PunchSessionCancellation>>,
+        measure_only: bool,
+        scheduled_send: Option<(u64, u64)>,
+        ordinary_cost: Option<&OrdinaryProbeCost>,
+    ) -> FreshMappingOutcome {
         if !self.peers.local_nat_requires_fresh_mapping_punch().await {
             return FreshMappingOutcome::Rejected(FreshMappingRejection::StableLocalNat);
         }
@@ -656,6 +730,9 @@ impl UdpTransport {
 
         let network_generation = self.peers.current_network_generation().await;
         let punch_generation = self.peers.next_punch_generation(peer_id).await;
+        if let Some(cost) = ordinary_cost {
+            cost.observe_generation(network_generation, punch_generation);
+        }
         let (socket_index, socket) = match self.bind_fresh_punch_socket().await {
             Ok(bound) => bound,
             Err(error) => {
@@ -1154,8 +1231,20 @@ impl UdpTransport {
                 }
                 for target in &stable_targets {
                     probe_summary.record_call();
-                    match self
-                        .send_probe_on_socket_result_with_hard_hard_token_classified(
+                    let result = if let Some(cost) = ordinary_cost {
+                        self.send_ordinary_probe_classified_observed(
+                            socket_index,
+                            socket.clone(),
+                            Some(peer_id),
+                            *target,
+                            true,
+                            PendingProbePurpose::ConnectivityCheck,
+                            false,
+                            cost,
+                        )
+                        .await
+                    } else {
+                        self.send_probe_on_socket_result_with_hard_hard_token_classified(
                             socket_index,
                             socket.clone(),
                             Some(peer_id),
@@ -1167,7 +1256,8 @@ impl UdpTransport {
                             None,
                         )
                         .await
-                    {
+                    };
+                    match result {
                         Ok(result) => {
                             sent = sent.saturating_add(1);
                             probe_summary.record_success(&result);
@@ -1384,6 +1474,7 @@ impl UdpTransport {
                 first_punch_sent_at_ms,
                 last_punch_sent_at_ms,
                 measurement: measurement.stats,
+                ordinary_probe_summary: (!measure_only).then_some(probe_summary),
             }),
             Box::new(provisional_guard),
         )

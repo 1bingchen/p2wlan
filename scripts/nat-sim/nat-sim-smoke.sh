@@ -709,7 +709,7 @@ status_http_code() {
   local side="$1" url="$2" token_file="$3" process_pid="$4"
   local timeout_s="${5:-2}" connect_timeout_s="${6:-0.2}" header_file="$ROUND_DIR/.status-${1}-headers"
   python3 - "$side" "$url" "$token_file" "$process_pid" "$timeout_s" \
-    "$connect_timeout_s" "$header_file" <<'PY'
+    "$connect_timeout_s" "$header_file" "$ROOT_DIR" <<'PY'
 import json
 import os
 import re
@@ -720,7 +720,9 @@ import time
 from pathlib import Path
 from urllib.parse import urlsplit
 
-side, url, token_path, process_pid, timeout_s, connect_timeout_s, header_path = sys.argv[1:]
+side, url, token_path, process_pid, timeout_s, connect_timeout_s, header_path, root_dir = sys.argv[1:]
+sys.path.insert(0, str(Path(root_dir) / "scripts/nat-sim"))
+from monotonic_clock import monotonic_ns
 parsed = urlsplit(url)
 host_port = f"{parsed.hostname or 'unknown'}:{parsed.port or (443 if parsed.scheme == 'https' else 80)}"
 try:
@@ -747,7 +749,7 @@ try:
 except (OSError, ValueError, subprocess.TimeoutExpired):
     pass
 
-started_ns = time.monotonic_ns()
+started_ns = monotonic_ns()
 stderr_text = ""
 stdout_text = ""
 exit_code = 1
@@ -788,7 +790,7 @@ else:
     except OSError as exc:
         exit_code = 127
         stderr_text = f"curl_launch_error:{type(exc).__name__}"
-completed_ns = time.monotonic_ns()
+completed_ns = monotonic_ns()
 
 parts = stdout_text.split("\t")
 code = parts[0] if parts and re.fullmatch(r"[0-9]{3}", parts[0]) else "000"
@@ -1353,7 +1355,7 @@ for round in $(seq 1 "$ROUNDS"); do
   if (( WORK_DEADLINE < SECONDS )); then WORK_DEADLINE=$SECONDS; fi
   # Observe monotonic floor and Unix ceil at original budget creation.
   # A crossed parent shell second only tightens this fixed projection.
-  ROUND_CLOCK_ORIGIN_SAMPLE=$(python3 -c 'import time; mono=time.monotonic_ns()//1000000; wall=time.time_ns(); print(mono, wall//1000000000, (wall+999999)//1000000)')
+  ROUND_CLOCK_ORIGIN_SAMPLE=$(python3 "$ROOT_DIR/scripts/nat-sim/monotonic_clock.py" origin)
   read -r ROUND_CLOCK_ORIGIN_MONOTONIC_MS ROUND_CLOCK_ORIGIN_UNIX_S ROUND_CLOCK_ORIGIN_UNIX_MS ROUND_CLOCK_ORIGIN_EXTRA <<< "$ROUND_CLOCK_ORIGIN_SAMPLE"
   [[ -z "$ROUND_CLOCK_ORIGIN_EXTRA" ]] || exit 1
   ROUND_CLOCK_ORIGIN_SECONDS=$SECONDS

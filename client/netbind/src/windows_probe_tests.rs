@@ -21,7 +21,11 @@ async fn windows_probe_profile_rejects_cached_path_mtu_modes_without_repairing_s
 
         // DO retains DF but lets a cached PMTU block probes. The old
         // DF-only capability check incorrectly accepted this socket.
-        assert!(set_and_verify_windows_option(&socket, level, dontfrag, 1));
+        assert_eq!(
+            read_windows_option(&socket, level, dontfrag),
+            Some(1),
+            "PROBE must already enforce no fragmentation without a legacy selector write",
+        );
         assert!(set_and_verify_windows_option(
             &socket,
             level,

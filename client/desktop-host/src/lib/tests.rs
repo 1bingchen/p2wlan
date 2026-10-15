@@ -3,6 +3,29 @@ mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+    async fn diagnostics_request<R: tokio::io::AsyncRead + Unpin>(
+        stream: &mut R,
+    ) -> std::io::Result<Vec<u8>> {
+        let mut request = [0_u8; 1024];
+        let mut count = 0;
+        loop {
+            let read = stream.read(&mut request[count..]).await?;
+            if read == 0 {
+                return Err(std::io::ErrorKind::UnexpectedEof.into());
+            }
+            count += read;
+            if request[..count]
+                .windows(4)
+                .any(|bytes| bytes == b"\r\n\r\n")
+            {
+                return Ok(request[..count].to_vec());
+            }
+            if count == request.len() {
+                return Err(std::io::ErrorKind::InvalidData.into());
+            }
+        }
+    }
+
     async fn diagnostics_server(
         health_status: u16,
         health_body: &'static str,
@@ -17,9 +40,15 @@ mod tests {
                 let Ok((mut stream, _)) = listener.accept().await else {
                     break;
                 };
-                let mut request = [0_u8; 1024];
-                let n = stream.read(&mut request).await.unwrap_or(0);
-                let request = String::from_utf8_lossy(&request[..n]);
+                let Ok(Ok(request)) = tokio::time::timeout(
+                    Duration::from_millis(500),
+                    diagnostics_request(&mut stream),
+                )
+                .await
+                else {
+                    break;
+                };
+                let request = String::from_utf8_lossy(&request);
                 let (status, content_type, body) = if request.starts_with("GET /health ") {
                     (health_status, "text/plain", health_body)
                 } else if request.starts_with("GET /status ") {
@@ -49,6 +78,46 @@ mod tests {
         let address = listener.local_addr().unwrap();
         drop(listener);
         format!("http://{address}/status")
+    }
+
+    #[tokio::test]
+    async fn diagnostics_fixture_reads_fragmented_request_header() {
+        let (mut writer, mut reader) = tokio::io::duplex(1);
+        let task = tokio::spawn(async move { diagnostics_request(&mut reader).await });
+        // Capacity one forces actual reads between writes; no sleep or TCP
+        // packet-boundary assumption can hide an early parser return.
+        let expected = b"GET /status HTTP/1.1\r\nHost: fixture\r\n\r\n";
+        let written = writer.write_all(expected).await;
+        let result = task.await.unwrap().unwrap();
+        assert!(
+            written.is_ok(),
+            "fixture returned before the complete header: {written:?}"
+        );
+        assert_eq!(result, expected);
+    }
+
+    #[tokio::test]
+    async fn diagnostics_fixture_retains_header_cap_and_rejects_early_eof() {
+        let mut short = &b"GET /status HTTP/1.1\r\n"[..];
+        assert_eq!(
+            diagnostics_request(&mut short).await.unwrap_err().kind(),
+            std::io::ErrorKind::UnexpectedEof
+        );
+        let header = [b'x'; 1024];
+        let mut oversized = header.as_slice();
+        assert_eq!(
+            diagnostics_request(&mut oversized)
+                .await
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::InvalidData
+        );
+        let mut boundary = header;
+        boundary[1020..].copy_from_slice(b"\r\n\r\n");
+        assert_eq!(
+            diagnostics_request(&mut boundary.as_slice()).await.unwrap(),
+            boundary
+        );
     }
 
     #[test]
@@ -176,8 +245,14 @@ mod tests {
                 let Ok((mut stream, _)) = listener.accept().await else {
                     return;
                 };
-                let mut request = [0_u8; 1024];
-                let _ = stream.read(&mut request).await;
+                let Ok(Ok(_)) = tokio::time::timeout(
+                    Duration::from_millis(500),
+                    diagnostics_request(&mut stream),
+                )
+                .await
+                else {
+                    return;
+                };
                 let (status, reason, body, content_type) = if attempt == 0 {
                     (401, "Unauthorized", "unauthorized\n", "text/plain")
                 } else {
@@ -209,7 +284,7 @@ mod tests {
 
         assert_eq!(error.kind, DesktopHostErrorKind::DaemonUnavailable);
         assert!(error.recoverable);
-        assert!(error.message.contains("HTTP 503"));
+        assert!(error.message.contains("HTTP 503"), "{error:?}");
     }
 
     #[tokio::test]

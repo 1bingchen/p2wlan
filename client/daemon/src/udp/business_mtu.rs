@@ -310,6 +310,15 @@ impl UdpTransport {
         prepared: &PreparedDirectBusinessSend,
         packet: &EncryptedPeerPacket,
     ) -> std::result::Result<usize, DirectBusinessUdpSendError> {
+        self.try_send_direct_business_packet_with_origin(prepared, packet, None)
+    }
+
+    pub(crate) fn try_send_direct_business_packet_with_origin(
+        &self,
+        prepared: &PreparedDirectBusinessSend,
+        packet: &EncryptedPeerPacket,
+        origin: Option<&mut UdpSendCapture>,
+    ) -> std::result::Result<usize, DirectBusinessUdpSendError> {
         if packet.wire_bytes.len() > prepared.token.max_udp_datagram_size.0 as usize {
             return Err(DirectBusinessUdpSendError::CiphertextTooLarge);
         }
@@ -346,7 +355,8 @@ impl UdpTransport {
                 ) {
                     return Err(DirectBusinessUdpSendError::WouldBlock);
                 }
-                prepared
+                let syscall_started = origin.as_ref().map(|_| Instant::now());
+                let result = prepared
                     .socket
                     .try_send_to(&packet.wire_bytes, prepared.endpoint)
                     .map_err(|error| {
@@ -357,7 +367,23 @@ impl UdpTransport {
                         } else {
                             DirectBusinessUdpSendError::Io(error.to_string())
                         }
-                    })
+                    });
+                if let (Ok(sent), Some(started), Some(capture)) = (&result, syscall_started, origin)
+                {
+                    capture.record_full_success(
+                        self,
+                        &prepared.socket,
+                        prepared.socket_index,
+                        prepared.endpoint,
+                        *sent,
+                        packet,
+                        started,
+                        Some(prepared.token.udp_publication_owner),
+                        UdpSendFence::ManagedPublication,
+                        Some(&prepared.token),
+                    );
+                }
+                result
             });
         let sent = attempted.ok_or(DirectBusinessUdpSendError::StaleToken)??;
         if sent != packet.wire_bytes.len() {
@@ -426,6 +452,7 @@ impl UdpTransport {
                 DirectBusinessWouldBlockInjection {
                     remaining: attempts,
                     attempts_tx,
+                    pending_waker: None,
                 },
             );
         attempts_rx
@@ -443,7 +470,58 @@ impl UdpTransport {
         if injection.remaining == 0 {
             return false;
         }
-        injection.remaining = injection.remaining.saturating_sub(1);
+        if injection.pending_waker.is_none() {
+            injection.remaining = injection.remaining.saturating_sub(1);
+        }
+        injection
+            .attempts_tx
+            .send_modify(|attempts| *attempts = attempts.saturating_add(1));
+        true
+    }
+
+    /// Keep the exact legacy syscall seam pending until explicitly released.
+    /// The same rule reports WouldBlock to a synchronous business send.
+    #[cfg(test)]
+    pub(crate) fn inject_udp_send_pending_for_test(&self, peer_id: &str) -> watch::Receiver<usize> {
+        let attempts = self.inject_direct_business_would_block_for_test(peer_id, 1);
+        self.direct_business_would_block
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get_mut(peer_id)
+            .unwrap()
+            .pending_waker = Some(Arc::new(futures_util::task::AtomicWaker::new()));
+        attempts
+    }
+
+    #[cfg(test)]
+    pub(crate) fn release_udp_send_pending_for_test(&self, peer_id: &str) {
+        let injection = self
+            .direct_business_would_block
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(peer_id);
+        if let Some(waker) = injection.and_then(|injection| injection.pending_waker) {
+            waker.wake();
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn poll_udp_send_pending_for_test(
+        &self,
+        peer_id: &str,
+        cx: &std::task::Context<'_>,
+    ) -> bool {
+        let mut injections = self
+            .direct_business_would_block
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(injection) = injections.get_mut(peer_id) else {
+            return false;
+        };
+        let Some(waker) = injection.pending_waker.as_ref() else {
+            return false;
+        };
+        waker.register(cx.waker());
         injection
             .attempts_tx
             .send_modify(|attempts| *attempts = attempts.saturating_add(1));

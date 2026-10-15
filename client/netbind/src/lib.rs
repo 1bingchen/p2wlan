@@ -398,19 +398,15 @@ fn configure_ipv6_no_fragment<S: UdpSocketRaw>(socket: &S) -> bool {
 fn configure_ipv6_no_fragment<S: UdpSocketRaw>(_socket: &S) -> bool {
     #[cfg(windows)]
     {
-        let dontfrag = set_and_verify_windows_option(
-            _socket,
-            windows_sys::Win32::Networking::WinSock::IPPROTO_IPV6,
-            windows_sys::Win32::Networking::WinSock::IPV6_DONTFRAG,
-            1,
-        );
+        // PROBE also enables the no-fragment flag. Mixing the legacy
+        // DONTFRAG selector with MTU_DISCOVER can reject the second write.
         let pmtudisc = set_and_verify_windows_option(
             _socket,
             windows_sys::Win32::Networking::WinSock::IPPROTO_IPV6,
             windows_sys::Win32::Networking::WinSock::IPV6_MTU_DISCOVER,
             windows_sys::Win32::Networking::WinSock::IP_PMTUDISC_PROBE,
         );
-        return dontfrag && pmtudisc && read_ipv6_no_fragment(_socket);
+        return pmtudisc && read_ipv6_no_fragment(_socket);
     }
 
     #[allow(unreachable_code)]

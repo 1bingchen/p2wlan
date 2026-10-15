@@ -200,16 +200,26 @@ impl UdpTransport {
     pub(crate) async fn run_original_reader_until_for_test(
         self,
         inbound_tx: mpsc::Sender<ReceivedEncryptedPacket>,
+        shutdown: watch::Receiver<bool>,
+    ) -> Result<()> {
+        self.run_original_indexed_reader_until_for_test(0, inbound_tx, shutdown)
+            .await
+    }
+
+    /// The same original reader on one actual pool member; fixture owns its join.
+    #[cfg(test)]
+    pub(crate) async fn run_original_indexed_reader_until_for_test(
+        self,
+        index: usize,
+        inbound_tx: mpsc::Sender<ReceivedEncryptedPacket>,
         mut shutdown: watch::Receiver<bool>,
     ) -> Result<()> {
-        self.run_inbound_socket_inner(
-            0,
-            self.socket.clone(),
-            inbound_tx,
-            Some(&mut shutdown),
-            None,
-        )
-        .await
+        let socket =
+            self.active_sockets().get(index).cloned().ok_or_else(|| {
+                DaemonError::Network("original fixture reader socket absent".into())
+            })?;
+        self.run_inbound_socket_inner(index, socket, inbound_tx, Some(&mut shutdown), None)
+            .await
     }
 
     /// Run an inbound reader that stops when `shutdown_rx` turns true.

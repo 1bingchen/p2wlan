@@ -259,6 +259,22 @@ void main() {
     expect(result.stdout.toString().trim(), 'P2WLAN-中文路径-✓');
   }, skip: !Platform.isWindows);
 
+  test('Windows helper loads its own native ACL module', () async {
+    final api = DiagnosticsApi(authTokenReader: () async => null);
+    addTearDown(api.close);
+    final controller = DaemonController(diagnosticsApi: api);
+    final result = await controller.runWindowsPowerShellForTesting(
+      r"$command = Get-Command Get-Acl -ErrorAction Stop; "
+      r"$expected = Join-Path $PSHOME 'Modules\Microsoft.PowerShell.Security'; "
+      r"if ($PSVersionTable.PSEdition -cne 'Desktop' -or "
+      r"-not $command.Module.ModuleBase.Equals($expected, "
+      r"[StringComparison]::OrdinalIgnoreCase)) { throw 'wrong ACL module' }; "
+      r"Write-Output 'desktop-acl-module'",
+    );
+    expect(result.exitCode, 0, reason: result.stderr.toString());
+    expect(result.stdout.toString().trim(), 'desktop-acl-module');
+  }, skip: !Platform.isWindows);
+
   test('trusted fresh child resolves identity through Win32', () async {
     final api = DiagnosticsApi(authTokenReader: () async => null);
     addTearDown(api.close);

@@ -52,6 +52,9 @@ mod asymmetric_endpoint;
 pub(super) use asymmetric_endpoint::{
     exercise_asymmetric_endpoint, exercise_asymmetric_invalidation,
 };
+#[path = "network_change.rs"]
+mod network_change;
+pub(super) use network_change::exercise_network_change;
 #[path = "common_hub.rs"]
 mod common_hub;
 pub(super) use common_hub::{exercise_common_native, exercise_common_replacement};
@@ -261,6 +264,8 @@ struct Endpoint {
     next_nonce: u64,
     next_seq: u32,
     common_encrypted_input: Option<mpsc::Sender<crate::transport::ReceivedEncryptedPacket>>,
+    supervisor_publication: Option<UdpTransportPublication>,
+    supervisor_encrypted_input: Option<mpsc::Sender<crate::transport::ReceivedEncryptedPacket>>,
 }
 
 impl Endpoint {
@@ -330,6 +335,63 @@ impl Endpoint {
         actual_validation: bool,
         common_hub: Option<&str>,
     ) -> Result<Self, String> {
+        Self::create_inner_with_supervisor(
+            node,
+            vip,
+            remote_node,
+            remote_vip,
+            path,
+            hub,
+            owners,
+            budget,
+            keep_bootstrap_vip,
+            actual_validation,
+            common_hub,
+            false,
+        )
+        .await
+    }
+
+    async fn create_supervised(
+        node: &'static str,
+        vip: &'static str,
+        remote_node: &'static str,
+        remote_vip: &'static str,
+        owners: &mut Owners,
+        budget: Budget,
+    ) -> Result<Self, String> {
+        Self::create_inner_with_supervisor(
+            node,
+            vip,
+            remote_node,
+            remote_vip,
+            PathKind::Direct,
+            None,
+            owners,
+            budget,
+            false,
+            true,
+            None,
+            true,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn create_inner_with_supervisor(
+        node: &'static str,
+        vip: &'static str,
+        remote_node: &'static str,
+        remote_vip: &'static str,
+        path: PathKind,
+        hub: Option<&str>,
+        owners: &mut Owners,
+        budget: Budget,
+        keep_bootstrap_vip: bool,
+        actual_validation: bool,
+        common_hub: Option<&str>,
+        supervised: bool,
+    ) -> Result<Self, String> {
         let mut config =
             Config::generate_default("http://ctrl.test", "default").map_err(|e| e.to_string())?;
         config.node.node_id = node.to_string();
@@ -354,7 +416,8 @@ impl Endpoint {
         let peers = Arc::new(PeerManager::new(config));
         let (wireguard, _unused_outbound) = WireGuardTransport::new_with_request_carriage();
         let (encrypted_tx, encrypted_rx) = mpsc::channel(16);
-        let udp_transport = if path == PathKind::Direct {
+        let supervisor_encrypted_input = supervised.then(|| encrypted_tx.clone());
+        let udp_transport = if path == PathKind::Direct && !supervised {
             let udp = budget
                 .step(
                     "bind actual UDP",
@@ -467,7 +530,12 @@ impl Endpoint {
             Ok(())
         });
         let (overlay_tx, overlay) = mpsc::channel(16);
-        let (udp_publication, udp_updates) = watch::channel(udp_transport.clone());
+        let supervisor_publication = supervised.then(|| UdpTransportPublication::new(udp.clone()));
+        let (udp_publication, udp_updates) = if let Some(publication) = &supervisor_publication {
+            (publication.inner.updates.clone(), publication.subscribe())
+        } else {
+            watch::channel(udp_transport.clone())
+        };
         let common_encrypted_input = common_hub.map(|_| encrypted_tx.clone());
         let inbound_wireguard = wireguard.clone();
         let inbound_peers = peers.clone();
@@ -531,6 +599,8 @@ impl Endpoint {
             next_nonce: 0x28_0000,
             next_seq: 28,
             common_encrypted_input,
+            supervisor_publication,
+            supervisor_encrypted_input,
         })
     }
 

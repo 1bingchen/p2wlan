@@ -696,3 +696,9 @@ async fn r00_same_outer_common_client_replacement_rejects_old_ack_then_new_reque
 ) -> Result<(), String> {
     fixture::exercise_common_replacement().await
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn c01_original_network_hint_rebinds_and_rejects_old_ack_then_two_current_requests_are_fresh(
+) -> Result<(), String> {
+    fixture::exercise_network_change().await
+}

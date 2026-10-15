@@ -228,6 +228,10 @@ const MAX_PENDING_BYTES_PER_PEER: usize = 2 * 1024 * 1024;
 // cross-peer fairness.
 const MAX_FLUSH_PER_PEER_PER_TICK: usize = 64;
 
+/// Socket readiness can be a false positive. Bound immediate retries as well
+/// as their time budget before returning to the paced maintenance fallback.
+const MAX_DIRECT_WRITABLE_RETRIES_PER_FLUSH: usize = 4;
+
 /// Stable reason code emitted when the first business packet has no usable
 /// path because the daemon is configured direct-only (no relay candidates are
 /// configured or expected).  Kept distinct from a relay startup timeout so the
@@ -308,11 +312,14 @@ enum SendOutcome {
     DirectBudgetStale {
         reason: String,
     },
-    /// The exact nonblocking socket accepted no bytes because its local send
-    /// queue is temporarily full. This is neither path/budget staleness nor a
-    /// Direct-health signal, and it must never enter Relay fallback.
+    /// The local send is known not to have handed off any bytes. This is
+    /// neither path/budget staleness nor a Direct-health signal and must
+    /// never enter Relay fallback.
     RetryableLocalBackpressure {
         reason: String,
+        /// Only exact UDP WouldBlock carries readiness. Publication contention
+        /// keeps the original paced retry without inventing a socket signal.
+        socket: Option<Arc<tokio::net::UdpSocket>>,
     },
     LocalMtuFailure {
         reason_code: &'static str,
@@ -405,6 +412,7 @@ enum EncryptSendOutcome {
     RetryableLocalBackpressure {
         packet: RawRequestDelivery,
         reason: String,
+        socket: Option<Arc<tokio::net::UdpSocket>>,
     },
     Terminal {
         packet: RawRequestDelivery,

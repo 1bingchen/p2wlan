@@ -274,6 +274,8 @@ jobs:
             --input-root "$RUNNER_TEMP/nat-topology-evidence" \
             --source-head-sha "${{ steps.identity.outputs.source_head_sha }}" \
             --workflow-sha "${{ steps.identity.outputs.workflow_sha }}" \
+            --github-run-id "$GITHUB_RUN_ID" \
+            --github-run-attempt "$GITHUB_RUN_ATTEMPT" \
             --output "$RUNNER_TEMP/nat-topology-aggregate.json"
 
       - name: Upload actual-execution NAT aggregate

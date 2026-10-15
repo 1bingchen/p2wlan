@@ -31,11 +31,22 @@ COMMANDS = r'''
       _round_context
       _round_fixed_windows
       candidate=$(($(_round_now) + 600))
-      if (( candidate < _ROUND_CAPTURE_END_MS )); then _ROUND_CAPTURE_END_MS=$candidate; fi
-      if [[ "$command" == RUN_COLLECTOR_CUTOFF ]]; then mode=cutoff; else mode=early; fi
-      if round_run_collector collector "$fixture_python" "$BASE_DIR/fixture-collector.py" \
-          "$ROUND_DIR" "$mode"; then rc=0; else rc=$?; fi
-      printf 'COLLECTOR:%s:%s:%s\n' "$rc" "$_ROUND_CAPTURE_END_MS" "$_ROUND_RESOURCE_END_MS" ;;
+      if (( _ROUND_CAPTURE_END_MS < candidate )); then candidate=$_ROUND_CAPTURE_END_MS; fi
+      if [[ "$command" == RUN_COLLECTOR_CUTOFF ]]; then
+        # This control exhausts the whole round's evidence window.
+        mode=cutoff
+        _ROUND_CAPTURE_END_MS=$candidate
+        if round_run_collector collector "$fixture_python" "$BASE_DIR/fixture-collector.py" \
+            "$ROUND_DIR" "$mode"; then rc=0; else rc=$?; fi
+      else
+        # An early collector owns a shorter subwindow. Its completed output
+        # must not shorten the original round fence used by both statuses.
+        mode=early
+        if ( _ROUND_CAPTURE_END_MS=$candidate
+          round_run_collector collector "$fixture_python" "$BASE_DIR/fixture-collector.py" \
+            "$ROUND_DIR" "$mode" ); then rc=0; else rc=$?; fi
+      fi
+      printf 'COLLECTOR:%s:%s:%s\n' "$rc" "$candidate" "$_ROUND_RESOURCE_END_MS" ;;
     EXIT7_DURING_CAPTURE)
       printf '%s\n' "$$" >"$ROUND_DIR/fixture-native-term-owner.pid"
       chmod 600 "$ROUND_DIR/fixture-native-term-owner.pid"
@@ -230,6 +241,9 @@ class RoundFinalizationRegressions(unittest.TestCase):
         self.assertEqual(value["collector"]["result"], "unknown")
         self.assertFalse(promoted_before_finish,
                          "B01_CUTOFF_COLLECTOR_CANONICAL: unknown cutoff output must remain staged")
+        terminal = self.read(fixture, "nat-evidence.json")
+        self.assertIsNone(terminal["collector_public_observations"])
+        self.assertFalse((fixture.round_dir / "collector-nat-evidence.json").exists())
 
     def test_early_collector_promotes_only_completed_output(self):
         fixture = self.fixture()
@@ -250,6 +264,20 @@ class RoundFinalizationRegressions(unittest.TestCase):
         self.assertEqual((json.loads(canonical_bytes), receipt["outputs"]),
                          (expected, [{"name": "nat-evidence.json", "captured_sha256": digest}]),
                          "B01_EARLY_COLLECTOR_PROMOTION: a completed bounded collector retains its output")
+        terminal = self.read(fixture, "nat-evidence.json")
+        hidden = fixture.round_dir / ".collector-nat-evidence.json"
+        public = fixture.round_dir / "collector-nat-evidence.json"
+        self.assertEqual(json.loads(public.read_bytes()), expected)
+        self.assertEqual(hidden.read_bytes(), public.read_bytes())
+        self.assertEqual(public.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(terminal["collector_public_observations"], {
+            "reference": public.name,
+            "sha256": hashlib.sha256(public.read_bytes()).hexdigest(),
+            "used_as_terminal": False,
+        })
+        self.assertEqual(terminal["result"], "fail")
+        self.assertIsNone(terminal["nat_terminal"])
+        self.assertEqual(terminal["decision"]["reason_code"], "harness:baseline_status_not_available")
 
     def test_explicit_round_init_before_first_spawn_tracks_all_actual_waits(self):
         fixture = self.fixture(explicit_init=True)

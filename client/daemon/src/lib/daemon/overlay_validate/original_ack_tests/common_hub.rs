@@ -209,6 +209,7 @@ async fn prepare(
             budget,
             false,
             false,
+            1,
             Some(&hubs[2]),
         )
         .await?,
@@ -228,6 +229,7 @@ async fn prepare(
             budget,
             false,
             false,
+            1,
             Some(&hubs[2]),
         )
         .await?,

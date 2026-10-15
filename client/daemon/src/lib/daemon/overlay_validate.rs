@@ -42,6 +42,11 @@ use std::path::PathBuf;
 use crate::overlay_requests::{fire_pending_bursts, send_overlay_payloads};
 use crate::transport::{OverlayIngress, OverlayIngressDelivery, OverlayIngressEvent};
 use p2pnet_tun::mock::MockTunController;
+include!("overlay_validate/native_ack.rs");
+
+#[cfg(test)]
+#[path = "overlay_validate/original_ack_tests.rs"]
+mod original_ack_tests;
 
 /// Overlay payload magic ("P2WLOV"), shared with the transport-layer
 /// pre-filter so the ingress feed forwards exactly these payloads.
@@ -95,6 +100,7 @@ struct PendingOverlayEcho {
     seq: u32,
     packet: Vec<u8>,
     queued_at: Instant,
+    original_echo: Option<crate::overlay_requests::RequestSendToken>,
 }
 
 /// The pending set is harness-only and bounded independently of the TUN queue.
@@ -171,24 +177,39 @@ fn build_pending_overlay_echo(
         seq,
         packet,
         queued_at: Instant::now(),
+        original_echo: None,
     })
 }
 
-async fn inject_pending_overlay_echo(controller: &MockTunController, echo: PendingOverlayEcho) {
+async fn inject_pending_overlay_echo(
+    controller: &MockTunController,
+    echo: PendingOverlayEcho,
+) -> bool {
     let PendingOverlayEcho {
         peer_id,
         virtual_ip,
         nonce,
         seq,
         packet,
+        original_echo,
         ..
     } = echo;
     let len = packet.len();
-    if controller.inject(packet).await.is_ok() {
+    let accepted = match original_echo {
+        Some(token) => {
+            controller
+                .inject_with_context(packet, Box::new(token))
+                .await
+        }
+        None => controller.inject(packet).await,
+    }
+    .is_ok();
+    if accepted {
         info!(
             "{OVERLAY_EVIDENCE_PREFIX}_echo peer={peer_id} dst_ip={virtual_ip} seq={seq} nonce={nonce:#x} len={len}"
         );
     }
+    accepted
 }
 
 fn committed_direct_ready_for_echo(peers: &PeerManager, peer_id: &str, generation: u64) -> bool {
@@ -345,6 +366,7 @@ pub async fn run_overlay_validate_loop(
         timeline,
         overlay_ingress_rx,
         shutdown_rx,
+        None,
     )
     .await;
 }
@@ -362,6 +384,7 @@ pub(crate) async fn run_sourced_overlay_validate_loop(
     timeline: Arc<ConnectionTimeline>,
     overlay_ingress_rx: mpsc::Receiver<OverlayIngressDelivery>,
     shutdown_rx: watch::Receiver<bool>,
+    native_owners: SourcedOverlayOwners,
 ) {
     run_overlay_validate_loop_inner(
         controller,
@@ -375,6 +398,7 @@ pub(crate) async fn run_sourced_overlay_validate_loop(
         timeline,
         overlay_ingress_rx,
         shutdown_rx,
+        Some(native_owners),
     )
     .await;
 }
@@ -392,6 +416,7 @@ async fn run_overlay_validate_loop_inner<T>(
     timeline: Arc<ConnectionTimeline>,
     mut overlay_ingress_rx: mpsc::Receiver<T>,
     mut shutdown_rx: watch::Receiver<bool>,
+    native_owners: Option<SourcedOverlayOwners>,
 ) where
     T: Into<OverlayIngressDelivery> + Send + 'static,
 {
@@ -452,14 +477,14 @@ async fn run_overlay_validate_loop_inner<T>(
     // Verification happens through the transport's ingress feed, so the
     // written bytes only need to be consumed, not inspected.
     let drain_controller = controller.clone();
-    let _drain_task = tokio::spawn(async move {
+    let mut drain_task = OverlayDrainTask(tokio::spawn(async move {
         let mut written: u64 = 0;
         let drain = drain_controller;
         while let Ok(_packet) = drain.recv_written().await {
             written = written.saturating_add(1);
         }
         written
-    });
+    }));
 
     loop {
         tokio::select! {
@@ -597,9 +622,26 @@ async fn run_overlay_validate_loop_inner<T>(
                     warn!("overlay_validate: overlay ingress feed closed; stopping");
                     break;
                 };
-                let event: OverlayIngressDelivery = event.into();
+                let delivery: OverlayIngressDelivery = event.into();
+                if let Some(owners) = native_owners.as_ref() {
+                    let (event, source) = delivery.into_parts();
+                    if crate::overlay_requests::OriginalOverlayAck::parse(&event.packet, &event.peer_id).is_some() {
+                        handle_native_overlay_ack(event, source, owners, &udp_transport,
+                            &peers, &timeline, &mut seen, &mut stats, &sent_nonces, &mut bursts).await;
+                        continue;
+                    }
+                    let outcome = handle_native_overlay_request(event, source, owners, &udp_transport,
+                        &peers, &controller, &local_vip, overlay_any_path, start_gate_released,
+                        &mut seen, &mut stats, &mut pending_echoes).await;
+                    if !matches!(outcome, OriginalRequestEchoOutcome::Injected
+                        | OriginalRequestEchoOutcome::Queued | OriginalRequestEchoOutcome::DuplicateRequest) {
+                        debug!(event = "overlay_native_request_rejected", outcome = ?outcome,
+                            "original REQUEST did not enter the sealed echo path");
+                    }
+                    continue;
+                }
                 handle_overlay_ingress(
-                    event,
+                    delivery,
                     &controller,
                     &local_vip,
                     &local_node_id,
@@ -623,10 +665,20 @@ async fn run_overlay_validate_loop_inner<T>(
             }
         }
     }
+    drain_task.0.abort();
+    let _ = (&mut drain_task.0).await;
     info!(
         "overlay_validate loop stopped: sent={} received_valid={} received_invalid={} verified_round_trips={} last_seq={}",
         stats.sent, stats.received_valid, stats.received_invalid, stats.verified_round_trips, stats.last_seq
     );
+}
+
+/// Cancellation also aborts the owned drain when its parent future is dropped.
+struct OverlayDrainTask(tokio::task::JoinHandle<u64>);
+impl Drop for OverlayDrainTask {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 /// Build one overlay business payload: magic + direction + nonce + sequence +
@@ -1070,7 +1122,9 @@ async fn verify_overlay_packet(
         seen.pop_front();
     }
     stats.received_valid += 1;
-    stats.verified_round_trips += 1;
+    if direction == OVERLAY_DIRECTION_ECHO {
+        stats.verified_round_trips += 1;
+    }
     info!(
         "{OVERLAY_EVIDENCE_PREFIX}_verified peer={peer_id} src_ip={src_ip} seq={seq} nonce={nonce:#x} len={} ingress={ingress_label} verified_round_trips={}",
         payload.len(),
@@ -2120,7 +2174,8 @@ mod ack01_exact_injection_tests {
             );
             assert!(fixture.pending.is_empty());
             assert_eq!(fixture.stats.received_valid, 1);
-            assert_eq!(fixture.stats.verified_round_trips, 1);
+            // A received REQUEST and its emitted ECHO do not prove a local roundtrip.
+            assert_eq!(fixture.stats.verified_round_trips, 0);
             assert_eq!(fixture.stats.received_invalid, 1);
             assert!(fixture.sent_nonces.is_empty());
             assert_eq!(
@@ -2193,7 +2248,8 @@ mod ack01_exact_injection_tests {
                     if reason.starts_with("duplicate nonce/seq")
             ));
             assert_eq!(fixture.stats.received_valid, 1);
-            assert_eq!(fixture.stats.verified_round_trips, 1);
+            // A received REQUEST and its emitted ECHO do not prove a local roundtrip.
+            assert_eq!(fixture.stats.verified_round_trips, 0);
             assert_eq!(fixture.stats.received_invalid, 3);
             assert!(fixture.sent_nonces.is_empty());
             assert_eq!(

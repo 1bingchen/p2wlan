@@ -58,6 +58,54 @@ pub(super) async fn send_via_relay_with_origin(
     sampled: Option<bool>,
     origin: Option<Arc<crate::relay::RelaySendCapture>>,
 ) -> SendOutcome {
+    send_via_relay_qualified(
+        relay,
+        packet,
+        peers,
+        generation,
+        relay_send_started,
+        sampled,
+        origin,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn send_via_relay_with_echo(
+    relay: &RelayTransport,
+    packet: &EncryptedPeerPacket,
+    peers: &PeerManager,
+    generation: u64,
+    relay_send_started: &AtomicBool,
+    sampled: Option<bool>,
+    echo: Arc<crate::overlay_requests::OriginalEchoPrewrite>,
+) -> SendOutcome {
+    send_via_relay_qualified(
+        relay,
+        packet,
+        peers,
+        generation,
+        relay_send_started,
+        sampled,
+        None,
+        Some(echo),
+    )
+    .await
+}
+
+/// Preserve original completion/policy bookkeeping for sourced echo writes.
+#[allow(clippy::too_many_arguments)]
+async fn send_via_relay_qualified(
+    relay: &RelayTransport,
+    packet: &EncryptedPeerPacket,
+    peers: &PeerManager,
+    generation: u64,
+    relay_send_started: &AtomicBool,
+    sampled: Option<bool>,
+    origin: Option<Arc<crate::relay::RelaySendCapture>>,
+    echo: Option<Arc<crate::overlay_requests::OriginalEchoPrewrite>>,
+) -> SendOutcome {
     relay_send_started.store(true, Ordering::Release);
     debug!(
         event = "relay_data_send_started",
@@ -73,9 +121,13 @@ pub(super) async fn send_via_relay_with_origin(
         "encrypted packet handed to the relay client command boundary"
     );
     let relay_send_call_started = Instant::now();
-    let send_result = match origin {
-        Some(origin) => relay.send_packet_with_origin(packet, origin).await,
-        None => relay.send_packet(packet).await,
+    let send_result = if let Some(echo) = echo {
+        relay.send_packet_with_original_echo(packet, echo).await
+    } else {
+        match origin {
+            Some(origin) => relay.send_packet_with_origin(packet, origin).await,
+            None => relay.send_packet(packet).await,
+        }
     };
     let relay_send_call_us = relay_send_call_started.elapsed();
     if let Some(sampled) = sampled {

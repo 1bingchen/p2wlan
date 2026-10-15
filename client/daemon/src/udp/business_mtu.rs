@@ -380,6 +380,7 @@ impl UdpTransport {
                         started,
                         Some(prepared.token.udp_publication_owner),
                         UdpSendFence::ManagedPublication,
+                        Some(&prepared.token),
                     );
                 }
                 result

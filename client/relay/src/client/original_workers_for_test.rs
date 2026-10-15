@@ -1,7 +1,7 @@
 //! Fixed external slots for the actual endpoint client's original workers.
 //! There is no replacement task, reader, client registry or production join.
-use std::sync::Mutex;
-use tokio::sync::watch;
+use super::close::{ClosePublisher, RelayCloseSignal};
+use std::sync::{Arc, Mutex};
 use tokio::task::JoinHandle;
 
 #[derive(Debug, Default)]
@@ -12,12 +12,17 @@ pub(crate) struct Capture {
 #[derive(Debug, Default)]
 struct State {
     handles: [Option<JoinHandle<()>>; 2],
-    close: Option<watch::Sender<bool>>,
+    close: Option<Arc<RelayCloseSignal>>,
 }
 
 impl Capture {
     /// Called synchronously after each original spawn and before reg_rx await.
-    pub(crate) fn install(&self, index: usize, handle: JoinHandle<()>, close: watch::Sender<bool>) {
+    pub(super) fn install(
+        &self,
+        index: usize,
+        handle: JoinHandle<()>,
+        close: Arc<RelayCloseSignal>,
+    ) {
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
         assert!(
             state.handles[index].is_none(),
@@ -63,7 +68,7 @@ impl Retired {
         end: tokio::time::Instant,
     ) -> std::result::Result<usize, String> {
         if let Some(close) = &self.state.close {
-            let _ = close.send(true);
+            close.publish_closed(ClosePublisher::Abort);
         }
         let mut joined = 0;
         let mut errors = Vec::new();
@@ -100,7 +105,7 @@ impl Drop for Retired {
 
 fn stop_and_abort(state: &mut State) {
     if let Some(close) = &state.close {
-        let _ = close.send(true);
+        close.publish_closed(ClosePublisher::Abort);
     }
     for handle in state.handles.iter().flatten() {
         handle.abort();

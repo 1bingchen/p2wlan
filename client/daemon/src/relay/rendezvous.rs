@@ -23,21 +23,31 @@ struct RelayRendezvous {
     routes: std::sync::Mutex<RendezvousRoutes>,
     tasks: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
     stopped: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    stop_attempted: std::sync::atomic::AtomicBool,
 }
 
 impl RelayRendezvous {
     fn stop(&self) {
-        self.stopped
+        #[cfg(test)]
+        self.stop_attempted
             .store(true, std::sync::atomic::Ordering::Release);
+        {
+            let mut routes = self.routes.lock().unwrap_or_else(|p| p.into_inner());
+            // The original routes gate freezes membership and this sole stop
+            // flag together for borrowed current-member qualification.
+            self.stopped
+                .store(true, std::sync::atomic::Ordering::Release);
+            for client in routes.clients.values() {
+                client.abort();
+            }
+            routes.clients.clear();
+            routes.peers.clear();
+        }
+        // Never nest the tasks gate with routes or a client close gate.
         for task in self.tasks.lock().unwrap_or_else(|p| p.into_inner()).iter() {
             task.abort();
         }
-        let mut routes = self.routes.lock().unwrap_or_else(|p| p.into_inner());
-        for client in routes.clients.values() {
-            client.abort();
-        }
-        routes.clients.clear();
-        routes.peers.clear();
     }
 
     async fn shutdown(&self) {
@@ -58,8 +68,15 @@ impl RelayRendezvous {
         true
     }
 
-    fn remove(&self, endpoint: &str) {
+    fn remove_if_client(&self, endpoint: &str, original: &Arc<RelayClient>) {
         let mut routes = self.routes.lock().unwrap_or_else(|p| p.into_inner());
+        if !routes
+            .clients
+            .get(endpoint)
+            .is_some_and(|client| Arc::ptr_eq(client, original))
+        {
+            return;
+        }
         if let Some(client) = routes.clients.remove(endpoint) {
             client.abort();
         }
@@ -173,6 +190,8 @@ impl RelayTransport {
             routes: std::sync::Mutex::new(RendezvousRoutes::default()),
             tasks: std::sync::Mutex::new(Vec::new()),
             stopped: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            stop_attempted: std::sync::atomic::AtomicBool::new(false),
         });
         pool.insert(self.endpoint(), self.client.clone());
         let (tx, rx) = mpsc::channel(256);
@@ -301,7 +320,7 @@ impl RelayTransport {
                         }
                     }
                     if let Some(pool) = weak.upgrade() {
-                        pool.remove(&candidate.endpoint);
+                        pool.remove_if_client(&candidate.endpoint, &guard.0);
                     }
                     drop(guard);
                     if !planned_renewal {

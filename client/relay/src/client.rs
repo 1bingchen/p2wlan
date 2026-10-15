@@ -234,7 +234,7 @@ pub struct RelayClient {
     /// Immediate shutdown signal for transport replacement or an outbound
     /// write timeout.  It must not wait behind a potentially blocked
     /// `SendData` command in `cmd_tx`.
-    close_tx: watch::Sender<bool>,
+    close_signal: Arc<close::RelayCloseSignal>,
 }
 
 impl RelayClient {
@@ -245,18 +245,32 @@ impl RelayClient {
     #[allow(dead_code)]
     pub fn new_for_test() -> Self {
         let (tx, _rx) = mpsc::channel(1);
-        let (close_tx, _close_rx) = watch::channel(false);
+        let (close_signal, _close_rx) = close::RelayCloseSignal::new();
         Self {
             cmd_tx: tx,
-            close_tx,
+            close_signal,
         }
     }
 
-    /// Abort the writer immediately.  This is intentionally synchronous: a
-    /// caller handling an uncertain send must be able to invalidate the old
-    /// connection without acquiring a mutex or enqueueing another command.
+    /// Synchronously close this client without waiting behind queued writes or
+    /// network IO. A short borrowed open guard may delay close publication;
+    /// callers must never abort while holding that same client's open guard.
     pub fn abort(&self) {
-        let _ = self.close_tx.send(true);
+        self.close_signal
+            .publish_closed(close::ClosePublisher::Abort);
+    }
+}
+
+mod close;
+pub use close::{RelayClientOpenError, RelayClientOpenGuard};
+
+impl RelayClient {
+    /// Freeze this exact client's original close watch, without waiting for its gate.
+    /// Does not establish current route, transport, peer or session ownership.
+    pub fn try_open_guard(
+        &self,
+    ) -> std::result::Result<RelayClientOpenGuard<'_>, RelayClientOpenError> {
+        self.close_signal.try_open()
     }
 }
 

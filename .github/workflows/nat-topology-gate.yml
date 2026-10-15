@@ -211,7 +211,7 @@ jobs:
   required:
     name: NAT Topology Required
     if: always()
-    needs: [unit, direct, relay]
+    needs: [macos-clock, unit, direct, relay]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -287,6 +287,7 @@ jobs:
 
       - name: Enforce required topology results and aggregate
         env:
+          MACOS_CLOCK_RESULT: ${{ needs.macos-clock.result }}
           UNIT_RESULT: ${{ needs.unit.result }}
           DIRECT_RESULT: ${{ needs.direct.result }}
           RELAY_RESULT: ${{ needs.relay.result }}
@@ -296,6 +297,7 @@ jobs:
           AGGREGATE_OUTCOME: ${{ steps.aggregate.outcome }}
         run: |
           set -euo pipefail
+          test "$MACOS_CLOCK_RESULT" = "success"
           test "$UNIT_RESULT" = "success"
           test "$DIRECT_RESULT" = "success"
           test "$RELAY_RESULT" = "success"

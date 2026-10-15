@@ -66,6 +66,17 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  macos-clock:
+    name: macOS cross-process deadline controls
+    runs-on: macos-14
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Check native system Python clock boundaries
+        run: |
+          /usr/bin/python3 --version
+          /usr/bin/python3 -m unittest discover -s scripts/nat-sim -p 'test_monotonic_clock.py' -v
+
   unit:
     name: NAT simulator unit tests
     runs-on: ubuntu-24.04

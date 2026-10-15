@@ -73,7 +73,8 @@ def write_new(path: Path, value: dict) -> None:
         stream.write(payload)
 
 
-def prepare_artifacts(base_dir: Path, binaries: dict[str, Path], source: dict) -> dict:
+def prepare_artifacts(base_dir: Path, binaries: dict[str, Path], source: dict,
+                      *, expected: dict | None = None) -> dict:
     """Copy completed builds once; every later exec uses these retained bytes."""
     validate_source(source)
     if not binaries or set(binaries) - COMPONENTS:
@@ -89,9 +90,25 @@ def prepare_artifacts(base_dir: Path, binaries: dict[str, Path], source: dict) -
         artifacts[component] = {"path": f"artifacts/{component}", "sha256": digest_file(target),
                                 "size_bytes": target.stat().st_size}
         validate_artifact(artifacts[component], component)
+        if expected is not None and artifacts[component] != expected[component]:
+            raise ValueError("launch_reused_artifact_changed_during_copy")
     result = {"schema_version": 1, "source": source, "artifacts": artifacts}
     write_new(base_dir / "artifact-set.json", result)
     return result
+
+
+def reuse_artifacts(base_dir: Path, artifact_set: Path, source: dict,
+                    required: set[str]) -> dict:
+    """Recheck one completed build before copying the same bytes for a fresh run."""
+    retained = load_object(artifact_set)
+    validate_artifact_set(retained)
+    if retained["source"] != source:
+        raise ValueError("launch_reused_source_mismatch")
+    if not required <= set(retained["artifacts"]):
+        raise ValueError("launch_reused_component_missing")
+    binaries = {name: verify_snapshot(artifact_set.parent, name, artifact)
+                for name, artifact in retained["artifacts"].items()}
+    return prepare_artifacts(base_dir, binaries, source, expected=retained["artifacts"])
 
 
 def configuration_identity(argv: list[str], environment: dict[str, str], environment_keys: list[str],
@@ -360,6 +377,9 @@ def main(argv=None) -> int:
     preparing.add_argument("--base-dir", type=Path, required=True)
     preparing.add_argument("--source-file", type=Path, required=True)
     preparing.add_argument("--repository", type=Path, required=True)
+    preparing.add_argument("--reuse-artifact-set", type=Path)
+    preparing.add_argument("--require-component", choices=sorted(COMPONENTS),
+                           action="append", default=[])
     for component in sorted(COMPONENTS):
         preparing.add_argument(f"--{component}", type=Path)
     execution = commands.add_parser("exec")
@@ -381,7 +401,15 @@ def main(argv=None) -> int:
                 raise ValueError("launch_source_changed_during_build")
             binaries = {component: getattr(args, component.replace("-", "_")) for component in COMPONENTS
                         if getattr(args, component.replace("-", "_")) is not None}
-            prepare_artifacts(args.base_dir, binaries, source)
+            if args.reuse_artifact_set is not None:
+                if binaries:
+                    raise ValueError("launch_reuse_and_build_inputs_mixed")
+                reuse_artifacts(args.base_dir, args.reuse_artifact_set, source,
+                                set(args.require_component))
+            else:
+                if not set(args.require_component) <= set(binaries):
+                    raise ValueError("launch_component_missing")
+                prepare_artifacts(args.base_dir, binaries, source)
         else:
             arguments = args.arguments[1:] if args.arguments[:1] == ["--"] else args.arguments
             exec_launch(args.artifact_set, args.component, args.record, args.role, arguments, args.env_key,

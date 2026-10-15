@@ -3,6 +3,8 @@ import copy
 import importlib.util
 import io
 import json
+import subprocess
+import sys
 from pathlib import Path
 import tempfile
 import unittest
@@ -79,6 +81,40 @@ class StartupPolicyMatrixTests(unittest.TestCase):
             self.assertEqual(pair[0]["NAT_SEED_BASE"], pair[1]["NAT_SEED_BASE"])
             expected_mode = "normal" if scenario == "reachable-direct" else "relay-only"
             self.assertTrue(all(env["MODE"] == expected_mode for env in pair))
+
+    def test_failed_build_keeps_four_scheduled_rows_and_launches_no_case(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "campaign"
+            plan = {"source": SOURCE, "requested_cases": 4, "native_marker_source_available": True,
+                    "cases": [{"status": "not_run", "environment": {}} for _ in range(4)]}
+            with patch.object(MATRIX, "make_plan", return_value=plan), \
+                    patch.object(MATRIX, "run_owned", return_value=(1, False)) as owned:
+                self.assertEqual(MATRIX.main(["--execute", "--output", str(output)]), 1)
+            self.assertEqual(owned.call_count, 1)
+            result = json.loads((output / "manifest.json").read_text())
+            self.assertEqual(len(result["cases"]), 4)
+            self.assertTrue(all(row["status"] == "not_run" for row in result["cases"]))
+            self.assertFalse(result["preparation"]["native_round_executed"])
+            self.assertFalse(result["valid_measurement"])
+
+    def test_outer_timeout_reaps_the_actual_owned_process(self):
+        with tempfile.TemporaryDirectory() as directory:
+            children = []
+            real_popen = subprocess.Popen
+
+            def owned(*arguments, **keywords):
+                child = real_popen(*arguments, **keywords)
+                children.append(child)
+                return child
+
+            with patch.object(MATRIX.subprocess, "Popen", side_effect=owned):
+                code, interrupted = MATRIX.run_owned(
+                    [sys.executable, "-c", "import time; time.sleep(30)"],
+                    Path(directory), dict(MATRIX.os.environ), Path(directory) / "owned.log", 0.05)
+            self.assertEqual(code, 124)
+            self.assertFalse(interrupted)
+            self.assertEqual(len(children), 1)
+            self.assertIsNotNone(children[0].returncode)
 
     def test_public_policy_receipt_records_same_argument_array_without_config_secrets(self):
         with tempfile.TemporaryDirectory() as directory:

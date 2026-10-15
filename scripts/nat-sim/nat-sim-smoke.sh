@@ -32,6 +32,8 @@ STARTUP_POLICY_FLAG=$(python3 "$ROOT_DIR/scripts/nat-sim/run-startup-policy-matr
   --daemon-flag "$STARTUP_POLICY" --legacy-prefer-relay "${PREFER_RELAY:-0}")
 # The standalone local control DB provisions only `default`; the real dual-end
 # harness uses NETWORK_ID explicitly and requires a provisioned test network.
+NAT_SIM_BUILD_ONLY=${NAT_SIM_BUILD_ONLY:-0}
+case "$NAT_SIM_BUILD_ONLY" in 0|1) ;; *) echo "invalid build-only input" >&2; exit 2 ;; esac
 NETWORK_ID=${NETWORK_ID:-default}
 MODE=${MODE:-direct}
 NORMAL_OBSERVE_S=${NORMAL_OBSERVE_S:-20}
@@ -894,6 +896,22 @@ PY
 # topology deadline by one client timeout per endpoint. Hidden scratch files
 # carry the two subshell results back to this shell; only the final bounded
 # code/timestamp stream is retained as acceptance evidence.
+# This classifies a failed gate only; it cannot change any acceptance flag.
+normal_round_failure_reason() {
+  if [[ "${ATTEMPTS_OK:-0}" -ne 1 ]]; then echo hard_hard_attempt_missing
+  elif [[ "${overlay_ok:-0}" -ne 1 ]]; then echo overlay_verification_failed
+  elif [[ "${A_TASKS_OK:-0}" -ne 1 || "${B_TASKS_OK:-0}" -ne 1 ]]; then echo critical_tasks_unhealthy
+  elif [[ "${REPLAY_POLICY_OK:-0}" -ne 1 ]]; then echo replay_policy_unsatisfied
+  elif [[ "${A_STATUS_ALWAYS_200:-0}" -ne 1 || "${B_STATUS_ALWAYS_200:-0}" -ne 1 ]]; then echo status_http_failure
+  elif [[ "${STATUS_SCHEMA_OK:-0}" -ne 1 ]]; then echo status_schema_invalid
+  elif [[ "${METRICS_SCHEMA_OK:-0}" -ne 1 ]]; then echo metrics_schema_invalid
+  elif [[ "${OBSERVATION_OK:-0}" -ne 1 ]]; then echo observation_window_incomplete
+  elif [[ -n "${EVIDENCE_REASON:-}" && "$EVIDENCE_REASON" != none ]]; then echo "$EVIDENCE_REASON"
+  elif [[ "${MODE:-normal}" == normal ]]; then echo normal_business_gate_failed
+  else echo hard_hard_experiment_invalid
+  fi
+}
+
 sample_relay_status_pair() {
   local a_url="$1" a_token_file="$2" a_process_pid="$3"
   local b_url="$4" b_token_file="$5" b_process_pid="$6"
@@ -1266,24 +1284,37 @@ echo "[nat-sim] reserved control port base: $PORT"
 echo "[nat-sim] traversal flags: strict_filtering_a=$STRICT_FILTERING_A strict_filtering_b=$STRICT_FILTERING_B mapping_a=$MAPPING_MODE_A mapping_b=$MAPPING_MODE_B delay_a_ms=$DELAY_A_MS delay_b_ms=$DELAY_B_MS stun_delay_a_ms=$STUN_DELAY_A_MS stun_delay_b_ms=$STUN_DELAY_B_MS signal_delay_a_ms=$SIGNAL_DELAY_A_MS signal_delay_b_ms=$SIGNAL_DELAY_B_MS prepare_delay_a_ms=$PREPARE_DELAY_A_MS prepare_delay_b_ms=$PREPARE_DELAY_B_MS duplicate_rate=$DUPLICATE_RATE unassigned_egress_listeners=$UNASSIGNED_EGRESS_LISTENERS fresh_mapping=$FRESH_MAPPING_PUNCH predicted_candidates=$PREDICTED_CANDIDATES birthday=$BIRTHDAY_PROBING socket_pool=${SOCKET_POOL:-default}"
 python3 "$ROOT_DIR/scripts/nat-sim/launch_identity.py" source \
   --repository "$ROOT_DIR" --output "$BASE_DIR/source-at-build.json"
-if [[ "$EGRESS_CAPTURE" == shim ]]; then
-  python3 "$ROOT_DIR/scripts/nat-sim/udp_egress.py" --build "$BASE_DIR/udp-egress-shim.so"
+if [[ -n "${NAT_SIM_REUSE_ARTIFACT_SET:-}" ]]; then
+  SNAPSHOT_ARGS=(prepare --base-dir "$BASE_DIR" --repository "$ROOT_DIR"
+    --source-file "$BASE_DIR/source-at-build.json"
+    --reuse-artifact-set "$NAT_SIM_REUSE_ARTIFACT_SET"
+    --require-component daemon --require-component control --require-component relay)
+  if [[ "$EGRESS_CAPTURE" == shim ]]; then SNAPSHOT_ARGS+=(--require-component udp-shim); fi
+  python3 "$ROOT_DIR/scripts/nat-sim/launch_identity.py" "${SNAPSHOT_ARGS[@]}"
+else
+  if [[ "$EGRESS_CAPTURE" == shim ]]; then
+    python3 "$ROOT_DIR/scripts/nat-sim/udp_egress.py" --build "$BASE_DIR/udp-egress-shim.so"
+  fi
+  echo "[nat-sim] building control server, relay and daemon..."
+  (
+    cd "$ROOT_DIR/server"
+    go build -o "$BASE_DIR/control-server" .
+    go build -o "$BASE_DIR/relay-server" ./relay
+  )
+  cargo build -p p2wlan-daemon --manifest-path "$ROOT_DIR/client/daemon/Cargo.toml" >/dev/null
+  DAEMON_TARGET_DIR=$(cargo metadata --no-deps --format-version 1 --manifest-path "$ROOT_DIR/client/daemon/Cargo.toml" | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')
+  SNAPSHOT_ARGS=(prepare --base-dir "$BASE_DIR" --repository "$ROOT_DIR" \
+    --source-file "$BASE_DIR/source-at-build.json" \
+    --daemon "$DAEMON_TARGET_DIR/debug/p2wlan-daemon" \
+    --control "$BASE_DIR/control-server" --relay "$BASE_DIR/relay-server")
+  if [[ "$EGRESS_CAPTURE" == shim ]]; then SNAPSHOT_ARGS+=(--udp-shim "$BASE_DIR/udp-egress-shim.so"); fi
+  python3 "$ROOT_DIR/scripts/nat-sim/launch_identity.py" "${SNAPSHOT_ARGS[@]}"
 fi
-echo "[nat-sim] building control server, relay and daemon..."
-(
-  cd "$ROOT_DIR/server"
-  go build -o "$BASE_DIR/control-server" .
-  go build -o "$BASE_DIR/relay-server" ./relay
-)
-cargo build -p p2wlan-daemon --manifest-path "$ROOT_DIR/client/daemon/Cargo.toml" >/dev/null
-DAEMON_TARGET_DIR=$(cargo metadata --no-deps --format-version 1 --manifest-path "$ROOT_DIR/client/daemon/Cargo.toml" | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')
-SNAPSHOT_ARGS=(prepare --base-dir "$BASE_DIR" --repository "$ROOT_DIR" \
-  --source-file "$BASE_DIR/source-at-build.json" \
-  --daemon "$DAEMON_TARGET_DIR/debug/p2wlan-daemon" \
-  --control "$BASE_DIR/control-server" --relay "$BASE_DIR/relay-server")
-if [[ "$EGRESS_CAPTURE" == shim ]]; then SNAPSHOT_ARGS+=(--udp-shim "$BASE_DIR/udp-egress-shim.so"); fi
-python3 "$ROOT_DIR/scripts/nat-sim/launch_identity.py" "${SNAPSHOT_ARGS[@]}"
 ARTIFACT_SET="$BASE_DIR/artifact-set.json"
+if [[ "$NAT_SIM_BUILD_ONLY" == 1 ]]; then
+  echo "[nat-sim] BUILD ONLY: retained source-verified artifacts; no daemon round executed"
+  exit 0
+fi
 DAEMON_IDENTITY_ENV=(
   --env-key P2WLAN_DISABLE_TUN --env-key P2WLAN_TEST_RUN_ID \
   --env-key P2WLAN_EXPERIMENT_BASELINE_SHA --env-key P2WLAN_EXPERIMENT_VARIANT \
@@ -2303,16 +2334,7 @@ except Exception:
           && "$A_INVALID" -eq 0 && "$B_INVALID" -eq 0 ]]; then
       echo "[nat-sim] ROUND $round: PASS traversal_mode=$MODE outcome=$outcome first_path=$EXPECTED_PATH overlay_ok=$overlay_ok a_direct=$A_DIRECT b_direct=$B_DIRECT a_ingress=${A_INGRESS:-none} b_ingress=${B_INGRESS:-none} hard_hard_a=$A_HARD_HARD hard_hard_b=$B_HARD_HARD drops_a=$A_DROPS drops_b=$B_DROPS replay_a=$A_REPLAY replay_b=$B_REPLAY invalid_a=$A_INVALID invalid_b=$B_INVALID elapsed_ms=$ELAPSED_MS evidence=$ROUND_DIR/nat-evidence.json"
     else
-      EXPERIMENT_REASON="${EVIDENCE_REASON:-hard_hard_experiment_invalid}"
-      if [[ "$ATTEMPTS_OK" -ne 1 ]]; then
-        EXPERIMENT_REASON="hard_hard_attempt_missing"
-      elif [[ "$overlay_ok" -ne 1 ]]; then
-        EXPERIMENT_REASON="overlay_verification_failed"
-      elif [[ "$A_TASKS_OK" -ne 1 || "$B_TASKS_OK" -ne 1 ]]; then
-        EXPERIMENT_REASON="critical_tasks_unhealthy"
-      elif [[ "$REPLAY_POLICY_OK" -ne 1 ]]; then
-        EXPERIMENT_REASON="replay_policy_unsatisfied"
-      fi
+      EXPERIMENT_REASON=$(normal_round_failure_reason)
       echo "[nat-sim] ROUND $round: FAIL reason_code=$EXPERIMENT_REASON traversal_mode=$MODE outcome=$outcome first_path=$EXPECTED_PATH overlay_ok=$overlay_ok a_direct=$A_DIRECT b_direct=$B_DIRECT a_ingress=${A_INGRESS:-none} b_ingress=${B_INGRESS:-none} hard_hard_a=$A_HARD_HARD hard_hard_b=$B_HARD_HARD drops_a=$A_DROPS drops_b=$B_DROPS replay_a=$A_REPLAY replay_b=$B_REPLAY invalid_a=$A_INVALID invalid_b=$B_INVALID elapsed_ms=$ELAPSED_MS evidence=$ROUND_DIR/nat-evidence.json" >&2
       round_fail "$EXPERIMENT_REASON" 1
     fi

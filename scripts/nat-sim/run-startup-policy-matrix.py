@@ -12,7 +12,8 @@ import signal
 import subprocess
 import time
 
-from launch_identity import SHA256, canonical, read_launch_evidence, source_identity
+from launch_identity import (SHA256, canonical, digest_file, load_object, read_launch_evidence,
+                             source_identity, validate_artifact_set, verify_snapshot)
 
 POLICIES = {"direct-first": "--prefer-direct", "auto": "--prefer-relay"}
 CASES = (("reachable-direct", "direct-first", 0), ("reachable-direct", "auto", 0),
@@ -91,7 +92,9 @@ def make_plan(root: Path, output: Path, seed: int, base: dict) -> dict:
             "native_marker_source_available": native_marker_available(root),
             "validation_baseline": "pending_source_integration_and_native_acceptance",
             "budgets": {"normal_observe_s": 30, "direct_s": 60, "overlay_s": 60,
-                        "round_s": 150, "finalize_s": 15, "outer_s": 360, "term_grace_s": 10},
+                        "round_s": 150, "finalize_s": 15, "outer_s": 360, "term_grace_s": 10,
+                        "campaign_outer_s": 1500, "campaign_execution_s": 1470,
+                        "build_only_outer_s": 360},
             "product_policy_windows_ms": {"direct_first": 5000, "relay_startup": 3000},
             "connection_to_first_business_ms": None,
             "limits": ["four_denominator_includes_all_failures", "no_performance_or_policy_adoption_claim",
@@ -214,6 +217,29 @@ def collect_case(row: dict, exit_code: int, source: dict) -> dict:
             "connection_to_first_business_ms": None, "pipeline_cost": None}
 
 
+def run_owned(command: list[str], root: Path, environment: dict, log: Path,
+              timeout_s: float) -> tuple[int, bool]:
+    interrupted = False
+    with log.open("w") as stream:
+        process = subprocess.Popen(command, cwd=root, env=environment, stdout=stream,
+                                   stderr=subprocess.STDOUT, start_new_session=True)
+        try:
+            code = process.wait(timeout=timeout_s)
+        except (subprocess.TimeoutExpired, KeyboardInterrupt) as error:
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            try:
+                process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                os.killpg(process.pid, signal.SIGKILL)
+                process.wait()
+            interrupted = isinstance(error, KeyboardInterrupt)
+            code = 130 if interrupted else 124
+    return code, interrupted
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--daemon-flag", metavar="POLICY")
@@ -260,26 +286,50 @@ def main(argv=None) -> int:
     source = plan["source"]
     manifest_path = output / "manifest.json"
     manifest_path.write_text(json.dumps(plan, indent=2) + "\n")
+    # The original four outer guards still share the same 1500s campaign cap.
+    # Build-only preparation starts no daemon round and consumes this cap.
+    campaign_end = time.monotonic() + 1470  # Reserve cleanup inside the original 1500s cap.
+    build_dir = output / "build"
+    build_env = {**plan["cases"][0]["environment"],
+                 "NAT_SIM_ARTIFACT_DIR": str(build_dir), "NAT_SIM_BUILD_ONLY": "1"}
+    code, interrupted = run_owned(["bash", "scripts/nat-sim/nat-sim-smoke.sh"], root,
+                                  build_env, output / "build.log", 360)
+    plan["preparation"] = {"status": "completed", "exit_code": code,
+                           "native_round_executed": False}
+    try:
+        if code or source_identity(root) != source:
+            raise ValueError("build_failed_or_source_changed")
+        if (build_dir / "round-1").exists():
+            raise ValueError("build_preparation_launched_a_native_round")
+        frozen_path = build_dir / "artifact-set.json"
+        frozen = load_object(frozen_path)
+        validate_artifact_set(frozen)
+        if frozen["source"] != source or set(frozen["artifacts"]) != {"daemon", "control", "relay", "udp-shim"}:
+            raise ValueError("frozen_build_source_or_components_mismatch")
+        for name, artifact in frozen["artifacts"].items():
+            verify_snapshot(build_dir, name, artifact)
+        plan["preparation"].update(artifact_set_sha256=digest_file(frozen_path),
+                                    source=source, artifacts=frozen["artifacts"])
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        plan["preparation"]["error_type"] = type(error).__name__
+        plan["valid_measurement"] = False
+        manifest_path.write_text(json.dumps(plan, indent=2) + "\n")
+        return 1
     for row in plan["cases"]:
+        row["environment"]["NAT_SIM_REUSE_ARTIFACT_SET"] = str(frozen_path)
         if source_identity(root) != source:
             row.update(status="not_run_source_changed")
             continue
-        interrupted = False
+        remaining = min(360, campaign_end - time.monotonic())
+        if remaining <= 0:
+            row.update(status="not_run_campaign_deadline")
+            continue
+        row.update(status="running")
+        manifest_path.write_text(json.dumps(plan, indent=2) + "\n")
         started = time.monotonic()
-        with (output / f'{row["scenario"]}-{row["policy"]}.log').open("w") as stream:
-            process = subprocess.Popen(row["command"], cwd=root, env=row["environment"],
-                                       stdout=stream, stderr=subprocess.STDOUT, start_new_session=True)
-            try:
-                code = process.wait(timeout=360)
-            except (subprocess.TimeoutExpired, KeyboardInterrupt) as error:
-                os.killpg(process.pid, signal.SIGTERM)
-                try:
-                    process.wait(timeout=10)
-                except subprocess.TimeoutExpired:
-                    os.killpg(process.pid, signal.SIGKILL)
-                    process.wait()
-                interrupted = isinstance(error, KeyboardInterrupt)
-                code = 130 if interrupted else 124
+        code, interrupted = run_owned(
+            row["command"], root, row["environment"],
+            output / f'{row["scenario"]}-{row["policy"]}.log', remaining)
         row.update(collect_case(row, code, source), status="completed",
                    duration_s=round(time.monotonic() - started, 3))
         if source_identity(root) != source:
@@ -296,8 +346,14 @@ def main(argv=None) -> int:
     }
     plan["same_daemon_bytes_across_cases"] = len(daemon_hashes) == 1
     plan["daemon_sha256"] = next(iter(daemon_hashes)) if len(daemon_hashes) == 1 else None
+    sets = set()
+    for row in plan["cases"]:
+        value = row.get("launch_identity", {}).get("artifact_set")
+        sets.add(value.get("sha256") if isinstance(value, dict) else None)
+    plan["same_build_artifacts_across_cases"] = sets == {plan["preparation"]["artifact_set_sha256"]}
     plan["valid_measurement"] = (
         plan["same_daemon_bytes_across_cases"]
+        and plan["same_build_artifacts_across_cases"]
         and all(row.get("valid_measurement") is True for row in plan["cases"]))
     manifest_path.write_text(json.dumps(plan, indent=2) + "\n")
     return 0 if plan["valid_measurement"] else 1

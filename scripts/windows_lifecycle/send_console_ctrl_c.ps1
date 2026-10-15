@@ -117,18 +117,50 @@ function Write-InjectorPhase {
         Write-Warning -WarningAction Continue "Ctrl+C phase diagnostic unavailable: $($_.Exception.Message)"
     }
 }
+function Initialize-CtrlCNativeMethods {
+    # Keep the same in-process Winapi imports without starting a C# compiler.
+    # BOOL marshalling, SetLastError and PreserveSig remain part of the ABI.
+    $name = [System.Reflection.AssemblyName]::new('P2WlanCtrlCInjector')
+    $access = [System.Reflection.Emit.AssemblyBuilderAccess]::Run
+    $factory = [System.Reflection.Emit.AssemblyBuilder].GetMethod(
+        'DefineDynamicAssembly', [Type[]]@([System.Reflection.AssemblyName],
+            [System.Reflection.Emit.AssemblyBuilderAccess]))
+    $assembly = if ($null -ne $factory) {
+        [System.Reflection.Emit.AssemblyBuilder]::DefineDynamicAssembly($name, $access)
+    } else {
+        # Windows PowerShell uses the existing .NET Framework AppDomain.
+        [AppDomain]::CurrentDomain.DefineDynamicAssembly($name, $access)
+    }
+    $module = $assembly.DefineDynamicModule($name.Name)
+    $native = $module.DefineType('P2WlanCtrlCInjector',
+        [System.Reflection.TypeAttributes]'Public, Abstract, Sealed')
+    $importConstructor = [System.Runtime.InteropServices.DllImportAttribute].GetConstructor(
+        [Type[]]@([string]))
+    $lastError = [System.Runtime.InteropServices.DllImportAttribute].GetField('SetLastError')
+    $definitions = @(
+        @{ Name = 'AttachConsole'; Parameters = [Type[]]@([uint32]) }
+        @{ Name = 'FreeConsole'; Parameters = [Type[]]@() }
+        @{ Name = 'GenerateConsoleCtrlEvent'; Parameters = [Type[]]@([uint32], [uint32]) }
+        @{ Name = 'SetConsoleCtrlHandler'; Parameters = [Type[]]@([IntPtr], [bool]) }
+    )
+    foreach ($definition in $definitions) {
+        $method = $native.DefinePInvokeMethod($definition.Name, 'kernel32.dll',
+            [System.Reflection.MethodAttributes]'Public, Static, HideBySig, PinvokeImpl',
+            [System.Reflection.CallingConventions]::Standard, [bool],
+            [Type[]]$definition.Parameters,
+            [System.Runtime.InteropServices.CallingConvention]::Winapi,
+            [System.Runtime.InteropServices.CharSet]::None)
+        $attribute = [System.Reflection.Emit.CustomAttributeBuilder]::new(
+            $importConstructor, [object[]]@('kernel32.dll'),
+            [System.Reflection.FieldInfo[]]@($lastError), [object[]]@($true))
+        $method.SetCustomAttribute($attribute)
+        $method.SetImplementationFlags([System.Reflection.MethodImplAttributes]::PreserveSig)
+    }
+    [void]$native.CreateType()
+}
 try {
     Write-InjectorPhase -Phase initialize
-    Add-Type @"
-using System;
-using System.Runtime.InteropServices;
-public static class P2WlanCtrlCInjector {
-  [DllImport("kernel32.dll", SetLastError = true)] public static extern bool AttachConsole(uint pid);
-  [DllImport("kernel32.dll", SetLastError = true)] public static extern bool FreeConsole();
-  [DllImport("kernel32.dll", SetLastError = true)] public static extern bool GenerateConsoleCtrlEvent(uint type, uint group);
-  [DllImport("kernel32.dll", SetLastError = true)] public static extern bool SetConsoleCtrlHandler(IntPtr handler, bool add);
-}
-"@
+    Initialize-CtrlCNativeMethods
     Write-InjectorPhase -Phase native_helper_ready
     $stage = 'attach_console'
     Write-InjectorPhase -Phase attach_console

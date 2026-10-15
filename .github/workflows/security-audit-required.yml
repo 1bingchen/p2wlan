@@ -460,14 +460,47 @@ jobs:
         shell: bash
         run: test "$(git rev-parse HEAD)" = "$P2WLAN_EXACT_HEAD"
 
-      - name: Download component evidence
-        id: download
+      # Download only upstream components. A rerun retains earlier aggregate
+      # artifacts, which must never become inputs to another aggregation.
+      - name: Download repository-policy evidence
+        id: download_policy
         if: always()
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
-          pattern: security-audit-*-${{ github.run_id }}
+          name: security-audit-policy-${{ github.run_id }}
           path: ${{ runner.temp }}/security-audit-components
-          merge-multiple: true
+
+      - name: Download Rust evidence
+        id: download_rust
+        if: always()
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: security-audit-rust-${{ github.run_id }}
+          path: ${{ runner.temp }}/security-audit-components
+
+      - name: Download Go evidence
+        id: download_go
+        if: always()
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: security-audit-go-${{ github.run_id }}
+          path: ${{ runner.temp }}/security-audit-components
+
+      - name: Download Flutter evidence
+        id: download_flutter
+        if: always()
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: security-audit-flutter-${{ github.run_id }}
+          path: ${{ runner.temp }}/security-audit-components
+
+      - name: Download release evidence
+        id: download_release
+        if: always()
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: security-audit-release-${{ github.run_id }}
+          path: ${{ runner.temp }}/security-audit-components
 
       - name: Scan generated artifact and log evidence
         id: evidence_scan
@@ -510,7 +543,11 @@ jobs:
       - name: Enforce all security audit gates
         if: always()
         env:
-          DOWNLOAD_OUTCOME: ${{ steps.download.outcome }}
+          POLICY_DOWNLOAD_OUTCOME: ${{ steps.download_policy.outcome }}
+          RUST_DOWNLOAD_OUTCOME: ${{ steps.download_rust.outcome }}
+          GO_DOWNLOAD_OUTCOME: ${{ steps.download_go.outcome }}
+          FLUTTER_DOWNLOAD_OUTCOME: ${{ steps.download_flutter.outcome }}
+          RELEASE_DOWNLOAD_OUTCOME: ${{ steps.download_release.outcome }}
           EVIDENCE_SCAN_OUTCOME: ${{ steps.evidence_scan.outcome }}
           AGGREGATE_OUTCOME: ${{ steps.aggregate.outcome }}
         shell: bash
@@ -521,7 +558,11 @@ jobs:
           test "$GO_DEPENDENCIES_RESULT" = "success"
           test "$FLUTTER_DEPENDENCIES_RESULT" = "success"
           test "$RELEASE_ASSETS_RESULT" = "success"
-          test "$DOWNLOAD_OUTCOME" = "success"
+          test "$POLICY_DOWNLOAD_OUTCOME" = "success"
+          test "$RUST_DOWNLOAD_OUTCOME" = "success"
+          test "$GO_DOWNLOAD_OUTCOME" = "success"
+          test "$FLUTTER_DOWNLOAD_OUTCOME" = "success"
+          test "$RELEASE_DOWNLOAD_OUTCOME" = "success"
           test "$EVIDENCE_SCAN_OUTCOME" = "success"
           test "$AGGREGATE_OUTCOME" = "success"
           echo "Security Audit Required passed for $P2WLAN_EXACT_HEAD"

@@ -19,6 +19,7 @@ from unittest.mock import patch
 import test_round_cleanup as legacy
 import test_round_finalization as common
 import test_round_finalization_regressions as semantic
+from monotonic_clock import monotonic_ns
 
 
 COMMANDS = r"""
@@ -90,6 +91,7 @@ capture_end = int(argument("--deadline-ms"))
 grace_end = int(argument("--grace-end-ms"))
 if Path(argument("--round-dir")) != round_dir or argument("--label") != "collector":
     raise AssertionError("fixture observer directory or label mismatch")
+sys.path.insert(0, str(module_path.parent))
 spec = importlib.util.spec_from_file_location("fixture_promotion_original_module", module_path)
 module = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = module
@@ -259,11 +261,11 @@ class RoundPromotionBoundaryControls(unittest.TestCase):
         self.assertFalse((fixture.round_dir / "mapping-evidence.json").exists())
         # Wait only to the already-declared absolute fence. No fresh window,
         # probability sleep, fake clock or increase to capture/resource is used.
-        self.assertLess(capture_end / 1000, fixture.protocol_end)
-        remaining = (capture_end * 1_000_000 - time.monotonic_ns()) / 1_000_000_000
+        remaining = (capture_end * 1_000_000 - monotonic_ns()) / 1_000_000_000
+        self.assertLess(remaining, fixture.protocol_end - time.monotonic())
         self.assertGreater(remaining, 0, "fixture must reach its controlled park before the original fence")
         select.select([], [], [], remaining)
-        self.assertGreaterEqual(time.monotonic_ns() // 1_000_000, capture_end)
+        self.assertGreaterEqual(monotonic_ns() // 1_000_000, capture_end)
         fd = os.open(fixture.round_dir / "fixture-promotion-release.fifo", os.O_WRONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0))
         try:
             self.assertEqual(os.write(fd, b"R"), 1)

@@ -137,6 +137,8 @@ control_reconnect_counter_survives_timeline_eviction 是必须保持的回归契
 
 矩阵包含等/异步长、负步长回绕、端口竞争、单/双侧严格过滤、非对称 NAT/STUN/信令/准备延迟、丢包/乱序/重复，以及固定 seed 的高熵随机映射和 Relay 重连。Hard↔Hard 模式默认 `EGRESS_CAPTURE=shim`，在 macOS/Linux 测试子进程中拦截生产 daemon 的 loopback UDP `sendto` / `sendmsg`，保留原 socket 和目的地址；发往尚未绑定目的端口的包也先创建源 NAT 映射，再执行对端过滤。此模式关闭预建监听槽。普通 Direct/Relay gate 保留原入口；shim 不链接进生产程序，也不安装到全局环境。
 
+同一次本机采证的绝对截止时间、启动记录、HTTP 样本、NAT trace 和业务连续性样本使用同一进程间共享的单调时钟；macOS 使用 `CLOCK_UPTIME_RAW`，其他平台使用 Python 的单调时钟。截止时间不能跨主机或系统重启比较。收尾子进程收到已经耗尽的截止时间时不得启动命令；切换解释器或启动新进程不会重置原有预算。
+
 `CONSUME_A` / `CONSUME_B` 在每个已测量 socket 的最后一次 STUN 与首次 peer 出站之间注入分配；`SWEEP_NOISE_EVERY` / `SWEEP_NOISE_COUNT` 在发送期间按新映射数量注入，并受 `SWEEP_NOISE_LIMIT` 总量约束。trace 区分两个阶段、源 socket、新映射和未绑定目的。`mapping_fidelity` 核对两端 shim 成功发送的包数/字节与网关捕获完全一致，并检查严格过滤与注入配置确实生效；本机 UDP 捕获丢包、缺计数或噪声阶段不符都会使该轮证据无效。互惠映射对数量是整轮模拟器事实，不能代替 attempt 命中、加密验证或业务成功。
 
 高熵场景是负对照：允许 Direct 失败并以 Relay 有界兜底，但不允许缺证据、任务泄漏或无界退出。取消的 generation/session fencing 由隔离 Rust 回归覆盖；本地双进程模拟不代表两台物理设备、真实运营商 NAT 或公网成功率。

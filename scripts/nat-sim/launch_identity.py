@@ -263,9 +263,20 @@ def exec_launch(artifact_set: Path, component: str, record_path: Path, role: str
     snapshots = {name: verify_snapshot(artifact_set.parent, name, artifact)
                  for name, artifact in artifacts["artifacts"].items()}
     executable = snapshots[component]
-    # The shim has already exec'd this wrapper. Hash its final controlled
-    # environment here, and exec the declared artifact itself as the same PID.
+    # System interpreters may discard loader injection before reaching this
+    # recorder. Re-arm the explicitly requested capture from the verified
+    # snapshot immediately before the native exec and its environment digest.
     environment = os.environ.copy()
+    gateway = environment.get("P2WLAN_NAT_SIM_GATEWAY_PORT")
+    if component == "daemon" and gateway is not None:
+        if not 1 <= len(gateway) <= 5 or not gateway.isdecimal() or not 1 <= int(gateway) <= 65535:
+            raise ValueError("launch_udp_capture_gateway_invalid")
+        if "udp-shim" not in snapshots:
+            raise ValueError("launch_udp_capture_snapshot_missing")
+        import udp_egress
+        stats = environment.get("P2WLAN_NAT_SIM_EGRESS_STATS")
+        environment = udp_egress.environment(snapshots["udp-shim"], int(gateway),
+                                             Path(stats) if stats else None)
     configuration = configuration_identity(arguments, environment, environment_keys,
         config_file=config_file, stdin_authorization=stdin_authorization)
     record = {"schema_version": 1, "source": artifacts["source"], "role": role, "component": component,

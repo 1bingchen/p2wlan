@@ -1483,8 +1483,8 @@ for round in $(seq 1 "$ROUNDS"); do
     exit 1
   fi
 
-  # The shim execs this recorder first; the recorder's final exec uses only
-  # the private daemon snapshot and does not consume its token-stdin pipe.
+  # Carry capture intent through the recorder without injecting its Python.
+  # Only the verified final native exec arms the shim, preserving token stdin.
   DAEMON_A_CMD=(python3 "$ROOT_DIR/scripts/nat-sim/launch_identity.py" exec \
     --artifact-set "$ARTIFACT_SET" --component daemon --role node-a \
     --record "$ROUND_DIR/launches/node-a.json" --config-file "$NODE_A_RUNTIME/config.json" \
@@ -1500,8 +1500,8 @@ for round in $(seq 1 "$ROUNDS"); do
       echo "[nat-sim] round $round: FAIL reason_code=egress_gateway_missing" >&2
       exit 1
     fi
-    DAEMON_A_CMD=(python3 "$ROOT_DIR/scripts/nat-sim/udp_egress.py" --library "$BASE_DIR/artifacts/udp-shim" --port "$EGRESS_A_PORT" --stats "$ROUND_DIR/node-a.egress-stats" -- "${DAEMON_A_CMD[@]}")
-    DAEMON_B_CMD=(python3 "$ROOT_DIR/scripts/nat-sim/udp_egress.py" --library "$BASE_DIR/artifacts/udp-shim" --port "$EGRESS_B_PORT" --stats "$ROUND_DIR/node-b.egress-stats" -- "${DAEMON_B_CMD[@]}")
+    DAEMON_A_CMD=(python3 "$ROOT_DIR/scripts/nat-sim/udp_egress.py" --recorder --library "$BASE_DIR/artifacts/udp-shim" --port "$EGRESS_A_PORT" --stats "$ROUND_DIR/node-a.egress-stats" -- "${DAEMON_A_CMD[@]}")
+    DAEMON_B_CMD=(python3 "$ROOT_DIR/scripts/nat-sim/udp_egress.py" --recorder --library "$BASE_DIR/artifacts/udp-shim" --port "$EGRESS_B_PORT" --stats "$ROUND_DIR/node-b.egress-stats" -- "${DAEMON_B_CMD[@]}")
   fi
 
   # Relay(s) (safety net; TCP, bypasses the NATs).  Multiple relays offer a

@@ -74,12 +74,22 @@ def environment(library: Path, port: int, stats_path: Path | None = None) -> dic
     return env
 
 
+def recorder_environment(env: dict[str, str]) -> dict[str, str]:
+    """Carry capture intent through Python; the verified final exec arms it."""
+    result = env.copy()
+    result.pop("DYLD_INSERT_LIBRARIES", None)
+    result.pop("LD_PRELOAD", None)
+    return result
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--build", type=Path)
     parser.add_argument("--library", type=Path)
     parser.add_argument("--port", type=int)
     parser.add_argument("--stats", type=Path)
+    parser.add_argument("--recorder", action="store_true",
+                        help="defer injection to the verified final native exec recorder")
     parser.add_argument("--drain", type=Path)
     parser.add_argument("--drain-timeout-ms", type=int, default=2000)
     parser.add_argument("command", nargs=argparse.REMAINDER)
@@ -92,7 +102,10 @@ def main() -> None:
     command = args.command[1:] if args.command[:1] == ["--"] else args.command
     if not args.library or args.port is None or not command:
         parser.error("require --build or --library, --port and -- command")
-    os.execvpe(command[0], command, environment(args.library, args.port, args.stats))
+    env = environment(args.library, args.port, args.stats)
+    if args.recorder:
+        env = recorder_environment(env)
+    os.execvpe(command[0], command, env)
 
 
 if __name__ == "__main__":

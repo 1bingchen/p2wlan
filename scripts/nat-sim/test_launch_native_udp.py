@@ -39,12 +39,18 @@ class FinalExecNativeUdpTests(unittest.IsolatedAsyncioTestCase):
 
         async def through_recorder(*arguments, **kwargs):
             self.assertEqual(Path(arguments[0]), Fixture.sender)
-            command = ["/usr/bin/python3", str(ROOT / "launch_identity.py"), "exec",
+            requested = kwargs["env"]
+            command = [sys.executable, str(ROOT / "udp_egress.py"), "--recorder",
+                       "--library", str(Fixture.library),
+                       "--port", requested["P2WLAN_NAT_SIM_GATEWAY_PORT"],
+                       "--stats", requested["P2WLAN_NAT_SIM_EGRESS_STATS"], "--",
+                       "/usr/bin/python3", str(ROOT / "launch_identity.py"), "exec",
                        "--artifact-set", str(prepared / "artifact-set.json"),
                        "--component", "daemon", "--role", "node-a", "--record", str(record)]
             for key in ("DYLD_INSERT_LIBRARIES", "P2WLAN_NAT_SIM_GATEWAY_PORT",
                         "P2WLAN_NAT_SIM_EGRESS_STATS"):
                 command.extend(["--env-key", key])
+            kwargs["env"] = native.udp_egress.recorder_environment(requested)
             child = await original_spawn(*command, "--", *arguments[1:], **kwargs)
             children.append(child)
             return child

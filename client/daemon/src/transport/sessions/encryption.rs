@@ -210,6 +210,7 @@ impl WireGuardTransport {
     /// then waiting for emit: inbound relay ACK/business evidence takes emit
     /// first and then commits generation-bound state, so the opposite order
     /// would create an ABBA deadlock.
+    #[cfg(test)]
     pub(crate) async fn encrypt_outbound_with_emit_guard(
         &self,
         packet: OutboundPacket,
@@ -234,26 +235,29 @@ impl WireGuardTransport {
             .await
     }
 
-    /// Encrypt a business packet only if the cached active session instance
-    /// is still installed.  The caller owns the per-peer emit guard and the
-    /// network-epoch gate. Contention returns the exact plaintext to the
-    /// bounded per-peer FIFO without waiting in the shared outbound actor.
+    /// Same crypto core without provenance capture, preserving an opt-in
+    /// buffer observation until its actual caller finishes the handoff.
+    pub(crate) async fn encrypt_outbound_with_emit_guard_observed(
+        &self,
+        packet: OutboundPacket,
+    ) -> Result<Option<EncryptedOutboundWithSource>> {
+        self.encrypt_outbound_inner_with_capture(packet, false, true, false)
+            .await
+    }
+
     pub(crate) fn try_encrypt_outbound_with_emit_guard_for_session(
         &self,
         packet: OutboundPacket,
         expected_session_instance: u64,
-    ) -> SessionBoundEncryption {
+    ) -> SessionBoundEncryptionWithSource {
         self.try_encrypt_outbound_with_emit_guard_for_session_inner(
             packet,
             expected_session_instance,
             false,
         )
-        .into_legacy()
     }
 
-    /// Same fast attempt and unchanged plaintext failure ownership, retaining
-    /// provenance only after the actual slot successfully allocates ciphertext.
-    #[allow(dead_code)] // Staged origin consumer; legacy entry does not capture.
+    /// Retain the actual successful slot's source for a sealed request.
     pub(crate) fn try_encrypt_outbound_with_emit_guard_for_session_and_source(
         &self,
         packet: OutboundPacket,
@@ -370,7 +374,8 @@ impl WireGuardTransport {
             wire_bytes,
             is_business: true,
         };
-        let encrypted = EncryptedOutboundWithSource::new(encrypted, source);
+        let encrypted =
+            EncryptedOutboundWithSource::new(encrypted, source, self.resource_capture());
         let session_lock_hold_us = session_lock_acquired.elapsed().as_micros() as u64;
         if let Some(sampled) = sampled {
             profiler.record(
@@ -582,6 +587,7 @@ impl WireGuardTransport {
                 is_business,
             },
             source,
+            self.resource_capture(),
         )))
     }
 
@@ -605,7 +611,11 @@ impl WireGuardTransport {
         packet: impl Into<crate::request_carriage::RawRequestDelivery> + Send,
         reason: &'static str,
     ) {
-        let packet = packet.into();
+        let mut packet = packet.into();
+        packet.observe_resources(
+            self.resource_capture(),
+            crate::dataplane_resources::ResidencyStage::SessionBacklog,
+        );
         let now = Instant::now();
         let peer_id = packet.peer_id.clone();
         let packet_len = packet.packet.len();
@@ -763,8 +773,11 @@ impl WireGuardTransport {
             let mut packets = Vec::with_capacity(queue.len());
             let mut expired_count = 0usize;
             let mut expired_bytes = 0usize;
-            while let Some(queued) = queue.pop_front() {
+            while let Some(mut queued) = queue.pop_front() {
                 if now.saturating_duration_since(queued.queued_at) <= PENDING_OUTBOUND_TTL {
+                    queued.packet.relocate_resources(
+                        crate::dataplane_resources::ResidencyStage::SessionFlush,
+                    );
                     packets.push(queued.packet);
                 } else {
                     expired_count = expired_count.saturating_add(1);

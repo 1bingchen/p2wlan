@@ -1,12 +1,15 @@
 //! Carriage adapters around the single original crypto core in each path.
-
+use super::{DeliveryMetadata, EncryptedRequestDelivery, RawRequestDelivery};
 use crate::error::{DaemonError, Result};
 use crate::transport::{
-    SessionBoundEncryption, SessionBoundEncryptionWithSource, SessionUnavailableReason,
-    WireGuardTransport,
+    SessionBoundEncryptionWithSource, SessionUnavailableReason, WireGuardTransport,
 };
 
-use super::{EncryptedRequestDelivery, RawRequestDelivery};
+fn observe_crypto_input(transport: &WireGuardTransport, packet: &mut RawRequestDelivery) {
+    packet
+        .metadata
+        .observe_crypto_input(transport.resource_capture(), &packet.raw.packet);
+}
 
 pub(crate) enum RequestEncryptionAttempt {
     Encrypted {
@@ -29,122 +32,93 @@ pub(crate) enum RequestEncryptionAttempt {
 impl WireGuardTransport {
     pub(crate) async fn encrypt_request_with_emit_guard(
         &self,
-        packet: RawRequestDelivery,
+        mut packet: RawRequestDelivery,
     ) -> Result<Option<EncryptedRequestDelivery>> {
-        let RawRequestDelivery { raw, binding } = packet;
-        if binding.is_some() {
+        observe_crypto_input(self, &mut packet);
+        let RawRequestDelivery { raw, metadata } = packet;
+        let (binding, original_residency) = metadata.into_parts();
+        let encrypted = if binding.is_some() {
             self.encrypt_outbound_with_emit_guard_and_source(raw)
-                .await
-                .map(|result| {
-                    result.map(|encrypted| {
-                        let (packet, source) = encrypted.into_parts();
-                        EncryptedRequestDelivery {
-                            packet,
-                            binding,
-                            source,
-                            echo_emit: None,
-                        }
-                    })
-                })
+                .await?
         } else {
-            self.encrypt_outbound_with_emit_guard(raw)
-                .await
-                .map(|result| {
-                    result.map(|packet| EncryptedRequestDelivery {
-                        packet,
-                        binding: None,
-                        source: None,
-                        echo_emit: None,
-                    })
-                })
-        }
+            self.encrypt_outbound_with_emit_guard_observed(raw).await?
+        };
+        // The original input observation survives the original crypto future,
+        // including cancellation, but does not retain or clone its Vec.
+        drop(original_residency);
+        Ok(encrypted.map(|encrypted| {
+            let (packet, source, residency) = encrypted.into_observed_parts();
+            EncryptedRequestDelivery {
+                packet,
+                metadata: DeliveryMetadata::from_parts(binding, residency),
+                source,
+                echo_emit: None,
+            }
+        }))
     }
 
     pub(crate) fn try_encrypt_request_with_emit_guard_for_session(
         &self,
-        packet: RawRequestDelivery,
+        mut packet: RawRequestDelivery,
         expected_session_instance: u64,
     ) -> RequestEncryptionAttempt {
-        let RawRequestDelivery { raw, binding } = packet;
-        if binding.is_some() {
-            match self.try_encrypt_outbound_with_emit_guard_for_session_and_source(
+        observe_crypto_input(self, &mut packet);
+        let RawRequestDelivery { raw, metadata } = packet;
+        let (binding, original_residency) = metadata.into_parts();
+        let encrypted = if binding.is_some() {
+            self.try_encrypt_outbound_with_emit_guard_for_session_and_source(
                 raw,
                 expected_session_instance,
-            ) {
-                SessionBoundEncryptionWithSource::Encrypted {
-                    packet,
-                    plaintext,
-                    session_lock_wait_us,
-                    crypto_us,
-                } => {
-                    let (packet, source) = packet.into_parts();
-                    RequestEncryptionAttempt::Encrypted {
-                        packet: EncryptedRequestDelivery {
-                            packet,
-                            binding: binding.clone(),
-                            source,
-                            echo_emit: None,
-                        },
-                        plaintext: RawRequestDelivery {
-                            raw: plaintext,
-                            binding,
-                        },
-                        session_lock_wait_us,
-                        crypto_us,
-                    }
-                }
-                SessionBoundEncryptionWithSource::Contended(raw) => {
-                    RequestEncryptionAttempt::Contended(RawRequestDelivery { raw, binding })
-                }
-                SessionBoundEncryptionWithSource::Unavailable {
-                    packet: raw,
-                    reason,
-                } => RequestEncryptionAttempt::Unavailable {
-                    packet: RawRequestDelivery { raw, binding },
-                    reason,
-                },
-                SessionBoundEncryptionWithSource::Failed { packet: raw, error } => {
-                    RequestEncryptionAttempt::Failed {
-                        packet: RawRequestDelivery { raw, binding },
-                        error,
-                    }
-                }
-            }
+            )
         } else {
-            match self
-                .try_encrypt_outbound_with_emit_guard_for_session(raw, expected_session_instance)
-            {
-                SessionBoundEncryption::Encrypted {
-                    packet,
-                    plaintext,
-                    session_lock_wait_us,
-                    crypto_us,
-                } => RequestEncryptionAttempt::Encrypted {
+            self.try_encrypt_outbound_with_emit_guard_for_session(raw, expected_session_instance)
+        };
+        match encrypted {
+            SessionBoundEncryptionWithSource::Encrypted {
+                packet,
+                plaintext,
+                session_lock_wait_us,
+                crypto_us,
+            } => {
+                let (packet, source, residency) = packet.into_observed_parts();
+                RequestEncryptionAttempt::Encrypted {
                     packet: EncryptedRequestDelivery {
                         packet,
-                        binding: None,
-                        source: None,
+                        metadata: DeliveryMetadata::from_parts(binding.clone(), residency),
+                        source,
                         echo_emit: None,
                     },
-                    plaintext: RawRequestDelivery::from(plaintext),
+                    plaintext: RawRequestDelivery {
+                        raw: plaintext,
+                        metadata: DeliveryMetadata::from_parts(binding, original_residency),
+                    },
                     session_lock_wait_us,
                     crypto_us,
-                },
-                SessionBoundEncryption::Contended(raw) => {
-                    RequestEncryptionAttempt::Contended(RawRequestDelivery::from(raw))
                 }
-                SessionBoundEncryption::Unavailable {
-                    packet: raw,
-                    reason,
-                } => RequestEncryptionAttempt::Unavailable {
-                    packet: RawRequestDelivery::from(raw),
-                    reason,
+            }
+            SessionBoundEncryptionWithSource::Contended(raw) => {
+                RequestEncryptionAttempt::Contended(RawRequestDelivery {
+                    raw,
+                    metadata: DeliveryMetadata::from_parts(binding, original_residency),
+                })
+            }
+            SessionBoundEncryptionWithSource::Unavailable {
+                packet: raw,
+                reason,
+            } => RequestEncryptionAttempt::Unavailable {
+                packet: RawRequestDelivery {
+                    raw,
+                    metadata: DeliveryMetadata::from_parts(binding, original_residency),
                 },
-                SessionBoundEncryption::Failed { packet: raw, error } => {
-                    RequestEncryptionAttempt::Failed {
-                        packet: RawRequestDelivery::from(raw),
-                        error,
-                    }
+                reason,
+            },
+            SessionBoundEncryptionWithSource::Failed { packet: raw, error } => {
+                RequestEncryptionAttempt::Failed {
+                    packet: RawRequestDelivery {
+                        raw,
+                        metadata: DeliveryMetadata::from_parts(binding, original_residency),
+                    },
+                    error,
                 }
             }
         }

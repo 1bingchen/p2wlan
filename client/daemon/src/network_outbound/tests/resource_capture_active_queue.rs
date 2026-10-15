@@ -3,7 +3,9 @@
 use super::super::super::test_support::{establish_sessions, test_peer};
 use super::*;
 use crate::config::Config;
-use crate::dataplane_resources::{BufferSnapshot, BufferStage, FifoSnapshot, ResourceCapture};
+use crate::dataplane_resources::{
+    BufferSnapshot, BufferStage, FifoSnapshot, ResidencyStage, ResourceCapture,
+};
 use tokio::sync::oneshot;
 use tokio::time::{timeout_at, Instant as TokioInstant};
 
@@ -75,6 +77,7 @@ async fn actual_preparation_timeout_reparks_without_live_buffer_and_fifo_double_
     });
     let ready = timeout_at(work, ready_rx).await;
     let live = capture.snapshot();
+    let live_owners = capture.residency_snapshot();
     let result = timeout_at(work, &mut worker).await;
     // If work timed out, retain the handle through cancellation and join before
     // reporting it. Missing-hook assertions never substitute for owner cleanup.
@@ -98,6 +101,7 @@ async fn actual_preparation_timeout_reparks_without_live_buffer_and_fifo_double_
         .expect("real original two-second preparation timeout must return")
         .unwrap();
     let after_return = capture.snapshot();
+    let returned_owners = capture.residency_snapshot();
     let actual_capacity = returned.queue.front().map(PendingPacket::stored_capacity);
     let actual_bytes = returned.bytes;
     let same_deadline = returned.wait_deadline == original_deadline;
@@ -106,6 +110,31 @@ async fn actual_preparation_timeout_reparks_without_live_buffer_and_fifo_double_
     drop(returned);
     capture.finish();
     let dropped = capture.snapshot();
+    let dropped_owners = capture.residency_snapshot();
+    for snapshot in [live_owners, returned_owners, dropped_owners] {
+        assert!(snapshot.coherent && snapshot.valid);
+        assert_eq!(snapshot.unknown_bits, 1);
+    }
+    assert_eq!(live_owners.total.unwrap().live_buffers, 3);
+    assert_eq!(live_owners.total.unwrap().len_bytes, 12);
+    assert_eq!(
+        live_owners.total.unwrap().capacity_bytes,
+        [
+            BufferStage::ActiveOriginal,
+            BufferStage::RetryPlaintext,
+            BufferStage::PreparationPlaintext
+        ]
+        .iter()
+        .map(|s| live.buffer(*s).capacity)
+        .sum::<u64>()
+    );
+    assert_eq!(returned_owners.total.unwrap().live_buffers, 1);
+    assert_eq!(
+        returned_owners.total,
+        returned_owners.stage(ResidencyStage::PendingFifo)
+    );
+    assert_eq!(returned_owners.clone_ops, Some(2));
+    assert_eq!(dropped_owners.total.unwrap().live_buffers, 0);
     assert!(ready.unwrap().unwrap());
     assert!(matches!(
         receiver.try_recv(),

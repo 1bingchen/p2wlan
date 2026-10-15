@@ -3,7 +3,10 @@
 
 pub(crate) async fn wait_tracked_outbound_receiver_closed(transport: &super::WireGuardTransport) {
     match &transport.outbound_tx {
-        crate::request_carriage::RawOutboundSink::Tracked(sender) => sender.closed().await,
+        crate::request_carriage::RawOutboundSink::Tracked(sender)
+        | crate::request_carriage::RawOutboundSink::ObservedTracked { tx: sender, .. } => {
+            sender.closed().await
+        }
         crate::request_carriage::RawOutboundSink::Legacy(_) => {
             panic!("graceful drain control requires its original tracked constructor");
         }

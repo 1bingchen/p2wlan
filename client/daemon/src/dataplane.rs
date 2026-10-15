@@ -38,3 +38,7 @@ mod room_connectivity_tests {
 mod resource_capture_admission_wait_tests {
     include!("dataplane/resource_capture_admission_wait_tests.rs");
 }
+
+#[cfg(test)]
+#[path = "dataplane/resource_residency_tests.rs"]
+mod resource_residency_tests;

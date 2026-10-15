@@ -11,7 +11,7 @@ impl EncryptedRequestDelivery {
         actual_encryption_generation: u64,
     ) -> Option<PreparedPhysicalPublication> {
         PreparedPhysicalPublication::capture_encryption_epoch(
-            self.binding.as_ref()?,
+            self.binding()?,
             self.source.as_ref()?,
             peers,
             transport,

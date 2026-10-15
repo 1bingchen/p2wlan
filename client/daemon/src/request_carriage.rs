@@ -17,8 +17,13 @@ use crate::transport::{EncryptedPeerPacket, OriginalEncryptionSource};
 mod channel;
 mod crypto;
 mod physical;
+mod residency_metadata;
+#[cfg(test)]
+mod residency_overhead_tests;
+use crate::dataplane_resources::{ResidencyStage, ResourceCapture};
 pub(crate) use channel::{RawOutboundReceiver, RawOutboundSink};
 pub(crate) use crypto::RequestEncryptionAttempt;
+use residency_metadata::DeliveryMetadata;
 #[cfg(test)]
 pub(crate) mod test_probe;
 #[cfg(test)]
@@ -207,41 +212,68 @@ fn original_identity_matches(
 
 /// Shared-core envelope layout exists for legacy packets too. Only a genuine
 /// sealed input carries a Weak binding; no strong request owner is retained.
-#[derive(Clone)]
 pub(crate) struct RawRequestDelivery {
     raw: OutboundPacket,
-    binding: Option<RequestBinding>,
+    metadata: DeliveryMetadata,
+}
+
+impl Clone for RawRequestDelivery {
+    fn clone(&self) -> Self {
+        let raw = self.raw.clone();
+        let metadata = self.metadata.clone_for(&raw.packet);
+        Self { raw, metadata }
+    }
 }
 
 impl std::fmt::Debug for RawRequestDelivery {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RawRequestDelivery")
             .field("raw", &self.raw)
-            .field("binding", &self.binding.as_ref().map(RequestBinding::state))
+            .field("binding", &self.binding().map(RequestBinding::state))
             .finish()
     }
 }
 
 impl From<OutboundPacket> for RawRequestDelivery {
     fn from(raw: OutboundPacket) -> Self {
-        Self { raw, binding: None }
+        Self {
+            raw,
+            metadata: DeliveryMetadata::Empty,
+        }
     }
 }
 
 impl RawRequestDelivery {
     pub(crate) fn routed(raw: OutboundPacket, binding: Option<RequestBinding>) -> Self {
-        Self { raw, binding }
+        Self {
+            raw,
+            metadata: DeliveryMetadata::from_parts(binding, None),
+        }
     }
 
     #[allow(dead_code)] // Historical carriage accessor, no send/credit authority.
     pub(crate) fn binding(&self) -> Option<&RequestBinding> {
-        self.binding.as_ref()
+        self.metadata.binding()
     }
 
     pub(crate) fn original_echo(&self) -> Option<&Arc<crate::overlay_requests::OriginalEchoInput>> {
-        self.binding
-            .as_ref()
-            .and_then(|binding| binding.token.echo())
+        self.binding().and_then(|binding| binding.token.echo())
+    }
+
+    pub(crate) fn observe_resources(
+        &mut self,
+        capture: Option<&Arc<ResourceCapture>>,
+        stage: ResidencyStage,
+    ) {
+        if let Some(capture) = capture {
+            self.metadata.observe(capture, stage, &self.raw.packet);
+        } else {
+            self.metadata.relocate(stage, &self.raw.packet);
+        }
+    }
+
+    pub(crate) fn relocate_resources(&mut self, stage: ResidencyStage) {
+        self.metadata.relocate(stage, &self.raw.packet);
     }
 }
 
@@ -263,7 +295,7 @@ impl DerefMut for RawRequestDelivery {
 /// legacy packet. Source B never supplies network-G or physical success.
 pub(crate) struct EncryptedRequestDelivery {
     packet: EncryptedPeerPacket,
-    binding: Option<RequestBinding>,
+    metadata: DeliveryMetadata,
     source: Option<OriginalEncryptionSource>,
     echo_emit: Option<std::sync::Weak<tokio::sync::OwnedMutexGuard<()>>>,
 }
@@ -274,8 +306,7 @@ impl EncryptedRequestDelivery {
         guard: &Arc<tokio::sync::OwnedMutexGuard<()>>,
     ) {
         if self
-            .binding
-            .as_ref()
+            .binding()
             .is_some_and(|binding| binding.token.echo().is_some())
         {
             self.echo_emit = Some(Arc::downgrade(guard));
@@ -285,7 +316,7 @@ impl EncryptedRequestDelivery {
     pub(crate) fn original_echo_prewrite(
         &self,
     ) -> Option<Arc<crate::overlay_requests::OriginalEchoPrewrite>> {
-        let echo = self.binding.as_ref()?.token.echo()?;
+        let echo = self.binding()?.token.echo()?;
         echo.prewrite(
             self.source.as_ref()?,
             self.echo_emit.as_ref()?.clone(),
@@ -294,13 +325,12 @@ impl EncryptedRequestDelivery {
     }
 
     pub(crate) fn has_original_echo(&self) -> bool {
-        self.binding
-            .as_ref()
+        self.binding()
             .is_some_and(|binding| binding.token.echo().is_some())
     }
     #[allow(dead_code)] // Historical carriage accessor, no send/credit authority.
     pub(crate) fn binding(&self) -> Option<&RequestBinding> {
-        self.binding.as_ref()
+        self.metadata.binding()
     }
 
     #[allow(dead_code)] // Actual B is immutable; final current ownership is separate.

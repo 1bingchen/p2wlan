@@ -32,6 +32,11 @@ mod tests {
     include!("tests/overlay_ingress_source.rs");
     include!("tests/encryption_origin.rs");
 
+    mod resource_residency_tests {
+        use super::*;
+        include!("tests/resource_residency.rs");
+    }
+
     mod request_carriage_queue_tests {
         use super::*;
         include!("tests/request_carriage_queue.rs");

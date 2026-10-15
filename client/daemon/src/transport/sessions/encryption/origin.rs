@@ -10,9 +10,7 @@ use super::super::{PeerTransportSessions, TransportSessionSlot};
 use crate::dataplane::OutboundPacket;
 use crate::error::DaemonError;
 use crate::peer::PeerSessionGeneration;
-use crate::transport::{
-    EncryptedPeerPacket, SessionBoundEncryption, SessionUnavailableReason, WireGuardTransport,
-};
+use crate::transport::{EncryptedPeerPacket, SessionUnavailableReason, WireGuardTransport};
 
 /// Identifies the actual slot that encrypted this ciphertext. No raw key bytes,
 /// network generation, current-owner qualification or physical-send success.
@@ -142,17 +140,35 @@ impl OriginalEncryptionSource {
 pub(crate) struct EncryptedOutboundWithSource {
     packet: EncryptedPeerPacket,
     source: Option<OriginalEncryptionSource>,
+    residency: Option<Box<crate::dataplane_resources::ResidencyLease>>,
 }
 
 impl EncryptedOutboundWithSource {
     pub(super) fn new(
         packet: EncryptedPeerPacket,
         source: Option<OriginalEncryptionSource>,
+        capture: Option<&Arc<crate::dataplane_resources::ResourceCapture>>,
     ) -> Self {
-        Self { packet, source }
+        let residency = capture
+            .and_then(|capture| {
+                crate::dataplane_resources::ResidencyLease::observe(
+                    capture,
+                    crate::dataplane_resources::ResidencyStage::SerializedWire,
+                    &packet.wire_bytes,
+                )
+            })
+            .map(Box::new);
+        Self {
+            packet,
+            source,
+            residency,
+        }
     }
 
     pub(crate) fn into_packet(self) -> EncryptedPeerPacket {
+        if let Some(lease) = self.residency.as_ref() {
+            lease.unobserved_exit();
+        }
         self.packet
     }
 
@@ -168,10 +184,29 @@ impl EncryptedOutboundWithSource {
 
     #[allow(dead_code)]
     pub(crate) fn into_parts(self) -> (EncryptedPeerPacket, Option<OriginalEncryptionSource>) {
+        if let Some(lease) = self.residency.as_ref() {
+            lease.unobserved_exit();
+        }
         (self.packet, self.source)
+    }
+
+    pub(crate) fn into_observed_parts(
+        self,
+    ) -> (
+        EncryptedPeerPacket,
+        Option<OriginalEncryptionSource>,
+        Option<crate::dataplane_resources::ResidencyLease>,
+    ) {
+        (self.packet, self.source, self.residency.map(|lease| *lease))
     }
 }
 
+/// Result of an encryption attempt that is bound to one cached session
+/// instance. Returning the plaintext on a stale-session miss avoids a
+/// per-packet clone on the successful LAN fast path while preserving the
+/// existing slow-path FIFO fallback. Successful encryption also retains that
+/// same plaintext until an exact nonblocking syscall has accepted the datagram;
+/// a known not-sent result abandons the counter and re-enters the plaintext FIFO.
 pub(crate) enum SessionBoundEncryptionWithSource {
     Encrypted {
         packet: EncryptedOutboundWithSource,
@@ -188,27 +223,4 @@ pub(crate) enum SessionBoundEncryptionWithSource {
         packet: OutboundPacket,
         error: DaemonError,
     },
-}
-
-impl SessionBoundEncryptionWithSource {
-    pub(super) fn into_legacy(self) -> SessionBoundEncryption {
-        match self {
-            Self::Encrypted {
-                packet,
-                plaintext,
-                session_lock_wait_us,
-                crypto_us,
-            } => SessionBoundEncryption::Encrypted {
-                packet: packet.into_packet(),
-                plaintext,
-                session_lock_wait_us,
-                crypto_us,
-            },
-            Self::Contended(packet) => SessionBoundEncryption::Contended(packet),
-            Self::Unavailable { packet, reason } => {
-                SessionBoundEncryption::Unavailable { packet, reason }
-            }
-            Self::Failed { packet, error } => SessionBoundEncryption::Failed { packet, error },
-        }
-    }
 }

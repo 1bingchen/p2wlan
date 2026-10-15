@@ -96,6 +96,10 @@ where
         if capture.is_finished() {
             return Err(crate::dataplane_resources::EnableError::CaptureFinished);
         }
+        self.outbound_tx = self
+            .outbound_tx
+            .clone()
+            .with_resource_capture(capture.clone());
         self.resource_capture = Some(capture);
         Ok(self)
     }
@@ -670,17 +674,22 @@ where
         // The routed Vec remains this future's local owner while reserve
         // waits. This observation ends before synchronous channel handoff;
         // it does not cover queued packets or change admission/deadlines.
+        let mut delivery = RawRequestDelivery::routed(routed, binding);
+        delivery.observe_resources(
+            self.resource_capture(),
+            crate::dataplane_resources::ResidencyStage::ChannelReserve,
+        );
         let admission_wait_lease = crate::dataplane_resources::OwnedBufferLease::observe(
             self.resource_capture(),
             crate::dataplane_resources::BufferStage::DataplaneAdmissionWait,
-            &routed.packet,
+            &delivery.packet,
         );
         let slot = self
             .outbound_tx
             .reserve()
             .await
             .map_err(|_| DaemonError::Network("outbound packet channel closed".to_string()))?;
-        if routed
+        if delivery
             .room_authorization
             .as_ref()
             .is_some_and(|permit| !permit.is_valid())
@@ -695,7 +704,7 @@ where
             return Ok(());
         }
         drop(admission_wait_lease);
-        slot.send(RawRequestDelivery::routed(routed, binding))
+        slot.send(delivery)
             .map_err(|_| DaemonError::Network("tracked outbound sink mismatch".to_string()))?;
         if let Some(auth) = self.room_authorization.as_ref() {
             auth.record_packet(&peer_id, false);

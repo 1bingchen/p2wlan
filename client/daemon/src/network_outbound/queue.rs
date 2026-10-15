@@ -58,6 +58,20 @@ pub(super) enum PendingPacket {
 }
 
 impl PendingPacket {
+    fn observe_residency(
+        &mut self,
+        capture: Option<&Arc<ResourceCapture>>,
+        stage: crate::dataplane_resources::ResidencyStage,
+    ) {
+        let Self::Plain { packet, .. } = self;
+        packet.observe_resources(capture, stage);
+    }
+
+    fn relocate_residency(&mut self, stage: crate::dataplane_resources::ResidencyStage) {
+        let Self::Plain { packet, .. } = self;
+        packet.relocate_resources(stage);
+    }
+
     fn plain(packet: impl Into<RawRequestDelivery>) -> Self {
         let packet = packet.into();
         let pending_residence =
@@ -212,9 +226,15 @@ impl PeerPendingQueue {
         // Usually the first ingress attaches to an empty new FIFO or timing
         // shell. An existing bounded FIFO is adopted once, never scanned on
         // each packet; every later mutation adjusts capacity in constant work.
-        let vec_capacity = self.queue.iter().try_fold(0usize, |capacity, packet| {
-            capacity.checked_add(packet.stored_capacity())
-        });
+        let mut vec_capacity = Some(0usize);
+        for packet in &mut self.queue {
+            packet.observe_residency(
+                capture,
+                crate::dataplane_resources::ResidencyStage::PendingFifo,
+            );
+            vec_capacity =
+                vec_capacity.and_then(|value| value.checked_add(packet.stored_capacity()));
+        }
         self.resource_capture = Some(PendingQueueCapture {
             lease,
             vec_capacity,
@@ -267,18 +287,28 @@ impl PeerPendingQueue {
     /// when the packet/byte bound is exceeded.  Returns (dropped packets,
     /// dropped bytes) for the overflow so the caller can count them into
     /// `/status.stats.outbound_drops` — the loss is never silently ignored.
-    fn enqueue(&mut self, packet: PendingPacket) -> (Vec<PendingPacket>, usize) {
+    fn enqueue(&mut self, mut packet: PendingPacket) -> (Vec<PendingPacket>, usize) {
         let packet_len = packet.stored_bytes();
+        let capture = self.resource_capture.as_ref().map(|c| c.lease.capture());
         if packet_len > MAX_PENDING_BYTES_PER_PEER {
+            packet.observe_residency(
+                capture,
+                crate::dataplane_resources::ResidencyStage::DiscardBatch,
+            );
             return (vec![packet], packet_len);
         }
+        packet.observe_residency(
+            capture,
+            crate::dataplane_resources::ResidencyStage::PendingFifo,
+        );
         let mut dropped_packets = Vec::new();
         let mut dropped_bytes = 0usize;
         while !self.queue.is_empty()
             && (self.queue.len() >= MAX_PENDING_PACKETS_PER_PEER
                 || self.bytes.saturating_add(packet_len) > MAX_PENDING_BYTES_PER_PEER)
         {
-            if let Some(old) = self.pop_front() {
+            if let Some(mut old) = self.pop_front() {
+                old.relocate_residency(crate::dataplane_resources::ResidencyStage::DiscardBatch);
                 let old_len = old.stored_bytes();
                 dropped_bytes = dropped_bytes.saturating_add(old_len);
                 dropped_packets.push(old);
@@ -292,13 +322,19 @@ impl PeerPendingQueue {
     }
 
     fn pop_front(&mut self) -> Option<PendingPacket> {
-        let packet = self.queue.pop_front()?;
+        let mut packet = self.queue.pop_front()?;
         self.bytes = self.bytes.saturating_sub(packet.stored_bytes());
         self.change_resource_capacity(packet.stored_capacity(), false);
+        packet.relocate_residency(crate::dataplane_resources::ResidencyStage::DetachedRaw);
         Some(packet)
     }
 
-    fn push_front(&mut self, packet: PendingPacket) {
+    fn push_front(&mut self, mut packet: PendingPacket) {
+        let capture = self.resource_capture.as_ref().map(|c| c.lease.capture());
+        packet.observe_residency(
+            capture,
+            crate::dataplane_resources::ResidencyStage::PendingFifo,
+        );
         let packet_capacity = packet.stored_capacity();
         self.bytes = self.bytes.saturating_add(packet.stored_bytes());
         self.queue.push_front(packet);

@@ -1185,6 +1185,19 @@ pub(crate) enum FreshMappingOutcome {
     Rejected(FreshMappingRejection),
 }
 
+impl FreshMappingOutcome {
+    /// Missing means no completed-call summary survived this outcome. In
+    /// particular, cancellation/Superseded and measurement-only are not zero
+    /// physical cost. This observation never grants a send or handoff permit.
+    pub(crate) fn ordinary_probe_summary(&self) -> Option<&FreshMappingProbeSummary> {
+        match self {
+            Self::Accepted(result, _) => result.ordinary_probe_summary.as_ref(),
+            Self::Rejected(FreshMappingRejection::NoProbesSent(summary)) => Some(summary),
+            Self::Rejected(_) => None,
+        }
+    }
+}
+
 /// Endpoint-free cost and timing facts for one local Hard↔Hard STUN
 /// measurement.  Durations use the transport's process-local monotonic clock;
 /// callers translate them onto the daemon timeline only after the measurement
@@ -1230,6 +1243,9 @@ pub(crate) struct FreshMappingResult {
     pub(crate) last_punch_sent_at_ms: u64,
     /// Measurement cost/timing exported for the Hard↔Hard attempt report.
     pub(crate) measurement: HardHardMeasurementStats,
+    /// Ordinary completed-call costs, excluding dropped futures and burst/ACK
+    /// workers. None for measurement-only; this is not a complete attempt ledger.
+    pub(crate) ordinary_probe_summary: Option<FreshMappingProbeSummary>,
 }
 
 /// One committed speculative mapping used by the bounded Hard↔Hard birthday

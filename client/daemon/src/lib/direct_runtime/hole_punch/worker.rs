@@ -400,7 +400,7 @@ async fn spawn_hole_punch_task_with_lifecycle(
 
     let invocation_cancellation = session.cancellation_handle();
     tokio::spawn(async move {
-        let worker = async move {
+        let worker = Box::pin(async move {
             if peers.current_network_generation_sync() != network_generation
                 || !peers.peer_session_is_current_sync(&peer_id, peer_session_generation)
             {
@@ -433,12 +433,19 @@ async fn spawn_hole_punch_task_with_lifecycle(
             // self-contained future now and start it only after all early
             // cancellation/candidate gates below have passed; the first punch and
             // this optimization then run concurrently.
+            let ordinary_cost = udp.ordinary_probe_cost(
+                session.session_id(),
+                network_generation,
+                peer_session_generation,
+                epoch,
+            );
             let fresh_mapping_future = {
                 let signal = signal.clone();
                 let udp = udp.clone();
                 let peers = peers.clone();
                 let peer_id = peer_id.clone();
                 let cancellation = session.cancellation_handle();
+                let child_cost = ordinary_cost.clone();
                 async move {
                     let fresh_generation = if let Some(signal) = signal.as_ref() {
                         if signal.boot_epoch_ms == 0 {
@@ -483,7 +490,7 @@ async fn spawn_hole_punch_task_with_lifecycle(
                             reservation.commit();
                             let targets = peers.stable_remote_punch_targets_for(&peer_id).await;
                             let mut generation = udp
-                                .run_fresh_mapping_generation(
+                                .run_fresh_mapping_generation_observed(
                                     &peer_id,
                                     &signal.stun_servers,
                                     signal.stun_timeout,
@@ -491,8 +498,15 @@ async fn spawn_hole_punch_task_with_lifecycle(
                                     probe_interval,
                                     attempts.min(2),
                                     Some(&cancellation),
+                                    &child_cost,
                                 )
                                 .await;
+                            debug!(
+                                event = "ordinary_probe_returned_cost",
+                                peer_id = %peer_id,
+                                summary = ?generation.ordinary_probe_summary(),
+                                "completed primary/compatibility call observation; cancellation and burst costs may be missing"
+                            );
                             match &mut generation {
                                 FreshMappingOutcome::Accepted(result, handoff) => {
                                     // The session may have been superseded while the
@@ -1371,8 +1385,13 @@ async fn spawn_hole_punch_task_with_lifecycle(
             // fresh-mapping optimization now start together.  The fresh-mapping
             // task can improve later windows, but it is never allowed to delay
             // the first Direct packet or relay-first business continuity.
-            let fresh_mapping_task = tokio::spawn(fresh_mapping_future);
-            let outcome = run_owned_punch_session_with_deadline(&session, deadline, async {
+            let session_deadline = sleep(deadline).deadline();
+            let mut fresh_mapping_task = crate::udp::OrdinaryProbeTask::spawn(
+                ordinary_cost.clone(),
+                session_deadline,
+                fresh_mapping_future,
+            );
+            let outcome = run_owned_punch_session_until(&session, session_deadline, async {
             if session.is_cancelled()
                 || !peers.peer_session_is_current_sync(&peer_id, peer_session_generation)
             {
@@ -1697,7 +1716,18 @@ async fn spawn_hole_punch_task_with_lifecycle(
         })
         .await;
 
-            if let Err(error) = fresh_mapping_task.await {
+            let cleanup_join_error = fresh_mapping_task
+                .finish(outcome != PunchSessionOutcome::Completed)
+                .await;
+            debug!(
+                event = "ordinary_probe_retained_cost",
+                original_peer_id = %peer_id,
+                snapshot = ?ordinary_cost.snapshot(),
+                join_error = ?cleanup_join_error,
+                scope = "observed_primary_compatibility_returns_only",
+                "original invocation lower bound; excludes bursts and ACKs; overlaps returned-call view"
+            );
+            if let Some(error) = cleanup_join_error.filter(|error| !error.is_cancelled()) {
                 peers
                 .record_direct_event(
                     &peer_id,
@@ -1809,7 +1839,7 @@ async fn spawn_hole_punch_task_with_lifecycle(
                     }
                 }
             }
-        };
+        });
 
         if let Some(shutdown_rx) = invocation_shutdown_rx {
             tokio::select! {

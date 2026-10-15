@@ -192,14 +192,6 @@ impl UdpTransport {
             return DirectBusinessBudgetGate::Unmanaged;
         }
 
-        let Some((socket_index, socket, lease)) = self
-            .resolve_send_socket_with_lease_for_endpoint(peer_id, Some(expected_endpoint))
-            .await
-        else {
-            return DirectBusinessBudgetGate::ManagedPending {
-                reason: "exact_socket_missing",
-            };
-        };
         let Some(committed) = self.peers.committed_business_path_snapshot_sync(peer_id) else {
             return DirectBusinessBudgetGate::ManagedPending {
                 reason: "committed_path_missing",
@@ -243,13 +235,25 @@ impl UdpTransport {
             };
         };
         if pair.generation != epoch.network_generation
+            || pair.peer_session_generation != epoch.peer_session_generation
             || pair.remote_candidate_epoch != epoch.remote_candidate_epoch
-            || socket.local_addr().ok() != Some(local_endpoint)
         {
             return DirectBusinessBudgetGate::ManagedPending {
                 reason: "exact_socket_identity_changed",
             };
         }
+        let Some((socket_index, socket, lease)) = self
+            .resolve_committed_direct_socket_with_lease(
+                peer_id,
+                local_endpoint,
+                epoch.network_generation,
+            )
+            .await
+        else {
+            return DirectBusinessBudgetGate::ManagedPending {
+                reason: "exact_socket_missing",
+            };
+        };
         let Some(path_identity) = crate::dplpmtud::DplpmtudPathIdentity::from_committed_validation(
             peer_id,
             validation,
@@ -589,13 +593,20 @@ impl UdpTransport {
                 continue;
             };
             if pair.generation != epoch.network_generation
+                || pair.peer_session_generation != epoch.peer_session_generation
                 || pair.remote_candidate_epoch != epoch.remote_candidate_epoch
             {
                 self.dplpmtud
                     .cancel_peer(&snapshot.peer_id, "direct_pair_stale", now);
                 continue;
             }
-            let Some((socket_index, socket)) = self.socket_for_peer(Some(&snapshot.peer_id)).await
+            let Some((socket_index, socket, _socket_lease)) = self
+                .resolve_committed_direct_socket_with_lease(
+                    &snapshot.peer_id,
+                    local_endpoint,
+                    epoch.network_generation,
+                )
+                .await
             else {
                 self.dplpmtud
                     .cancel_peer(&snapshot.peer_id, "local_socket_missing", now);

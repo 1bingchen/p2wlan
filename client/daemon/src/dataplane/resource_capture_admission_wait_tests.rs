@@ -1,10 +1,11 @@
-// Actual original reserve ownership; channel residency remains unmeasured.
+// Actual reserve and tracked-channel ownership, including original cancellation.
 
 use super::*;
 use crate::config::Config;
 use crate::control::PeerInfo;
 use crate::dataplane_resources::{
-    BufferSnapshot, BufferStage, ResourceCapture, ResourceSnapshot, VecSite,
+    BufferSnapshot, BufferStage, ResidencySnapshot, ResidencyStage, ResourceCapture,
+    ResourceSnapshot, VecSite,
 };
 use crate::request_carriage::RawOutboundReceiver;
 use crate::rooms::RoomAuthorization;
@@ -134,6 +135,8 @@ fn filler(sequence: u16) -> Vec<u8> {
 
 struct Evidence {
     held: ResourceSnapshot,
+    held_owners: ResidencySnapshot,
+    after_operation_owners: ResidencySnapshot,
     after_operation: ResourceSnapshot,
     route_result: Option<crate::error::Result<()>>,
     live_queue_len: usize,
@@ -176,6 +179,7 @@ async fn exercise(case: Case) {
                     ));
                 }
                 let held = capture.snapshot();
+                let held_owners = capture.residency_snapshot();
                 let live_queue_len = fixture.receiver.as_ref().unwrap().len();
                 let live_capacity = sender.capacity();
                 let mut fifo_exact = true;
@@ -206,6 +210,7 @@ async fn exercise(case: Case) {
                 // Save the release while the channel still contains its own Vecs.
                 // Resource assertions happen only after every fixture owner drops.
                 let after_operation = capture.snapshot();
+                let after_operation_owners = capture.residency_snapshot();
                 let after_queue_len = fixture
                     .receiver
                     .as_ref()
@@ -229,6 +234,8 @@ async fn exercise(case: Case) {
                 }
                 Ok::<_, String>(Evidence {
                     held,
+                    held_owners,
+                    after_operation_owners,
                     after_operation,
                     route_result,
                     live_queue_len,
@@ -275,6 +282,65 @@ async fn exercise(case: Case) {
         );
         assert_eq!(capture.snapshot().buffer(STAGE), BufferSnapshot::default());
         assert!(evidence.fifo_exact);
+        for owners in [evidence.held_owners, evidence.after_operation_owners] {
+            assert!(owners.coherent && owners.valid);
+            assert_eq!(
+                owners.unknown_bits,
+                u32::from(matches!(channel, Channel::Legacy))
+            );
+            assert!(!owners.whole_pipeline_bytes_measured);
+        }
+        let reserved = evidence
+            .held_owners
+            .stage(ResidencyStage::ChannelReserve)
+            .unwrap();
+        assert_eq!(reserved.live_buffers, 1);
+        assert_eq!(reserved.len_bytes, original_len);
+        assert_eq!(reserved.capacity_bytes, observed.capacity);
+        let channel_owners = evidence
+            .held_owners
+            .stage(ResidencyStage::RawChannel)
+            .unwrap();
+        let expected_fillers = if matches!(channel, Channel::Tracked) {
+            1024
+        } else {
+            0
+        };
+        assert_eq!(channel_owners.live_buffers, expected_fillers);
+        assert_eq!(channel_owners.len_bytes, 3 * expected_fillers);
+        assert_eq!(channel_owners.capacity_bytes, 3 * expected_fillers);
+        let total = evidence.held_owners.total.unwrap();
+        assert_eq!(total.live_buffers, expected_fillers + 1);
+        assert_eq!(total.len_bytes, channel_owners.len_bytes + original_len);
+        assert_eq!(
+            total.capacity_bytes,
+            channel_owners.capacity_bytes + reserved.capacity_bytes
+        );
+        assert_eq!(
+            evidence
+                .after_operation_owners
+                .stage(ResidencyStage::ChannelReserve)
+                .unwrap()
+                .live_buffers,
+            0
+        );
+        let after_channel = evidence
+            .after_operation_owners
+            .stage(ResidencyStage::RawChannel)
+            .unwrap();
+        assert_eq!(
+            after_channel.live_buffers,
+            if matches!(channel, Channel::Tracked) {
+                match case {
+                    Case::ReceiverClosed => 0,
+                    Case::RoomRevoked => 1023,
+                    _ => 1024,
+                }
+            } else {
+                0
+            }
+        );
+        assert_eq!(evidence.after_operation_owners.total, Some(after_channel));
         match case {
             Case::Cancel => {
                 assert!(evidence.route_result.is_none());
@@ -306,6 +372,7 @@ async fn exercise(case: Case) {
                 assert!(evidence.actual_packet.is_none());
             }
         }
+        assert_eq!(capture.residency_snapshot().total.unwrap().live_buffers, 0);
         for snapshot in [
             &evidence.held,
             &evidence.after_operation,

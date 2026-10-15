@@ -3,7 +3,9 @@
 use super::super::test_support::*;
 use super::*;
 use crate::config::Config;
-use crate::dataplane_resources::{BufferSnapshot, BufferStage, ResourceCapture};
+use crate::dataplane_resources::{
+    BufferSnapshot, BufferStage, ResidencySnapshot, ResidencyStage, ResourceCapture,
+};
 use crate::relay::publication_test_support::{Budget, Fixture, WriterPath};
 use futures_util::FutureExt;
 use std::panic::AssertUnwindSafe;
@@ -23,6 +25,7 @@ struct Position {
     buffers: [BufferSnapshot; 4],
     observed: [bool; 4],
     valid: bool,
+    residency: ResidencySnapshot,
 }
 
 fn position(capture: &ResourceCapture) -> Position {
@@ -31,6 +34,7 @@ fn position(capture: &ResourceCapture) -> Position {
         buffers: STAGES.map(|stage| snapshot.buffer(stage)),
         observed: STAGES.map(|stage| snapshot.buffer_scope_observed(stage)),
         valid: snapshot.valid,
+        residency: capture.residency_snapshot(),
     }
 }
 
@@ -57,6 +61,10 @@ fn packet(raw: Vec<u8>) -> OutboundPacket {
 fn assert_released(capture: &ResourceCapture) {
     let snapshot = capture.snapshot();
     assert!(snapshot.valid);
+    let owners = capture.residency_snapshot();
+    assert!(owners.coherent && owners.valid);
+    assert_eq!(owners.total.unwrap().live_buffers, 0);
+    assert_eq!(owners.gap_bits, 0);
     assert!(!snapshot.coherent);
     assert!(!snapshot.active_attempt_bytes_measured);
     assert!(!snapshot.total_pipeline_bytes_measured);
@@ -143,6 +151,22 @@ async fn actual_preparation_live_owners_cancel_and_join_release_before_positive_
         assert!(live.buffers[i].capacity >= len);
     }
     assert_eq!(live.buffers[0].capacity, capacity);
+    assert!(live.residency.coherent && live.residency.valid);
+    assert_eq!(live.residency.unknown_bits, 1); // This fixture starts at the send entry.
+    assert_eq!(live.residency.total.unwrap().live_buffers, 3);
+    assert_eq!(live.residency.total.unwrap().len_bytes, 3 * len);
+    assert_eq!(
+        live.residency.total.unwrap().capacity_bytes,
+        live.buffers[..3].iter().map(|b| b.capacity).sum::<u64>()
+    );
+    for stage in [
+        ResidencyStage::DetachedRaw,
+        ResidencyStage::RetryPlaintext,
+        ResidencyStage::PreparationPlaintext,
+    ] {
+        assert_eq!(live.residency.stage(stage).unwrap().live_buffers, 1);
+    }
+    assert_eq!(live.residency.clone_ops, Some(2));
     assert!(!live.observed[3]);
     assert_eq!(live.buffers[3], BufferSnapshot::default());
 }
@@ -327,6 +351,41 @@ async fn actual_relay_writer_wait_retains_only_retry_and_serialized_local_owners
         assert_eq!(decrypted, raw);
         assert_released(&capture);
         assert!(live.valid);
+        assert!(live.residency.coherent && live.residency.valid);
+        assert_eq!(live.residency.total.unwrap().live_buffers, 2);
+        assert_eq!(
+            live.residency.total.unwrap().capacity_bytes,
+            live.buffers[1].capacity + live.buffers[3].capacity
+        );
+        assert_eq!(
+            live.residency
+                .stage(ResidencyStage::RetryPlaintext)
+                .unwrap()
+                .live_buffers,
+            1
+        );
+        assert_eq!(
+            live.residency
+                .stage(ResidencyStage::SerializedWire)
+                .unwrap()
+                .live_buffers,
+            1
+        );
+        assert_eq!(
+            live.residency
+                .stage(ResidencyStage::DetachedRaw)
+                .unwrap()
+                .live_buffers,
+            0
+        );
+        assert_eq!(
+            live.residency
+                .stage(ResidencyStage::PreparationPlaintext)
+                .unwrap()
+                .live_buffers,
+            0
+        );
+        assert_eq!(live.residency.clone_ops, Some(2));
         assert_eq!(live.buffers[0], BufferSnapshot::default());
         assert_eq!(live.buffers[2], BufferSnapshot::default());
         for i in [1, 3] {

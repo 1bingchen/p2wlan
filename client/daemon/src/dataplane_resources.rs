@@ -11,10 +11,12 @@ use std::sync::Arc;
 use std::time::Instant;
 
 mod owned_buffers;
+mod residency;
 #[cfg(test)]
 mod tests;
 use owned_buffers::BufferCounters;
 pub(crate) use owned_buffers::{BufferSnapshot, BufferStage, OwnedBufferLease};
+pub(crate) use residency::{ResidencyLease, ResidencySnapshot, ResidencyStage};
 
 const CAS_ATTEMPTS: usize = 8;
 const MAX_CAPTURE_BYTES: usize = 16 * 1024;
@@ -233,6 +235,7 @@ pub(crate) struct ResourceCapture {
     sites: [VecCounters; VecSite::COUNT],
     fifo: [FifoCounters; QueueStage::COUNT],
     buffers: [BufferCounters; BufferStage::COUNT],
+    residency: residency::ResidencyLedger,
 }
 
 const _: () = assert!(std::mem::size_of::<ResourceCapture>() <= MAX_CAPTURE_BYTES);
@@ -247,11 +250,23 @@ impl ResourceCapture {
             sites: std::array::from_fn(|_| VecCounters::default()),
             fifo: std::array::from_fn(|_| FifoCounters::default()),
             buffers: std::array::from_fn(|_| BufferCounters::default()),
+            residency: residency::ResidencyLedger::default(),
         })
     }
 
     pub(crate) fn is_finished(&self) -> bool {
         self.ended.load(Ordering::Acquire)
+    }
+
+    /// One coherent ledger read of observed message owners. This is distinct
+    /// from the older multi-atomic site readout and never asserts RSS coverage.
+    #[allow(dead_code)] // Private opt-in readout; no default status export.
+    pub(crate) fn residency_snapshot(&self) -> ResidencySnapshot {
+        self.residency.snapshot()
+    }
+
+    pub(crate) fn unobserved_residency_exit(&self) {
+        self.residency.unobserved_exit();
     }
 
     #[allow(dead_code)] // Private capture lifecycle, without a default caller.
@@ -454,6 +469,10 @@ pub(crate) struct QueueAggregateLease {
 }
 
 impl QueueAggregateLease {
+    pub(crate) fn capture(&self) -> &Arc<ResourceCapture> {
+        &self.capture
+    }
+
     pub(crate) fn new(capture: Arc<ResourceCapture>, stage: QueueStage) -> Option<Self> {
         if capture.is_finished() {
             return None;

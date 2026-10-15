@@ -3,11 +3,126 @@
 use super::super::super::test_support::test_peer;
 use super::*;
 use crate::config::Config;
-use crate::dataplane_resources::{FifoSnapshot, QueueStage, ResourceCapture};
+use crate::dataplane_resources::{
+    FifoSnapshot, QueueStage, ResidencySnapshot, ResidencyStage, ResourceCapture,
+};
 use crate::transport::ResourceQueueTestGate;
 use futures_util::FutureExt;
 use std::panic::AssertUnwindSafe;
 use tokio::time::{timeout_at, Instant as TokioInstant};
+
+#[test]
+fn resource_capture_late_actual_fifo_adoption_overflow_and_discard_keep_real_owner_totals() {
+    let capture = ResourceCapture::new([0xe8; 16]);
+    let mut queue = PeerPendingQueue::new();
+    let first = packet(1, 128);
+    let first_ptr = first.packet.as_ptr();
+    let first_capacity = first.packet.capacity() as u64;
+    let second = packet(2, 256);
+    let mut capacity = first_capacity + second.packet.capacity() as u64;
+    assert!(queue.enqueue(PendingPacket::plain(first)).0.is_empty());
+    assert!(queue.enqueue(PendingPacket::plain(second)).0.is_empty());
+    queue.attach_resource_capture(Some(&capture));
+    let adopted = capture.residency_snapshot();
+    assert!(adopted.coherent && adopted.valid);
+    assert_eq!(adopted.unknown_bits, 1); // Earlier channel/history remains unknown.
+    assert_eq!(adopted.total.unwrap().live_buffers, 2);
+    assert_eq!(adopted.total.unwrap().capacity_bytes, capacity);
+    assert_eq!(
+        queue.queue.front().unwrap().raw_packet().as_ptr(),
+        first_ptr
+    );
+    assert_eq!(adopted.total, adopted.stage(ResidencyStage::PendingFifo));
+    for _ in 2..MAX_PENDING_PACKETS_PER_PEER {
+        let filler = packet(3, 16);
+        capacity += filler.packet.capacity() as u64;
+        assert!(queue.enqueue(PendingPacket::plain(filler)).0.is_empty());
+    }
+    let next = packet(4, 512);
+    capacity += next.packet.capacity() as u64;
+    let (discarded, dropped_bytes) = queue.enqueue(PendingPacket::plain(next));
+    assert_eq!(dropped_bytes, 4);
+    assert_eq!(discarded.len(), 1);
+    assert_eq!(discarded[0].raw_packet().as_ptr(), first_ptr);
+    let overflow = capture.residency_snapshot();
+    assert!(overflow.coherent && overflow.valid);
+    assert_eq!(
+        overflow.total.unwrap().live_buffers,
+        (MAX_PENDING_PACKETS_PER_PEER + 1) as u64
+    );
+    assert_eq!(overflow.total.unwrap().capacity_bytes, capacity);
+    assert_eq!(
+        overflow
+            .stage(ResidencyStage::DiscardBatch)
+            .unwrap()
+            .live_buffers,
+        1
+    );
+    assert_eq!(
+        overflow
+            .stage(ResidencyStage::DiscardBatch)
+            .unwrap()
+            .capacity_bytes,
+        first_capacity
+    );
+    drop(discarded);
+    capacity -= first_capacity;
+    let oversized = OutboundPacket {
+        packet: vec![9; MAX_PENDING_BYTES_PER_PEER + 1],
+        ..packet(9, 4)
+    };
+    let oversized_capacity = oversized.packet.capacity() as u64;
+    let (discarded, dropped_bytes) = queue.enqueue(PendingPacket::plain(oversized));
+    assert_eq!(dropped_bytes, MAX_PENDING_BYTES_PER_PEER + 1);
+    let rejected = capture.residency_snapshot();
+    assert!(rejected.coherent && rejected.valid);
+    assert_eq!(
+        rejected.total.unwrap().capacity_bytes,
+        capacity + oversized_capacity
+    );
+    assert_eq!(
+        rejected
+            .stage(ResidencyStage::PendingFifo)
+            .unwrap()
+            .live_buffers,
+        MAX_PENDING_PACKETS_PER_PEER as u64
+    );
+    assert_eq!(
+        rejected
+            .stage(ResidencyStage::DiscardBatch)
+            .unwrap()
+            .capacity_bytes,
+        oversized_capacity
+    );
+    drop(discarded);
+    let before_move = capture.residency_snapshot();
+    let front = queue.pop_front().unwrap();
+    assert_eq!(front.raw_packet(), [2; 4]);
+    let detached = capture.residency_snapshot();
+    assert_eq!(detached.total, before_move.total);
+    assert_eq!(
+        detached
+            .stage(ResidencyStage::DetachedRaw)
+            .unwrap()
+            .live_buffers,
+        1
+    );
+    queue.push_front(front);
+    let returned = capture.residency_snapshot();
+    assert_eq!(returned.total, before_move.total);
+    assert_eq!(
+        returned.capacity_high_water_bytes,
+        before_move.capacity_high_water_bytes
+    );
+    assert_eq!(returned.clone_ops, Some(0));
+    capture.finish();
+    drop(queue);
+    let drained = capture.residency_snapshot();
+    assert!(drained.coherent && drained.valid);
+    assert_eq!(drained.total.unwrap().live_buffers, 0);
+    assert_eq!(drained.unknown_bits, 1);
+    assert!(!drained.whole_pipeline_bytes_measured);
+}
 
 struct Children(JoinSet<(String, PeerPendingQueue)>);
 
@@ -56,6 +171,7 @@ struct Position {
     actor_scope: bool,
     task_scope: bool,
     valid: bool,
+    residency: ResidencySnapshot,
 }
 
 fn position(resources: &ResourceCapture) -> Position {
@@ -66,6 +182,7 @@ fn position(resources: &ResourceCapture) -> Position {
         actor_scope: snapshot.fifo_scope_observed(QueueStage::ActorFifo),
         task_scope: snapshot.fifo_scope_observed(QueueStage::TaskOrUnjoinedFifo),
         valid: snapshot.valid,
+        residency: resources.residency_snapshot(),
     }
 }
 
@@ -250,6 +367,20 @@ async fn workflow(
 
 fn assert_position(observed: Position, actor: FifoSnapshot, task: FifoSnapshot) {
     assert!(observed.valid);
+    assert!(observed.residency.coherent && observed.residency.valid);
+    let pending = observed
+        .residency
+        .stage(ResidencyStage::PendingFifo)
+        .unwrap();
+    assert_eq!(pending.live_buffers, actor.live_packets + task.live_packets);
+    assert_eq!(pending.len_bytes, actor.plaintext_len + task.plaintext_len);
+    assert_eq!(
+        pending.capacity_bytes,
+        actor.vec_capacity + task.vec_capacity
+    );
+    assert_eq!(observed.residency.total, Some(pending));
+    assert_eq!(observed.residency.unknown_bits, 1); // Original fixture starts at FIFO ingress.
+    assert_eq!(observed.residency.clone_ops, Some(0));
     // The first RED targets actual task-owned bytes, including an unjoined
     // result. Zero with no observed lease remains missing coverage.
     assert_eq!(

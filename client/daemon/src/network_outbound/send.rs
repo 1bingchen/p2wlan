@@ -44,13 +44,18 @@ pub(super) async fn encrypt_then_send_with_deadline(
     admission_deadline: Option<Instant>,
     stopping: Option<&AtomicBool>,
 ) -> EncryptSendOutcome {
-    let packet = packet.into();
+    let mut packet = packet.into();
+    packet.observe_resources(
+        transport.resource_capture(),
+        crate::dataplane_resources::ResidencyStage::DetachedRaw,
+    );
     let original_buffer_lease = crate::dataplane_resources::OwnedBufferLease::observe(
         transport.resource_capture(),
         crate::dataplane_resources::BufferStage::ActiveOriginal,
         &packet.packet,
     );
-    let retry_packet = packet.clone();
+    let mut retry_packet = packet.clone();
+    retry_packet.relocate_resources(crate::dataplane_resources::ResidencyStage::RetryPlaintext);
     let _retry_buffer_lease = crate::dataplane_resources::OwnedBufferLease::observe(
         transport.resource_capture(),
         crate::dataplane_resources::BufferStage::RetryPlaintext,
@@ -76,7 +81,9 @@ pub(super) async fn encrypt_then_send_with_deadline(
     // gate is released. Managed Direct later takes a fresh epoch guard only
     // across its exact nonblocking UDP syscall, which is the revocation/path
     // replacement linearization point.
-    let preparation_retry = retry_packet.clone();
+    let mut preparation_retry = retry_packet.clone();
+    preparation_retry
+        .relocate_resources(crate::dataplane_resources::ResidencyStage::PreparationPlaintext);
     let preparation_buffer_lease = crate::dataplane_resources::OwnedBufferLease::observe(
         transport.resource_capture(),
         crate::dataplane_resources::BufferStage::PreparationPlaintext,

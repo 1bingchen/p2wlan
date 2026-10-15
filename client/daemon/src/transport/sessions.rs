@@ -331,6 +331,10 @@ impl WireGuardTransport {
         if capture.is_finished() {
             return Err(crate::dataplane_resources::EnableError::CaptureFinished);
         }
+        self.outbound_tx = self
+            .outbound_tx
+            .clone()
+            .with_resource_capture(capture.clone());
         self.resource_capture = Some(capture);
         Ok(self)
     }

@@ -1,7 +1,8 @@
 //! Private, opt-in software-buffer observations, without packet authority.
 //!
 //! Vec operations and observed capacities are not allocator calls or RSS.
-//! Counters cover fixed sites; leases cover only their two plaintext FIFOs.
+//! Counters cover fixed sites; leases cover two plaintext FIFOs and explicitly
+//! observed buffers in the slow send. They do not cover the whole pipeline.
 //! The private opt-in readout is retained without wiring a default capture or
 //! status export. Its currently unused readout items are marked individually.
 
@@ -9,8 +10,11 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
+mod owned_buffers;
 #[cfg(test)]
 mod tests;
+use owned_buffers::BufferCounters;
+pub(crate) use owned_buffers::{BufferSnapshot, BufferStage, OwnedBufferLease};
 
 const CAS_ATTEMPTS: usize = 8;
 const MAX_CAPTURE_BYTES: usize = 16 * 1024;
@@ -190,6 +194,8 @@ pub(crate) struct ResourceSnapshot {
     sites: [VecSiteSnapshot; VecSite::COUNT],
     fifo: [FifoSnapshot; QueueStage::COUNT],
     fifo_lease_scope_observed: [bool; QueueStage::COUNT],
+    buffers: [BufferSnapshot; BufferStage::COUNT],
+    buffer_lease_scope_observed: [bool; BufferStage::COUNT],
 }
 
 #[allow(dead_code)] // Private opt-in readout; no default status export.
@@ -207,6 +213,14 @@ impl ResourceSnapshot {
     pub(crate) fn fifo_scope_observed(&self, stage: QueueStage) -> bool {
         self.fifo_lease_scope_observed[stage.index()]
     }
+
+    pub(crate) fn buffer(&self, stage: BufferStage) -> BufferSnapshot {
+        self.buffers[stage.index()]
+    }
+
+    pub(crate) fn buffer_scope_observed(&self, stage: BufferStage) -> bool {
+        self.buffer_lease_scope_observed[stage.index()]
+    }
 }
 
 /// A fixed footprint, explicit-finish capture. Existing leases survive finish.
@@ -218,6 +232,7 @@ pub(crate) struct ResourceCapture {
     gaps: AtomicU32,
     sites: [VecCounters; VecSite::COUNT],
     fifo: [FifoCounters; QueueStage::COUNT],
+    buffers: [BufferCounters; BufferStage::COUNT],
 }
 
 const _: () = assert!(std::mem::size_of::<ResourceCapture>() <= MAX_CAPTURE_BYTES);
@@ -231,6 +246,7 @@ impl ResourceCapture {
             gaps: AtomicU32::new(0),
             sites: std::array::from_fn(|_| VecCounters::default()),
             fifo: std::array::from_fn(|_| FifoCounters::default()),
+            buffers: std::array::from_fn(|_| BufferCounters::default()),
         })
     }
 
@@ -347,6 +363,13 @@ impl ResourceCapture {
         });
         let fifo_lease_scope_observed =
             std::array::from_fn(|i| self.fifo[i].lease_scope_observed.load(Ordering::Relaxed));
+        let buffers = std::array::from_fn(|i| BufferSnapshot {
+            live_buffers: self.buffers[i].live_buffers.load(Ordering::Relaxed),
+            len: self.buffers[i].len.load(Ordering::Relaxed),
+            capacity: self.buffers[i].capacity.load(Ordering::Relaxed),
+        });
+        let buffer_lease_scope_observed =
+            std::array::from_fn(|i| self.buffers[i].scope_observed.load(Ordering::Relaxed));
         let gap_bits = self.gaps.load(Ordering::Relaxed);
         if gap_bits != 0 {
             for site in &mut sites {
@@ -376,6 +399,8 @@ impl ResourceCapture {
             sites,
             fifo,
             fifo_lease_scope_observed,
+            buffers,
+            buffer_lease_scope_observed,
         }
     }
 

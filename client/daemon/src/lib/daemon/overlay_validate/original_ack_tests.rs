@@ -674,6 +674,68 @@ async fn b28_runtime_vip_relay_stale_session_rejects_old_ack_then_new_a_is_fresh
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn b28_managed_real_probe_request_echo_fresh_duplicate_and_new_a() -> Result<(), String> {
+    fixture::exercise_publication(
+        fixture::PublicationMode::ManagedPrimary,
+        fixture::PublicationCase::ManagedFresh,
+    )
+    .await
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn b28_managed_actual_budget_revoke_rejects_old_ack_then_new_a() -> Result<(), String> {
+    fixture::exercise_publication(
+        fixture::PublicationMode::ManagedPrimary,
+        fixture::PublicationCase::ManagedBudgetRevoke,
+    )
+    .await
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn b28_managed_original_budget_contention_releases_then_actual_ack_is_fresh(
+) -> Result<(), String> {
+    fixture::exercise_publication(
+        fixture::PublicationMode::ManagedPrimary,
+        fixture::PublicationCase::ManagedContention,
+    )
+    .await
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn b28_managed_queued_echo_withdrawn_owner_rejects_then_new_publication_a(
+) -> Result<(), String> {
+    fixture::exercise_publication(
+        fixture::PublicationMode::ManagedPrimary,
+        fixture::PublicationCase::ManagedQueuedEcho,
+    )
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn b28_dynamic_actual_socket_contention_releases_then_native_fresh_and_new_a(
+) -> Result<(), String> {
+    fixture::exercise_publication(
+        fixture::PublicationMode::DynamicLan,
+        fixture::PublicationCase::DynamicFresh,
+    )
+    .await
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn b28_dynamic_actual_detach_rejects_old_ack_then_new_socket_a() -> Result<(), String> {
+    fixture::exercise_publication(
+        fixture::PublicationMode::DynamicLan,
+        fixture::PublicationCase::DynamicDetach,
+    )
+    .await
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn b28_dynamic_original_cap_eight_rejects_ninth_and_keeps_native_owner() -> Result<(), String>
+{
+    fixture::exercise_publication(
+        fixture::PublicationMode::DynamicLan,
+        fixture::PublicationCase::DynamicCapacity,
+    )
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pr209_actual_asymmetric_direct_request_uses_verified_return_path_and_native_once(
 ) -> Result<(), String> {
     fixture::exercise_asymmetric_endpoint().await
@@ -701,4 +763,22 @@ async fn r00_same_outer_common_client_replacement_rejects_old_ack_then_new_reque
 async fn c01_original_network_hint_rebinds_and_rejects_old_ack_then_two_current_requests_are_fresh(
 ) -> Result<(), String> {
     fixture::exercise_network_change().await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pr212_actual_request_on_other_socket_returns_on_verified_direct_and_native_once(
+) -> Result<(), String> {
+    fixture::exercise_asymmetric_receive_socket().await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pr212_other_socket_echo_rejects_revoked_return_then_new_canonical_recovers(
+) -> Result<(), String> {
+    fixture::exercise_asymmetric_receive_socket_invalidation().await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pr212_equal_remote_request_on_other_socket_uses_verified_return_and_native_once(
+) -> Result<(), String> {
+    fixture::exercise_equal_remote_distinct_socket().await
 }

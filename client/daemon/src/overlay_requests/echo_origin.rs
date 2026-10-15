@@ -194,14 +194,13 @@ impl OriginalEchoPrewrite {
             .original_udp_read()
             .ok_or(Error::StaleToken)?;
         let source = self.input.source.source().ok_or(Error::StaleToken)?;
-        let verified_local = if source == endpoint {
-            None // Preserve the existing equal-source compatibility scope.
-        } else {
-            Some(
-                peer.verified_direct_return_local(&self.input, endpoint)
-                    .ok_or(Error::StaleToken)?,
-            )
-        };
+        let verified_local = peer.verified_direct_return_local(&self.input, endpoint);
+        // A current owned return can differ in local socket even when its
+        // remote endpoint equals the observed REQUEST source. Legacy
+        // equal-source compatibility still uses only the original RX socket.
+        if source != endpoint && verified_local.is_none() {
+            return Err(Error::StaleToken);
+        }
         udp.try_send_original_echo_on_receive_socket(
             read,
             self.input.generation,

@@ -25,6 +25,7 @@ include!("tests/part06.rs");
 mod synchronized_punch_e2e;
 
 include!("tests/business_budget.rs");
+include!("tests/business_budget_affinity.rs");
 include!("tests/mobile_lifecycle_evidence.rs");
 include!("tests/dplpmtud_final_acceptance.rs");
 

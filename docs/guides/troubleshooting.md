@@ -9,6 +9,7 @@
 | 启动提示运行目录权限失败 | 客户端启动阶段、配置和日志目录属主、旧实例是否已退出、路径是否为默认用户目录及普通文件 | 不能据此判断 NAT 打洞失败，也不需要清空账号或网络配置 |
 | 本地 `/health` 正常但 `/status` 返回 401 | 诊断密钥文件的读取权限、对应实例的运行目录、是否有不同配置共用日志目录；刷新后确认是否恢复 | 不是 Control 登录到期，也不能据此判断数据面已断开 |
 | Direct 不通 | NAT profile、候选来源、UDP 防火墙、路径 reason code | STUN 成功不等于对端可入站 |
+| Direct 已建立但应用延迟忽高忽低 | 同一时间窗内的虚拟 IP 往返延迟、实际业务路径、出站发送失败和丢包计数、两端负载及应用服务端耗时 | Direct 只说明路径已确认，不能保证链路无抖动；应用卡顿也不能单独证明网络丢包 |
 | 只有 Relay | Relay TLS、audience/region、ticket、/readyz、撤权 feed | Relay 路径不说明 Direct 一定有缺陷 |
 | 虚拟 IP 可见但业务不通 | 本机路由、房间租约、数据面收发计数、目标应用监听和防火墙 | 加密 ACK 或在线人数不等于业务往返 |
 | 重启后状态错误 | daemon process/revision、网络 generation、peer session、房间授权 | 旧快照不能当作实时状态 |
@@ -21,11 +22,15 @@
     p2wlan route verify
     p2wlan logs -f
 
+排查直连延迟尖峰时，比较问题发生前后的 `status --json`，并将两端日志与应用卡顿时间对齐。`direct_business_local_backpressure` 表示本地发送尚未交付，发送端保留原始数据；只有实际 UDP socket 返回暂不可写时，才有界等待该 socket 的可写通知，发布身份争用仍使用原节奏重验。它不是 Direct 失效或 MTU 预算过期。持续阻塞超过原有交付期限时，`direct_business_local_backpressure_deadline_expired` 才计入终态丢包。应区分发送失败尝试与实际丢包，结合链路测量和应用服务端耗时判断原因。
+
 支持包上传必须由用户显式确认。上传前移除不必要的业务日志和环境文件，保留能解释问题的 reason code、版本、时间和脱敏状态。
 
 客户端上传支持包时附带主实例的有界状态摘要，记录 NAT 模型、代际、路径、探测预算、近期事件及 hard attempt。主实例最多用 1.5 秒读取本地状态；401、超时或不可用时保留明确失败原因，并在有缓存时标记其来源和陈旧状态，不阻止日志上传。房间摘要来自缓存，不为上传触发额外网络探测。每份摘要最多 64 KiB，保留最多 8 个 peer、每 peer 24 条近期 Direct 事件和 4 份 attempt；另保留最多 16 条进程时间线事件、8 条首次可用摘要、8 条已封存 HH 终态摘要、8 个历史来源和每 peer 8 条路径转换，连同精确的热路径分类计数及 Direct/Relay 健康计数。裁剪会显式标记；地址使用仅在该摘要内有效的别名并保留端口，不包含凭据、原始会话 token、报文或自由文本错误。每个日志文件与最多 4 个连续轮转段共享 1 MiB 采集预算，保留可用的最早片段和近期尾部。只有运行标识相同且段序号连续的轮转文件才可纳入；缺少标识的旧格式仅采集当前文件。`p2wlan-log-coverage` 标记采集范围、遗漏字节、启动片段是否仍在、轮转链停止原因与读取期间的轮转；中间裁剪用 `p2wlan-log-gap` 明示。Android 同进程重启 daemon 也切换日志运行标识。
 
 排查双对称网络始终 Relay 时，先确认同一 session 的协商接纳、profile 绑定、实际扫描和确认阶段。`candidate_not_executed`、租约重投、代际取消与已发送但无响应是不同问题，不能只凭候选数量判断端口预测是否有效。摘要缺失字段表示未知；缓存状态和单侧日志不能证明双方在同一时间窗执行了同一计划。
+
+排查 Direct 使用一段时间后转为 Relay 时，同时查看路径转换原因和 `dplpmtud_probe_send_failed`。`LocalPacketTooLarge` 表示本机拒绝发送该尺寸的 UDP 包，不等于 NAT 映射失效；已确认的业务 MTU 失效后，流量可暂由已确认的 Relay 承载，Direct 继续探测。Windows 的 Direct UDP socket 使用 `IP_PMTUDISC_PROBE`，保持禁止分片并按接口 MTU 发出探测，避免系统缓存的路径 MTU 阻止重新验证；业务尺寸仍须经过加密 ACK 确认。若基础探测仍持续失败，应检查物理接口 MTU、路由和 VPN。日志有 `p2wlan-log-gap` 时，不能仅凭缺失的转换记录断言回退原因。
 
 Relay 关闭原因区分 `peer_closed`、`partial_frame`、`local_closed`、`connection_reset`、`idle_timeout` 和兜底的 `read_error`；正常 EOF/本地关闭不计入 frame error。关闭原因只说明传输如何结束，不能单独推断 NAT 打洞或路径提升失败。
 
@@ -33,4 +38,4 @@ Relay 关闭原因区分 `peer_closed`、`partial_frame`、`local_closed`、`con
 
 Windows 在身份校验前记录系统返回的子进程 PID，并使用原生进程查询区分正在运行、已退出和查询不可用。查询不可用会保留失败操作与 Win32 错误码；提前退出会报告 `DAEMON_EXITED_DURING_STARTUP`，并在 daemon 日志已有明确原因时显示对应的 Wintun、凭据或认证错误。排查时同时查看客户端启动日志和 daemon 日志；管理员权限本身不能证明后台进程已成功启动。
 
-选择手动 / 离线模式时可以不配置 Control 地址。启动参数校验失败会记录 `STARTUP_CONFIG_INVALID` 和无效参数名称，客户端提示检查启动配置；日志不回显该参数的原始值。daemon 的 `--relay` 接受 `[region@]tls://host:port`、`tcp://host:port` 和兼容的 `host:port` 格式，TLS 与明文传输仍受原有安全策略约束。
+图形客户端必须填写服务器地址并登录，不提供离线启动。缺少服务器地址或登录凭据时，先按提示完成登录；中继配置会自动获取。daemon 启动参数校验失败会记录 `STARTUP_CONFIG_INVALID` 和无效参数名称，客户端提示检查启动配置；日志不回显该参数的原始值。daemon 的 `--relay` 接受 `[region@]tls://host:port`、`tcp://host:port` 和兼容的 `host:port` 格式，TLS 与明文传输仍受原有安全策略约束。

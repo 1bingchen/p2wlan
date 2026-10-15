@@ -178,7 +178,14 @@ pub(super) async fn encrypt_then_send_with_deadline(
                 )
                 .await;
             let mut force_relay = false;
-            let direct_business_plan = if selection.path == Some(NetworkPath::Direct)
+            // A sealed Relay REQUEST echo must use its original Relay writer.
+            // Direct may have won since ingress, but cannot validate a Relay
+            // read as an original UDP read at its final write boundary.
+            let original_relay_echo = preparation_retry
+                .original_echo()
+                .is_some_and(|echo| echo.source().original_relay_read().is_some());
+            let direct_business_plan = if !original_relay_echo
+                && selection.path == Some(NetworkPath::Direct)
                 && selection.direct_confirmed
             {
                 match (udp, selection.direct_endpoint) {
@@ -946,16 +953,30 @@ async fn send_encrypted_packet_once_with_origin(
             profiler.record(sampled, "tx_udp_transport_rwlock_hold_us", udp_read_hold);
         }
         let udp_local_endpoint = udp.as_ref().and_then(|udp| udp.local_addr().ok());
-        let selection = select_outbound_path(
-            packet,
-            peers,
-            prefer_direct,
-            relay_available,
-            relay_expected,
-            udp_local_endpoint,
-            force_relay,
-        )
-        .await;
+        let original_relay_echo = packet
+            .binding()
+            .and_then(|binding| binding.token().echo())
+            .is_some_and(|echo| echo.source().original_relay_read().is_some());
+        let selection = if original_relay_echo {
+            // Packet-specific return routing does not change the peer's
+            // committed Direct owner. Relay admission and the original
+            // reader/client/session prewrite fences still apply below.
+            PathSelection::relay(
+                "original_relay_echo_return",
+                "sealed Relay REQUEST echo retains its original return writer",
+            )
+        } else {
+            select_outbound_path(
+                packet,
+                peers,
+                prefer_direct,
+                relay_available,
+                relay_expected,
+                udp_local_endpoint,
+                force_relay,
+            )
+            .await
+        };
         // These authority/slot awaits still precede every syscall or writer
         // admission. After the check below, the physical operation owns its
         // existing terminal-aware timeout and is never externally replayed.
@@ -969,6 +990,7 @@ async fn send_encrypted_packet_once_with_origin(
             counter = ?crate::transport::wire_counter(&packet.wire_bytes),
             wire_fp = format_args!("{:016x}", crate::transport::wire_fingerprint(&packet.wire_bytes)),
             selected_path = ?selection.path,
+            reason_code = selection.reason_code,
             direct_confirmed = selection.direct_confirmed,
             relay_peer_confirmed,
             relay_connection_id = relay.as_ref().map(RelayTransport::connection_id),

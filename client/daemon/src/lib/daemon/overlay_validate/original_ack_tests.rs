@@ -14,6 +14,11 @@ use fixture::{
 };
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pr219_original_relay_request_echo_survives_real_direct_promotion() -> Result<(), String> {
+    exercise(PathKind::Relay, Scenario::RelayEchoAfterDirect).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pr209_direct_native_request_contention_retains_original_before_tun_echo(
 ) -> Result<(), String> {
     exercise(

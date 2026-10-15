@@ -52,6 +52,8 @@ mod runtime_vip;
 pub(super) use runtime_vip::RuntimeVipCase;
 #[path = "asymmetric_endpoint.rs"]
 mod asymmetric_endpoint;
+#[path = "relay_return.rs"]
+mod relay_return;
 pub(super) use asymmetric_endpoint::{
     exercise_asymmetric_endpoint, exercise_asymmetric_invalidation,
     exercise_asymmetric_receive_socket, exercise_asymmetric_receive_socket_invalidation,
@@ -88,6 +90,7 @@ pub(super) enum Scenario {
     EchoTransfer(EchoCase),
     EchoContention(EchoContentionCase),
     PublicationOrder,
+    RelayEchoAfterDirect,
     RuntimeVip(RuntimeVipCase),
 }
 
@@ -518,59 +521,60 @@ impl Endpoint {
         let validation_ingress = (publication_mode == Some(PublicationMode::ManagedPrimary))
             .then(|| crate::DirectValidationIngress::with_peer_manager(peers.clone()));
         let supervisor_encrypted_input = supervised.then(|| encrypted_tx.clone());
-        let udp_transport = if path == PathKind::Direct && !supervised {
-            let udp = budget
-                .step(
-                    "bind actual UDP",
-                    UdpTransport::bind(
-                        "127.0.0.1:0"
-                            .parse()
-                            .map_err(|e: std::net::AddrParseError| e.to_string())?,
-                        peers.clone(),
-                    ),
-                )
-                .await?
-                .map_err(|e| e.to_string())?;
-            let udp = if pool_count > 1 {
-                budget
-                    .step("bind actual owned pool", udp.with_socket_pool(pool_count))
+        let udp_transport =
+            if (path == PathKind::Direct || (actual_validation && hub.is_some())) && !supervised {
+                let udp = budget
+                    .step(
+                        "bind actual UDP",
+                        UdpTransport::bind(
+                            "127.0.0.1:0"
+                                .parse()
+                                .map_err(|e: std::net::AddrParseError| e.to_string())?,
+                            peers.clone(),
+                        ),
+                    )
                     .await?
-                    .map_err(|e| e.to_string())?
+                    .map_err(|e| e.to_string())?;
+                let udp = if pool_count > 1 {
+                    budget
+                        .step("bind actual owned pool", udp.with_socket_pool(pool_count))
+                        .await?
+                        .map_err(|e| e.to_string())?
+                } else {
+                    udp
+                };
+                let udp = if actual_validation {
+                    udp.with_local_node_id(node)
+                        .with_wireguard_transport(wireguard.clone())
+                        .with_inbound_channel(encrypted_tx.clone())
+                        .with_dplpmtud_local_virtual_ip(
+                            vip.parse()
+                                .map_err(|e: std::net::AddrParseError| e.to_string())?,
+                        )
+                } else {
+                    udp
+                };
+                // This is the actual publication consumed by the actual single
+                // reader, not a synthesized OriginalUdpIngressSource/fact.
+                udp.set_inbound_publication_owner(if node == NODE_A { 28001 } else { 28002 });
+                let mut udp = udp.with_inbound_channel(encrypted_tx.clone());
+                if let Some(ingress) = validation_ingress.as_ref() {
+                    let ingress = ingress.clone();
+                    udp = udp
+                        .with_local_node_id(node)
+                        .with_wireguard_transport(wireguard.clone())
+                        .with_dplpmtud_local_virtual_ip(
+                            vip.parse()
+                                .map_err(|e: std::net::AddrParseError| e.to_string())?,
+                        )
+                        .with_validation_admission_trigger(Arc::new(move |observation| {
+                            ingress.submit(observation)
+                        }));
+                }
+                Some(udp)
             } else {
-                udp
+                None
             };
-            let udp = if actual_validation {
-                udp.with_local_node_id(node)
-                    .with_wireguard_transport(wireguard.clone())
-                    .with_inbound_channel(encrypted_tx.clone())
-                    .with_dplpmtud_local_virtual_ip(
-                        vip.parse()
-                            .map_err(|e: std::net::AddrParseError| e.to_string())?,
-                    )
-            } else {
-                udp
-            };
-            // This is the actual publication consumed by the actual single
-            // reader, not a synthesized OriginalUdpIngressSource/fact.
-            udp.set_inbound_publication_owner(if node == NODE_A { 28001 } else { 28002 });
-            let mut udp = udp.with_inbound_channel(encrypted_tx.clone());
-            if let Some(ingress) = validation_ingress.as_ref() {
-                let ingress = ingress.clone();
-                udp = udp
-                    .with_local_node_id(node)
-                    .with_wireguard_transport(wireguard.clone())
-                    .with_dplpmtud_local_virtual_ip(
-                        vip.parse()
-                            .map_err(|e: std::net::AddrParseError| e.to_string())?,
-                    )
-                    .with_validation_admission_trigger(Arc::new(move |observation| {
-                        ingress.submit(observation)
-                    }));
-            }
-            Some(udp)
-        } else {
-            None
-        };
         let mut relay_rx: Option<mpsc::Receiver<OriginalRelayDelivery>> = None;
         let relay_transport = if path == PathKind::Relay {
             let (relay, rx) = if let Some(common) = common_hub {
@@ -712,7 +716,8 @@ impl Endpoint {
                     .map_err(|e| e.to_string())
                 });
             }
-        } else if let (Some(transport), Some(rx)) = (relay_transport, relay_rx) {
+        }
+        if let (Some(transport), Some(rx)) = (relay_transport, relay_rx) {
             let relay_encrypted = encrypted_tx.clone();
             owners.spawn("actual original Relay queue converter", async move {
                 transport
@@ -1755,7 +1760,7 @@ async fn exercise_with_runtime_vip(
             } else {
                 (VIP_A, VIP_B)
             };
-            let mut a = Endpoint::create(
+            let mut a = Endpoint::create_inner(
                 NODE_A,
                 vip_a,
                 NODE_B,
@@ -1765,9 +1770,12 @@ async fn exercise_with_runtime_vip(
                 &mut owners,
                 budget,
                 keep_bootstrap_vip,
+                scenario == Scenario::RelayEchoAfterDirect,
+                1,
+                None,
             )
             .await?;
-            let mut b = Endpoint::create(
+            let mut b = Endpoint::create_inner(
                 NODE_B,
                 vip_b,
                 NODE_A,
@@ -1777,6 +1785,9 @@ async fn exercise_with_runtime_vip(
                 &mut owners,
                 budget,
                 keep_bootstrap_vip,
+                scenario == Scenario::RelayEchoAfterDirect,
+                1,
+                None,
             )
             .await?;
             let (session_a, session_b, a_key, b_key) = session_pair_for(&a.identity, &b.identity)?;
@@ -1786,7 +1797,9 @@ async fn exercise_with_runtime_vip(
                 .await?;
             b.install_peer(a_key, udp_a, session_b, path, budget)
                 .await?;
-            if scenario == Scenario::PublicationOrder {
+            if scenario == Scenario::RelayEchoAfterDirect {
+                relay_return::exercise_relay_return(&mut a, &mut b, &mut owners, budget).await
+            } else if scenario == Scenario::PublicationOrder {
                 require(
                     path == PathKind::Direct,
                     "publication causal fixture requires actual LAN",

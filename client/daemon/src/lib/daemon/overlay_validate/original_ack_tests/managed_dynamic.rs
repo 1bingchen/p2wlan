@@ -165,7 +165,32 @@ async fn reject_actual(
 ) -> Check {
     let rounds = a.stats.verified_round_trips;
     let valid = a.stats.received_valid;
-    let got = commit(a, request, ack)?;
+    // Live control workers can briefly own an emit/epoch/publication gate
+    // after a revoke. Contention must retain this same original ACK without credit;
+    // it is not a stale verdict. Resolve only that typed conflict within the
+    // fixture's existing step/body end, then still require the exact rejection.
+    let got = budget
+        .step("original revoked ACK typed try-lock conflict", async {
+            let mut conflicts = 0usize;
+            loop {
+                let got = commit(a, request, ack)?;
+                if expected != OverlayCreditOutcome::Stale(Stale::DirectPublication)
+                    || !matches!(got, OverlayCreditOutcome::Contended(_))
+                {
+                    eprintln!("b28_original_revoke_publication_conflicts={conflicts}");
+                    return Ok::<_, String>(got);
+                }
+                require(
+                    !request.native_ack_credited_for_test()
+                        && a.stats.verified_round_trips == rounds
+                        && a.stats.received_valid == valid,
+                    "publication conflict consumed original once or diagnostics",
+                )?;
+                conflicts += 1;
+                tokio::task::yield_now().await;
+            }
+        })
+        .await??;
     require(
         got == expected,
         &format!("actual managed rejection {got:?}; expected {expected:?}"),

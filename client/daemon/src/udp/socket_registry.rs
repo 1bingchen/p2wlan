@@ -534,6 +534,55 @@ impl UdpTransport {
                 % (usize::MAX - DYNAMIC_SOCKET_INDEX_BASE)
     }
 
+    /// Resolve the local socket named by the authoritative Direct pair.
+    /// Probe affinity may move independently while that pair remains current.
+    /// This lookup neither changes affinity nor falls back to another mapping;
+    /// callers still qualify the complete Direct identity and MTU budget.
+    pub(crate) async fn resolve_committed_direct_socket_with_lease(
+        &self,
+        peer_id: &str,
+        local_endpoint: SocketAddr,
+        generation: u64,
+    ) -> Option<(usize, Arc<UdpSocket>, DynamicSocketSendLease)> {
+        let state = self.socket_state.lock().await;
+        if generation != self.peers.current_network_generation_sync() {
+            return None;
+        }
+        for (index, socket) in self.active_sockets().iter().enumerate() {
+            if socket.local_addr().ok() == Some(local_endpoint) {
+                return Some((index, socket.clone(), DynamicSocketSendLease::noop(index)));
+            }
+        }
+        if let Some(socket) = self
+            .ipv6_socket
+            .as_ref()
+            .filter(|socket| socket.local_addr().ok() == Some(local_endpoint))
+        {
+            return Some((
+                IPV6_SOCKET_INDEX,
+                socket.clone(),
+                DynamicSocketSendLease::noop(IPV6_SOCKET_INDEX),
+            ));
+        }
+        let (&index, entry) = state.dynamic.iter().find(|(_, entry)| {
+            entry.peer_id == peer_id
+                && entry.network_generation == generation
+                && entry.phase.is_usable()
+                && entry.permits_ordinary_traffic()
+                && entry.socket.local_addr().ok() == Some(local_endpoint)
+        })?;
+        let leases = entry.send_leases.clone();
+        leases.acquire();
+        Some((
+            index,
+            entry.socket.clone(),
+            DynamicSocketSendLease {
+                state: leases,
+                socket_index: index,
+            },
+        ))
+    }
+
     pub(crate) async fn resolve_send_socket_with_lease_for_endpoint(
         &self,
         peer_id: &str,

@@ -48,6 +48,8 @@ struct UdpDirectTaskContext {
     /// Lets the binder skip its normal failure backoff after a physical
     /// network hint has deliberately withdrawn the current socket.
     android_network_change_observed: Arc<std::sync::atomic::AtomicU64>,
+    #[cfg(test)]
+    original_owners_for_test: Option<Arc<C01UdpOwnersForTest>>,
 }
 
 enum UdpDirectLifecycleSignal {
@@ -64,6 +66,8 @@ struct UdpDirectBinding {
 }
 
 include!("udp_direct_gateway_commit.rs");
+#[cfg(test)]
+include!("udp_direct_original_owner_test.rs");
 
 fn direct_socket_interface_for_bind(
     environment: &crate::netenv::DirectRouteSnapshot,
@@ -307,6 +311,11 @@ async fn run_udp_direct_instance(
     direct_validation_worker_permits: Arc<tokio::sync::Semaphore>,
     peer_reflexive_signal_worker_permits: Arc<tokio::sync::Semaphore>,
 ) -> Result<()> {
+    #[cfg(test)]
+    let original_instance_for_test = ctx
+        .original_owners_for_test
+        .as_ref()
+        .map(|owner| owner.begin());
     let UdpDirectTaskContext {
         udp_bind: _,
         fresh_mapping_harness_loopback,
@@ -344,6 +353,8 @@ async fn run_udp_direct_instance(
         shutdown_rx,
         android_network_change_rx,
         android_network_change_observed,
+        #[cfg(test)]
+            original_owners_for_test: _,
     } = ctx;
 
     let udp = if socket_pool_enabled {
@@ -404,6 +415,8 @@ async fn run_udp_direct_instance(
             direct_validation_local_ip.clone(),
             direct_validation_worker_permits,
             lease.shutdown_receiver(),
+            #[cfg(test)]
+            original_instance_for_test.clone(),
         ));
     let dplpmtud_scheduler_worker = tokio::spawn(run_dplpmtud_scheduler_until_cancelled(
         udp.clone(),
@@ -419,6 +432,8 @@ async fn run_udp_direct_instance(
         punch_deduplicator.clone(),
         peer_reflexive_signal_worker_permits,
         lease.shutdown_receiver(),
+        #[cfg(test)]
+        original_instance_for_test.clone(),
     ));
 
     // Start the reader before the initial STUN gather. The live gather uses
@@ -431,12 +446,25 @@ async fn run_udp_direct_instance(
         async move { udp.run_inbound(inbound_tx).await }
     });
 
+    #[cfg(test)]
+    if let Some(owner) = &original_instance_for_test {
+        owner.spawned(0, validation_scheduler_worker.id());
+        owner.spawned(1, dplpmtud_scheduler_worker.id());
+        owner.spawned(2, peer_reflexive_worker.id());
+        owner.spawned(3, inbound_worker.id());
+    }
     let mut initial_publication_worker = None;
     // One lifecycle future covers startup discovery as well as steady-state
     // work. Cancellation drops the gather, then runs the same owner-scoped
     // cleanup; a queued edge cannot wait behind an entire STUN refresh.
     let outcome = {
         let work = async {
+            // The local cfg fixture exercises lifecycle/socket ownership only.
+            // Do not reach route/STUN/HTTP setup or hold the candidate lock.
+            #[cfg(test)]
+            if original_instance_for_test.is_some() {
+                std::future::pending::<()>().await;
+            }
             let local_interface_networks = p2pnet_nat::gather_local_networks();
             info!(
                 count = local_interface_networks.len(),
@@ -847,8 +875,19 @@ async fn run_udp_direct_instance(
         let _ = worker.await;
     }
 
+    #[cfg(test)]
+    let original_inbound_id = inbound_worker.id();
     inbound_worker.abort();
-    let _ = inbound_worker.await;
+    let _original_inbound_join = inbound_worker.await;
+    #[cfg(test)]
+    if let Some(owner) = &original_instance_for_test {
+        let error = match &_original_inbound_join {
+            Ok(Ok(())) => None,
+            Err(error) if error.is_cancelled() => None,
+            other => Some(format!("original inbound join: {other:?}")),
+        };
+        owner.joined(3, original_inbound_id, error);
+    }
 
     // This sends the ownership-scoped stop signal before withdrawing the
     // watch value and cancels every validation owner tied to this socket.  A
@@ -861,6 +900,10 @@ async fn run_udp_direct_instance(
     let withdrew_current = udp_transport_publication
         .clear_if_owner(lease.owner())
         .await;
+    #[cfg(test)]
+    if let Some(owner) = &original_instance_for_test {
+        owner.withdrawn(withdrew_current);
+    }
     if withdrew_current && udp_transport_publication.current_owner().await.is_none() {
         if let Ok(_refresh_guard) = candidate_refresh_lock.try_lock() {
             // Never signal endpoints from a socket that has already closed.
@@ -890,9 +933,24 @@ async fn run_udp_direct_instance(
             });
         }
     }
-    stop_direct_validation_scheduler_worker(validation_scheduler_worker).await;
-    stop_dplpmtud_scheduler_worker(dplpmtud_scheduler_worker).await;
-    stop_peer_reflexive_signal_worker(peer_reflexive_worker).await;
+    stop_direct_validation_scheduler_worker(
+        validation_scheduler_worker,
+        #[cfg(test)]
+        original_instance_for_test.as_ref(),
+    )
+    .await;
+    stop_dplpmtud_scheduler_worker(
+        dplpmtud_scheduler_worker,
+        #[cfg(test)]
+        original_instance_for_test.as_ref(),
+    )
+    .await;
+    stop_peer_reflexive_signal_worker(
+        peer_reflexive_worker,
+        #[cfg(test)]
+        original_instance_for_test.as_ref(),
+    )
+    .await;
     outcome
 }
 
@@ -1473,7 +1531,15 @@ async fn run_dplpmtud_scheduler_until_cancelled(
     while workers.join_next().await.is_some() {}
 }
 
-async fn stop_dplpmtud_scheduler_worker(mut worker: tokio::task::JoinHandle<()>) {
+async fn stop_dplpmtud_scheduler_worker(
+    mut worker: tokio::task::JoinHandle<()>,
+    #[cfg(test)] original_owner_for_test: Option<&C01UdpInstanceForTest>,
+) {
+    #[cfg(test)]
+    if let Some(owner) = original_owner_for_test {
+        c01_stop_original_worker_for_test(worker, owner, 1).await;
+        return;
+    }
     if timeout(Duration::from_secs(1), &mut worker).await.is_err() {
         worker.abort();
         let _ = worker.await;
@@ -1483,6 +1549,7 @@ async fn stop_dplpmtud_scheduler_worker(mut worker: tokio::task::JoinHandle<()>)
 /// Tie the authoritative validation scheduler to this UDP transport instance.
 /// A failed/replaced transport first cancels every registry owner, then this
 /// wrapper drops the queue receiver; no scheduler can outlive its socket.
+#[cfg_attr(test, allow(clippy::too_many_arguments))]
 async fn run_direct_validation_scheduler_until_cancelled(
     observations: DirectValidationIngress,
     udp: UdpTransport,
@@ -1491,7 +1558,23 @@ async fn run_direct_validation_scheduler_until_cancelled(
     local_virtual_ip: String,
     worker_permits: Arc<tokio::sync::Semaphore>,
     shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    #[cfg(test)] original_owner_for_test: Option<C01UdpInstanceForTest>,
 ) {
+    #[cfg(test)]
+    if let Some(owner) = original_owner_for_test {
+        c01_validation_until_joined_for_test(
+            observations,
+            udp,
+            peers,
+            transport,
+            local_virtual_ip,
+            worker_permits,
+            shutdown_rx,
+            owner,
+        )
+        .await;
+        return;
+    }
     tokio::select! {
         _ = run_direct_validation_scheduler(observations, udp, peers, transport, local_virtual_ip, worker_permits) => {},
         _ = wait_for_udp_direct_shutdown(shutdown_rx) => {},
@@ -1502,6 +1585,7 @@ async fn run_direct_validation_scheduler_until_cancelled(
 /// historical detached task held a sender and receiver for its own channel,
 /// so it could outlive a failed socket forever; this wrapper exits whenever
 /// that instance is superseded or withdrawn.
+#[cfg_attr(test, allow(clippy::too_many_arguments))]
 async fn run_peer_reflexive_signal_loop_until_cancelled(
     ingress: PeerReflexiveIngress,
     control: ControlClient,
@@ -1510,14 +1594,38 @@ async fn run_peer_reflexive_signal_loop_until_cancelled(
     punch_deduplicator: PunchAttemptDeduplicator,
     worker_permits: Arc<tokio::sync::Semaphore>,
     shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    #[cfg(test)] original_owner_for_test: Option<C01UdpInstanceForTest>,
 ) {
+    #[cfg(test)]
+    if let Some(owner) = original_owner_for_test {
+        c01_peer_reflexive_until_joined_for_test(
+            ingress,
+            control,
+            udp,
+            peers,
+            punch_deduplicator,
+            worker_permits,
+            shutdown_rx,
+            owner,
+        )
+        .await;
+        return;
+    }
     tokio::select! {
         _ = run_peer_reflexive_signal_loop(ingress, control, udp, peers, punch_deduplicator, worker_permits) => {},
         _ = wait_for_udp_direct_shutdown(shutdown_rx) => {},
     }
 }
 
-async fn stop_peer_reflexive_signal_worker(mut worker: tokio::task::JoinHandle<()>) {
+async fn stop_peer_reflexive_signal_worker(
+    mut worker: tokio::task::JoinHandle<()>,
+    #[cfg(test)] original_owner_for_test: Option<&C01UdpInstanceForTest>,
+) {
+    #[cfg(test)]
+    if let Some(owner) = original_owner_for_test {
+        c01_stop_original_worker_for_test(worker, owner, 2).await;
+        return;
+    }
     if timeout(Duration::from_secs(1), &mut worker).await.is_err() {
         worker.abort();
         let _ = worker.await;
@@ -1628,6 +1736,7 @@ mod udp_direct_tests {
             shutdown_rx,
             android_network_change_rx: None,
             android_network_change_observed: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            original_owners_for_test: None,
         }
     }
 
@@ -1785,7 +1894,15 @@ mod udp_direct_tests {
     }
 }
 
-async fn stop_direct_validation_scheduler_worker(mut worker: tokio::task::JoinHandle<()>) {
+async fn stop_direct_validation_scheduler_worker(
+    mut worker: tokio::task::JoinHandle<()>,
+    #[cfg(test)] original_owner_for_test: Option<&C01UdpInstanceForTest>,
+) {
+    #[cfg(test)]
+    if let Some(owner) = original_owner_for_test {
+        c01_stop_original_worker_for_test(worker, owner, 0).await;
+        return;
+    }
     if timeout(Duration::from_secs(1), &mut worker).await.is_err() {
         worker.abort();
         let _ = worker.await;

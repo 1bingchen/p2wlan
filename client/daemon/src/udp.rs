@@ -298,6 +298,9 @@ pub struct UdpTransport {
     probe_send_failure_hook: Arc<std::sync::Mutex<Option<ProbeSendFailureHook>>>,
     #[cfg(test)]
     probe_send_failure_hook_enabled: Arc<AtomicBool>,
+    /// Fixture-only ownership of this transport's original retransmit tasks.
+    #[cfg(test)]
+    probe_burst_capture_for_test: Option<Arc<ProbeBurstCaptureForTest>>,
     /// Per-transport one-shot ordinary fresh-mapping lifecycle barrier.
     /// Absent from production; it never supplies send authority or summaries.
     #[cfg(test)]
@@ -436,6 +439,14 @@ use hard_hard_pair_validation::HardHardSocketMode;
 pub(crate) use hard_hard_pair_validation::{HardHardValidationScope, HardHardValidationWork};
 
 mod diagnostics;
+
+mod ordinary_probe_cost;
+use ordinary_probe_cost::{OrdinaryProbeCall, OrdinaryProbeKind, OrdinaryProbeSocket};
+pub(crate) use ordinary_probe_cost::{OrdinaryProbeCost, OrdinaryProbeIdentity};
+mod ordinary_probe_task;
+#[cfg(test)]
+use ordinary_probe_cost::OrdinaryProbeTestStage;
+pub(crate) use ordinary_probe_task::OrdinaryProbeTask;
 
 mod dynamic_punch;
 mod hard_hard_measurement;

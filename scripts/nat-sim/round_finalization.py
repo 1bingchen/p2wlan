@@ -22,6 +22,8 @@ import subprocess
 import sys
 import time
 
+from monotonic_clock import monotonic_ns
+
 
 MAX_RECEIPT_BYTES = 128 * 1024
 MAX_RECORDS = 128
@@ -41,7 +43,7 @@ ENV_KEYS = {
 
 
 def now_ms():
-    return time.monotonic_ns() // 1_000_000
+    return monotonic_ns() // 1_000_000
 
 
 class _FixedDeadlineExpired(ValueError):
@@ -814,6 +816,16 @@ def read_or_unknown(path):
         return {"result": "unknown", "reason_code": "not_captured"}
 
 
+def preserve_collector_observations(directory, previous, collector_ran):
+    # Preserve the original hidden receipt and its reference. Only bytes
+    # verified as the original collector's public output get a public alias.
+    atomic_json(directory / ".collector-nat-evidence.json", previous)
+    if not collector_ran:
+        return None
+    name = "collector-nat-evidence.json"
+    return {"reference": name, "sha256": atomic_json(directory / name, previous), "used_as_terminal": False}
+
+
 def publish(args):
     directory = Path(args.round_dir)
     rows = []
@@ -922,13 +934,15 @@ def publish(args):
                     collector_ran = hashlib.sha256(previous_bytes).hexdigest() == output_hash
             except (OSError, ValueError, json.JSONDecodeError):
                 pass
+        public_observations = None
         if (directory / "nat-evidence.json").is_file():
-            atomic_json(directory / ".collector-nat-evidence.json", previous)
+            public_observations = preserve_collector_observations(directory, previous, collector_ran)
         atomic_json(directory / "nat-evidence.json", {
             "schema_version": 1, "executed": collector_ran and previous.get("executed") is True,
             "result": "fail", "decision": {"result": "fail", "reason_code": "harness:" + terminal_reason},
             "collector_observations": {"available": collector_ran and previous.get("schema_version") is not None,
                                        "reference": ".collector-nat-evidence.json" if previous.get("schema_version") is not None else None},
+            "collector_public_observations": public_observations,
             "nat_terminal": None})
     atomic_json(directory / "cleanup.json", cleanup)
     atomic_json(directory / "round-finalization.json", receipt)

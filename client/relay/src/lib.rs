@@ -199,6 +199,11 @@ impl RelayServerConfig {
 /// Relay client limits configuration.
 #[derive(Debug, Clone)]
 pub struct RelayClientConfig {
+    /// External test owner of the two original workers, including failed
+    /// registration. Production never captures or changes their lifecycle.
+    #[cfg(test)]
+    pub(crate) original_workers_for_test:
+        Option<std::sync::Arc<client::original_workers_for_test::Capture>>,
     pub cmd_queue_capacity: usize,
     pub inbound_queue_capacity: usize,
     pub register_timeout: Duration,
@@ -229,6 +234,8 @@ pub struct RelayClientConfig {
 impl Default for RelayClientConfig {
     fn default() -> Self {
         Self {
+            #[cfg(test)]
+            original_workers_for_test: None,
             cmd_queue_capacity: 128,
             // A relay-only 256-packet overlay burst must remain bounded but
             // must not overflow the client-side reader before the daemon's

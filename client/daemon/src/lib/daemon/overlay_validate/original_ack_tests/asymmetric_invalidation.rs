@@ -111,11 +111,30 @@ async fn reject_old_prewrite(
     let input = echo
         .original_echo()
         .ok_or("actual sealed original Echo missing")?;
-    b.peers
-        .try_qualify_original_echo_input_in_epoch(&b.wireguard, input)
-        .map_err(|e| {
-            format!("rejection did not preserve real current source qualification: {e:?}")
-        })?;
+    // The real UDP owner can briefly publish while this read-only fixture
+    // check runs. Keep the original input and emit/epoch fencing, and wait
+    // only for that explicit contention within the existing step deadline.
+    // Stale/unknown input still fails; this does not retry any send or ACK.
+    budget
+        .step("qualify actual current Echo source before rejection", async {
+            loop {
+                match b
+                    .peers
+                    .try_qualify_original_echo_input_in_epoch(&b.wireguard, input)
+                {
+                    Ok(()) => break Ok(()),
+                    Err(crate::overlay_requests::OverlayCreditOutcome::Contended(
+                        crate::overlay_requests::OverlayCreditLockSite::DirectPublication,
+                    )) => tokio::task::yield_now().await,
+                    Err(error) => {
+                        break Err(format!(
+                            "rejection did not preserve real current source qualification: {error:?}"
+                        ));
+                    }
+                }
+            }
+        })
+        .await??;
     // Demonstrate the new qualifier is reached with real active session and
     // current original RX provenance. Do not hold this guard while reacquiring
     // it in the actual prewrite method below.

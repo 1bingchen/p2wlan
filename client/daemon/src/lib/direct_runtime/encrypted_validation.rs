@@ -295,9 +295,7 @@ async fn run_direct_validation_scheduler_with_worker_permits(
     .await;
 }
 
-// The caller retains the original sole JoinSet so a cfg-test cancellation can
-// await its real children after the scheduler future leaves scope. Production
-// cancellation still drops this same original owner as before.
+// Same original task owner; cfg cancellation can drain it after the core future drops.
 #[allow(clippy::too_many_arguments)]
 async fn run_direct_validation_scheduler_with_owned_workers(
     observations: DirectValidationIngress,

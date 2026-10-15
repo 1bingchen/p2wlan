@@ -144,7 +144,7 @@ impl UdpTransport {
         if owner.guard.is_some() || owner.reader.is_some() || !owner.retired.is_empty() {
             return Err(DynamicSocketAttachError::Superseded);
         }
-        match self
+        if let Some(guard) = self
             .attach_original_dynamic_inner(
                 peer,
                 index,
@@ -156,11 +156,8 @@ impl UdpTransport {
             )
             .await?
         {
-            super::socket_lifecycle::OriginalDynamicAttachSuccess::RetainedForTest => Ok(()),
-            super::socket_lifecycle::OriginalDynamicAttachSuccess::Guard(guard) => {
-                owner.guard = Some(guard);
-                Ok(())
-            }
+            owner.guard = Some(guard);
         }
+        Ok(())
     }
 }

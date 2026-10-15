@@ -186,12 +186,12 @@ impl RelayClient {
                 let server_name = config
                     .tls_server_name
                     .clone()
-                    .unwrap_or_else(|| parsed.host.clone());
+                    .unwrap_or_else(|| parsed.connect_host().to_string());
 
                 let tcp_stream = tokio::time::timeout(
                     config.connect_timeout,
                     p2pnet_netbind::connect_tcp_host(
-                        &parsed.host,
+                        parsed.connect_host(),
                         parsed.port,
                         config.outbound_interface.as_deref(),
                     ),
@@ -215,7 +215,7 @@ impl RelayClient {
                 let stream = tokio::time::timeout(
                     config.connect_timeout,
                     p2pnet_netbind::connect_tcp_host(
-                        &parsed.host,
+                        parsed.connect_host(),
                         parsed.port,
                         config.outbound_interface.as_deref(),
                     ),
@@ -467,6 +467,10 @@ impl RelayClient {
         });
 
         // Read task
+        #[cfg(test)]
+        if let Some(capture) = &config.original_workers_for_test {
+            capture.install(0, _write_task, close_signal.clone());
+        }
         let msg_tx_clone = msg_tx.clone();
         let mut reg_tx = Some(reg_tx);
         let read_close_signal = close_signal.clone();
@@ -475,7 +479,7 @@ impl RelayClient {
         let registration_timeout = config.register_timeout;
         let read_reason = close_reason.clone();
         let read_ping_expectations = ping_expectations;
-        tokio::spawn(async move {
+        let read_task = tokio::spawn(async move {
             let mut reader = reader;
             let mut buf = vec![0u8; max_payload + FRAME_HEADER_SIZE];
 
@@ -703,6 +707,14 @@ impl RelayClient {
             let _ = msg_tx_clone.try_send(RelayMessage::Closed { reason });
             debug!("Relay read task ended; close_reason={reason:?}");
         });
+        #[cfg(test)]
+        match &config.original_workers_for_test {
+            Some(capture) => capture.install(1, read_task, close_signal.clone()),
+            None => drop(read_task),
+        }
+        // Preserve the original immediate detached-handle drop outside tests.
+        #[cfg(not(test))]
+        drop(read_task);
 
         // Wait for registration confirmation
         match tokio::time::timeout(config.register_timeout, reg_rx).await {

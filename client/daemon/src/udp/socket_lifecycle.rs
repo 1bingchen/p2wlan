@@ -632,12 +632,6 @@ impl std::fmt::Debug for ProvisionalSocketGuard {
     }
 }
 
-pub(super) enum OriginalDynamicAttachSuccess {
-    Guard(ProvisionalSocketGuard),
-    #[cfg(test)]
-    RetainedForTest,
-}
-
 fn take_original_dynamic_attach_reader(
     reader: &mut Option<tokio::task::JoinHandle<()>>,
     #[cfg(test)] owner: Option<&mut super::original_dynamic_test::OriginalDynamicAttachForTest>,
@@ -691,25 +685,18 @@ impl UdpTransport {
         punch_generation: u64,
         cancellation: Option<&Arc<crate::PunchSessionCancellation>>,
     ) -> std::result::Result<ProvisionalSocketGuard, DynamicSocketAttachError> {
-        match self
-            .attach_original_dynamic_inner(
-                peer_id,
-                socket_index,
-                socket,
-                network_generation,
-                punch_generation,
-                cancellation,
-                #[cfg(test)]
-                None,
-            )
-            .await?
-        {
-            OriginalDynamicAttachSuccess::Guard(guard) => Ok(guard),
+        self.attach_original_dynamic_inner(
+            peer_id,
+            socket_index,
+            socket,
+            network_generation,
+            punch_generation,
+            cancellation,
             #[cfg(test)]
-            OriginalDynamicAttachSuccess::RetainedForTest => {
-                Err(DynamicSocketAttachError::ReaderStartupFailed)
-            }
-        }
+            None,
+        )
+        .await?
+        .ok_or(DynamicSocketAttachError::ReaderStartupFailed)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -724,7 +711,7 @@ impl UdpTransport {
         #[cfg(test)] mut test_owner: Option<
             &mut super::original_dynamic_test::OriginalDynamicAttachForTest,
         >,
-    ) -> std::result::Result<OriginalDynamicAttachSuccess, DynamicSocketAttachError> {
+    ) -> std::result::Result<Option<ProvisionalSocketGuard>, DynamicSocketAttachError> {
         if self.inbound_channel().is_none() {
             return Err(DynamicSocketAttachError::NoInboundChannel);
         }
@@ -971,9 +958,9 @@ impl UdpTransport {
         // from this point on the generation is always covered by the watcher,
         // even if the future is dropped at the very next await point.
         match provisional_guard.take() {
-            Some(guard) => Ok(OriginalDynamicAttachSuccess::Guard(guard)),
+            Some(guard) => Ok(Some(guard)),
             #[cfg(test)]
-            None if test_owner.is_some() => Ok(OriginalDynamicAttachSuccess::RetainedForTest),
+            None if test_owner.is_some() => Ok(None),
             None => Err(DynamicSocketAttachError::ReaderStartupFailed),
         }
     }

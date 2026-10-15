@@ -25,6 +25,7 @@ pub(crate) struct RequestHandoffArguments {
     pub(crate) point: HandoffArgumentPoint,
     pub(crate) token: Option<RequestSendToken>,
     pub(crate) source: Option<HandoffEncryptionFacts>,
+    pub(crate) wire: (usize, Option<u64>, u64),
 }
 
 pub(crate) struct RequestHandoffArgumentProbe {
@@ -54,6 +55,11 @@ impl RequestHandoffArgumentProbe {
         }
         *recorded = Some(RequestHandoffArguments {
             point,
+            wire: (
+                packet.wire_bytes.len(),
+                crate::transport::wire_counter(&packet.wire_bytes),
+                crate::transport::wire_fingerprint(&packet.wire_bytes),
+            ),
             token: packet.binding().map(|binding| binding.token().clone()),
             source: packet.source().map(|source| HandoffEncryptionFacts {
                 peer_id: source.peer_id().to_string(),

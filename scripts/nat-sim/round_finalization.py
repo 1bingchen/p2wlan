@@ -22,6 +22,8 @@ import subprocess
 import sys
 import time
 
+from monotonic_clock import monotonic_ns
+
 
 MAX_RECEIPT_BYTES = 128 * 1024
 MAX_RECORDS = 128
@@ -41,7 +43,7 @@ ENV_KEYS = {
 
 
 def now_ms():
-    return time.monotonic_ns() // 1_000_000
+    return monotonic_ns() // 1_000_000
 
 
 class _FixedDeadlineExpired(ValueError):

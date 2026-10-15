@@ -13,7 +13,7 @@ import shutil
 import stat
 import subprocess
 import sys
-import time
+from monotonic_clock import monotonic_ns
 
 
 MAX_JSON_BYTES = 128 * 1024
@@ -235,7 +235,7 @@ def exec_launch(artifact_set: Path, component: str, record_path: Path, role: str
     configuration = configuration_identity(arguments, environment, environment_keys,
         config_file=config_file, stdin_authorization=stdin_authorization)
     record = {"schema_version": 1, "source": artifacts["source"], "role": role, "component": component,
-              "state": "exec_requested", "pid": os.getpid(), "monotonic_ns": time.monotonic_ns(),
+              "state": "exec_requested", "pid": os.getpid(), "monotonic_ns": monotonic_ns(),
               "artifact_set_sha256": digest_file(artifact_set), "artifact": artifacts["artifacts"][component],
               "configuration": configuration}
     validate_record(record, artifacts["source"])

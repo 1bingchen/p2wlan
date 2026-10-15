@@ -127,13 +127,17 @@ async fn spawn_hole_punch_task_with_lifecycle(
     {
         return;
     }
-    // Hard↔Hard is a planner-gated replacement for the ordinary first punch
-    // only on the deterministic initiator side.  The initiator measures a
-    // fresh socket and publishes the first prediction; the responder is
-    // entered exclusively by the matching `hh1` fresh signal.  Other NAT
-    // strategies continue through the existing scheduler below.
+    // Give production cold starts the ordinary bounded candidate path first.
+    // The existing recovery retry can admit HH after same-epoch ordinary
+    // feedback; only the isolated experiment replaces the first punch with HH.
+    // The responder still requires the matching authenticated control context
+    // and the existing owned encrypted validation before Direct promotion.
     let local_is_hard_hard_initiator = peers.local_node_id_for_traversal() < peer_id;
-    if fresh_prediction.is_none() && frozen_targets.is_none() && local_is_hard_hard_initiator {
+    if hard_hard_experiment_only
+        && fresh_prediction.is_none()
+        && frozen_targets.is_none()
+        && local_is_hard_hard_initiator
+    {
         if let Some(plan) = peers.hard_hard_plan_for_peer(&peer_id).await {
             if let Some(signal) = signal.clone() {
                 peers
@@ -241,18 +245,46 @@ async fn spawn_hole_punch_task_with_lifecycle(
     {
         return;
     }
-    let RecoveryAdmission::Accepted { epoch } = peers.recovery_epoch_admit(&peer_id).await else {
-        peers
-            .record_direct_event(
-                &peer_id,
-                "punch_suppressed_superseded",
-                None,
-                None,
-                None,
-                "suppressed punch trigger: peer is Direct, offline or gone",
-            )
-            .await;
+    let admission = peers.recovery_epoch_admit(&peer_id).await;
+    if peers.current_network_generation_sync() != network_generation
+        || !peers.peer_session_is_current_sync(&peer_id, peer_session_generation)
+    {
         return;
+    }
+    let epoch = match admission {
+        RecoveryAdmission::Accepted { epoch } => epoch,
+        RecoveryAdmission::Superseded => {
+            peers
+                .record_direct_event_for_generation_with_socket(
+                    &peer_id,
+                    network_generation,
+                    "punch_suppressed_superseded",
+                    None,
+                    None,
+                    None,
+                    Some(0),
+                    "suppressed punch trigger: peer is Direct, offline or gone",
+                )
+                .await;
+            return;
+        }
+        RecoveryAdmission::BudgetExhausted { epoch } => {
+            // A frozen epoch remains current. Do not describe quota/backoff
+            // rejection as path convergence, or create another recovery owner.
+            peers
+                .record_direct_event_for_generation_with_socket(
+                    &peer_id,
+                    network_generation,
+                    "punch_suppressed_budget_exhausted",
+                    None,
+                    None,
+                    None,
+                    Some(0),
+                    format!("suppressed ordinary punch: recovery_epoch={epoch} budget is exhausted; awaiting existing bounded recovery backoff"),
+                )
+                .await;
+            return;
+        }
     };
     let claim_priority = if fresh_prediction.is_some() {
         PUNCH_PRIORITY_FRESH_PREDICTION

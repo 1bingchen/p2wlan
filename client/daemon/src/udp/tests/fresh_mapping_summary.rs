@@ -30,6 +30,18 @@ impl PayloadFixture {
             .await,
         )
         .await;
+        let cost = predecessor
+            .ordinary_probe_summary
+            .as_ref()
+            .expect("ordinary accepted generation must retain its returned-call summary");
+        assert_eq!(cost.logical_calls_attempted, 1);
+        assert_eq!(cost.successful_primary_sends, 1);
+        assert!(cost.success_cost.datagrams > 0 && cost.success_cost.bytes > 0);
+        assert_eq!(
+            cost.success_cost.first_socket_index,
+            Some(predecessor.socket_index)
+        );
+        assert!(cost.success_cost.first_observed_primary_at_ms.is_some());
         let (index, socket) = udp.socket_for_peer(Some(PEER)).await.unwrap();
         assert_eq!(index, predecessor.socket_index);
         let pin = udp.socket_state.lock().await.affinity[PEER];

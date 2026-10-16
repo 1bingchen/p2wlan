@@ -2,7 +2,8 @@
 //!
 //! Vec operations and observed capacities are not allocator calls or RSS.
 //! Counters cover fixed sites; leases cover two plaintext FIFOs and explicitly
-//! observed buffers in the slow send. They do not cover the whole pipeline.
+//! observed buffers in the slow send, plus fixed UDP/TUN reader storage.
+//! They do not cover the whole pipeline.
 //! A daemon may explicitly enable the authenticated, bounded runtime readout.
 //! Default instances retain no capture and never serialize per-packet data.
 
@@ -10,9 +11,11 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
+mod fixed_read_buffer;
 mod owned_buffers;
 mod residency;
 mod runtime;
+pub(crate) use fixed_read_buffer::FixedReadBuffer;
 pub(crate) use runtime::RuntimeResourceCapture;
 #[cfg(test)]
 mod tests;

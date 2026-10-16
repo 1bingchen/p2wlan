@@ -56,6 +56,8 @@ impl RuntimeResourceCapture {
             ResidencyStage::SerializedWire,
             ResidencyStage::SessionBacklog,
             ResidencyStage::SessionFlush,
+            ResidencyStage::UdpReaderStorage,
+            ResidencyStage::TunReaderStorage,
         ];
         let stages = STAGES.map(|stage| {
             json!({

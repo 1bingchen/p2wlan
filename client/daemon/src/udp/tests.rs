@@ -155,5 +155,8 @@ mod resource_capture;
 #[path = "tests/resource_capture_tx.rs"]
 mod resource_capture_tx;
 
+#[path = "tests/fixed_reader_storage.rs"]
+mod fixed_reader_storage;
+
 #[path = "tests/direct_origin.rs"]
 mod direct_origin;

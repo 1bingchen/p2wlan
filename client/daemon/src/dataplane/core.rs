@@ -318,7 +318,7 @@ where
 
     /// Run the packet pump until the TUN device closes or an unrecoverable error occurs.
     pub async fn run(&mut self) -> Result<()> {
-        let mut buf = vec![0u8; 65_535];
+        let mut buf = crate::dataplane_resources::FixedReadBuffer::tun(self.resource_capture());
         let mut local_feedback_rx = self
             .local_feedback_rx
             .take()

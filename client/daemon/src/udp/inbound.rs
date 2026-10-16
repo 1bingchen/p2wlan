@@ -398,7 +398,10 @@ impl UdpTransport {
             let authenticated_probe = is_authenticated_punch_candidate(data);
             let legacy_punch = decode_punch_packet(data);
             #[cfg(test)]
-            if let Some(packet) = legacy_punch.as_ref().filter(|p| p.kind == PunchPacketKind::Ack) {
+            if let Some(packet) = legacy_punch
+                .as_ref()
+                .filter(|p| p.kind == PunchPacketKind::Ack)
+            {
                 self.trace_consent(packet.nonce, ConsentStage::AckDecoded);
             }
 

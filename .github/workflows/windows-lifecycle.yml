@@ -125,6 +125,34 @@ jobs:
           toolchain: stable
           components: rustfmt
 
+      - name: Build the one-shot native console injector
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $directory = Join-Path $env:P2WLAN_TRAY_DIAGNOSTICS_DIR 'ctrl-c-native'
+          New-Item -ItemType Directory -Path $directory | Out-Null
+          $source = (Resolve-Path 'scripts/windows_lifecycle/console_ctrl_c.rs').Path
+          $binary = Join-Path $directory 'console_ctrl_c.exe'
+          $tests = Join-Path $directory 'console_ctrl_c_tests.exe'
+          & rustc --edition=2021 -D warnings -C opt-level=2 -C panic=abort $source -o $binary
+          if ($LASTEXITCODE -ne 0) { throw 'native console injector build failed' }
+          & rustc --edition=2021 -D warnings --test $source -o $tests
+          if ($LASTEXITCODE -ne 0) { throw 'native console injector test build failed' }
+          & $tests --test-threads=1
+          if ($LASTEXITCODE -ne 0) { throw 'native console injector record/argument tests failed' }
+          $digest = (Get-FileHash -LiteralPath $binary -Algorithm SHA256).Hash.ToLowerInvariant()
+          Copy-Item -LiteralPath $source -Destination (Join-Path $directory 'console_ctrl_c.rs')
+          [ordered]@{
+            source_head_sha = $env:P2WLAN_EXACT_HEAD
+            workflow_sha = $env:P2WLAN_WORKFLOW_SHA
+            source_sha256 = (Get-FileHash -LiteralPath $source -Algorithm SHA256).Hash.ToLowerInvariant()
+            binary_sha256 = $digest
+            test_binary_sha256 = (Get-FileHash -LiteralPath $tests -Algorithm SHA256).Hash.ToLowerInvariant()
+            compiler = (& rustc -Vv) -join "`n"
+          } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $directory 'build.json') -Encoding utf8
+          "P2WLAN_CTRL_C_HELPER=$binary" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "P2WLAN_CTRL_C_HELPER_SHA256=$digest" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
       - name: Set up Flutter
         uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2
         with:
@@ -148,6 +176,7 @@ jobs:
         shell: bash
         run: |
           cargo fmt --all -- --check
+          rustfmt --edition 2021 --check scripts/windows_lifecycle/console_ctrl_c.rs
           cd apps/flutter_client
           dart format --output=none --set-exit-if-changed \
             lib/app/desktop_tray_controller.dart \

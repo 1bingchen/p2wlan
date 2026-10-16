@@ -502,7 +502,14 @@ function Write-ExclusiveCtrlCDiagnostic {
 
 function Send-ConsoleCtrlC {
     param([Parameter(Mandatory = $true)][int]$ProcessId)
-    $injectorPath = Join-Path $PSScriptRoot 'send_console_ctrl_c.ps1'
+    $injectorPath = [string]$env:P2WLAN_CTRL_C_HELPER
+    if ([string]::IsNullOrWhiteSpace($injectorPath) -or -not (Test-Path -LiteralPath $injectorPath -PathType Leaf)) {
+        throw 'prebuilt native Ctrl+C injector is required'
+    }
+    $injectorHash = (Get-FileHash -LiteralPath $injectorPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($injectorHash -cne [string]$env:P2WLAN_CTRL_C_HELPER_SHA256) {
+        throw 'prebuilt native Ctrl+C injector digest mismatch'
+    }
     $evidenceRoot = if ($env:P2WLAN_TRAY_DIAGNOSTICS_DIR) {
         Join-Path $env:P2WLAN_TRAY_DIAGNOSTICS_DIR 'ctrl-c'
     } else { Join-Path $runRoot 'ctrl-c' }
@@ -526,20 +533,12 @@ function Send-ConsoleCtrlC {
         $diagnosticReady = $false
         Write-Warning -WarningAction Continue "Ctrl+C parent diagnostic setup unavailable: $($_.Exception.Message)"
     }
-    $pwshPath = (Get-Command pwsh -CommandType Application | Select-Object -First 1).Source
     $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
-    $startInfo.FileName = $pwshPath
+    $startInfo.FileName = $injectorPath
     $startInfo.WorkingDirectory = Split-Path -Parent $injectorPath
     $startInfo.UseShellExecute = $false
     $startInfo.CreateNoWindow = $true
     foreach ($argument in @(
-            '-NoLogo',
-            '-NoProfile',
-            '-NonInteractive',
-            '-ExecutionPolicy',
-            'Bypass',
-            '-File',
-            $injectorPath,
             '-ProcessId',
             $ProcessId.ToString(),
             '-RequestId',
@@ -599,6 +598,7 @@ function Send-ConsoleCtrlC {
                     request_id = $requestId
                     target_process_id = $ProcessId
                     helper_process_id = if ($injectorStarted) { $injector.Id } else { $null }
+                    helper_binary_sha256 = $injectorHash
                     helper_started = $injectorStarted
                     initial_wait_seconds = 5
                     initial_wait = $initialWait

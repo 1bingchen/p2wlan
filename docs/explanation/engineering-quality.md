@@ -99,6 +99,8 @@ UDP 的 `core.rs` 和 `dynamic_punch.rs` 使用真正的 Rust 子模块，而不
 
 测试模块改名必须同时更新 workflow、验收脚本和 evidence contract 的完整 test ID。失效过滤器不能视作通过，不得删除真实断言或降低测试数量来让流水线变绿。
 
+UDP consent 测试可以在原 transport 上安装仅测试构建可用的时间线：最多记录 32 条带 nonce 和本机单调时间的发送返回、ACK 解码、采用锁、匹配、健康提交及轮次回收观测。记录不等待锁、不唤醒协议任务；容量用尽、锁竞争或损坏均计入 `dropped`。失败输出中的缺失事件不能解释成“该步骤未发生”，成功样本也不能解释为旧失败的根因证明。记录不会更改原断言、时限或健康状态所有者，生产构建不包含该时间线。
+
 CI 的通用 workspace 套件由 `scripts/quality/run_cargo_test.py` 执行一次。Linux 使用 `--all-targets`，Windows 保留包含 doctest 的默认 target 范围；原 `--test-threads=1 --skip hard_hard_` 不变。包装器添加 Cargo JSON 构建输出，记录源码、工具链、原退出状态及有界日志；原测试失败不会因采证成功变为通过，也不会因复制失败被重跑。
 
     python3 scripts/quality/run_cargo_test.py --all-targets --evidence-dir ../p2wlan-rust-general-evidence

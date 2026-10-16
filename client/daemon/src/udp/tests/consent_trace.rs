@@ -112,6 +112,52 @@ fn stages(trace: &ConsentTrace, nonce: ProbeNonce) -> Vec<ConsentStage> {
 }
 
 #[tokio::test]
+async fn consent_trace_real_unanswered_round_records_removal_and_collects_original_burst() {
+    let end = TokioInstant::now() + Duration::from_secs(2);
+    let work_end = end - Duration::from_secs(1);
+    let (mut udp, _remote, trace, _pending) = fixture().await;
+    let _report = ConsentTraceReport(trace.clone());
+    let bursts = Arc::new(ProbeBurstCaptureForTest::new());
+    udp.probe_burst_capture_for_test = Some(bursts.clone());
+    let before = udp.peers.get_connection("peer-b").await.unwrap();
+    // Exercise the existing real send and timeout owner with no ACK producer.
+    // Collect its original retransmit task even if the timed body fails.
+    let round = timeout_at(
+        work_end,
+        udp.run_keepalive_round(Duration::from_millis(500)),
+    )
+    .await;
+    let (count, joined) = bursts.abort_and_join_until(end).await;
+    assert!(joined);
+    assert_eq!(count, 1);
+    round.expect("one original unanswered round must finish within work end");
+    let (events, dropped) = trace.snapshot();
+    assert_eq!(dropped, 0);
+    let events: Vec<_> = events.into_iter().flatten().collect();
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0].nonce, events[1].nonce);
+    assert_eq!(
+        stages(&trace, events[0].nonce),
+        [
+            ConsentStage::SendReturned,
+            ConsentStage::RoundRemovedPending
+        ]
+    );
+    assert!(udp.pending_probes.lock().await.is_empty());
+    let after = udp.peers.get_connection("peer-b").await.unwrap();
+    assert_eq!(
+        after.direct_health.success_count,
+        before.direct_health.success_count
+    );
+    assert_eq!(
+        after.direct_health.failure_count,
+        before.direct_health.failure_count + 1
+    );
+    assert_eq!(after.direct_health.consecutive_failures, 1);
+    assert_eq!(after.state, ConnectionState::Direct);
+}
+
+#[tokio::test]
 async fn consent_trace_real_ack_commits_once_and_duplicate_or_missing_nonce_cannot_commit() {
     let end = TokioInstant::now() + Duration::from_secs(2);
     let (udp, remote, trace, pending) = fixture().await;

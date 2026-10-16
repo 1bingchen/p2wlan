@@ -6,7 +6,6 @@ impl UdpTransport {
     pub(super) async fn handle_legacy_probe_ack(
         &self,
         socket_index: usize,
-        socket: &Arc<UdpSocket>,
         source: SocketAddr,
         nonce: ProbeNonce,
     ) {

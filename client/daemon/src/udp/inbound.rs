@@ -1401,7 +1401,7 @@ impl UdpTransport {
                         }
                     }
                     PunchPacketKind::Ack => {
-                        self.handle_legacy_probe_ack(socket_index, &socket, source, packet.nonce)
+                        self.handle_legacy_probe_ack(socket_index, source, packet.nonce)
                             .await;
                     }
                 }

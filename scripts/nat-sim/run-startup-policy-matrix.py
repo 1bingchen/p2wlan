@@ -55,6 +55,11 @@ def record_policy_input(path: Path, role: str, policy: str, argv: list[str]) -> 
 
 def case_environment(base: dict, directory: Path, scenario: str, policy: str, seed: int) -> dict:
     env = {key: value for key, value in base.items() if key in HOST_KEYS}
+    birth = base.get("NAT_SIM_PROCESS_BIRTH", "0")
+    if birth not in {"0", "1"}:
+        raise ValueError("process_birth_must_be_zero_or_one")
+    if birth == "1":
+        env["NAT_SIM_PROCESS_BIRTH"] = birth
     if scenario not in {"reachable-direct", "direct-blackhole"}:
         raise ValueError("unknown_fixed_scenario")
     flag = daemon_flag(policy)

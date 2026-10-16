@@ -91,6 +91,13 @@ jobs:
           command -v cc
           python -B -m unittest discover -s scripts/nat-sim -p 'test_launch_native_udp.py' -v \
             2>&1 | tee "$RUNNER_TEMP/p2wlan-final-native-capture.log"
+      - name: Check original exec birth against native Darwin SDK
+        env:
+          P2WLAN_NAT_SIM_BIRTH_EVIDENCE_DIR: ${{ runner.temp }}/p2wlan-final-native-birth-fixture
+        run: |
+          set -euo pipefail
+          python -B -m unittest discover -s scripts/nat-sim -p 'test_process_birth.py' -v \
+            2>&1 | tee "$RUNNER_TEMP/p2wlan-final-native-birth.log"
       - name: Preserve original native fixture artifacts and output
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
@@ -99,6 +106,8 @@ jobs:
           path: |
             ${{ runner.temp }}/p2wlan-final-native-capture-fixture/
             ${{ runner.temp }}/p2wlan-final-native-capture.log
+            ${{ runner.temp }}/p2wlan-final-native-birth-fixture/
+            ${{ runner.temp }}/p2wlan-final-native-birth.log
           if-no-files-found: error
           retention-days: 14
 

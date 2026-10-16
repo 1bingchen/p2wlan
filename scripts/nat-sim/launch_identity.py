@@ -255,7 +255,8 @@ def validate_record(value: object, source: dict) -> None:
 
 def exec_launch(artifact_set: Path, component: str, record_path: Path, role: str,
                 arguments: list[str], environment_keys: list[str], *,
-                config_file: Path | None = None, stdin_authorization: bool = False) -> None:
+                config_file: Path | None = None, stdin_authorization: bool = False,
+                process_birth: bool = False) -> None:
     artifacts = load_object(artifact_set)
     validate_artifact_set(artifacts)
     if component != role_component(role) or component not in artifacts["artifacts"]:
@@ -285,6 +286,9 @@ def exec_launch(artifact_set: Path, component: str, record_path: Path, role: str
               "configuration": configuration}
     validate_record(record, artifacts["source"])
     write_new(record_path, record)
+    if process_birth:
+        import process_birth as native_birth
+        native_birth.write_pre_exec(record_path, record)
     try:
         os.execve(str(executable), [str(executable), *arguments], environment)
     except OSError as error:
@@ -293,6 +297,16 @@ def exec_launch(artifact_set: Path, component: str, record_path: Path, role: str
         record.update(state="exec_failed", exec_errno=error.errno or 5)
         record_path.write_bytes(canonical(record) + b"\n")
         raise
+
+
+def read_bound_process_birth(record_path: Path, source: dict, role: str) -> dict:
+    """Return a pre-exec birth fence, never successful-exec or TCP evidence."""
+    import process_birth
+    record = load_object(record_path)
+    validate_record(record, source)
+    if record["role"] != role:
+        raise ValueError("birth_launch_role_mismatch")
+    return process_birth.read_bound(record_path, record)
 
 
 def read_launch_evidence(base_dir: Path, expected_source: dict | None = None,
@@ -401,6 +415,7 @@ def main(argv=None) -> int:
     execution.add_argument("--env-key", action="append", default=[])
     execution.add_argument("--config-file", type=Path)
     execution.add_argument("--stdin-authorization", action="store_true")
+    execution.add_argument("--process-birth", action="store_true")
     execution.add_argument("arguments", nargs=argparse.REMAINDER)
     args = parser.parse_args(argv)
     try:
@@ -424,7 +439,8 @@ def main(argv=None) -> int:
         else:
             arguments = args.arguments[1:] if args.arguments[:1] == ["--"] else args.arguments
             exec_launch(args.artifact_set, args.component, args.record, args.role, arguments, args.env_key,
-                        config_file=args.config_file, stdin_authorization=args.stdin_authorization)
+                        config_file=args.config_file, stdin_authorization=args.stdin_authorization,
+                        process_birth=args.process_birth)
     except (OSError, ValueError, TypeError, KeyError) as error:
         # Error text and launch inputs can contain credentials. Emit type only.
         print(f"launch_identity_failure:{type(error).__name__}", file=sys.stderr)

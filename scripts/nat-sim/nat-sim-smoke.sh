@@ -34,6 +34,10 @@ STARTUP_POLICY_FLAG=$(python3 "$ROOT_DIR/scripts/nat-sim/run-startup-policy-matr
 # harness uses NETWORK_ID explicitly and requires a provisioned test network.
 NAT_SIM_BUILD_ONLY=${NAT_SIM_BUILD_ONLY:-0}
 case "$NAT_SIM_BUILD_ONLY" in 0|1) ;; *) echo "invalid build-only input" >&2; exit 2 ;; esac
+NAT_SIM_PROCESS_BIRTH=${NAT_SIM_PROCESS_BIRTH:-0}
+case "$NAT_SIM_PROCESS_BIRTH" in 0|1) ;; *) echo "invalid process-birth input" >&2; exit 2 ;; esac
+PROCESS_BIRTH_ARGS=()
+if [[ "$NAT_SIM_PROCESS_BIRTH" == 1 ]]; then PROCESS_BIRTH_ARGS=(--process-birth); fi
 NETWORK_ID=${NETWORK_ID:-default}
 MODE=${MODE:-direct}
 NORMAL_OBSERVE_S=${NORMAL_OBSERVE_S:-20}
@@ -1488,11 +1492,11 @@ for round in $(seq 1 "$ROUNDS"); do
   DAEMON_A_CMD=(python3 "$ROOT_DIR/scripts/nat-sim/launch_identity.py" exec \
     --artifact-set "$ARTIFACT_SET" --component daemon --role node-a \
     --record "$ROUND_DIR/launches/node-a.json" --config-file "$NODE_A_RUNTIME/config.json" \
-    --stdin-authorization "${DAEMON_IDENTITY_ENV[@]}" --)
+    --stdin-authorization "${DAEMON_IDENTITY_ENV[@]}" ${PROCESS_BIRTH_ARGS[@]+"${PROCESS_BIRTH_ARGS[@]}"} --)
   DAEMON_B_CMD=(python3 "$ROOT_DIR/scripts/nat-sim/launch_identity.py" exec \
     --artifact-set "$ARTIFACT_SET" --component daemon --role node-b \
     --record "$ROUND_DIR/launches/node-b.json" --config-file "$NODE_B_RUNTIME/config.json" \
-    --stdin-authorization "${DAEMON_IDENTITY_ENV[@]}" --)
+    --stdin-authorization "${DAEMON_IDENTITY_ENV[@]}" ${PROCESS_BIRTH_ARGS[@]+"${PROCESS_BIRTH_ARGS[@]}"} --)
   if [[ "$EGRESS_CAPTURE" == shim ]]; then
     EGRESS_A_PORT=$(sed -n 's/^EGRESS_A_PORT=//p' "$ROUND_DIR/nat-sim.out")
     EGRESS_B_PORT=$(sed -n 's/^EGRESS_B_PORT=//p' "$ROUND_DIR/nat-sim.out")

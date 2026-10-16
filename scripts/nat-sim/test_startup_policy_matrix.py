@@ -21,6 +21,18 @@ spec.loader.exec_module(MATRIX)
 
 
 class StartupPolicyMatrixTests(unittest.TestCase):
+    def test_birth_opt_in_is_frozen_in_each_case_without_changing_budgets(self):
+        for scenario, policy, offset in MATRIX.CASES:
+            original = MATRIX.case_environment({}, Path('/synthetic/output'), scenario, policy, 932300+offset)
+            observed = MATRIX.case_environment({'NAT_SIM_PROCESS_BIRTH':'1'},
+                Path('/synthetic/output'), scenario, policy, 932300+offset)
+            self.assertNotIn('NAT_SIM_PROCESS_BIRTH', original)
+            self.assertEqual(observed.pop('NAT_SIM_PROCESS_BIRTH'), '1')
+            self.assertEqual(observed, original)
+        with self.assertRaisesRegex(ValueError, 'process_birth'):
+            MATRIX.case_environment({'NAT_SIM_PROCESS_BIRTH':'yes'}, Path('/synthetic/output'),
+                                    'reachable-direct', 'auto', 932300)
+
     def policy_case(self, root, actual_policy="auto", receipt_policy="auto"):
         actual = ["--config", "/private/synthetic-config.json", MATRIX.daemon_flag(actual_policy),
                   "--validate-overlay", "--overlay-any-path"]

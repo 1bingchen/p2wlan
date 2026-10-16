@@ -38,6 +38,13 @@ NAT_SIM_PROCESS_BIRTH=${NAT_SIM_PROCESS_BIRTH:-0}
 case "$NAT_SIM_PROCESS_BIRTH" in 0|1) ;; *) echo "invalid process-birth input" >&2; exit 2 ;; esac
 PROCESS_BIRTH_ARGS=()
 if [[ "$NAT_SIM_PROCESS_BIRTH" == 1 ]]; then PROCESS_BIRTH_ARGS=(--process-birth); fi
+NAT_SIM_TCP_OBSERVER=${NAT_SIM_TCP_OBSERVER:-0}
+case "$NAT_SIM_TCP_OBSERVER" in 0|1) ;; *) echo "invalid TCP observer input" >&2; exit 2 ;; esac
+if [[ "$NAT_SIM_TCP_OBSERVER" == 1 && "$NAT_SIM_PROCESS_BIRTH" != 1 ]]; then
+  echo "TCP observer requires the original process-birth fence" >&2
+  exit 2
+fi
+source "$ROOT_DIR/scripts/nat-sim/owned_tcp_observer.sh"
 NETWORK_ID=${NETWORK_ID:-default}
 MODE=${MODE:-direct}
 NORMAL_OBSERVE_S=${NORMAL_OBSERVE_S:-20}
@@ -720,142 +727,27 @@ PY
 status_http_code() {
   local side="$1" url="$2" token_file="$3" process_pid="$4"
   local timeout_s="${5:-2}" connect_timeout_s="${6:-0.2}" header_file="$ROUND_DIR/.status-${1}-headers"
-  python3 - "$side" "$url" "$token_file" "$process_pid" "$timeout_s" \
-    "$connect_timeout_s" "$header_file" "$ROOT_DIR" <<'PY'
-import json
-import os
-import re
-import shutil
-import subprocess
-import sys
-import time
-from pathlib import Path
-from urllib.parse import urlsplit
-
-side, url, token_path, process_pid, timeout_s, connect_timeout_s, header_path, root_dir = sys.argv[1:]
-sys.path.insert(0, str(Path(root_dir) / "scripts/nat-sim"))
-from monotonic_clock import monotonic_ns
-parsed = urlsplit(url)
-host_port = f"{parsed.hostname or 'unknown'}:{parsed.port or (443 if parsed.scheme == 'https' else 80)}"
-try:
-    token = Path(token_path).read_text(encoding="utf-8").strip()
-except OSError:
-    token = ""
-curl_path = shutil.which("curl")
-header_file = Path(header_path)
-header_file.touch(mode=0o600, exist_ok=True)
-try:
-    os.chmod(header_file, 0o600)
-except OSError:
-    pass
-
-process_started = None
-try:
-    process_started = subprocess.run(
-        ["ps", "-p", str(int(process_pid)), "-o", "lstart="],
-        capture_output=True,
-        text=True,
-        timeout=1,
-        check=False,
-    ).stdout.strip() or None
-except (OSError, ValueError, subprocess.TimeoutExpired):
-    pass
-
-started_ns = monotonic_ns()
-stderr_text = ""
-stdout_text = ""
-exit_code = 1
-if not token:
-    stderr_text = "diagnostics_token_file_missing"
-elif not curl_path:
-    stderr_text = "curl_executable_missing"
-else:
-    writeout = "%{http_code}\t%{time_connect}\t%{time_starttransfer}\t%{time_total}\t%{size_download}"
-    command = [
-        curl_path,
-        "--config", "-",
-        "--silent", "--show-error",
-        "--connect-timeout", connect_timeout_s,
-        "--max-time", timeout_s,
-        "--output", os.devnull,
-        "--dump-header", str(header_file),
-        "--write-out", writeout,
-        url,
-    ]
-    try:
-        completed = subprocess.run(
-            command,
-            input=f'header = "Authorization: Bearer {token}"\n',
-            capture_output=True,
-            text=True,
-            timeout=float(timeout_s) + 2,
-            check=False,
-        )
-        exit_code = completed.returncode
-        stdout_text = completed.stdout.strip()
-        stderr_text = completed.stderr.strip()
-    except subprocess.TimeoutExpired as exc:
-        exit_code = 124
-        stderr_text = "curl_wrapper_timeout"
-        if isinstance(exc.stdout, str):
-            stdout_text = exc.stdout.strip()
-    except OSError as exc:
-        exit_code = 127
-        stderr_text = f"curl_launch_error:{type(exc).__name__}"
-completed_ns = monotonic_ns()
-
-parts = stdout_text.split("\t")
-code = parts[0] if parts and re.fullmatch(r"[0-9]{3}", parts[0]) else "000"
-def float_field(index):
-    try:
-        value = float(parts[index])
-        return value if value >= 0 else None
-    except (IndexError, ValueError):
-        return None
-try:
-    response_bytes = int(float(parts[4]))
-    if response_bytes < 0:
-        response_bytes = None
-except (IndexError, ValueError, OverflowError):
-    response_bytes = None
-
-request_id = None
-try:
-    for line in header_file.read_text(encoding="iso-8859-1").splitlines():
-        name, separator, value = line.partition(":")
-        if separator and name.strip().lower() == "x-p2wlan-status-request-id":
-            request_id = value.strip()
-except OSError:
-    pass
-finally:
-    try:
-        header_file.unlink()
-    except OSError:
-        pass
-
-stderr_text = stderr_text.replace(token, "<redacted>") if token else stderr_text
-stderr_text = re.sub(r"(?i)authorization\s*:\s*bearer\s+\S+", "Authorization: Bearer <redacted>", stderr_text)
-stderr_text = "".join(ch for ch in stderr_text if ch in "\t" or ord(ch) >= 32)[:500]
-record = {
-    "side": side,
-    "target_host_port": host_port,
-    "target_path": parsed.path or "/",
-    "target_process_pid": int(process_pid) if process_pid.isdigit() else None,
-    "target_process_start": process_started,
-    "client_started_monotonic_ns": started_ns,
-    "client_completed_monotonic_ns": completed_ns,
-    "client_duration_ms": round((completed_ns - started_ns) / 1_000_000, 3),
-    "curl_exit_code": exit_code,
-    "http_status": code,
-    "time_connect_s": float_field(1),
-    "time_starttransfer_s": float_field(2),
-    "time_total_s": float_field(3),
-    "response_bytes": response_bytes,
-    "server_request_id": request_id,
-    "curl_stderr": stderr_text,
-}
-print(json.dumps(record, sort_keys=True))
-PY
+  local observer_pid=0 sampler_pid sampler_status
+  if [[ -n "${_TCP_CONTEXT_DIR:-}" ]]; then
+    if [[ "$side" == a ]]; then observer_pid=${_TCP_A_OBSERVER_PID:-0}
+    else observer_pid=${_TCP_B_OBSERVER_PID:-0}; fi
+  fi
+  if [[ "$observer_pid" == 0 ]]; then
+    python3 "$ROOT_DIR/scripts/nat-sim/status_http_sampler.py" "$side" "$url" "$token_file" \
+      "$process_pid" "$timeout_s" "$connect_timeout_s" "$header_file" "$ROOT_DIR" "" 0
+    return $?
+  fi
+  python3 "$ROOT_DIR/scripts/nat-sim/status_http_sampler.py" "$side" "$url" "$token_file" \
+    "$process_pid" "$timeout_s" "$connect_timeout_s" "$header_file" "$ROOT_DIR" \
+    "$_TCP_CONTEXT_DIR" "$observer_pid" &
+  sampler_pid=$!
+  # This function is the original background status Bash. Forward cancellation
+  # to its actual direct child, which owns and joins curl and its observer.
+  trap 'kill -TERM "$sampler_pid" 2>/dev/null || true; wait "$sampler_pid" 2>/dev/null || true; exit 143' TERM
+  trap 'kill -TERM "$sampler_pid" 2>/dev/null || true; wait "$sampler_pid" 2>/dev/null || true; exit 130' INT
+  if wait "$sampler_pid"; then sampler_status=0; else sampler_status=$?; fi
+  trap - TERM INT
+  return "$sampler_status"
 }
 
 record_relay_status_code() {
@@ -933,16 +825,20 @@ sample_relay_status_pair() {
   local b_code_file="$ROUND_DIR/.status-b-code.json"
   local a_pid b_pid a_code b_code a_status b_status
 
+  owned_tcp_select_pair "$a_process_pid" "$b_process_pid" "$DIAG_A_PORT" "$DIAG_B_PORT"
   status_http_code a "$a_url" "$a_token_file" "$a_process_pid" \
     "$timeout_s" "$connect_timeout_s" >"$a_code_file" &
   a_pid=$!
+  if [[ -n "${_TCP_CONTEXT_DIR:-}" ]]; then round_register_process tcp-status-a "$a_pid"; fi
   status_http_code b "$b_url" "$b_token_file" "$b_process_pid" \
     "$timeout_s" "$connect_timeout_s" >"$b_code_file" &
   b_pid=$!
+  if [[ -n "${_TCP_CONTEXT_DIR:-}" ]]; then round_register_process tcp-status-b "$b_pid"; fi
   if wait "$a_pid"; then a_status=0; else a_status=$?; fi
   round_record_wait "$a_pid" "$a_status"
   if wait "$b_pid"; then b_status=0; else b_status=$?; fi
   round_record_wait "$b_pid" "$b_status"
+  owned_tcp_join_pair
   (( a_status == 0 )) || return "$a_status"
   (( b_status == 0 )) || return "$b_status"
   a_code=$(python3 - "$a_code_file" <<'PY'
@@ -1315,6 +1211,13 @@ else
   python3 "$ROOT_DIR/scripts/nat-sim/launch_identity.py" "${SNAPSHOT_ARGS[@]}"
 fi
 ARTIFACT_SET="$BASE_DIR/artifact-set.json"
+if [[ "$NAT_SIM_TCP_OBSERVER" == 1 ]]; then
+  TCP_IMAGE_ARGS=(prepare --base "$BASE_DIR")
+  if [[ -n "${NAT_SIM_REUSE_TCP_OBSERVER:-}" ]]; then TCP_IMAGE_ARGS+=(--reuse "$NAT_SIM_REUSE_TCP_OBSERVER"); fi
+  if ! python3 "$ROOT_DIR/scripts/nat-sim/owned_tcp_manifest.py" "${TCP_IMAGE_ARGS[@]}"; then
+    echo "[nat-sim] owned_tcp_unavailable:image_preparation_failed" >&2
+  fi
+fi
 if [[ "$NAT_SIM_BUILD_ONLY" == 1 ]]; then
   echo "[nat-sim] BUILD ONLY: retained source-verified artifacts; no daemon round executed"
   exit 0

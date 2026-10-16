@@ -98,6 +98,13 @@ jobs:
           set -euo pipefail
           python -B -m unittest discover -s scripts/nat-sim -p 'test_process_birth.py' -v \
             2>&1 | tee "$RUNNER_TEMP/p2wlan-final-native-birth.log"
+      - name: Check original concurrent owned status observers
+        env:
+          P2WLAN_NAT_SIM_TCP_EVIDENCE_DIR: ${{ runner.temp }}/p2wlan-final-owned-tcp-fixture
+        run: |
+          set -euo pipefail
+          python -B -m unittest discover -s scripts/nat-sim -p 'test_owned_tcp_observer.py' -v \
+            2>&1 | tee "$RUNNER_TEMP/p2wlan-final-owned-tcp.log"
       - name: Preserve original native fixture artifacts and output
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
@@ -108,6 +115,8 @@ jobs:
             ${{ runner.temp }}/p2wlan-final-native-capture.log
             ${{ runner.temp }}/p2wlan-final-native-birth-fixture/
             ${{ runner.temp }}/p2wlan-final-native-birth.log
+            ${{ runner.temp }}/p2wlan-final-owned-tcp-fixture/
+            ${{ runner.temp }}/p2wlan-final-owned-tcp.log
           if-no-files-found: error
           retention-days: 14
 

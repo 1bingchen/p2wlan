@@ -236,6 +236,10 @@ case "$PROFILE" in
       -s "$ROOT_DIR/scripts/nat-sim" \
       -p 'test_udp_egress*.py' \
       -v 2>&1 | tee "${ARTIFACT_DIR}-egress.log"
+    python3 -B -m unittest discover \
+      -s "$ROOT_DIR/scripts/nat-sim" \
+      -p 'test_owned_tcp_observer.py' \
+      -v 2>&1 | tee "${ARTIFACT_DIR}-owned-tcp.log"
     ;;
   direct)
     run_single_attempt \

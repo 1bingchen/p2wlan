@@ -17,12 +17,30 @@ CAP = 65536
 MAX_CYCLES = 50
 SENSITIVE = re.compile(r"token|secret|password|private|authorization|bearer|-----BEGIN|-----END", re.I)
 OPAQUE = re.compile(r"[A-Za-z0-9_+/=-]{40,}")
+UNAVAILABLE_REASONS = frozenset({
+    "symlink", "not_single_regular_file", "file_capacity", "file_changed_or_capacity",
+    "readiness_contract", "readiness_identity_mismatch", "readiness_process_mismatch",
+    "sample_capacity", "sample_type", "sample_time", "sample_order", "http_status",
+    "sample_boolean", "exception_type", "dropped_samples",
+})
+
+
+def unavailable_reason(error: Exception) -> str:
+    if isinstance(error, FileNotFoundError):
+        return "missing_source"
+    if isinstance(error, OSError):
+        return "source_io_error"
+    # Only our fixed codes may leave the collector. Parse errors can carry
+    # the source document; neither their text nor filenames are evidence.
+    if len(error.args) == 1 and type(error.args[0]) is str and error.args[0] in UNAVAILABLE_REASONS:
+        return error.args[0]
+    return "invalid_evidence"
 
 
 def bounded_file(path: Path, *, tail: bool = False) -> tuple[bytes, dict]:
     if path.is_symlink():
         raise ValueError("symlink")
-    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
     try:
         before = os.fstat(descriptor)
         if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
@@ -119,8 +137,8 @@ def collect(document: dict, output: Path) -> dict:
                     value = readiness(raw, document, cycle)
                     (target / name).write_text(json.dumps(value, indent=2) + "\n")
                 row[name] = {"state": "collected", **info}
-            except (OSError, ValueError, TypeError, KeyError):
-                row[name] = {"state": "unavailable"}
+            except (OSError, ValueError, TypeError, KeyError) as error:
+                row[name] = {"state": "unavailable", "reason": unavailable_reason(error)}
         rows.append(row)
     result = {"schema_version": 1, "source_head_sha": document["source_head_sha"], "workflow_sha": document["workflow_sha"], "original_cycles": len(cycles), "cycle_capacity": MAX_CYCLES, "file_read_capacity": CAP, "changes_original_verdict": False, "rows": rows}
     (output / "collection.json").write_text(json.dumps(result, indent=2) + "\n")

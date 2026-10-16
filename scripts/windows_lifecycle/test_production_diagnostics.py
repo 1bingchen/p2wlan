@@ -6,6 +6,7 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+from unittest.mock import patch
 
 import production_diagnostics as diagnostic
 
@@ -30,6 +31,7 @@ class ProductionDiagnosticTests(unittest.TestCase):
         self.assertTrue(result["rows"][0]["forced_termination"])
         self.assertEqual(result["rows"][0]["daemon.log"]["state"], "unavailable")
         self.assertEqual(result["rows"][0]["readiness.json"]["state"], "unavailable")
+        self.assertEqual(result["rows"][0]["daemon.log"]["reason"], "missing_source")
 
     def test_only_bounded_allowlisted_evidence_is_copied_without_credentials(self):
         secret = "gh" + "p_" + "X" * 40
@@ -73,6 +75,37 @@ class ProductionDiagnosticTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             diagnostic.bounded_file(path)
 
+    def test_byte_identity_survives_crt_text_translation_defaults(self):
+        path = self.directory / "daemon.log"
+        raw = b"first startup\r\nTUN initialization\r\n\x1aafter control-Z\r\n"
+        path.write_bytes(raw)
+        real_open, real_read = os.open, os.read
+        native_binary = getattr(os, "O_BINARY", 0)
+        binary_flag = 1 << 28
+        modes = {}
+
+        def crt_open(filename, flags):
+            descriptor = real_open(filename, (flags & ~binary_flag) | native_binary)
+            modes[descriptor] = bool(flags & binary_flag)
+            return descriptor
+
+        def crt_read(descriptor, count):
+            data = real_read(descriptor, count)
+            if not modes[descriptor]:
+                return data.replace(b"\r\n", b"\n").split(b"\x1a", 1)[0]
+            return data
+
+        # Exercise untranslated length/offset/identity semantics on every OS.
+        # Native Windows also runs this alongside the original CRLF fixture.
+        with patch.object(os, "O_BINARY", binary_flag, create=True), \
+                patch.object(os, "open", side_effect=crt_open), \
+                patch.object(os, "read", side_effect=crt_read):
+            data, metadata = diagnostic.bounded_file(path, tail=True)
+        self.assertEqual(data, raw)
+        self.assertEqual(metadata["source_bytes"], len(raw))
+        self.assertFalse(metadata["truncated_prefix"])
+        self.assertEqual(path.read_bytes(), raw)
+
     def test_aliases_and_cycle_capacity_are_rejected(self):
         path = self.directory / "daemon.log"
         path.write_text("original startup\n")
@@ -84,6 +117,17 @@ class ProductionDiagnosticTests(unittest.TestCase):
         wrong["cycles"] *= 51
         with self.assertRaises(ValueError):
             diagnostic.collect(wrong, self.base / "output")
+
+    def test_unavailable_reasons_never_copy_arbitrary_errors_or_source_content(self):
+        marker = "fixture-only-sensitive-value"
+        (self.directory / "readiness.json").write_text("bad-json " + marker)
+        output = self.base / "output"
+        result = diagnostic.collect(self.document, output)
+        self.assertEqual(result["rows"][0]["readiness.json"]["reason"], "invalid_evidence")
+        self.assertNotIn(marker, (output / "collection.json").read_text())
+        self.assertEqual(diagnostic.unavailable_reason(ValueError(marker)), "invalid_evidence")
+        self.assertEqual(diagnostic.unavailable_reason(ValueError("file_changed_or_capacity")), "file_changed_or_capacity")
+        self.assertEqual(diagnostic.unavailable_reason(PermissionError(marker)), "source_io_error")
 
 
 @unittest.skipUnless(shutil.which("pwsh"), "requires the actual PowerShell runtime")

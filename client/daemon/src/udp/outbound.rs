@@ -2125,6 +2125,8 @@ impl UdpTransport {
                 .await
             {
                 Ok(nonce) => {
+                    #[cfg(test)]
+                    self.trace_consent(nonce, ConsentStage::SendReturned);
                     let local_endpoint = self
                         .pending_probes
                         .lock()
@@ -2169,6 +2171,15 @@ impl UdpTransport {
         sleep(ack_timeout).await;
         for (peer_id, endpoint, nonce) in sent {
             let unanswered = self.pending_probes.lock().await.remove(&nonce);
+            #[cfg(test)]
+            self.trace_consent(
+                nonce,
+                if unanswered.is_some() {
+                    ConsentStage::RoundRemovedPending
+                } else {
+                    ConsentStage::RoundPendingAbsent
+                },
+            );
             let Some(pending) = unanswered else {
                 continue;
             };

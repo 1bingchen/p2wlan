@@ -135,6 +135,8 @@ impl UdpTransport {
             #[cfg(test)]
             probe_burst_capture_for_test: None,
             #[cfg(test)]
+            consent_trace: None,
+            #[cfg(test)]
             fresh_mapping_generation_gate: Arc::new(StdMutex::new(None)),
             #[cfg(test)]
             remote_incarnation_cleanup_gate: Arc::new(std::sync::Mutex::new(None)),

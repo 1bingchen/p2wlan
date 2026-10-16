@@ -49,9 +49,22 @@ jobs:
           RUSTDOCFLAGS: "-D warnings"
         run: cargo doc --locked -p p2wlan-daemon --lib --no-deps --all-features
       - name: Rust Tests (general suite)
-        run: cargo test --workspace --all-targets -- --test-threads=1 --skip hard_hard_
+        id: general_tests
+        run: python3 scripts/quality/run_cargo_test.py --all-targets --evidence-dir "${{ runner.temp }}/p2wlan-rust-general"
+      - name: Retain original general-suite failure (Linux)
+        if: ${{ failure() && steps.general_tests.outcome == 'failure' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: rust-general-first-failure-linux-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/p2wlan-rust-general/
+          if-no-files-found: error
+          retention-days: 7
       - name: Rust Tests (Hard↔Hard isolated suite)
         run: python3 scripts/quality/run_rust_tests.py hard_hard_ --each
+      - name: Rust Tests (Hard↔Hard NAT strategy suite)
+        run: python3 scripts/quality/run_rust_tests.py hard_hard_ --package p2pnet-nat --each
+      - name: Rust Tests (Hard↔Hard daemon command entrypoint)
+        run: python3 scripts/quality/run_rust_tests.py hard_hard_ --bin p2wlan-daemon --each
       - name: Linux route gate tests
         run: "python3 scripts/quality/run_rust_tests.py route::tests::"
       - name: Daemon ownership regressions (privileged Linux)
@@ -104,9 +117,22 @@ jobs:
       - name: Rust Fmt Check (Windows)
         run: cargo fmt --all -- --check
       - name: Rust Tests (Windows, general suite)
-        run: cargo test --workspace -- --test-threads=1 --skip hard_hard_
+        id: general_tests
+        run: python scripts/quality/run_cargo_test.py --evidence-dir "${{ runner.temp }}/p2wlan-rust-general"
+      - name: Retain original general-suite failure (Windows)
+        if: ${{ failure() && steps.general_tests.outcome == 'failure' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: rust-general-first-failure-windows-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/p2wlan-rust-general/
+          if-no-files-found: error
+          retention-days: 7
       - name: Rust Tests (Windows, Hard↔Hard isolated suite)
         run: python scripts/quality/run_rust_tests.py hard_hard_ --each
+      - name: Rust Tests (Hard↔Hard NAT strategy suite)
+        run: python scripts/quality/run_rust_tests.py hard_hard_ --package p2pnet-nat --each
+      - name: Rust Tests (Hard↔Hard daemon command entrypoint)
+        run: python scripts/quality/run_rust_tests.py hard_hard_ --bin p2wlan-daemon --each
 
   go:
     name: Go Check

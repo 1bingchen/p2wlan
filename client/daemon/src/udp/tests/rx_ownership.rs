@@ -28,12 +28,7 @@ async fn observed_workload(enabled: bool) -> serde_json::Value {
         DataPlane::new_bidirectional_for_daemon(tun, peers.clone(), false, capture.clone());
     plane = plane.with_overlay_cidr("10.20.0.0/16");
     assert_eq!(inbound.max_capacity(), 1024);
-    let (wg, _out) = WireGuardTransport::new();
-    let wg = if let Some(c) = &capture {
-        wg.with_resource_capture(c.clone()).unwrap()
-    } else {
-        wg
-    };
+    let (wg, _out) = WireGuardTransport::new_for_daemon(false, capture.clone());
     let (mut remote, local) = establish_sessions();
     assert!(!wg.add_session("peer-a", local).await);
     let udp = UdpTransport::bind("127.0.0.1:0".parse().unwrap(), peers.clone())
@@ -50,8 +45,14 @@ async fn observed_workload(enabled: bool) -> serde_json::Value {
     let (tx, rx) = EncryptedRxSink::channel(1024, capture.clone());
     assert_eq!(tx.max_capacity(), 1024);
     let (ready, mut readiness) = oneshot::channel();
-    let mut reader =
-        Box::pin(udp.run_inbound_socket_inner(0, udp.socket.clone(), tx, None, Some(ready)));
+    let (_shutdown, mut shutdown_rx) = watch::channel(false);
+    let mut reader = Box::pin(udp.run_inbound_socket_inner(
+        0,
+        udp.socket.clone(),
+        tx,
+        Some(&mut shutdown_rx),
+        Some(ready),
+    ));
     let mut decrypt = Box::pin(wg.run_inbound_with_peers_live_udp_and_relay(
         rx,
         inbound,
@@ -191,8 +192,14 @@ async fn rx_ownership_real_udp_waiting_wire_and_queued_wire_drop_on_cancel_or_cl
             .unwrap();
         let (tx, rx) = EncryptedRxSink::channel(1, Some(c.clone()));
         let (txready, mut ready) = oneshot::channel();
-        let mut reader =
-            Box::pin(udp.run_inbound_socket_inner(0, udp.socket.clone(), tx, None, Some(txready)));
+        let (_shutdown, mut shutdown_rx) = watch::channel(false);
+        let mut reader = Box::pin(udp.run_inbound_socket_inner(
+            0,
+            udp.socket.clone(),
+            tx,
+            Some(&mut shutdown_rx),
+            Some(txready),
+        ));
         poll_fn(|cx| {
             assert!(reader.as_mut().poll(cx).is_pending());
             Poll::Ready(())
@@ -240,10 +247,10 @@ async fn rx_ownership_real_udp_waiting_wire_and_queued_wire_drop_on_cancel_or_cl
         if close {
             drop(rx);
             assert_eq!(c.residency_snapshot().total.unwrap().live_buffers, 2);
-            tokio::time::timeout_at(end, reader.as_mut())
-                .await
-                .unwrap()
-                .unwrap();
+            assert!(matches!(
+                tokio::time::timeout_at(end, reader.as_mut()).await.unwrap(),
+                Err(crate::error::DaemonError::Network(_))
+            ));
             assert_eq!(c.residency_snapshot().total.unwrap().live_buffers, 0);
             drop(reader);
         } else {

@@ -24,8 +24,7 @@ fn pair(index: u32) -> (TransportSession, TransportSession) {
 #[tokio::test]
 async fn rx_ownership_parsed_payload_lives_during_original_session_lock_wait() {
     let c = ResourceCapture::new([0xe1; 16]);
-    let (t, _out) = WireGuardTransport::new();
-    let t = t.with_resource_capture(c.clone()).unwrap();
+    let (t, _out) = WireGuardTransport::new_for_daemon(false, Some(c.clone()));
     let (mut remote, _local) = pair(77);
     let wire = remote.encrypt_to_bytes(b"parsed-wait-owner").unwrap();
     let lock = t.sessions.lock().await;
@@ -62,8 +61,7 @@ async fn rx_ownership_parsed_payload_lives_during_original_session_lock_wait() {
 async fn pending_wait(cancel: bool) {
     let end = tokio::time::Instant::now() + Duration::from_secs(2);
     let c = ResourceCapture::new([0xe2; 16]);
-    let (t, _out) = WireGuardTransport::new();
-    let t = t.with_resource_capture(c.clone()).unwrap();
+    let (t, _out) = WireGuardTransport::new_for_daemon(false, Some(c.clone()));
     let (mut remote, local) = pair(81);
     assert!(matches!(
         t.stage_responder_session("resource-peer", "owner-pending".into(), local)
@@ -136,8 +134,7 @@ async fn rx_ownership_pending_plaintext_original_handoff_keeps_exact_capacity() 
 async fn rx_ownership_active_and_previous_keys_retain_actual_plaintext_and_reject_replay() {
     for previous in [false, true] {
         let c = ResourceCapture::new([0xe3; 16]);
-        let (t, _out) = WireGuardTransport::new();
-        let t = t.with_resource_capture(c.clone()).unwrap();
+        let (t, _out) = WireGuardTransport::new_for_daemon(false, Some(c.clone()));
         let (mut remote, local) = pair(91);
         assert!(!t.add_session("resource-peer", local).await);
         if previous {
@@ -173,8 +170,7 @@ async fn rx_ownership_active_and_previous_keys_retain_actual_plaintext_and_rejec
 #[tokio::test]
 async fn rx_ownership_malformed_and_unknown_receiver_have_no_authenticated_owner() {
     let c = ResourceCapture::new([0xe4; 16]);
-    let (t, _out) = WireGuardTransport::new();
-    let t = t.with_resource_capture(c.clone()).unwrap();
+    let (t, _out) = WireGuardTransport::new_for_daemon(false, Some(c.clone()));
     assert!(t.decrypt_inbound_with_source(b"bad").await.is_err());
     assert_eq!(c.residency_snapshot().total.unwrap().live_buffers, 0);
     let (mut remote, _local) = pair(111);

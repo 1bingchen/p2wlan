@@ -443,7 +443,7 @@ impl OriginalSessionSource {
 }
 
 pub(crate) struct DecryptedInboundWithSource {
-    pub(crate) packet: InboundPacket,
+    pub(crate) packet: crate::dataplane_resources::RxOwned<InboundPacket>,
     pub(crate) source: OriginalSessionSource,
 }
 

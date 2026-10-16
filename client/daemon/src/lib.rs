@@ -133,7 +133,7 @@ use connection_timeline::ConnectionTimeline;
 #[cfg(test)]
 use control::RelayCatalogEntry;
 use control::{ControlClient, ControlEvent, PeerOfferSendFailure};
-use dataplane::{DataPlane, InboundPacket, OutboundPacket};
+use dataplane::{DataPlane, OutboundPacket};
 use diagnostics::{
     run_diagnostics_server_with_retry_ready, run_speedtest_server_with_retry, DiagnosticsContext,
 };
@@ -173,8 +173,7 @@ use relay_runtime::{relay_spec_is_plaintext, send_relay_validation_packet, Relay
 use transport::parse_direct_validation_token;
 use transport::{
     build_direct_validation_payload, DirectValidationKind, InboundEvidenceFeed,
-    ReceivedEncryptedPacket, ResponderSessionCommit, ResponderSessionStage, TransportSessionStatus,
-    WireGuardTransport,
+    ResponderSessionCommit, ResponderSessionStage, TransportSessionStatus, WireGuardTransport,
 };
 use udp::{
     FreshMappingOutcome, FreshMappingRejection, FreshMappingResult, HardHardBirthdayResult,

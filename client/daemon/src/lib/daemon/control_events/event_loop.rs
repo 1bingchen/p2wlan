@@ -85,8 +85,9 @@ impl Daemon {
     async fn run_control_event_loop(
         &mut self,
         relay_started: &mut bool,
-        network_inbound_tx: mpsc::Sender<ReceivedEncryptedPacket>,
+        network_inbound_tx: impl Into<crate::dataplane_resources::EncryptedRxSink>,
     ) {
+        let network_inbound_tx = network_inbound_tx.into();
         // Process control events until shutdown is requested.
         // Move the receiver out first so the event loop can hold immutable
         // borrows of the daemon in its cooperative slow-work set.  All daemon

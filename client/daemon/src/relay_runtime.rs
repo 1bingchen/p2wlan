@@ -44,7 +44,7 @@ use crate::relay::{
 #[cfg(test)]
 use crate::transport::build_relay_validation_payload;
 
-use crate::transport::{ReceivedEncryptedPacket, WireGuardTransport};
+use crate::transport::WireGuardTransport;
 
 use super::{is_stun_clear_value, unix_time_millis};
 
@@ -83,7 +83,7 @@ pub(super) struct RelaySupervisor {
     pub(super) peers: Arc<PeerManager>,
     pub(super) relay_transport: Arc<RwLock<Option<RelayTransport>>>,
     pub(super) relay_selection: Arc<RwLock<RelaySelectionDiagnostics>>,
-    pub(super) inbound_tx: mpsc::Sender<ReceivedEncryptedPacket>,
+    pub(super) inbound_tx: crate::dataplane_resources::EncryptedRxSink,
     /// Android's physical-network callback stream. `None` on desktop, where
     /// the existing stable route monitor remains the authority.
     pub(super) android_network_change_rx: Option<crate::AndroidNetworkChangeReceiver>,

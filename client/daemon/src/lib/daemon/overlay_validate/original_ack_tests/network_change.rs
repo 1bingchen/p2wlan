@@ -32,7 +32,8 @@ fn context(
             .supervisor_encrypted_input
             .as_ref()
             .ok_or("supervised original WG ingress sender missing")?
-            .clone(),
+            .clone()
+            .into(),
         local_node_id: endpoint.node.into(),
         stun_servers: Vec::new(),
         stun_server_specs: vec!["off".into()],

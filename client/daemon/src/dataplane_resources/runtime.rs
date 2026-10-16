@@ -58,6 +58,16 @@ impl RuntimeResourceCapture {
             ResidencyStage::SessionFlush,
             ResidencyStage::UdpReaderStorage,
             ResidencyStage::TunReaderStorage,
+            ResidencyStage::RxWireAdmission,
+            ResidencyStage::RxWireChannel,
+            ResidencyStage::RxWireActive,
+            ResidencyStage::RxParsedPayload,
+            ResidencyStage::RxAuthenticatedPlaintext,
+            ResidencyStage::RxPlaintextAdmission,
+            ResidencyStage::RxPlaintextChannel,
+            ResidencyStage::RxPlaintextActive,
+            ResidencyStage::RxTunPacket,
+            ResidencyStage::RxTunNormalized,
         ];
         let stages = STAGES.map(|stage| {
             json!({
@@ -104,7 +114,7 @@ impl RuntimeResourceCapture {
                     "whole_pipeline_bytes_measured":legacy.total_pipeline_bytes_measured,
                     "resident_set_bytes_measured":false,
                     "capacity_semantics":"observed_logical_vec_owner_lifetimes",
-                    "excludes":["rx_ownership","control_buffers","relay_frames","crypto_temporaries","container_metadata","allocator_and_kernel"],
+                    "excludes":["rx_outside_observed_handoffs","control_buffers","relay_frames_before_daemon_handoff","crypto_temporaries","container_metadata","allocator_and_kernel"],
                 },
             },
         })

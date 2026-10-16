@@ -44,3 +44,7 @@ include!("relay/rendezvous.rs");
 mod tests {
     include!("relay/tests.rs");
 }
+
+#[cfg(test)]
+#[path = "relay/rx_ownership_tests.rs"]
+mod rx_ownership_tests;

@@ -53,8 +53,8 @@ impl WireGuardTransport {
     /// `Option<UdpTransport>` setup.
     pub(crate) async fn run_inbound_with_peers_live_udp_and_relay(
         &self,
-        encrypted_rx: mpsc::Receiver<ReceivedEncryptedPacket>,
-        inbound_tx: mpsc::Sender<InboundPacket>,
+        encrypted_rx: impl Into<crate::dataplane_resources::EncryptedRxReceiver>,
+        inbound_tx: impl Into<crate::dataplane_resources::PlaintextRxSink>,
         peers: Option<Arc<PeerManager>>,
         udp_updates: watch::Receiver<Option<crate::udp::UdpTransport>>,
         evidence: Option<InboundEvidenceFeed>,
@@ -93,13 +93,20 @@ impl WireGuardTransport {
 
     pub(in crate::transport) async fn run_inbound_with_udp_source(
         &self,
-        mut encrypted_rx: mpsc::Receiver<ReceivedEncryptedPacket>,
-        inbound_tx: mpsc::Sender<InboundPacket>,
+        encrypted_rx: impl Into<crate::dataplane_resources::EncryptedRxReceiver>,
+        inbound_tx: impl Into<crate::dataplane_resources::PlaintextRxSink>,
         peers: Option<Arc<PeerManager>>,
         udp_source: InboundUdpTransport,
         evidence: Option<InboundEvidenceFeed>,
     ) -> Result<()> {
-        while let Some(packet) = encrypted_rx.recv().await {
+        let mut encrypted_rx = encrypted_rx.into();
+        let inbound_tx = inbound_tx.into();
+        while let Some(delivery) = encrypted_rx.recv(self.resource_capture()).await {
+            let parts = delivery.into_parts();
+            // This guard precedes the original packet local: cancellation and
+            // every early exit free its Vec before retiring its observation.
+            let _wire_resources = parts.0;
+            let packet = parts.1;
             let profiler = global_dataplane_profiler();
             let sampled = packet.profile_sampled;
             let transport_dequeued = Instant::now();
@@ -154,9 +161,12 @@ impl WireGuardTransport {
             let decrypt_started = Instant::now();
             match self.decrypt_inbound_with_source(&packet.wire_bytes).await {
                 Ok(Some(DecryptedInboundWithSource {
-                    packet: mut inbound,
+                    packet: owned_inbound,
                     source: original_session_source,
                 })) => {
+                    let parts = owned_inbound.into_parts();
+                    let plaintext_resources = parts.0;
+                    let mut inbound = parts.1;
                     let overlay_source =
                         overlay_origin.map(|origin| origin.authenticated(original_session_source));
                     #[cfg(test)]
@@ -1453,9 +1463,15 @@ impl WireGuardTransport {
                             );
                         }
                     }
-                    inbound_tx.send(inbound).await.map_err(|_| {
-                        DaemonError::Network("inbound packet channel closed".to_string())
-                    })?;
+                    inbound_tx
+                        .send_owned(crate::dataplane_resources::RxOwned::from_parts(
+                            inbound,
+                            plaintext_resources,
+                        ))
+                        .await
+                        .map_err(|_| {
+                            DaemonError::Network("inbound packet channel closed".to_string())
+                        })?;
                 }
                 Ok(None) => {
                     debug!("Inbound encrypted packet has no matching WireGuard session");

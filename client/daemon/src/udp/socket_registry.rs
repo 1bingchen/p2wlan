@@ -482,11 +482,19 @@ impl UdpTransport {
     /// attached punch sockets can start their own readers with the same
     /// receive destination.
     pub fn with_inbound_channel(mut self, tx: mpsc::Sender<ReceivedEncryptedPacket>) -> Self {
+        self.inbound_tx = Some(tx.into());
+        self
+    }
+
+    pub(crate) fn with_inbound_sink(
+        mut self,
+        tx: crate::dataplane_resources::EncryptedRxSink,
+    ) -> Self {
         self.inbound_tx = Some(tx);
         self
     }
 
-    pub(super) fn inbound_channel(&self) -> Option<mpsc::Sender<ReceivedEncryptedPacket>> {
+    pub(super) fn inbound_channel(&self) -> Option<crate::dataplane_resources::EncryptedRxSink> {
         self.inbound_tx.clone()
     }
 

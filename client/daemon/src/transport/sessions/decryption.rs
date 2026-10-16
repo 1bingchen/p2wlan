@@ -15,7 +15,7 @@ impl WireGuardTransport {
     ) -> std::result::Result<Option<InboundPacket>, InboundDecryptError> {
         self.decrypt_inbound_with_source(wire_bytes)
             .await
-            .map(|inbound| inbound.map(|inbound| inbound.packet))
+            .map(|inbound| inbound.map(|inbound| inbound.packet.into_unobserved()))
     }
 
     pub(in crate::transport) async fn decrypt_inbound_with_source(
@@ -31,6 +31,11 @@ impl WireGuardTransport {
                 &msg.encrypted_payload,
             );
         }
+        let msg = crate::dataplane_resources::RxOwned::observe(
+            msg,
+            self.resource_capture(),
+            crate::dataplane_resources::ResidencyStage::RxParsedPayload,
+        );
         let receiver_index = msg.receiver_index;
 
         let mut sessions = self.sessions.lock().await;
@@ -69,6 +74,11 @@ impl WireGuardTransport {
                             &packet,
                         );
                     }
+                    let packet = crate::dataplane_resources::RxOwned::observe(
+                        packet,
+                        self.resource_capture(),
+                        crate::dataplane_resources::ResidencyStage::RxAuthenticatedPlaintext,
+                    );
                     let token = active
                         .awaiting_confirmation
                         .then(|| active.token.clone())
@@ -106,14 +116,14 @@ impl WireGuardTransport {
                 self.remember_promoted_responder_token(&peer_id, token);
             }
             return Ok(Some(DecryptedInboundWithSource {
-                packet: InboundPacket {
+                packet: packet.map(|packet| InboundPacket {
                     authenticated_ingress: None,
                     peer_id,
                     packet,
                     session_instance: Some(session_instance),
                     from_previous_session: false,
                     trace: None,
-                },
+                }),
                 source,
             }));
         }
@@ -137,6 +147,11 @@ impl WireGuardTransport {
                                 &packet,
                             );
                         }
+                        let packet = crate::dataplane_resources::RxOwned::observe(
+                            packet,
+                            self.resource_capture(),
+                            crate::dataplane_resources::ResidencyStage::RxAuthenticatedPlaintext,
+                        );
                         let source = self.original_session_source(
                             peer_id,
                             pending.slot.session_instance,
@@ -217,14 +232,14 @@ impl WireGuardTransport {
                 self.flush_pending_outbound_for_peer(&peer_id).await;
             }
             return Ok(Some(DecryptedInboundWithSource {
-                packet: InboundPacket {
+                packet: packet.map(|packet| InboundPacket {
                     authenticated_ingress: None,
                     peer_id,
                     packet,
                     session_instance: Some(session_instance),
                     from_previous_session: false,
                     trace: None,
-                },
+                }),
                 source,
             }));
         }
@@ -246,6 +261,11 @@ impl WireGuardTransport {
                             &packet,
                         );
                     }
+                    let packet = crate::dataplane_resources::RxOwned::observe(
+                        packet,
+                        self.resource_capture(),
+                        crate::dataplane_resources::ResidencyStage::RxAuthenticatedPlaintext,
+                    );
                     let source = self.original_session_source(
                         peer_id,
                         previous.slot.session_instance,
@@ -253,14 +273,14 @@ impl WireGuardTransport {
                         previous.slot.authorized_peer_lifecycle,
                     );
                     return Ok(Some(DecryptedInboundWithSource {
-                        packet: InboundPacket {
+                        packet: packet.map(|packet| InboundPacket {
                             authenticated_ingress: None,
                             peer_id: peer_id.clone(),
                             packet,
                             session_instance: Some(previous.slot.session_instance),
                             from_previous_session: true,
                             trace: None,
-                        },
+                        }),
                         source,
                     }));
                 }
@@ -367,3 +387,7 @@ impl WireGuardTransport {
 #[cfg(test)]
 #[path = "tests/decryption.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "tests/rx_ownership.rs"]
+mod rx_ownership_tests;

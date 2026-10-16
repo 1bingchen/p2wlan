@@ -160,3 +160,6 @@ mod fixed_reader_storage;
 
 #[path = "tests/direct_origin.rs"]
 mod direct_origin;
+
+#[path = "tests/rx_ownership.rs"]
+mod rx_ownership;

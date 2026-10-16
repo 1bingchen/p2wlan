@@ -243,7 +243,11 @@ impl Daemon {
                 "outbound packet receiver already attached".to_string(),
             ));
         };
-        let (network_inbound_tx, network_inbound_rx) = mpsc::channel(1024);
+        let (network_inbound_tx, network_inbound_rx) =
+            crate::dataplane_resources::EncryptedRxSink::channel(
+                1024,
+                self.transport.resource_capture().cloned(),
+            );
 
         // Relay setup is the availability path.  Start it immediately after
         // control registration/TUN setup, before any best-effort STUN DNS

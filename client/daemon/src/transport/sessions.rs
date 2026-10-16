@@ -248,6 +248,25 @@ impl PeerTransportSessions {
 }
 
 impl WireGuardTransport {
+    /// Select the original channel capacity before any worker or clone exists.
+    /// Tracked envelopes can carry only observer metadata, without a request
+    /// binding; enabling observations never mints delivery authority.
+    pub(crate) fn new_for_daemon(
+        track_requests: bool,
+        capture: Option<Arc<crate::dataplane_resources::ResourceCapture>>,
+    ) -> (Self, crate::request_carriage::RawOutboundReceiver) {
+        if !track_requests && capture.is_none() {
+            let (transport, receiver) = Self::new();
+            return (transport, receiver.into());
+        }
+        let (mut transport, receiver) = Self::new_with_request_carriage();
+        if let Some(capture) = capture {
+            transport.outbound_tx = transport.outbound_tx.with_resource_capture(capture.clone());
+            transport.resource_capture = Some(capture);
+        }
+        (transport, receiver.into())
+    }
+
     /// Create a transport adapter and a receiver for RAW routed outbound
     /// packets.  The network outbound worker consumes the receiver and is the
     /// only place that encrypts business packets (under the per-peer emit

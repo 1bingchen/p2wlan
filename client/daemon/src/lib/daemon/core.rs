@@ -31,6 +31,8 @@ impl CandidatePostprocessTestGate {
 ///
 /// Holds all subsystems and coordinates their lifecycle.
 pub struct Daemon {
+    /// One optional observer run, shared by the original packet owners only.
+    resource_capture: Option<Arc<crate::dataplane_resources::RuntimeResourceCapture>>,
     /// Configuration.
     config: Arc<Config>,
     /// Control plane client.
@@ -212,19 +214,12 @@ impl Daemon {
             Some(health.clone()),
             Some(peers.telemetry_hub()),
         );
-        let (transport, outbound_rx) = if config.network.validate_overlay {
-            let (transport, rx) = WireGuardTransport::new_with_request_carriage();
-            (
-                transport,
-                crate::request_carriage::RawOutboundReceiver::from(rx),
-            )
-        } else {
-            let (transport, rx) = WireGuardTransport::new();
-            (
-                transport,
-                crate::request_carriage::RawOutboundReceiver::from(rx),
-            )
-        };
+        let resource_capture =
+            crate::dataplane_resources::RuntimeResourceCapture::from_config(&config.diagnostics);
+        let (transport, outbound_rx) = WireGuardTransport::new_for_daemon(
+            config.network.validate_overlay,
+            resource_capture.as_ref().map(|run| run.capture().clone()),
+        );
         let acl_engine = AclEngine::from_config(&config.acl);
         let route_manager = Arc::new(route::RouteManager::new(config.network.interface.clone()));
 
@@ -293,6 +288,7 @@ impl Daemon {
         }
 
         Self {
+            resource_capture,
             config: Arc::new(config.clone()),
             control,
             control_rx,

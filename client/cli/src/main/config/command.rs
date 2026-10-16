@@ -100,6 +100,7 @@ fn config_command(path: &Path, command: ConfigCommand) -> Result<(), String> {
                 config.relay.relay_startup_timeout_ms
             );
             println!("diagnostics = {}", config.diagnostics.bind);
+            println!("resource-capture = {}", config.diagnostics.resource_capture);
             Ok(())
         }
         ConfigCommand::Set { key, value } => {

@@ -165,6 +165,14 @@ impl UdpTransport {
         mut self,
         capture: Arc<crate::dataplane_resources::ResourceCapture>,
     ) -> std::result::Result<Self, crate::dataplane_resources::EnableError> {
+        self.attach_resource_capture(capture)?;
+        Ok(self)
+    }
+
+    pub(crate) fn attach_resource_capture(
+        &mut self,
+        capture: Arc<crate::dataplane_resources::ResourceCapture>,
+    ) -> std::result::Result<(), crate::dataplane_resources::EnableError> {
         if self.resource_capture.is_some() {
             return Err(crate::dataplane_resources::EnableError::AlreadyEnabled);
         }
@@ -172,7 +180,7 @@ impl UdpTransport {
             return Err(crate::dataplane_resources::EnableError::CaptureFinished);
         }
         self.resource_capture = Some(capture);
-        Ok(self)
+        Ok(())
     }
 
     #[allow(dead_code)]

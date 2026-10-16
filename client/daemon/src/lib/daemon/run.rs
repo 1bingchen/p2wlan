@@ -467,7 +467,8 @@ impl Daemon {
                 self.config.diagnostics.auth_token.clone(),
                 runtime_incarnation,
             )
-            .with_room_authorization(self.control.room_authorization().await);
+            .with_room_authorization(self.control.room_authorization().await)
+            .with_resource_capture(self.resource_capture.clone());
             let shutdown_rx = self.shutdown_rx.clone();
             let (diagnostics_ready_tx, diagnostics_ready_rx) = tokio::sync::oneshot::channel();
             self.task_manager
@@ -629,6 +630,9 @@ impl Daemon {
         self.udp_transport_publication.clear_current().await;
         self.request_shutdown();
         self.task_manager.shutdown_all(Duration::from_secs(5)).await;
+        if let Some(capture) = &self.resource_capture {
+            capture.capture().finish();
+        }
         self.route_manager.cleanup();
         Ok(())
     }

@@ -77,6 +77,33 @@ control_reconnect_counter_survives_timeline_eviction 是必须保持的回归契
 
 已移交 flush 任务的 FIFO 及任务正在处理的包不在 actor pending 读数内；任务数不能换算成包数。channel 字节深度、session 层 pending、上游队列、生产者等待提交的包及加密/重试副本不由这些字段覆盖。资源报告携带 `total_logical_bytes_measured=false`，表示整条逻辑流水线的总字节尚未计量；上述原始包长度也不是实际分配内存或 RSS。
 
+## 软件缓冲资源观测
+
+`p2wlan config set resource-capture true` 保存显式开关并启用本地诊断，重启对应 daemon 后用 `p2wlan status --resources` 读取。该命令访问原实例令牌保护的 `GET /resources`，不需要输出或手工复制令牌。缺省关闭；未启用时返回 `enabled=false`、`capture=null`。接口只读取固定数量的观测字段，不读取 peer、会话或 UDP 状态锁，不参与 `/status` 的 revision 语义，也不改变发送权限、队列容量和期限。
+
+schema 1 的 `capture.id` 是每次观测随机生成的标签，不能跨进程拼接。`read_started_us`、`read_completed_us` 使用该次观测的单调时钟，既不是 Unix 时间，也不是其他诊断对象的时间线。`ended=true` 表示不再接纳新的观察；此前的消息 lease 仍可释放，不能把结束标记当作所有缓冲已排空。
+
+`site_and_lexical_counters` 包含 12 个固定 Vec 站点的物化操作、已知复制字节和目标长度/容量累计值，以及两个 FIFO、五类局部缓冲 lease 的读数。该组 `coherent=false`：多个原子量并非同一事务；读取必须结合 `valid`、`gap_bits` 及各站点/作用域是否实际观察到。目标容量累计值不是存活内存峰值。这组数与下面的所有者观测有重叠，不能相加。
+
+`observed_owner_residency` 单独读取十个实际 Vec 所有者阶段：channel reserve、raw channel、detached raw、pending FIFO、discard batch、retry/preparation plaintext、serialized wire、session backlog/flush。正常生产 TUN 和显式 Mock TUN 验证入口在启用后共用同一 capture，原 WireGuard 与每次重建的 UDP transport 继承该次观测。默认通道与原容量保持；仅为观察而创建的消息不具有原请求 binding。
+
+启用后通道使用带观测元数据的消息，缓冲所有者计数也有原子操作和 lease 存储开销；诊断读取还会分配并序列化固定规模的 JSON。这些开销不代表业务性能收益，也不保证默认路径的总体成本为零。
+
+| 字段 | 口径 |
+| --- | --- |
+| `coherent` / `valid` | 固定最多 8 次读取内得到同一稳定 revision，且未发生计数损坏，才可使用整组数值 |
+| `total.live_buffers` | 实际观察到的缓冲所有者数；深复制是独立所有者，不是应用请求数 |
+| `total.len_bytes` / `capacity_bytes` | 上述逻辑所有者钩子当前记录的 Vec 长度/容量字节和 |
+| `capacity_high_water_bytes` | 同一全局观测容量和的一项标量高水位，不是不同阶段峰值相加 |
+| `stages[].scope_observed` | 该类阶段是否见过观察；没有覆盖不能解释成该阶段内存为零 |
+| `clone_ops` / `cloned_len_bytes` | 受观察真实深复制次数与复制长度，不是分配器调用数 |
+| `gap_bits` | 1=无效量，2=溢出，4=下溢，8=更新竞争缺口；计数损坏不恢复为已知 |
+| `unknown_bits` | 1=未观察出口/不匹配的 capture，2=钩子之间尺寸变化；为零仍不代表完整覆盖 |
+
+数据面更新不等待读取。忙读返回 `coherent=false`、`valid=false`，总量、峰值、revision、复制数和各阶段量为 `null`；不是测得的零，也不返回上一份缓存冒充当前读数，后续读数可以恢复。计数损坏时也将相关数值保留为 `null`。固定负载可分别统计可用/不可用读数，不能仅筛选成功读数计算可用率。
+
+容量只按观察钩子的逻辑所有者生命周期记账，交接/析构边界和钩子之间的临时量不作分配器瞬时驻留量。RX/控制/Relay frame 所有权、密码库临时量、容器元数据、分配器、内核与 RSS 仍不完整；`whole_pipeline_bytes_measured=false`。这不是整个数据面的内存上限、RSS、release 吞吐或端到端性能证明。接口不导出载荷、peer 身份、地址、私钥或 token。观测关闭后重启 daemon 可停止这部分计数。
+
 ## Hard↔Hard attempt report
 
 控制客户端的阶段追踪同时识别 `hh1` 与 `hh2`，服务端在 `P2WLAN_A0_SIGNAL_TRACE=1` 时记录对应信令接纳阶段。关联字段使用短摘要标签，不输出原始 session token；信令持久化仅表示服务端接纳，不能证明对端已执行探测或建立 Direct。

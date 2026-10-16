@@ -37,6 +37,14 @@ Control 信令服务在 WebSocket `ready` 帧中向客户端声明 `path_telemet
 
 配置生成器会检查目录、证书、签票关系和随机秘密。正式启动还必须拒绝占位符、弱默认值和缺失证书。
 
+## 客户端资源观测
+
+客户端软件缓冲观测由 `diagnostics.resource_capture` 控制，缺省为 `false`。只有它与 `diagnostics.enabled` 同为 `true` 时，daemon 才为本次进程建立观测。CLI 可设置并保存：
+
+    p2wlan config set resource-capture true
+
+该命令同时启用本地诊断；重新启动对应 daemon 后生效。读取使用 `p2wlan status --resources`，经原有实例诊断令牌访问 `GET /resources`。关闭使用 `p2wlan config set resource-capture false` 后重启，不会关闭其他诊断。资源观测的单位、不可用状态和覆盖限制见[路径可观测性](path-observability.md#软件缓冲资源观测)。
+
 ## 客户端路径策略
 
 `relay.path_policy` 缺省值为 `direct-first`。首次在线 peer 生命周期保留 5 秒直连窗口；健康的加密确认 Direct 保持优先。Relay 可提前建立和认证，但窗口到期前不承载本端首个业务包。确认 Direct 失活后立即允许已认证 Relay 兜底，不为已建立连接重跑冷启动等待。

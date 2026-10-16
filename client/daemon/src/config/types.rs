@@ -519,6 +519,10 @@ pub struct DiagnosticsConfig {
     /// Whether to expose the local diagnostics HTTP endpoint.
     #[serde(default)]
     pub enabled: bool,
+    /// Opt in to fixed-site software buffer observations for this daemon run.
+    /// Requires diagnostics.enabled; read through the authenticated endpoint.
+    #[serde(default)]
+    pub resource_capture: bool,
     /// Local bind address for diagnostics. Keep this on loopback.
     #[serde(default = "default_diagnostics_bind")]
     pub bind: String,
@@ -547,6 +551,7 @@ impl Default for DiagnosticsConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            resource_capture: false,
             bind: default_diagnostics_bind(),
             log_path: None,
             auth_token: None,

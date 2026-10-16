@@ -2,8 +2,9 @@
 """Exercise the actual injector against an explicitly detached owned target."""
 
 import itertools
+import hashlib
 import json
-import shutil
+import os
 import subprocess
 import sys
 import tempfile
@@ -155,10 +156,16 @@ class ConsoleDiagnosticBoundsTests(unittest.TestCase):
 @unittest.skipUnless(sys.platform == "win32", "requires native Windows console API")
 class ConsoleCtrlCInjectorTests(unittest.TestCase):
     def test_target_without_console_cannot_report_a_successful_broadcast(self):
-        powershell = shutil.which("pwsh")
-        self.assertIsNotNone(powershell)
+        injector_path = Path(os.environ.get("P2WLAN_CTRL_C_HELPER", ""))
+        self.assertTrue(injector_path.is_file(), "prebuilt native injector is required")
+        self.assertEqual(
+            hashlib.sha256(injector_path.read_bytes()).hexdigest(),
+            os.environ.get("P2WLAN_CTRL_C_HELPER_SHA256"),
+        )
         with tempfile.TemporaryDirectory() as directory:
             evidence = Path(directory) / "injector.json"
+            diagnostic_directory = Path(str(evidence) + ".diagnostic")
+            diagnostic_directory.mkdir()
             ready_path = Path(directory) / "target-ready.json"
             request = uuid.uuid4().hex
             # CREATE_NO_WINDOW remains an input flag. The target's own native
@@ -193,20 +200,15 @@ class ConsoleCtrlCInjectorTests(unittest.TestCase):
                 self.assertIsNone(target_process.poll(), ready)
                 injector_process = subprocess.Popen(
                     [
-                        powershell,
-                        "-NoLogo",
-                        "-NoProfile",
-                        "-NonInteractive",
-                        "-ExecutionPolicy",
-                        "Bypass",
-                        "-File",
-                        str(Path(__file__).with_name("send_console_ctrl_c.ps1")),
+                        str(injector_path),
                         "-ProcessId",
                         str(target),
                         "-RequestId",
                         request,
                         "-EvidencePath",
                         str(evidence),
+                        "-DiagnosticDirectory",
+                        str(diagnostic_directory),
                     ],
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,

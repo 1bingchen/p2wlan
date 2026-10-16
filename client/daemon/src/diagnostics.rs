@@ -37,3 +37,6 @@ include!("diagnostics/snapshot.rs");
 include!("diagnostics/response.rs");
 #[cfg(test)]
 include!("diagnostics/tests.rs");
+#[cfg(test)]
+#[path = "diagnostics/resource_tests.rs"]
+mod resource_tests;

@@ -83,6 +83,31 @@ impl<T> DataPlane<T>
 where
     T: VirtualInterface + Send + 'static,
 {
+    /// Construct the daemon's channel once, retaining the legacy default and
+    /// its capacity. Observer-only envelopes do not gain a request binding.
+    pub(crate) fn new_bidirectional_for_daemon(
+        tun: T,
+        peers: Arc<PeerManager>,
+        track_requests: bool,
+        capture: Option<Arc<crate::dataplane_resources::ResourceCapture>>,
+    ) -> (
+        Self,
+        crate::request_carriage::RawOutboundReceiver,
+        mpsc::Sender<InboundPacket>,
+    ) {
+        if !track_requests && capture.is_none() {
+            let (plane, receiver, inbound) = Self::new_bidirectional(tun, peers);
+            return (plane, receiver.into(), inbound);
+        }
+        let (mut plane, receiver, inbound) =
+            Self::new_bidirectional_with_request_carriage(tun, peers);
+        if let Some(capture) = capture {
+            plane.outbound_tx = plane.outbound_tx.with_resource_capture(capture.clone());
+            plane.resource_capture = Some(capture);
+        }
+        (plane, receiver.into(), inbound)
+    }
+
     /// Install aggregate diagnostics before starting the worker. The owner
     /// does not authorize delivery and is absent from default instances.
     #[allow(dead_code)]

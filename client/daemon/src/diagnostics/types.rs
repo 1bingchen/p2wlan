@@ -387,6 +387,7 @@ pub struct PermissionPreflightResponse {
 /// Shared state needed to build diagnostics responses.
 #[derive(Clone)]
 pub struct DiagnosticsContext {
+    resource_capture: Option<Arc<crate::dataplane_resources::RuntimeResourceCapture>>,
     room_authorization: Option<Arc<crate::rooms::RoomAuthorization>>,
     config: Arc<Config>,
     peers: Arc<PeerManager>,
@@ -426,6 +427,14 @@ pub struct DiagnosticsContext {
 }
 
 impl DiagnosticsContext {
+    pub(crate) fn with_resource_capture(
+        mut self,
+        capture: Option<Arc<crate::dataplane_resources::RuntimeResourceCapture>>,
+    ) -> Self {
+        self.resource_capture = capture;
+        self
+    }
+
     pub(crate) fn with_room_authorization(
         mut self,
         authorization: Arc<crate::rooms::RoomAuthorization>,
@@ -456,6 +465,7 @@ impl DiagnosticsContext {
     ) -> Self {
         Self {
             room_authorization: None,
+            resource_capture: None,
             config,
             peers,
             udp_transport,

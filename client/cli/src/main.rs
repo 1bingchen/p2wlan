@@ -24,7 +24,7 @@ const DEFAULT_NETWORK: &str = "default";
 const DEFAULT_DIAGNOSTICS_BIND: &str = "127.0.0.1:39277";
 const DEFAULT_UPDATE_REPO: &str = "yhan-sun/p2wlan";
 const DEFAULT_INSTALL_DIR: &str = "/usr/local/bin";
-const SUPPORTED_CONFIG_KEYS: &str = "control、network、device-name、interface、mtu、udp-bind、udp-advertise、stun、port-mapping/upnp、birthday-probing、socket-pool、diagnostics、relay、relay-regions、relay-selection-timeout、relay-policy、prefer-direct、path-policy、relay-startup-timeout、proxy-mode";
+const SUPPORTED_CONFIG_KEYS: &str = "control、network、device-name、interface、mtu、udp-bind、udp-advertise、stun、port-mapping/upnp、birthday-probing、socket-pool、diagnostics、resource-capture、relay、relay-regions、relay-selection-timeout、relay-policy、prefer-direct、path-policy、relay-startup-timeout、proxy-mode";
 
 #[derive(Parser, Debug)]
 #[command(name = "p2wlan", version, about = "p2wlan Linux command-line client")]
@@ -61,6 +61,9 @@ enum Commands {
         /// Print the complete diagnostics response as JSON
         #[arg(long)]
         json: bool,
+        /// Read the opt-in software buffer observation as JSON
+        #[arg(long, conflicts_with = "json")]
+        resources: bool,
     },
     /// Read daemon logs
     Logs {
@@ -118,7 +121,7 @@ enum ConfigCommand {
     Path,
     /// Set one supported configuration value
     Set {
-        /// control, network, device-name, interface, mtu, udp-bind, udp-advertise, stun, port-mapping/upnp, birthday-probing, socket-pool, diagnostics, relay, relay-regions, relay-selection-timeout, relay-policy, prefer-direct, path-policy, relay-startup-timeout, or proxy-mode
+        /// control, network, device-name, interface, mtu, udp-bind, udp-advertise, stun, port-mapping/upnp, birthday-probing, socket-pool, diagnostics, resource-capture, relay, relay-regions, relay-selection-timeout, relay-policy, prefer-direct, path-policy, relay-startup-timeout, or proxy-mode
         key: String,
         value: String,
     },
@@ -205,7 +208,13 @@ async fn run(cli: Cli) -> Result<(), String> {
         Commands::Account { command } => account_command(&config_path, command).await,
         Commands::Up => start(&config_path).await,
         Commands::Down => stop(&config_path).await,
-        Commands::Status { json } => status(&config_path, json).await,
+        Commands::Status { json, resources } => {
+            if resources {
+                resource_status(&config_path).await
+            } else {
+                status(&config_path, json).await
+            }
+        }
         Commands::Logs { lines, follow } => logs(&config_path, lines, follow),
         Commands::Config { command } => config_command(&config_path, command),
         Commands::Route { command } => route_command(&config_path, command).await,

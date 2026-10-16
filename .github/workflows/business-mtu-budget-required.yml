@@ -104,15 +104,28 @@ jobs:
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
       - name: Cargo workspace tests
+        id: workspace_tests
         env:
           RUST_TEST_THREADS: "1"
         run: |
           set -o pipefail
-          cargo test --workspace --all-features -- --test-threads=1 --skip hard_hard_ 2>&1 | tee /tmp/workspace-tests.log
+          python3 scripts/quality/run_cargo_test.py --all-features --evidence-dir "$RUNNER_TEMP/business-mtu-workspace" 2>&1 | tee /tmp/workspace-tests.log
           ! grep -qE '0 tests, [1-9][0-9]* benchmarks' /tmp/workspace-tests.log
 
       - name: Hard-hard E2E tests
-        run: cargo test -p p2wlan-daemon --lib hard_hard_ -- --test-threads=1
+        id: hard_hard_tests
+        run: python3 scripts/quality/run_cargo_test.py --hard-hard-lib --evidence-dir "$RUNNER_TEMP/business-mtu-hard-hard"
+
+      - name: Retain original failed Linux test program
+        if: failure() && (steps.workspace_tests.outcome == 'failure' || steps.hard_hard_tests.outcome == 'failure')
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: business-mtu-linux-failure-${{ env.P2WLAN_VALIDATION_SHA }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/business-mtu-workspace/
+            ${{ runner.temp }}/business-mtu-hard-hard/
+          if-no-files-found: error
+          retention-days: 14
 
       - name: WireGuard sizing and inbound-control regression
         run: cargo test -p p2wlan-daemon --lib transport::tests -- --test-threads=1

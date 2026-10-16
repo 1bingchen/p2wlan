@@ -55,6 +55,46 @@ impl HardHardCleanupDescriptor {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HardHardCleanupTrigger {
+    Cancelled,
+    Expired,
+    CompetingDirect,
+}
+
+async fn hard_hard_wait_for_competing_direct(
+    udp: &UdpTransport,
+    peers: &PeerManager,
+    descriptor: &HardHardCleanupDescriptor,
+) {
+    let notify = peers.direct_commit_notify();
+    let mut first_observation = true;
+    let mut observed_sequence = None;
+    loop {
+        // Register before inspecting the authoritative sequence so a commit
+        // during the socket query cannot be lost. Other peers' notifications
+        // do not cause another scan of this token's socket ownership.
+        let notified = notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        let sequence = peers.direct_commit_seq_sync(&descriptor.peer_id);
+        if first_observation || sequence != observed_sequence {
+            first_observation = false;
+            observed_sequence = sequence;
+            if udp
+                .hard_hard_token_is_superseded_by_direct(
+                    &descriptor.peer_id,
+                    &descriptor.session_token,
+                )
+                .await
+            {
+                return;
+            }
+        }
+        notified.await;
+    }
+}
+
 #[derive(Clone)]
 struct HardHardCleanupCompletion {
     completed: Arc<std::sync::atomic::AtomicBool>,
@@ -189,14 +229,17 @@ fn spawn_hard_hard_session_cleanup_with_owner(
             return;
         }
 
-        let expiry_woke = if descriptor.cancellation.is_cancelled() {
-            false
+        let trigger = if descriptor.cancellation.is_cancelled() {
+            HardHardCleanupTrigger::Cancelled
         } else {
             let delay = descriptor.expires_at_ms.saturating_sub(hard_hard_now_ms());
             tokio::select! {
                 biased;
-                _ = descriptor.cancellation.cancelled() => false,
-                _ = sleep(Duration::from_millis(delay)) => true,
+                _ = descriptor.cancellation.cancelled() => HardHardCleanupTrigger::Cancelled,
+                _ = hard_hard_wait_for_competing_direct(&udp, &peers, &descriptor) => {
+                    HardHardCleanupTrigger::CompetingDirect
+                }
+                _ = sleep(Duration::from_millis(delay)) => HardHardCleanupTrigger::Expired,
             }
         };
         let snapshot = peers
@@ -210,7 +253,7 @@ fn spawn_hard_hard_session_cleanup_with_owner(
             .as_ref()
             .map(|record| record.fresh_socket.clone())
             .unwrap_or_else(|| descriptor.fresh_socket.clone());
-        let retain_fresh_socket = expiry_woke
+        let retain_fresh_socket = trigger == HardHardCleanupTrigger::Expired
             && snapshot.as_ref().is_some_and(|record| {
                 record.state != crate::peer::HardHardSessionState::Retiring
                     && !record.cancellation.is_cancelled()
@@ -287,10 +330,10 @@ fn spawn_hard_hard_session_cleanup_with_owner(
                     probe_rx,
                     false,
                     None,
-                    if expiry_woke {
-                        "peer_response_timeout"
-                    } else {
-                        "session_cancelled"
+                    match trigger {
+                        HardHardCleanupTrigger::Expired => "peer_response_timeout",
+                        HardHardCleanupTrigger::Cancelled => "session_cancelled",
+                        HardHardCleanupTrigger::CompetingDirect => "superseded_by_other_direct",
                     },
                 )
                 .await;

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the original workspace suite once and retain its failed native artifact."""
+"""Run a fixed Cargo suite once and retain its failed native artifact."""
 
 from __future__ import annotations
 
@@ -177,17 +177,41 @@ def capture_stream(stream, path: Path, output, consume, errors: list[str], stop=
             consume(bytes(pending))
 
 
-def run_suite(root: Path, evidence: Path, *, all_targets: bool, echo: bool = True) -> int:
+def cargo_test_command(*, all_targets: bool, all_features: bool, hard_hard_lib: bool) -> list[str]:
+    if hard_hard_lib:
+        if all_targets or all_features:
+            raise ValueError("--hard-hard-lib uses the original daemon lib and default features")
+        return ["cargo", "test", "-p", "p2wlan-daemon", "--lib", "hard_hard_", "--message-format=json", "--", "--test-threads=1"]
+    command = ["cargo", "test", "--workspace"]
+    if all_targets:
+        command.append("--all-targets")
+    if all_features:
+        command.append("--all-features")
+    return command + ["--message-format=json", "--", "--test-threads=1", "--skip", "hard_hard_"]
+
+
+def hard_hard_summary(path: Path) -> dict | None:
+    # The fixed --lib selection must produce one real libtest suite. Log
+    # capture is bounded separately; ignored tests cannot satisfy execution.
+    summaries = []
+    with path.open("rb") as stream:
+        for line in stream:
+            match = re.match(rb"^test result: (ok|FAILED)\. (\d+) passed; (\d+) failed; (\d+) ignored;", line)
+            if match:
+                summaries.append(dict(result=match[1].decode(), passed=int(match[2]), failed=int(match[3]), ignored=int(match[4])))
+                if len(summaries) > 1:
+                    return None
+    return summaries[0] if len(summaries) == 1 else None
+
+
+def run_suite(root: Path, evidence: Path, *, all_targets: bool, all_features: bool = False, hard_hard_lib: bool = False, echo: bool = True) -> int:
+    command = cargo_test_command(all_targets=all_targets, all_features=all_features, hard_hard_lib=hard_hard_lib)
     root = root.resolve()
     evidence = evidence.resolve()
     if evidence == root or root in evidence.parents or evidence.exists():
         raise ValueError("evidence must be a new directory outside the repository")
     evidence.mkdir(parents=True, mode=0o700)
     os.chmod(evidence, 0o700)
-    command = ["cargo", "test", "--workspace"]
-    if all_targets:
-        command.append("--all-targets")
-    command += ["--message-format=json", "--", "--test-threads=1", "--skip", "hard_hard_"]
     manifest = {"schema": 1, "started_at": _utc_now(), "command": command, "source": source_identity(root), "toolchain": toolchain_identity(), "workflow": {key: os.environ.get(key) for key in ("GITHUB_SHA", "GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT", "GITHUB_JOB", "RUNNER_OS")}, "cargo_returncode": None, "failed_binary": {"state": "unavailable", "reason": "cargo_not_finished"}}
     manifest_path = evidence / "manifest.json"
     _atomic_json(manifest_path, manifest)
@@ -240,6 +264,11 @@ def run_suite(root: Path, evidence: Path, *, all_targets: bool, echo: bool = Tru
         manifest.update(cargo_returncode=returncode, build_success=identity.build_success, compiler_artifact_count=len(identity.artifacts), stream_drain={"complete": drained, "postexit_limit_seconds": DRAIN_AFTER_EXIT_SECONDS}, failed_binary=identity.retain(evidence, returncode) if drained else {"state": "unavailable", "reason": "stream_not_closed_after_cargo_exit"})
         if identity.capacity_exceeded:
             errors.append("artifact_capacity")
+        if hard_hard_lib and drained:
+            summary = hard_hard_summary(evidence / "cargo.stdout.log")
+            manifest["hard_hard_lib_summary"] = summary
+            if returncode == 0 and (summary is None or summary["result"] != "ok" or summary["passed"] == 0 or summary["failed"] != 0):
+                errors.append("hard_hard_lib_not_executed")
         manifest["source_after"] = source_identity(root)
         manifest["toolchain_after"] = toolchain_identity()
         if manifest["source_after"] != manifest["source"]:
@@ -265,9 +294,11 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--evidence-dir", type=Path, required=True)
     parser.add_argument("--all-targets", action="store_true")
+    parser.add_argument("--all-features", action="store_true")
+    parser.add_argument("--hard-hard-lib", action="store_true", help="run the original daemon lib HH subset in one shared test process")
     args = parser.parse_args()
     try:
-        return run_suite(ROOT, args.evidence_dir, all_targets=args.all_targets)
+        return run_suite(ROOT, args.evidence_dir, all_targets=args.all_targets, all_features=args.all_features, hard_hard_lib=args.hard_hard_lib)
     except (OSError, ValueError, subprocess.CalledProcessError) as error:
         print(f"FAIL Cargo evidence setup: {error}", file=sys.stderr)
         return 1

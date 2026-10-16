@@ -22,21 +22,29 @@ class TestSelectionError(RuntimeError):
     pass
 
 
-def test_executables(messages: Iterable[dict]) -> set[Path]:
+def test_executables(messages: Iterable[dict], bin_name: str | None = None) -> set[Path]:
     return {
         Path(message["executable"])
         for message in messages
         if message.get("reason") == "compiler-artifact"
-        and "lib" in message.get("target", {}).get("kind", [])
+        and (
+            message.get("target", {}).get("kind") == ["bin"]
+            and message.get("target", {}).get("name") == bin_name
+            if bin_name is not None
+            else "lib" in message.get("target", {}).get("kind", [])
+        )
         and message.get("profile", {}).get("test") is True
         and isinstance(message.get("executable"), str)
         and message["executable"]
     }
 
 
-def build_test_binary(root: Path, package: str, transcript_path: Path | None = None) -> Path:
+def build_test_binary(
+    root: Path, package: str, transcript_path: Path | None = None, *, bin_name: str | None = None
+) -> Path:
     messages = []
-    command = ["cargo", "test", "--locked", "-p", package, "--lib", "--no-run", "--message-format=json"]
+    target = ["--lib"] if bin_name is None else ["--bin", bin_name]
+    command = ["cargo", "test", "--locked", "-p", package, *target, "--no-run", "--message-format=json"]
     with subprocess.Popen(
         command,
         cwd=root,
@@ -59,9 +67,9 @@ def build_test_binary(root: Path, package: str, transcript_path: Path | None = N
         returncode = process.wait()
     if returncode:
         raise TestSelectionError(f"Cargo test build failed ({returncode}); no existing binary will be reused")
-    candidates = test_executables(messages)
+    candidates = test_executables(messages, bin_name)
     if len(candidates) != 1:
-        raise TestSelectionError(f"expected exactly one Cargo library test executable, found {len(candidates)}")
+        raise TestSelectionError(f"expected exactly one Cargo {'library' if bin_name is None else bin_name} test executable, found {len(candidates)}")
     binary = candidates.pop()
     if not binary.is_file():
         raise TestSelectionError(f"Cargo reported a missing test executable: {binary}")
@@ -218,6 +226,8 @@ def run_plan(
     plan: list[dict],
     evidence_dir: Path,
     test_timeout_seconds: int,
+    *,
+    bin_name: str | None = None,
 ) -> int:
     root = root.resolve()
     evidence_dir = evidence_dir.resolve()
@@ -230,7 +240,8 @@ def run_plan(
     log_dir = evidence_dir / "logs"
     log_dir.mkdir(mode=0o700)
     manifest_path = evidence_dir / "manifest.json"
-    build_command = ["cargo", "test", "--locked", "-p", package, "--lib", "--no-run", "--message-format=json"]
+    target = ["--lib"] if bin_name is None else ["--bin", bin_name]
+    build_command = ["cargo", "test", "--locked", "-p", package, *target, "--no-run", "--message-format=json"]
     groups = [
         {
             **group,
@@ -249,6 +260,7 @@ def run_plan(
         "finished_at": None,
         "result": "running",
         "package": package,
+        "target": {"kind": "lib"} if bin_name is None else {"kind": "bin", "name": bin_name},
         "source": None,
         "toolchain": None,
         "build": {
@@ -276,7 +288,8 @@ def run_plan(
         manifest["build"]["started_at"] = _utc_now()
         save()
         build_log = log_dir / "build.stdout.log"
-        binary = build_test_binary(root, package, transcript_path=build_log).resolve()
+        build_options = {} if bin_name is None else {"bin_name": bin_name}
+        binary = build_test_binary(root, package, transcript_path=build_log, **build_options).resolve()
         manifest["build"].update({"status": "passed", "finished_at": _utc_now(), "returncode": 0})
         if source_identity(root) != starting_source:
             raise TestSelectionError("source tree changed while the test binary was building")
@@ -491,6 +504,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("selector", nargs="?")
     parser.add_argument("--package", default="p2wlan-daemon")
+    parser.add_argument("--bin", dest="bin_name", help="select the exact Cargo binary test target instead of its library")
     parser.add_argument("--exact", action="store_true")
     parser.add_argument("--each", action="store_true", help="run each selected test in its own process")
     parser.add_argument("--show-output", action="store_true")
@@ -499,6 +513,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--evidence-dir", type=Path, help="new private directory outside the repository")
     parser.add_argument("--test-timeout-seconds", type=int, default=60)
     args = parser.parse_args(argv)
+    if args.bin_name is not None and not args.bin_name.strip():
+        parser.error("--bin requires a non-empty Cargo target name")
+    target_options = {} if args.bin_name is None else {"bin_name": args.bin_name}
     if args.plan is not None:
         if any((args.selector, args.exact, args.each, args.show_output, args.nocapture)):
             parser.error("--plan cannot be combined with a positional selector or legacy run options")
@@ -508,14 +525,14 @@ def main(argv: list[str] | None = None) -> int:
             parser.error("--test-timeout-seconds must be between 1 and 300")
         try:
             plan = parse_run_plan(args.plan.read_text(encoding="utf-8"))
-            return run_plan(ROOT, args.package, plan, args.evidence_dir, args.test_timeout_seconds)
+            return run_plan(ROOT, args.package, plan, args.evidence_dir, args.test_timeout_seconds, **target_options)
         except (OSError, TestSelectionError) as error:
             print(f"FAIL Rust test plan: {error}", file=sys.stderr)
             return 1
     if args.selector is None:
         parser.error("selector is required unless --plan is used")
     try:
-        binary = build_test_binary(ROOT, args.package)
+        binary = build_test_binary(ROOT, args.package, **target_options)
         selected = select_tests(list_tests(binary), args.selector, args.exact, list_tests(binary, ignored=True))
         print(f"Selected {len(selected)} runnable tests from {binary.name}", flush=True)
         batches = [(name, True, 1) for name in selected] if args.each else [(args.selector, args.exact, len(selected))]

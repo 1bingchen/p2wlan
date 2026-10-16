@@ -215,5 +215,29 @@ class RustTestRunnerTests(unittest.TestCase):
         self.assertEqual(run.call_count, 1)
 
 
+class BinaryTargetTests(unittest.TestCase):
+    def test_binary_selection_rejects_library_other_target_and_non_test_artifacts(self):
+        right=dict(reason='compiler-artifact',target=dict(kind=['bin'],name='daemon'),profile=dict(test=True),executable='/tmp/current-daemon-test')
+        rows=[right,dict(right,target=dict(kind=['lib'],name='daemon')),dict(right,target=dict(kind=['bin'],name='cli')),dict(right,profile=dict(test=False)),dict(right,executable=None)]
+        self.assertEqual(runner.test_executables(rows,'daemon'),{Path('/tmp/current-daemon-test')})
+        self.assertEqual(runner.test_executables(rows,'absent'),set())
+
+    def test_plan_cli_preserves_requested_target(self):
+        with mock.patch.object(Path,'read_text',return_value='[{"name":"entry","selector":"entry"}]'),mock.patch.object(runner,'run_plan',return_value=0)as call:
+            self.assertEqual(runner.main(['--bin','daemon','--plan','plan.json','--evidence-dir','outside']),0)
+        self.assertEqual(call.call_args.kwargs,dict(bin_name='daemon'))
+
+    def test_legacy_cli_requests_binary_target_before_selecting(self):
+        with mock.patch.object(runner,'build_test_binary',side_effect=runner.TestSelectionError('stop before execution'))as call,contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(runner.main(['entry','--bin','daemon']),1)
+        self.assertEqual(call.call_args.kwargs,dict(bin_name='daemon'))
+
+    def test_empty_binary_target_rejected_before_build(self):
+        with mock.patch.object(runner,'build_test_binary')as call,contextlib.redirect_stderr(io.StringIO()),self.assertRaises(SystemExit)as error:
+            runner.main(['entry','--bin',''])
+        self.assertEqual(error.exception.code,2)
+        call.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -89,11 +89,21 @@ UDP 的 `core.rs` 和 `dynamic_punch.rs` 使用真正的 Rust 子模块，而不
 
 选定 Rust 场景由 `scripts/quality/run_rust_tests.py` 执行。它从 Cargo 本次构建输出获取测试程序，而不是按文件修改时间猜测二进制；在运行前枚举测试，拒绝零匹配和仅匹配 ignored 的选择，并核对实际执行数量。Hard↔Hard 场景使用 `--each` 保持进程隔离。
 
+默认选择 library target；`--package` 指定 crate，`--bin` 显式选择对应 binary test target。通用套件过滤掉的 Hard↔Hard 测试须在其实际 target 中单独执行，不能由另一个 target 的同名过滤器代替。
+
     python3 scripts/quality/run_rust_tests.py dplpmtud
     python3 scripts/quality/run_rust_tests.py hard_hard_ --each
+    python3 scripts/quality/run_rust_tests.py hard_hard_ --package p2pnet-nat --each
+    python3 scripts/quality/run_rust_tests.py hard_hard_ --bin p2wlan-daemon --each
     python3 scripts/quality/run_rust_tests.py transport::tests::pending_receiver_index_collision_tries_every_matching_key --exact
 
 测试模块改名必须同时更新 workflow、验收脚本和 evidence contract 的完整 test ID。失效过滤器不能视作通过，不得删除真实断言或降低测试数量来让流水线变绿。
+
+CI 的通用 workspace 套件由 `scripts/quality/run_cargo_test.py` 执行一次。Linux 使用 `--all-targets`，Windows 保留包含 doctest 的默认 target 范围；原 `--test-threads=1 --skip hard_hard_` 不变。包装器添加 Cargo JSON 构建输出，记录源码、工具链、原退出状态及有界日志；原测试失败不会因采证成功变为通过，也不会因复制失败被重跑。
+
+    python3 scripts/quality/run_cargo_test.py --all-targets --evidence-dir ../p2wlan-rust-general-evidence
+
+证据目录必须是仓库外尚不存在的目录。原生测试失败时，仅从同一次 Cargo 的 compiler-artifact 与最终 Running 记录绑定程序，并校验文件身份、大小与摘要后留存实际字节。构建失败、doctest 未报告可执行文件、身份变化或容量超限时明确记录不可用，不扫描 target 猜测，也不重建旧失败产物。每条输出流最多归档 64 MiB、解析行最多 2 MiB、构建记录最多 512 个，失败程序最多 1 GiB；超限继续排空原 Cargo 输出，并使证据资格失败。该留存仅覆盖通用套件；其他工作流和精确选择器需使用各自证据入口。
 
 ## 变更审查
 

@@ -69,7 +69,7 @@ jobs:
           grep -q '/admin/app.js' ../admin/web/index.html
 
       - name: Set up Go
-        uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
         with:
           go-version-file: ${{ env.GO_VERSION_FILE }}
           cache: true

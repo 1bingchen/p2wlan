@@ -70,6 +70,8 @@ def sidecar_path(record: Path) -> Path:
 def _private_bytes(path: Path, capacity: int) -> bytes:
     # Nonblocking open rejects a substituted FIFO before any read can wait
     # for a writer. O_NOFOLLOW and fstat inspect the actual opened object.
+    if not all(hasattr(os, name) for name in ("O_NOFOLLOW", "O_NONBLOCK", "getuid", "fchmod")):
+        raise ValueError("birth_private_file_capability_unavailable")
     fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     with os.fdopen(fd, "rb") as stream:
         info = os.fstat(stream.fileno())
@@ -100,7 +102,7 @@ def write_pre_exec(record_path: Path, record: dict) -> None:
         with os.fdopen(fd, "wb") as stream:
             os.fchmod(stream.fileno(), 0o600)
             stream.write(payload)
-    except (OSError, ValueError):
+    except (OSError, ValueError, NotImplementedError):
         # No path, native error text or launch input is disclosed.
         print("launch_birth_unavailable:sidecar_write_failed", file=sys.stderr)
 

@@ -92,6 +92,13 @@ class ProcessBirthTests(unittest.TestCase):
         execute.assert_called_once()
         self.assertEqual(sidecar.read_bytes(), b'original evidence')
 
+    def test_missing_private_file_capability_does_not_prevent_original_exec(self):
+        with patch.dict(birth.os.__dict__), patch('sys.stderr'):
+            birth.os.__dict__.pop('O_NOFOLLOW', None)
+            _, execute = self.emit()
+        execute.assert_called_once()
+        self.assertFalse(birth.sidecar_path(self.record).exists())
+
     def test_source_role_record_and_pid_rebinding_are_rejected(self):
         self.emit()
         with self.assertRaises(ValueError):

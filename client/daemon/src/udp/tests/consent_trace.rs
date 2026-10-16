@@ -179,6 +179,7 @@ async fn consent_trace_real_ack_commits_once_and_duplicate_or_missing_nonce_cann
         stages(&trace, nonce),
         [
             ConsentStage::AckDecoded,
+            ConsentStage::AckHandlerEntered,
             ConsentStage::PendingLookup,
             ConsentStage::AdoptionAcquired,
             ConsentStage::EpochAcquired,
@@ -226,6 +227,7 @@ async fn consent_trace_real_ack_commits_once_and_duplicate_or_missing_nonce_cann
         stages(&trace, missing),
         [
             ConsentStage::AckDecoded,
+            ConsentStage::AckHandlerEntered,
             ConsentStage::PendingLookup,
             ConsentStage::NoPeerOwnedPending
         ]
@@ -251,6 +253,7 @@ async fn consent_trace_expired_real_ack_retires_nonce_without_health_commit() {
         stages(&trace, nonce),
         [
             ConsentStage::AckDecoded,
+            ConsentStage::AckHandlerEntered,
             ConsentStage::PendingLookup,
             ConsentStage::AdoptionAcquired,
             ConsentStage::EpochAcquired,
@@ -294,6 +297,7 @@ async fn consent_trace_real_ack_fences_all_seven_pending_identity_mismatches() {
             stages(&trace, nonce),
             [
                 ConsentStage::AckDecoded,
+                ConsentStage::AckHandlerEntered,
                 ConsentStage::PendingLookup,
                 ConsentStage::AdoptionAcquired,
                 ConsentStage::EpochAcquired,
@@ -315,4 +319,88 @@ async fn consent_trace_real_ack_fences_all_seven_pending_identity_mismatches() {
         assert_eq!(rx.probe_acks_received, 0);
         assert_eq!(rx.legacy_probe_acks_unmatched, 1);
     }
+}
+
+#[tokio::test]
+async fn consent_trace_actual_decode_precedes_diagnostics_wait_and_handler_then_commits() {
+    let end = TokioInstant::now() + Duration::from_secs(2);
+    let (udp, remote, trace, pending) = fixture().await;
+    let _report = ConsentTraceReport(trace.clone());
+    let nonce = [0x61; 8];
+    let before = udp.peers.get_connection("peer-b").await.unwrap();
+    udp.pending_probes.lock().await.insert(nonce, pending);
+    let diagnostics = udp.hold_primary_socket_diagnostics_for_test().await;
+    let (tx, _rx) = mpsc::channel::<ReceivedEncryptedPacket>(1);
+    let (shutdown, mut stop) = watch::channel(false);
+    let mut reader =
+        Box::pin(udp.run_inbound_socket_inner(0, udp.socket.clone(), tx, Some(&mut stop), None));
+    let ack = build_punch_ack(nonce);
+    assert_eq!(
+        remote
+            .send_to(&ack, udp.local_addr().unwrap())
+            .await
+            .unwrap(),
+        ack.len()
+    );
+    timeout_at(
+        end,
+        poll_fn(|cx| {
+            assert!(reader.as_mut().poll(cx).is_pending());
+            if !stages(&trace, nonce).is_empty() {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        }),
+    )
+    .await
+    .expect("original reader must decode while diagnostics are held");
+    assert_eq!(stages(&trace, nonce), [ConsentStage::AckDecoded]);
+    assert!(udp.pending_probes.lock().await.contains_key(&nonce));
+    assert_eq!(
+        udp.peers
+            .get_connection("peer-b")
+            .await
+            .unwrap()
+            .direct_health
+            .success_count,
+        before.direct_health.success_count
+    );
+    drop(diagnostics);
+    timeout_at(
+        end,
+        poll_fn(|cx| {
+            assert!(reader.as_mut().poll(cx).is_pending());
+            if stages(&trace, nonce).contains(&ConsentStage::HealthCommitted) {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        }),
+    )
+    .await
+    .expect("original handler must commit after the real diagnostics lock is released");
+    drop(shutdown);
+    timeout_at(end, reader.as_mut()).await.unwrap().unwrap();
+    assert_eq!(
+        stages(&trace, nonce),
+        [
+            ConsentStage::AckDecoded,
+            ConsentStage::AckHandlerEntered,
+            ConsentStage::PendingLookup,
+            ConsentStage::AdoptionAcquired,
+            ConsentStage::EpochAcquired,
+            ConsentStage::Matched,
+            ConsentStage::HealthCommitted
+        ]
+    );
+    assert_eq!(
+        udp.peers
+            .get_connection("peer-b")
+            .await
+            .unwrap()
+            .direct_health
+            .success_count,
+        before.direct_health.success_count + 1
+    );
 }

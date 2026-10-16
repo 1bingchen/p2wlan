@@ -10,7 +10,7 @@ impl UdpTransport {
         nonce: ProbeNonce,
     ) {
         #[cfg(test)]
-        self.trace_consent(nonce, ConsentStage::AckDecoded);
+        self.trace_consent(nonce, ConsentStage::AckHandlerEntered);
         self.update_socket_diagnostics(socket_index, |metrics| {
             metrics.legacy_probe_acks_observed =
                 metrics.legacy_probe_acks_observed.saturating_add(1)

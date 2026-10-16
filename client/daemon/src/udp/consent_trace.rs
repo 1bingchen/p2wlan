@@ -6,6 +6,7 @@ use super::*;
 pub(super) enum ConsentStage {
     SendReturned,
     AckDecoded,
+    AckHandlerEntered,
     PendingLookup,
     NoPeerOwnedPending,
     AdoptionAcquired,

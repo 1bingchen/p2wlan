@@ -482,6 +482,26 @@ impl ProvisionalSocketGuard {
     }
 
     #[cfg(test)]
+    pub(crate) async fn commit_speculative_for_test(
+        &self,
+        transport: &UdpTransport,
+        peer_id: &str,
+        socket_index: usize,
+        network_generation: u64,
+        punch_generation: u64,
+    ) -> bool {
+        self.commit_speculative(
+            transport,
+            peer_id,
+            socket_index,
+            network_generation,
+            punch_generation,
+        )
+        .await
+        .committed
+    }
+
+    #[cfg(test)]
     pub(crate) async fn join_original_watcher_for_test(
         &mut self,
     ) -> std::result::Result<(), tokio::task::JoinError> {
@@ -1265,6 +1285,40 @@ impl UdpTransport {
                 }
             })
             .collect()
+    }
+
+    /// An established Direct pair on another local socket ends this token's
+    /// experiment even when its short-lived punch permit has already gone.
+    /// Derive ownership under the existing socket lock; a nominated socket
+    /// from this token must not be mistaken for a competing primary commit.
+    pub(crate) async fn hard_hard_token_is_superseded_by_direct(
+        &self,
+        peer_id: &str,
+        token: &str,
+    ) -> bool {
+        let state = self.socket_state.lock().await;
+        let Some(commit) = self.peers.direct_commit_pair_snapshot_sync(peer_id) else {
+            return false;
+        };
+        let Some(local_endpoint) = commit.local_endpoint else {
+            return false;
+        };
+        if commit.path_revision.is_none()
+            || !self.peers.is_direct_sync(peer_id)
+            || commit.generation != self.peers.current_network_generation_sync()
+            || !self
+                .peers
+                .peer_session_is_current_sync(peer_id, commit.peer_session_generation)
+        {
+            return false;
+        }
+        !state.dynamic.values().any(|entry| {
+            entry.peer_id == peer_id
+                && entry.network_generation == commit.generation
+                && entry.hard_hard_session_token.as_deref() == Some(token)
+                && entry.phase.is_usable()
+                && entry.socket.local_addr().ok() == Some(local_endpoint)
+        })
     }
 
     pub(crate) async fn detach_hard_hard_sockets_for_token(

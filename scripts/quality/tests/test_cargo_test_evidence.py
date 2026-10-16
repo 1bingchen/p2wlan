@@ -13,6 +13,29 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import run_cargo_test as runner
 
 
+class CargoSuiteScopeTests(unittest.TestCase):
+    def test_default_keeps_workspace_targets_features_and_original_skip(self):
+        self.assertEqual(runner.cargo_test_command(all_targets=False, all_features=False, hard_hard_lib=False), ["cargo", "test", "--workspace", "--message-format=json", "--", "--test-threads=1", "--skip", "hard_hard_"])
+
+    def test_shared_hh_scope_preserves_lib_filter_and_rejects_expansion(self):
+        self.assertEqual(runner.cargo_test_command(all_targets=False, all_features=False, hard_hard_lib=True), ["cargo", "test", "-p", "p2wlan-daemon", "--lib", "hard_hard_", "--message-format=json", "--", "--test-threads=1"])
+        for targets, features in [(True, False), (False, True), (True, True)]:
+            with self.assertRaises(ValueError):
+                runner.cargo_test_command(all_targets=targets, all_features=features, hard_hard_lib=True)
+
+    def test_business_mtu_keeps_original_scopes_deadlines_and_failure_upload(self):
+        workflow = (Path(__file__).resolve().parents[3] / ".github/workflows/business-mtu-budget-required.yml").read_text()
+        linux = workflow.split("  linux_validation:\n", 1)[1].split("  production_e2e:\n", 1)[0]
+        self.assertIn("timeout-minutes: 75", linux)
+        self.assertIn("run_cargo_test.py --all-features --evidence-dir", linux)
+        self.assertIn("run_cargo_test.py --hard-hard-lib --evidence-dir", linux)
+        self.assertNotIn("--each", linux)
+        self.assertNotIn("continue-on-error", linux)
+        self.assertIn("! grep -qE '0 tests, [1-9][0-9]* benchmarks'", linux)
+        self.assertIn("if: failure() && (steps.workspace_tests.outcome == 'failure' || steps.hard_hard_tests.outcome == 'failure')", linux)
+        self.assertIn("if-no-files-found: error", linux)
+
+
 class CargoArtifactIdentityTests(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
@@ -117,13 +140,14 @@ class CargoArtifactIdentityTests(unittest.TestCase):
 
 @unittest.skipUnless(shutil.which("cargo") and shutil.which("rustc"), "actual Cargo toolchain required")
 class ActualCargoFailureEvidenceTests(unittest.TestCase):
-    def fixture(self, source, *, all_targets):
+    def fixture(self, source, *, all_targets, all_features=False, hard_hard_lib=False):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         base = Path(temporary.name).resolve()
         root = base / "repo with spaces"
         (root / "src").mkdir(parents=True)
-        (root / "Cargo.toml").write_text('[package]\nname="evidence-fixture"\nversion="0.1.0"\nedition="2021"\n[workspace]\n')
+        name = "p2wlan-daemon" if hard_hard_lib else "evidence-fixture"
+        (root / "Cargo.toml").write_text(f'[package]\nname="{name}"\nversion="0.1.0"\nedition="2021"\n[features]\nexplicit=[]\n[workspace]\n')
         (root / ".gitignore").write_text('/target/\n/Cargo.lock\n')
         (root / "src/lib.rs").write_text(source)
         subprocess.run(["git", "init", "-q", str(root)], check=True)
@@ -133,8 +157,38 @@ class ActualCargoFailureEvidenceTests(unittest.TestCase):
         # Do not reuse the product target, flags, or test profile for this tiny control.
         environment = {key: value for key, value in runner.os.environ.items() if not key.startswith(("CARGO_TARGET_", "CARGO_PROFILE_")) and key not in {"CARGO_TARGET_DIR", "CARGO_BUILD_TARGET", "RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS"}}
         with mock.patch.dict(runner.os.environ, environment, clear=True):
-            result = runner.run_suite(root, evidence, all_targets=all_targets, echo=False)
+            result = runner.run_suite(root, evidence, all_targets=all_targets, all_features=all_features, hard_hard_lib=hard_hard_lib, echo=False)
         return result, json.loads((evidence / "manifest.json").read_text()), evidence
+
+    def test_actual_shared_hh_failure_retains_original_program_and_101(self):
+        result, manifest, evidence = self.fixture('#[test]\nfn hard_hard_first_failure(){assert_eq!(1,2);}\n', all_targets=False, hard_hard_lib=True)
+        self.assertEqual(result, 101)
+        self.assertEqual(manifest["cargo_returncode"], 101)
+        self.assertEqual(manifest["hard_hard_lib_summary"], dict(result="FAILED", passed=0, failed=1, ignored=0))
+        binary = manifest["failed_binary"]
+        self.assertEqual(binary["state"], "retained")
+        self.assertEqual(runner.sha256_file(evidence / binary["path"]), runner.sha256_file(Path(binary["original_path"])))
+
+    def test_actual_hh_filter_excludes_unrelated_failure_in_shared_process(self):
+        result, manifest, _ = self.fixture('#[test]\nfn hard_hard_selected(){}\n#[test]\nfn unrelated(){panic!("outside original filter");}\n', all_targets=False, hard_hard_lib=True)
+        self.assertEqual(result, 0)
+        self.assertEqual(manifest["hard_hard_lib_summary"], dict(result="ok", passed=1, failed=0, ignored=0))
+        self.assertEqual(manifest["evidence_errors"], [])
+
+    def test_actual_empty_or_only_ignored_hh_selection_fails_without_rerun(self):
+        for source in ['#[test]\nfn unrelated(){}\n', '#[test]\n#[ignore]\nfn hard_hard_ignored(){}\n']:
+            with self.subTest(source=source):
+                result, manifest, _ = self.fixture(source, all_targets=False, hard_hard_lib=True)
+                self.assertEqual(result, 1)
+                self.assertEqual(manifest["cargo_returncode"], 0)
+                self.assertIn("hard_hard_lib_not_executed", manifest["evidence_errors"])
+                self.assertFalse(manifest["source_bound"])
+
+    def test_actual_explicit_all_features_is_available_without_changing_default(self):
+        result, manifest, _ = self.fixture('#[cfg(not(feature="explicit"))]\ncompile_error!("explicit feature required");\n#[test]\nfn enabled(){}\n', all_targets=False, all_features=True)
+        self.assertEqual(result, 0)
+        self.assertIn("--all-features", manifest["command"])
+        self.assertNotIn("--all-targets", manifest["command"])
 
     def test_actual_first_native_failure_preserves_101_and_exact_executable(self):
         result, manifest, evidence = self.fixture('#[test]\nfn original_failure(){assert_eq!(1,2);}\n', all_targets=True)

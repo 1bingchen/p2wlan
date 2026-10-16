@@ -84,7 +84,12 @@ use stun_waiter::StunWaiters;
 mod test_ingress;
 #[cfg(test)]
 pub(crate) use test_ingress::TestUdpIngressGate;
+#[cfg(test)]
+mod consent_trace;
 mod direct_validation_preflight;
+mod legacy_probe_ack;
+#[cfg(test)]
+use consent_trace::{ConsentStage, ConsentTrace, ConsentTraceReport};
 
 include!("udp/admission.rs");
 include!("udp/gather.rs");
@@ -301,6 +306,9 @@ pub struct UdpTransport {
     /// Fixture-only ownership of this transport's original retransmit tasks.
     #[cfg(test)]
     probe_burst_capture_for_test: Option<Arc<ProbeBurstCaptureForTest>>,
+    /// Fixed test-only lifecycle observations; never consent authority.
+    #[cfg(test)]
+    consent_trace: Option<Arc<ConsentTrace>>,
     /// Per-transport one-shot ordinary fresh-mapping lifecycle barrier.
     /// Absent from production; it never supplies send authority or summaries.
     #[cfg(test)]

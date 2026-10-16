@@ -195,6 +195,8 @@ async fn assert_healthy_consent_preserves_actual_selector(
     let work_end = end - Duration::from_secs(1);
     let peers = peer_manager();
     let bursts = Arc::new(ProbeBurstCaptureForTest::new());
+    let trace = Arc::new(ConsentTrace::new());
+    let _trace_report = ConsentTraceReport(trace.clone());
     let mut owners = IdleOwners::default();
     let mut remote_addr = None;
     let mut local_addr = None;
@@ -235,6 +237,7 @@ async fn assert_healthy_consent_preserves_actual_selector(
         );
         let udp = owners.udp.as_mut().unwrap();
         udp.probe_burst_capture_for_test = Some(bursts.clone());
+        udp.consent_trace = Some(trace.clone());
         primary = Some(Arc::downgrade(&udp.socket));
         ipv6 = udp.ipv6_socket.as_ref().map(Arc::downgrade);
         let source_endpoint = udp.local_addr().map_err(|e| e.to_string())?;

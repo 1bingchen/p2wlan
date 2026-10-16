@@ -225,25 +225,71 @@ function Wait-DaemonReady {
     param(
         [Parameter(Mandatory = $true)][string]$BaseUrl,
         [Parameter(Mandatory = $true)][string]$AuthPath,
-        [int]$TimeoutSeconds = 20
+        [int]$TimeoutSeconds = 20,
+        [string]$DiagnosticPath,
+        [int]$ObservedProcessId
     )
     $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
-    while ([DateTime]::UtcNow -lt $deadline) {
-        try {
-            $health = Invoke-WebRequest -UseBasicParsing -Uri "$BaseUrl/health" -TimeoutSec 2
-            if ($health.StatusCode -ge 200 -and $health.StatusCode -lt 300 -and (Test-Path -LiteralPath $AuthPath)) {
-                $token = (Get-Content -LiteralPath $AuthPath -Raw).Trim()
-                if ($token) {
-                    return $token
-                }
+    $clock = [System.Diagnostics.Stopwatch]::StartNew()
+    $samples = [System.Collections.Generic.List[object]]::new()
+    $droppedSamples = 0
+    try {
+        while ([DateTime]::UtcNow -lt $deadline) {
+            $sample = [ordered]@{
+                sequence = $samples.Count + 1
+                started_ms = $clock.ElapsedMilliseconds
+                completed_ms = $null
+                http_status = $null
+                auth_exists = $null
+                token_nonempty = $null
+                exception_type = $null
             }
-        } catch {
-            # The daemon can be between instance-lock, diagnostics bind, and
-            # auth-file publication. Keep polling inside the bounded budget.
+            try {
+                $health = Invoke-WebRequest -UseBasicParsing -Uri "$BaseUrl/health" -TimeoutSec 2
+                $sample.http_status = [int]$health.StatusCode
+                try { $sample.auth_exists = [bool](Test-Path -LiteralPath $AuthPath) } catch { $sample.auth_exists = $null }
+                if ($health.StatusCode -ge 200 -and $health.StatusCode -lt 300 -and $sample.auth_exists) {
+                    $token = (Get-Content -LiteralPath $AuthPath -Raw).Trim()
+                    $sample.token_nonempty = [bool]$token
+                    if ($token) {
+                        return $token
+                    }
+                }
+            } catch {
+                # Keep the original request, retry spacing and 20s deadline.
+                # A type name is safe evidence; messages/headers/tokens are not.
+                $sample.exception_type = $_.Exception.GetType().FullName
+                try { $sample.auth_exists = [bool](Test-Path -LiteralPath $AuthPath) } catch { $sample.auth_exists = $null }
+            } finally {
+                $sample.completed_ms = $clock.ElapsedMilliseconds
+                if ($samples.Count -lt 128) { $samples.Add($sample) } else { $droppedSamples++ }
+            }
+            Start-Sleep -Milliseconds 200
         }
-        Start-Sleep -Milliseconds 200
+        throw "daemon diagnostics did not become ready at $BaseUrl"
+    } finally {
+        if ($DiagnosticPath) {
+            try {
+                $record = [ordered]@{
+                    schema_version = 1
+                    source_head_sha = $expectedSourceHeadSha
+                    workflow_sha = $expectedWorkflowSha
+                    process_id = $ObservedProcessId
+                    timeout_seconds = $TimeoutSeconds
+                    clock = 'stopwatch'
+                    dropped_samples = $droppedSamples
+                    samples = @($samples)
+                }
+                $bytes = [System.Text.UTF8Encoding]::new($false).GetBytes(($record | ConvertTo-Json -Depth 5 -Compress) + "`n")
+                if ($bytes.Length -gt 65536) { throw 'readiness evidence exceeded capacity' }
+                $stream = [System.IO.FileStream]::new($DiagnosticPath, [System.IO.FileMode]::CreateNew,
+                    [System.IO.FileAccess]::Write, [System.IO.FileShare]::Read)
+                try { $stream.Write($bytes, 0, $bytes.Length) } finally { $stream.Dispose() }
+            } catch {
+                Write-Warning -WarningAction Continue 'Readiness evidence unavailable; original startup result is unchanged'
+            }
+        }
     }
-    throw "daemon diagnostics did not become ready at $BaseUrl"
 }
 
 function Wait-ProcessExited {
@@ -674,7 +720,8 @@ function Invoke-ProductionCycle {
             $process = Start-ProductionDaemon -ConfigPath $configPath -LogPath $logPath -DiagnosticsBind "127.0.0.1:$port"
             $processStartTime = try { $process.StartTime } catch { [DateTime]::Now }
         }
-        $token = Wait-DaemonReady -BaseUrl $baseUrl -AuthPath $authPath
+        $token = Wait-DaemonReady -BaseUrl $baseUrl -AuthPath $authPath `
+            -DiagnosticPath (Join-Path $cycleRoot 'readiness.json') -ObservedProcessId $process.Id
         $startSucceeded = $true
         $wintunDeadline = [DateTime]::UtcNow.AddSeconds(5)
         while ($RealWintun -and [DateTime]::UtcNow -lt $wintunDeadline) {
@@ -1291,6 +1338,7 @@ $evidence = [ordered]@{
     workflow_sha = $expectedWorkflowSha
     runner_os = 'windows-latest'
     generated_at_utc = [DateTime]::UtcNow.ToString('o')
+    production_artifact_root = $runRoot
     components = @($components)
     handler_mapping = $handlerMapping
     capabilities = @($capabilities)

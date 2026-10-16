@@ -471,10 +471,24 @@ async fn relay_selector_skips_cooled_down_candidate() {
 
 #[tokio::test]
 async fn relay_selector_falls_back_when_preferred_region_is_unreachable() {
-    let dead_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let dead_addr = dead_listener.local_addr().unwrap();
-    drop(dead_listener);
+    // Keep the unreachable endpoint reserved. Dropping a listener before
+    // starting the fallback lets the OS assign that same port to a live relay.
+    let dead_socket = tokio::net::TcpSocket::new_v4().unwrap();
+    dead_socket.set_reuseaddr(false).unwrap();
+    dead_socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let dead_addr = dead_socket.local_addr().unwrap();
     let fallback = RelayServer::start_random().await.unwrap();
+    assert_ne!(dead_addr, fallback.addr);
+    assert!(tokio::net::TcpListener::bind(dead_addr).await.is_err());
+    let unreachable = tokio::time::timeout(
+        Duration::from_secs(1),
+        tokio::net::TcpStream::connect(dead_addr),
+    )
+    .await;
+    // Some kernels refuse immediately; others leave a bound, non-listening
+    // endpoint pending. Neither may establish a usable TCP connection within
+    // the selector's original one-second connection budget.
+    assert!(!matches!(unreachable, Ok(Ok(_))));
     let specs = vec![
         RelayCandidateConfig::legacy(format!("preferred@{dead_addr}")),
         RelayCandidateConfig::legacy(format!("fallback@{}", fallback.addr)),
@@ -502,6 +516,33 @@ async fn relay_selector_falls_back_when_preferred_region_is_unreachable() {
 
     drop(outcome);
     fallback.shutdown().await;
+    drop(dead_socket);
+}
+
+#[tokio::test]
+async fn relay_selector_shared_endpoint_keeps_its_preferred_region_label() {
+    let relay = RelayServer::start_random().await.unwrap();
+    let specs = vec![
+        RelayCandidateConfig::legacy(format!("preferred@{}", relay.addr)),
+        RelayCandidateConfig::legacy(format!("fallback@{}", relay.addr)),
+    ];
+    let outcome = select_relay(
+        &specs,
+        &["preferred".to_string()],
+        Duration::from_secs(1),
+        "node-a",
+        peer_manager(),
+        None,
+        None,
+        true,
+        None,
+    )
+    .await;
+    let transport = outcome.transport.as_ref().unwrap();
+    assert_eq!(transport.region(), "preferred");
+    assert_eq!(transport.endpoint(), relay.addr.to_string());
+    drop(outcome);
+    relay.shutdown().await;
 }
 
 #[tokio::test]

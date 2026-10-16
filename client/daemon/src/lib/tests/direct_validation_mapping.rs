@@ -85,6 +85,7 @@ fn mapping_peer(node_id: &str, public_key: String, virtual_ip: &str) -> control:
 /// boundary; retrying toward R would conceal the APDM port-chasing regression.
 #[tokio::test]
 async fn ordinary_validation_preflight_authenticates_return_mapping_without_chasing_it() {
+    let fixture_clock = std::time::Instant::now();
     let a_identity = NodeIdentity::generate();
     let b_identity = NodeIdentity::generate();
     let peers_a = Arc::new(PeerManager::new(mapping_config(
@@ -195,6 +196,10 @@ async fn ordinary_validation_preflight_authenticates_return_mapping_without_chas
     tasks.spawn(async move {
         let mut packet = vec![0u8; 2048];
         let (len, source) = original.recv_from(&mut packet).await.unwrap();
+        eprintln!(
+            "mapping_boundary phase=proxy_probe_received elapsed_us={}",
+            fixture_clock.elapsed().as_micros()
+        );
         assert_eq!(source, a_addr, "preflight must use A's actual socket");
         let preflight = decode_authenticated_punch_packet(&packet[..len], &probe_key)
             .expect("the first packet must be an authenticated Probe-v2 preflight");
@@ -207,18 +212,34 @@ async fn ordinary_validation_preflight_authenticates_return_mapping_without_chas
         assert_eq!(preflight.target_node_id.as_deref(), Some("node-b"));
         assert_eq!(preflight.generation, Some(generation));
         returning.send_to(&packet[..len], b_addr).await.unwrap();
+        eprintln!(
+            "mapping_boundary phase=proxy_probe_forwarded elapsed_us={}",
+            fixture_clock.elapsed().as_micros()
+        );
 
         let (len, source) = returning.recv_from(&mut packet).await.unwrap();
+        eprintln!(
+            "mapping_boundary phase=proxy_probe_ack_received elapsed_us={}",
+            fixture_clock.elapsed().as_micros()
+        );
         assert_eq!(source, b_addr);
         let probe_ack = decode_authenticated_punch_packet(&packet[..len], &probe_key)
             .expect("the responder must return an authenticated Probe ACK");
         assert_eq!(probe_ack.kind, PunchPacketKind::Ack);
         assert_eq!(probe_ack.nonce, preflight.nonce);
         returning.send_to(&packet[..len], a_addr).await.unwrap();
+        eprintln!(
+            "mapping_boundary phase=proxy_probe_ack_forwarded elapsed_us={}",
+            fixture_clock.elapsed().as_micros()
+        );
 
         // Receiving this packet at P proves that learning R did not retarget
         // the already prepared request. No unrelated punch loop is running.
         let (len, source) = original.recv_from(&mut packet).await.unwrap();
+        eprintln!(
+            "mapping_boundary phase=proxy_request_received elapsed_us={}",
+            fixture_clock.elapsed().as_micros()
+        );
         assert_eq!(
             source, a_addr,
             "encrypted Request must reuse the probe socket"
@@ -257,6 +278,10 @@ async fn ordinary_validation_preflight_authenticates_return_mapping_without_chas
             break;
         }
         let encrypted_ack = encrypted_ack.expect("the first Request must receive a real WG ACK");
+        eprintln!(
+            "mapping_boundary phase=proxy_encrypted_ack_held elapsed_us={}",
+            fixture_clock.elapsed().as_micros()
+        );
         request_tx.send(request).unwrap();
         release_ack_rx.await.unwrap();
         returning.send_to(&encrypted_ack, a_addr).await.unwrap();
@@ -270,6 +295,10 @@ async fn ordinary_validation_preflight_authenticates_return_mapping_without_chas
     let subscriber = tracing_subscriber::registry().with(preflight.clone());
     tasks.spawn(
         async move {
+            eprintln!(
+                "mapping_boundary phase=worker_started elapsed_us={}",
+                fixture_clock.elapsed().as_micros()
+            );
             run_direct_encrypted_validation(
                 PeerReflexiveObservation {
                     peer_id: "node-b".to_string(),
@@ -302,6 +331,14 @@ async fn ordinary_validation_preflight_authenticates_return_mapping_without_chas
         if !independent_authentication {
             let counters = timeout(Duration::from_millis(20), udp_a.probe_rx_snapshot()).await;
             eprintln!("mapping_preflight original_failure_rx={counters:?}");
+            let diagnostics = timeout(Duration::from_millis(20), peers_a.diagnostics()).await;
+            if let Ok(diagnostics) = diagnostics {
+                for peer in diagnostics {
+                    for event in peer.direct_events.iter().take(32) {
+                        eprintln!("mapping_preflight original_failure_event={event:?}");
+                    }
+                }
+            }
         }
         assert!(
             independent_authentication,

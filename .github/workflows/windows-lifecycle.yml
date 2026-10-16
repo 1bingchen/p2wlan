@@ -270,6 +270,14 @@ jobs:
             -TrayCycles 20 `
             -AttemptRealWintun
 
+      - name: Collect original production startup evidence
+        if: always()
+        shell: pwsh
+        run: |
+          python scripts/windows_lifecycle/production_diagnostics.py `
+            --input windows-lifecycle-evidence.json `
+            --output (Join-Path $env:P2WLAN_TRAY_DIAGNOSTICS_DIR 'production')
+
       - name: Collect Windows tray crash diagnostics
         id: tray_diagnostics
         if: always()

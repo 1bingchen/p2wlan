@@ -141,6 +141,12 @@ CI 的通用 workspace 套件由 `scripts/quality/run_cargo_test.py` 执行一�
 
 NAT 仿真的 `NAT_SIM_PROCESS_BIRTH=1` 可选开启原生进程出生身份记录；默认关闭。`launch_identity.py exec --process-birth` 在同一进程原始 exec 前读取自己的 Darwin 原生身份，以私有、最多 4 KiB 的 `.birth` sidecar 绑定原启动记录摘要、源码、角色和产物摘要，不读取 token stdin。原 schema 1 启动记录与严格收集器保持不变。其他平台或原生查询失败会保留不可用原因，诊断写入失败不能阻止原 exec。该记录只为后续受归属约束的观察提供出生身份 fence，不能证明 exec 成功、当前 PID 仍对应原实例或 TCP 已建立；原 exec 失败会使该绑定不可用，禁止按晚到的 PID 查询补造原实例身份。固定四例策略测量会将显式 opt-in 纳入各例原环境，保持原预算与分母。
 
+Darwin 上同时设置 `NAT_SIM_PROCESS_BIRTH=1 NAT_SIM_TCP_OBSERVER=1` 可诊断每轮第一个原始并发 a/b status 请求。构建阶段保留原生观察程序、源码与产物摘要；固定四例复用同一份程序。原 Bash 仅为已经登记的两个 daemon 启动观察器，并在原 PIDS 清单登记观察器及原 HTTP 子进程。采样 Python 只观察自己拥有的实际 curl；在 poll/wait 前读取其出生身份，后续每次 TCP 查询都验证原出生身份、UID 和直接所有者，并在 FD 读取后再次复核所有者与目标。
+
+准备及预热消耗原固定工作期限；原生 ready 等待最多 5 秒，TCP 查询最多 200ms，原生 watchdog 为 10 秒、最多 7 条非退出命令、128 个 FD。两侧观察器共用最多 1 秒的 join 界限，并受原工作期限收紧，不提前启动或延长轮次 finalizer 的资源宽限；未回收者仍归原 PIDS 清理。私有 FIFO 的读端与原生写端独立打开，不共享非阻塞标志。客户端保留 0/25/75/125/175ms 五个预定采样点及其实际时间；错过窗口、进程退出、身份不匹配、容量超限或取消都不能证明“没有 socket”。只保留 IPv4 TCP 与目标端口匹配的顺序 FD 行，不声称全局原子快照。原 curl 参数、认证 stdin、连接/请求/wrapper 时限、HTTP 验收和轮次分母保持原规则；诊断不能把原 HTTP 失败改为成功，也不能据此给出策略收益或旧失败根因。原始记录位于私有轮次的 `tcp-observation/`，取消和强制清理必须结合原所有者退出记录解读。
+
+原生 overlay 验证的 `p2pnet_daemon::overlay_native_credit=debug` target 将 REQUEST/ACK 拒绝的 nonce、seq、类型化结果与原 Full publication 的实际观察点关联。ACK 字段只在原 owner/once 事务返回后采样；publication 日志只在原观察时间已写入后输出。缺失时间保留为空，这些顺序快照不构成原子事实，也不能把晚到的 publication 用作较早原读的信用。该 target 不记录密钥或载荷，不改变原读时间、成功计数、拒绝规则、重试或时限。NAT 仿真的默认诊断过滤器包含该 target；自定义过滤器需自行保留它。
+
 ## 完成标准
 
 代码完成不等于功能能运行一次。一个改动只有在以下条件满足后才可合并：边界清楚、资源有界、错误可分类、取消路径完整、核心不变量有自动测试、CI 通过、文档只描述已实现行为，并明确真实设备或公网环境仍未验证的部分。

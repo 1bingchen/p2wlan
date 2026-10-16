@@ -60,6 +60,11 @@ def case_environment(base: dict, directory: Path, scenario: str, policy: str, se
         raise ValueError("process_birth_must_be_zero_or_one")
     if birth == "1":
         env["NAT_SIM_PROCESS_BIRTH"] = birth
+    observer = base.get("NAT_SIM_TCP_OBSERVER", "0")
+    if observer not in {"0", "1"} or (observer == "1" and birth != "1"):
+        raise ValueError("tcp_observer_requires_zero_or_one_and_original_birth")
+    if observer == "1":
+        env["NAT_SIM_TCP_OBSERVER"] = observer
     if scenario not in {"reachable-direct", "direct-blackhole"}:
         raise ValueError("unknown_fixed_scenario")
     flag = daemon_flag(policy)
@@ -315,6 +320,10 @@ def main(argv=None) -> int:
             verify_snapshot(build_dir, name, artifact)
         plan["preparation"].update(artifact_set_sha256=digest_file(frozen_path),
                                     source=source, artifacts=frozen["artifacts"])
+        if build_env.get("NAT_SIM_TCP_OBSERVER") == "1":
+            from owned_tcp_manifest import image_from_manifest
+            manifest, _ = image_from_manifest(build_dir / "tcp-observer/manifest.json", source)
+            plan["preparation"]["tcp_observer"] = manifest
     except (OSError, ValueError, KeyError, TypeError) as error:
         plan["preparation"]["error_type"] = type(error).__name__
         plan["valid_measurement"] = False
@@ -322,6 +331,8 @@ def main(argv=None) -> int:
         return 1
     for row in plan["cases"]:
         row["environment"]["NAT_SIM_REUSE_ARTIFACT_SET"] = str(frozen_path)
+        if build_env.get("NAT_SIM_TCP_OBSERVER") == "1":
+            row["environment"]["NAT_SIM_REUSE_TCP_OBSERVER"] = str(build_dir / "tcp-observer/manifest.json")
         if source_identity(root) != source:
             row.update(status="not_run_source_changed")
             continue

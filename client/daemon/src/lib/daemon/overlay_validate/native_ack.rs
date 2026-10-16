@@ -166,6 +166,11 @@ async fn handle_native_overlay_ack(
                 .cloned()
         });
     let Some(request) = request else {
+        debug!(target: "p2pnet_daemon::overlay_native_credit",
+            event = "overlay_native_ack_unavailable", peer = %ack.peer_id,
+            nonce = ack.nonce, seq = ack.seq,
+            reason_code = "canonical_original_request_unavailable",
+            "original ACK has no matching canonical request in the retained views");
         return;
     };
     let borrowed = crate::peer::OriginalOverlayCurrentOwners {
@@ -191,8 +196,27 @@ async fn handle_native_overlay_ack(
         tokio::time::sleep_until(tokio::time::Instant::from_std(wake)).await;
     };
     let OverlayCreditOutcome::Fresh(receipt) = outcome else {
-        debug!(event = "overlay_native_ack_rejected", outcome = ?outcome,
-            "original ACK did not commit native credit");
+        if tracing::enabled!(target: "p2pnet_daemon::overlay_native_credit", tracing::Level::DEBUG)
+        {
+            let read_at = source.as_ref().and_then(|source| {
+                match (source.original_udp_read(), source.original_relay_read()) {
+                    (Some(read), None) => Some(read.received_at()),
+                    (None, Some(read)) => Some(read.completed_at()),
+                    _ => None,
+                }
+            });
+            let observed_at = request.physical_publication.recorded_observed_at();
+            // Post-transaction observations only. A later publication cannot
+            // replace the original read or upgrade this rejected ACK.
+            debug!(target: "p2pnet_daemon::overlay_native_credit",
+                event = "overlay_native_ack_rejected", peer = %ack.peer_id,
+                nonce = ack.nonce, seq = ack.seq, outcome = ?outcome,
+                publication_phase = ?request.physical_publication.state(),
+                original_read_before_publication = ?read_at.zip(observed_at).map(|(read, observed)| read < observed),
+                original_read_age_us = ?read_at.and_then(|read| read.checked_duration_since(request.sent_at)).map(|age| age.as_micros()),
+                publication_age_us = ?observed_at.and_then(|observed| observed.checked_duration_since(request.sent_at)).map(|age| age.as_micros()),
+                "original ACK did not commit native credit; snapshots are not atomic");
+        }
         return;
     };
     // No authority is granted after this point. All owner guards are gone;

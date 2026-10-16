@@ -21,6 +21,19 @@ spec.loader.exec_module(MATRIX)
 
 
 class StartupPolicyMatrixTests(unittest.TestCase):
+    def test_owned_TCP_opt_in_freezes_both_fences_without_changing_original_case_inputs(self):
+        for scenario, policy, offset in MATRIX.CASES:
+            directory = Path('/synthetic/output')
+            original = MATRIX.case_environment({}, directory, scenario, policy, 932300 + offset)
+            observed = MATRIX.case_environment({'NAT_SIM_PROCESS_BIRTH': '1', 'NAT_SIM_TCP_OBSERVER': '1'},
+                                               directory, scenario, policy, 932300 + offset)
+            self.assertEqual(observed.pop('NAT_SIM_PROCESS_BIRTH'), '1')
+            self.assertEqual(observed.pop('NAT_SIM_TCP_OBSERVER'), '1')
+            self.assertEqual(observed, original)
+        for base in [{'NAT_SIM_TCP_OBSERVER': '1'}, {'NAT_SIM_TCP_OBSERVER': 'yes'}]:
+            with self.assertRaisesRegex(ValueError, 'tcp_observer'):
+                MATRIX.case_environment(base, Path('/synthetic/output'), 'reachable-direct', 'auto', 932300)
+
     def test_birth_opt_in_is_frozen_in_each_case_without_changing_budgets(self):
         for scenario, policy, offset in MATRIX.CASES:
             original = MATRIX.case_environment({}, Path('/synthetic/output'), scenario, policy, 932300+offset)

@@ -5,6 +5,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from unittest import mock
 
@@ -97,6 +98,22 @@ class CargoArtifactIdentityTests(unittest.TestCase):
         self.assertCountEqual(errors, ["log_capacity", "line_capacity"])
         self.assertEqual(stream.tell(), len(stream.getvalue()))
 
+    def test_console_raw_descriptor_preserves_bytes_across_partial_writes(self):
+        read_fd, write_fd = runner.os.pipe()
+        original_write = runner.os.write
+        content = b"native\r\n\x1aexact bytes\n"
+        try:
+            with mock.patch.object(runner.os, "write", side_effect=lambda fd, data: original_write(fd, data[:2])):
+                runner.capture_stream(io.BytesIO(content), self.evidence / "log", write_fd, lambda _: None, [])
+            runner.os.close(write_fd)
+            write_fd = None
+            self.assertEqual(runner.os.read(read_fd, 1024), content)
+            self.assertEqual((self.evidence / "log").read_bytes(), content)
+        finally:
+            if write_fd is not None:
+                runner.os.close(write_fd)
+            runner.os.close(read_fd)
+
 
 @unittest.skipUnless(shutil.which("cargo") and shutil.which("rustc"), "actual Cargo toolchain required")
 class ActualCargoFailureEvidenceTests(unittest.TestCase):
@@ -145,6 +162,61 @@ class ActualCargoFailureEvidenceTests(unittest.TestCase):
         self.assertEqual(result, 101)
         self.assertNotIn("--all-targets", manifest["command"])
         self.assertEqual(manifest["failed_binary"]["reason"], "doctest_executable_not_reported")
+
+    def test_actual_cargo_failure_does_not_wait_for_inherited_pipe_eof(self):
+        release = threading.Event()
+        closed = threading.Event()
+        original_popen = subprocess.Popen
+        timers = []
+
+        class HeldEOF:
+            def __init__(self, stream):
+                self.stream = stream
+
+            def read1(self, size):
+                data = self.stream.read1(size)
+                if not data:
+                    release.wait(10)
+                return data
+
+            def close(self):
+                self.stream.close()
+                closed.set()
+
+        class Process:
+            def __init__(self, process):
+                self.process = process
+                self.stdout = HeldEOF(process.stdout)
+                self.stderr = process.stderr
+
+            def wait(self):
+                code = self.process.wait()
+                # A safety release also makes this regression finite on the
+                # old unbounded join. The assertion uses the typed outcome.
+                timer = threading.Timer(2, release.set)
+                timer.start()
+                timers.append(timer)
+                return code
+
+        def popen(command, *args, **kwargs):
+            process = original_popen(command, *args, **kwargs)
+            return Process(process) if command[:2] == ["cargo", "test"] else process
+
+        try:
+            with mock.patch.object(runner.subprocess, "Popen", side_effect=popen), mock.patch.object(runner, "DRAIN_AFTER_EXIT_SECONDS", 0.01):
+                result, manifest, _ = self.fixture('#[test]\nfn original_failure(){assert_eq!(1,2);}\n', all_targets=True)
+            self.assertEqual(result, 101)
+            self.assertEqual(manifest["cargo_returncode"], 101)
+            self.assertEqual(manifest["stream_drain"], {"complete": False, "postexit_limit_seconds": 0.01})
+            self.assertIn("stream_not_closed_after_cargo_exit", manifest["evidence_errors"])
+            self.assertEqual(manifest["failed_binary"]["state"], "unavailable")
+            self.assertTrue(all(not log["complete"] and log["sha256"] is None for log in manifest["logs"].values()))
+        finally:
+            release.set()
+            self.assertTrue(closed.wait(2), "owned stream pump did not close")
+            for timer in timers:
+                timer.cancel()
+                timer.join()
 
 
 if __name__ == "__main__":

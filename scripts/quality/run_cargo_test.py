@@ -13,6 +13,7 @@ import stat
 import subprocess
 import sys
 import threading
+import time
 
 from run_rust_tests import ROOT, _atomic_json, _utc_now, sha256_file, source_identity, toolchain_identity
 
@@ -20,6 +21,7 @@ MAX_LOG_BYTES = 64 * 1024 * 1024
 MAX_LINE_BYTES = 2 * 1024 * 1024
 MAX_ARTIFACTS = 512
 MAX_BINARY_BYTES = 1024 * 1024 * 1024
+DRAIN_AFTER_EXIT_SECONDS = 5
 
 
 def fingerprint(path: Path) -> tuple[int, ...]:
@@ -133,22 +135,32 @@ class CargoIdentity:
             return {"state": "unavailable", "reason": "binary_copy_or_identity_failed"}
 
 
-def capture_stream(stream, path: Path, output, consume, errors: list[str]) -> None:
+def capture_stream(stream, path: Path, output, consume, errors: list[str], stop=None) -> None:
     pending = bytearray()
     oversized_line = False
     stored = 0
-    with path.open("xb") as log:
+    with path.open("xb", buffering=0) as log:
         os.chmod(path, 0o600)
         while chunk := stream.read1(65536):
+            if stop is not None and stop.is_set():
+                return
             remaining = max(0, MAX_LOG_BYTES - stored)
             log.write(chunk[:remaining])
             stored += min(len(chunk), remaining)
             if len(chunk) > remaining and "log_capacity" not in errors:
                 errors.append("log_capacity")
             if output is not None:
-                output.write(chunk)
-                output.flush()
+                # Raw descriptors avoid a daemon pump owning Python's
+                # buffered stdout lock during interpreter shutdown.
+                remaining_output = memoryview(chunk)
+                while remaining_output and (stop is None or not stop.is_set()):
+                    written = os.write(output, remaining_output)
+                    if written <= 0:
+                        raise OSError("console_write_failed")
+                    remaining_output = remaining_output[written:]
             for part in chunk.splitlines(keepends=True):
+                if stop is not None and stop.is_set():
+                    return
                 if not oversized_line:
                     pending.extend(part)
                 if len(pending) > MAX_LINE_BYTES:
@@ -161,7 +173,7 @@ def capture_stream(stream, path: Path, output, consume, errors: list[str]) -> No
                         consume(bytes(pending))
                     pending.clear()
                     oversized_line = False
-        if pending and not oversized_line:
+        if pending and not oversized_line and (stop is None or not stop.is_set()):
             consume(bytes(pending))
 
 
@@ -185,22 +197,47 @@ def run_suite(root: Path, evidence: Path, *, all_targets: bool, echo: bool = Tru
         metadata = subprocess.run(["cargo", "metadata", "--no-deps", "--format-version=1"], cwd=root, check=True, capture_output=True)
         identity = CargoIdentity(root, Path(json.loads(metadata.stdout)["target_directory"]))
         environment = dict(os.environ, CARGO_TERM_COLOR="never")
-        with subprocess.Popen(command, cwd=root, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=environment) as process:
-            def pump(stream, name, output, consume):
+        # The original Cargo wait has no added test timeout. After it exits,
+        # an inherited pipe can remain open in a descendant. Never wait for
+        # that descendant's EOF or close a BufferedReader held by its pump.
+        stop = threading.Event()
+        ready = threading.Event()
+        process_box = []
+        def pump(stream_name, name, output, consume):
+            ready.wait()
+            if not process_box:
+                return
+            stream = getattr(process_box[0], stream_name)
+            try:
+                capture_stream(stream, evidence / name, output, consume, errors, stop)
+            except Exception:
+                errors.append("stream_capture_failed")
+                # Keep draining while the original Cargo is alive.
+                while not stop.is_set() and stream.read1(65536):
+                    pass
+            finally:
                 try:
-                    capture_stream(stream, evidence / name, output, consume, errors)
-                except Exception:
-                    errors.append("stream_capture_failed")
-                    # Keep draining: evidence failure must not deadlock or restart Cargo.
-                    while stream.read(65536):
-                        pass
-            threads = [threading.Thread(target=pump, args=(process.stdout, "cargo.stdout.log", sys.stdout.buffer if echo else None, identity.stdout_line)), threading.Thread(target=pump, args=(process.stderr, "cargo.stderr.log", sys.stderr.buffer if echo else None, identity.stderr_line))]
+                    stream.close()
+                except OSError:
+                    errors.append("stream_close_failed")
+        threads = [threading.Thread(target=pump, args=("stdout", "cargo.stdout.log", sys.stdout.fileno() if echo else None, identity.stdout_line), daemon=True), threading.Thread(target=pump, args=("stderr", "cargo.stderr.log", sys.stderr.fileno() if echo else None, identity.stderr_line), daemon=True)]
+        try:
+            # A thread-capacity failure occurs before Cargo is spawned.
             for thread in threads:
                 thread.start()
-            returncode = process.wait()
-            for thread in threads:
-                thread.join()
-        manifest.update(cargo_returncode=returncode, build_success=identity.build_success, compiler_artifact_count=len(identity.artifacts), failed_binary=identity.retain(evidence, returncode))
+            process = subprocess.Popen(command, cwd=root, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=environment)
+            process_box.append(process)
+        finally:
+            ready.set()
+        returncode = process.wait()
+        drain_end = time.monotonic() + DRAIN_AFTER_EXIT_SECONDS
+        for thread in threads:
+            thread.join(max(0, drain_end - time.monotonic()))
+        drained = all(not thread.is_alive() for thread in threads)
+        stop.set()
+        if not drained:
+            errors.append("stream_not_closed_after_cargo_exit")
+        manifest.update(cargo_returncode=returncode, build_success=identity.build_success, compiler_artifact_count=len(identity.artifacts), stream_drain={"complete": drained, "postexit_limit_seconds": DRAIN_AFTER_EXIT_SECONDS}, failed_binary=identity.retain(evidence, returncode) if drained else {"state": "unavailable", "reason": "stream_not_closed_after_cargo_exit"})
         if identity.capacity_exceeded:
             errors.append("artifact_capacity")
         manifest["source_after"] = source_identity(root)
@@ -211,8 +248,8 @@ def run_suite(root: Path, evidence: Path, *, all_targets: bool, echo: bool = Tru
             errors.append("toolchain_changed")
         for name in ("cargo.stdout.log", "cargo.stderr.log"):
             path = evidence / name
-            manifest.setdefault("logs", {})[name] = {"bytes": path.stat().st_size, "sha256": sha256_file(path)}
-    except (OSError, ValueError, subprocess.CalledProcessError):
+            manifest.setdefault("logs", {})[name] = {"complete": drained, "bytes": path.stat().st_size, "sha256": sha256_file(path) if drained else None}
+    except (OSError, ValueError, RuntimeError, subprocess.CalledProcessError):
         errors.append("runner_or_metadata_failed")
     finally:
         manifest.update(finished_at=_utc_now(), evidence_errors=sorted(set(errors)), source_bound=not errors)

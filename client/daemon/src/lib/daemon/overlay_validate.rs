@@ -630,12 +630,18 @@ async fn run_overlay_validate_loop_inner<T>(
                             &peers, &timeline, &mut seen, &mut stats, &sent_nonces, &mut bursts).await;
                         continue;
                     }
+                    let diagnostic_request = tracing::enabled!(target: "p2pnet_daemon::overlay_native_credit", tracing::Level::DEBUG)
+                        .then(|| crate::overlay_requests::OriginalOverlayAck::parse_request(&event.packet, &event.peer_id)
+                            .map(|request| (request.nonce, request.seq))).flatten();
                     let outcome = handle_native_overlay_request(event, source, owners, &udp_transport,
                         &peers, &controller, &local_vip, overlay_any_path, start_gate_released,
                         &mut seen, &mut stats, &mut pending_echoes).await;
                     if !matches!(outcome, OriginalRequestEchoOutcome::Injected
                         | OriginalRequestEchoOutcome::Queued | OriginalRequestEchoOutcome::DuplicateRequest) {
-                        debug!(event = "overlay_native_request_rejected", outcome = ?outcome,
+                        debug!(target: "p2pnet_daemon::overlay_native_credit",
+                            event = "overlay_native_request_rejected", outcome = ?outcome,
+                            nonce = ?diagnostic_request.map(|(nonce, _)| nonce),
+                            seq = ?diagnostic_request.map(|(_, seq)| seq),
                             "original REQUEST did not enter the sealed echo path");
                     }
                     continue;

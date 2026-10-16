@@ -422,6 +422,16 @@ impl PhysicalRequestPublisher {
             }
         }
         let _ = publication.recorded_observed_at.set(Instant::now());
+        // Log only after the original observation exists. Logging must not
+        // move that boundary or manufacture a fact for an earlier ACK read.
+        tracing::debug!(target: "p2pnet_daemon::overlay_native_credit",
+            event = "overlay_original_publication_observed",
+            peer = %request.peer_id, nonce = request.nonce, seq = request.seq,
+            attempt_id = self.id,
+            publication_age_us = ?publication.recorded_observed_at()
+                .and_then(|observed| observed.checked_duration_since(request.sent_at))
+                .map(|age| age.as_micros()),
+            "original Full publication observed; no ACK credit granted");
         Ok(())
     }
     pub(crate) fn fail_metadata(&mut self) {

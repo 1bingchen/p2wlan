@@ -57,7 +57,7 @@ BACKGROUND_DURATION_MS=${BACKGROUND_DURATION_MS:-0}
 # Keep the local regression logs at the same diagnostic granularity as the
 # dual-end harness: per-packet counter/order and transport handoff boundaries
 # are DEBUG, while the rest remains INFO. Override this for a quieter run.
-  NAT_SIM_RUST_LOG=${NAT_SIM_RUST_LOG:-info,p2pnet_daemon::transport=debug,p2pnet_daemon::network_outbound=debug,p2pnet_daemon::relay=debug,p2pnet_daemon::relay_runtime=debug,p2pnet_daemon::connection_timeline=debug,p2pnet_daemon::direct_validation=debug,p2pnet_daemon::peer::connection=debug,p2pnet_daemon::peer::connection::events=debug,p2pnet_daemon::peer::manager::relay=debug,p2pnet_relay::client=debug}
+  NAT_SIM_RUST_LOG=${NAT_SIM_RUST_LOG:-info,p2pnet_daemon::transport=debug,p2pnet_daemon::network_outbound=debug,p2pnet_daemon::relay=debug,p2pnet_daemon::relay_runtime=debug,p2pnet_daemon::connection_timeline=debug,p2pnet_daemon::overlay_native_credit=debug,p2pnet_daemon::direct_validation=debug,p2pnet_daemon::peer::connection=debug,p2pnet_daemon::peer::connection::events=debug,p2pnet_daemon::peer::manager::relay=debug,p2pnet_relay::client=debug}
 ROUNDS=${ROUNDS:-5}
 NAT_SEED_BASE=${NAT_SEED_BASE:-20260806}
 # Number of relay candidates offered in the catalog. With RELAY_FAILOVER=1,

@@ -47,7 +47,7 @@ async fn rx_ownership_real_relay_handoff_waits_moves_and_cancels_original_values
                 room_authorization: None,
                 peer_id: "rx-b".into(),
                 wire_bytes: vec![byte; byte as usize],
-                probe_budget: None,
+                dst_ip: "10.20.0.2".into(),
                 is_business: false,
             };
             relay_a.send_packet(&packet).await.unwrap();

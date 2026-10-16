@@ -137,6 +137,26 @@ async fn rx_ownership_mismatched_observers_keep_one_owner_and_mark_both_unknown(
 }
 
 #[tokio::test]
+async fn rx_ownership_finished_source_mismatch_marks_both_without_duplicate_credit() {
+    let source = ResourceCapture::new([0xfa; 16]);
+    let target = ResourceCapture::new([0xfb; 16]);
+    source.finish();
+    let (tx, mut rx) = PlaintextRxSink::channel(1, Some(target.clone()));
+    tx.send_with_capture(packet(31), Some(&source))
+        .await
+        .unwrap();
+    assert_eq!(coherent(&source).total.unwrap().live_buffers, 0);
+    assert_eq!(coherent(&target).total.unwrap().live_buffers, 1);
+    assert_ne!(coherent(&source).unknown_bits & 1, 0);
+    assert_ne!(coherent(&target).unknown_bits & 1, 0);
+    let owned = rx.recv(Some(&target)).await.unwrap();
+    assert_eq!(owned.packet, vec![0x45; 31]);
+    drop(owned);
+    assert_eq!(coherent(&source).total.unwrap().live_buffers, 0);
+    assert_eq!(coherent(&target).total.unwrap().live_buffers, 0);
+}
+
+#[tokio::test]
 async fn rx_ownership_legacy_boundary_is_explicitly_unknown_without_duplicate_credit() {
     let c = ResourceCapture::new([0xf5; 16]);
     let (tx, raw_rx) = mpsc::channel(1);

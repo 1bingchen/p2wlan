@@ -103,6 +103,14 @@ impl<T: RxChannelPayload> RxSink<T> {
         value: T,
         capture: Option<&Arc<ResourceCapture>>,
     ) -> Result<(), RxChannelClosed> {
+        if let (Some(source), Some(target)) = (capture, self.capture()) {
+            if !Arc::ptr_eq(source, target) {
+                // A finished source creates no lease. Keep the diagnostic
+                // boundary visible even when only the target observes bytes.
+                source.unobserved_residency_exit();
+                target.unobserved_residency_exit();
+            }
+        }
         self.send_owned(RxOwned::observe(
             value,
             capture.or(self.capture()),

@@ -292,15 +292,7 @@ impl UdpTransport {
     ) -> Result<()> {
         use crate::dataplane_resources::{VecOperation, VecSite};
 
-        let mut buf = vec![0u8; 65_535];
-        if let Some(capture) = self.resource_capture() {
-            capture.observe_vec(
-                VecSite::UdpReaderBuffer,
-                VecOperation::FixedReadBuffer,
-                None,
-                &buf,
-            );
-        }
+        let mut buf = crate::dataplane_resources::FixedReadBuffer::udp(self.resource_capture());
 
         loop {
             // The shutdown signal is selected TOGETHER with the receive: a

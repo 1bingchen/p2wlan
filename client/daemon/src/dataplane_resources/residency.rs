@@ -19,9 +19,11 @@ pub(crate) enum ResidencyStage {
     SerializedWire,
     SessionBacklog,
     SessionFlush,
+    UdpReaderStorage,
+    TunReaderStorage,
 }
 impl ResidencyStage {
-    pub(crate) const COUNT: usize = 10;
+    pub(crate) const COUNT: usize = 12;
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Serialize)]
@@ -84,7 +86,7 @@ pub(crate) struct ResidencySnapshot {
     pub(crate) clone_ops: Option<u64>,
     pub(crate) cloned_len_bytes: Option<u64>,
     /// Observed message-owner capacity, not RSS, allocator internals, metadata,
-    /// control/RX/Relay-frame buffers or a whole-pipeline memory claim.
+    /// control/RX-payload/Relay-frame buffers or a whole-pipeline memory claim.
     pub(crate) whole_pipeline_bytes_measured: bool,
 }
 #[allow(dead_code)] // Private readout accessor.

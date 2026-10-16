@@ -85,7 +85,9 @@ schema 1 的 `capture.id` 是每次观测随机生成的标签，不能跨进程
 
 `site_and_lexical_counters` 包含 12 个固定 Vec 站点的物化操作、已知复制字节和目标长度/容量累计值，以及两个 FIFO、五类局部缓冲 lease 的读数。该组 `coherent=false`：多个原子量并非同一事务；读取必须结合 `valid`、`gap_bits` 及各站点/作用域是否实际观察到。目标容量累计值不是存活内存峰值。这组数与下面的所有者观测有重叠，不能相加。
 
-`observed_owner_residency` 单独读取十个实际 Vec 所有者阶段：channel reserve、raw channel、detached raw、pending FIFO、discard batch、retry/preparation plaintext、serialized wire、session backlog/flush。正常生产 TUN 和显式 Mock TUN 验证入口在启用后共用同一 capture，原 WireGuard 与每次重建的 UDP transport 继承该次观测。默认通道与原容量保持；仅为观察而创建的消息不具有原请求 binding。
+`observed_owner_residency` 单独读取十二个实际 Vec 所有者阶段：channel reserve、raw channel、detached raw、pending FIFO、discard batch、retry/preparation plaintext、serialized wire、session backlog/flush，以及 `udp_reader_storage`、`tun_reader_storage`。正常生产 TUN 和显式 Mock TUN 验证入口在启用后共用同一 capture，原 WireGuard 与每次重建的 UDP transport 继承该次观测。默认通道与原容量保持；仅为观察而创建的消息不具有原请求 binding。
+
+两个 reader storage 阶段分别记录每个 UDP 读循环和 TUN packet pump 的固定读存储，覆盖空闲等待、收包处理直到原循环退出或 future 取消。每份存储的初始化长度为 65,535 字节，容量取实际 Vec 值；长度不是最近一包的有效字节数。读接口只借出 slice，不调整长度或容量。UDP 原固定站点累计值仍只记一次，TUN 存储不记作 UDP 站点。该包装器保留可选 lease 的内联存储；默认关闭时没有额外堆分配，但不表示 reader future 的布局成本为零。
 
 启用后通道使用带观测元数据的消息，缓冲所有者计数也有原子操作和 lease 存储开销；诊断读取还会分配并序列化固定规模的 JSON。这些开销不代表业务性能收益，也不保证默认路径的总体成本为零。
 
@@ -102,7 +104,7 @@ schema 1 的 `capture.id` 是每次观测随机生成的标签，不能跨进程
 
 数据面更新不等待读取。忙读返回 `coherent=false`、`valid=false`，总量、峰值、revision、复制数和各阶段量为 `null`；不是测得的零，也不返回上一份缓存冒充当前读数，后续读数可以恢复。计数损坏时也将相关数值保留为 `null`。固定负载可分别统计可用/不可用读数，不能仅筛选成功读数计算可用率。
 
-容量只按观察钩子的逻辑所有者生命周期记账，交接/析构边界和钩子之间的临时量不作分配器瞬时驻留量。RX/控制/Relay frame 所有权、密码库临时量、容器元数据、分配器、内核与 RSS 仍不完整；`whole_pipeline_bytes_measured=false`。这不是整个数据面的内存上限、RSS、release 吞吐或端到端性能证明。接口不导出载荷、peer 身份、地址、私钥或 token。观测关闭后重启 daemon 可停止这部分计数。
+容量只按观察钩子的逻辑所有者生命周期记账，交接/析构边界和钩子之间的临时量不作分配器瞬时驻留量。RX 包及其 channel、控制/Relay frame 所有权、密码库临时量、容器元数据、分配器、内核与 RSS 仍不完整；`whole_pipeline_bytes_measured=false`。这不是整个数据面的内存上限、RSS、release 吞吐或端到端性能证明。接口不导出载荷、peer 身份、地址、私钥或 token。观测关闭后重启 daemon 可停止这部分计数。
 
 ## Hard↔Hard attempt report
 

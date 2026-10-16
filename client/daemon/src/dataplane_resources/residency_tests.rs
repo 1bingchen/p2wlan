@@ -11,6 +11,8 @@ fn runtime_resource_busy_and_damaged_readouts_keep_unavailable_values_null() {
     let capture = run.capture();
     let bytes = vec![0; 32];
     let lease = ResidencyLease::observe(capture, ResidencyStage::RawChannel, &bytes).unwrap();
+    let _udp = super::super::FixedReadBuffer::udp(Some(capture));
+    let _tun = super::super::FixedReadBuffer::tun(Some(capture));
     // Deterministic writer-entry hold, using the real ledger's bounded reader.
     capture.residency.writers.store(1, Ordering::SeqCst);
     let busy = run.readout();
@@ -31,7 +33,7 @@ fn runtime_resource_busy_and_damaged_readouts_keep_unavailable_values_null() {
     capture.residency.writers.store(0, Ordering::SeqCst);
     assert_eq!(
         run.readout()["capture"]["observed_owner_residency"]["total"]["live_buffers"],
-        1
+        3
     );
     capture.residency.gap(RecordDisposition::CounterOverflow);
     let damaged = run.readout();

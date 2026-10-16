@@ -17,7 +17,7 @@ struct UdpDirectTaskContext {
     udp_transport_publication: UdpTransportPublication,
     direct_validation_transport: WireGuardTransport,
     direct_validation_local_ip: String,
-    udp_inbound_tx: mpsc::Sender<ReceivedEncryptedPacket>,
+    udp_inbound_tx: crate::dataplane_resources::EncryptedRxSink,
     local_node_id: String,
     stun_servers: Vec<SocketAddr>,
     stun_server_specs: Vec<String>,
@@ -397,7 +397,7 @@ async fn run_udp_direct_instance(
     let udp = udp
         .with_local_node_id(local_node_id.clone())
         .with_wireguard_transport(direct_validation_transport.clone())
-        .with_inbound_channel(udp_inbound_tx.clone())
+        .with_inbound_sink(udp_inbound_tx.clone())
         .with_peer_reflexive_observer(peer_reflexive_ingress.clone())
         .with_dplpmtud_local_virtual_ip(dplpmtud_local_virtual_ip);
     // Matched ACKs enter the same scheduler as peer-reflexive
@@ -454,7 +454,7 @@ async fn run_udp_direct_instance(
     let mut inbound_worker = tokio::spawn({
         let udp = udp.clone();
         let inbound_tx = udp_inbound_tx.clone();
-        async move { udp.run_inbound(inbound_tx).await }
+        async move { udp.run_inbound_with_sink(inbound_tx).await }
     });
 
     #[cfg(test)]
@@ -1726,7 +1726,7 @@ mod udp_direct_tests {
             udp_transport_publication: daemon.udp_transport_publication.clone(),
             direct_validation_transport: daemon.transport.clone(),
             direct_validation_local_ip: daemon.config.network.virtual_ip.clone(),
-            udp_inbound_tx,
+            udp_inbound_tx: udp_inbound_tx.into(),
             local_node_id: daemon.config.node.node_id.clone(),
             stun_servers: Vec::new(),
             stun_server_specs: vec!["off".to_string()],

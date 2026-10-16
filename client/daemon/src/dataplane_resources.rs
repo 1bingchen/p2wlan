@@ -2,7 +2,8 @@
 //!
 //! Vec operations and observed capacities are not allocator calls or RSS.
 //! Counters cover fixed sites; leases cover two plaintext FIFOs and explicitly
-//! observed buffers in the slow send, plus fixed UDP/TUN reader storage.
+//! observed buffers in the slow send, fixed UDP/TUN reader storage and the
+//! daemon's business RX handoffs through authenticated plaintext/TUN writes.
 //! They do not cover the whole pipeline.
 //! A daemon may explicitly enable the authenticated, bounded runtime readout.
 //! Default instances retain no capture and never serialize per-packet data.
@@ -15,8 +16,14 @@ mod fixed_read_buffer;
 mod owned_buffers;
 mod residency;
 mod runtime;
+mod rx_channel;
+mod rx_owned;
 pub(crate) use fixed_read_buffer::FixedReadBuffer;
 pub(crate) use runtime::RuntimeResourceCapture;
+pub(crate) use rx_channel::{
+    EncryptedRxReceiver, EncryptedRxSink, PlaintextRxReceiver, PlaintextRxSink,
+};
+pub(crate) use rx_owned::RxOwned;
 #[cfg(test)]
 mod tests;
 use owned_buffers::BufferCounters;

@@ -147,6 +147,13 @@ impl UdpTransport {
         self,
         inbound_tx: mpsc::Sender<ReceivedEncryptedPacket>,
     ) -> Result<()> {
+        self.run_inbound_with_sink(inbound_tx.into()).await
+    }
+
+    pub(crate) async fn run_inbound_with_sink(
+        self,
+        inbound_tx: crate::dataplane_resources::EncryptedRxSink,
+    ) -> Result<()> {
         let sockets = self.active_sockets().to_vec();
         let mut readers = JoinSet::new();
         for (socket_index, socket) in sockets.into_iter().enumerate() {
@@ -189,7 +196,7 @@ impl UdpTransport {
         &self,
         socket_index: usize,
         socket: Arc<UdpSocket>,
-        inbound_tx: mpsc::Sender<ReceivedEncryptedPacket>,
+        inbound_tx: impl Into<crate::dataplane_resources::EncryptedRxSink>,
     ) -> Result<()> {
         self.run_inbound_socket_inner(socket_index, socket, inbound_tx, None, None)
             .await
@@ -286,12 +293,13 @@ impl UdpTransport {
         &self,
         socket_index: usize,
         socket: Arc<UdpSocket>,
-        inbound_tx: mpsc::Sender<ReceivedEncryptedPacket>,
+        inbound_tx: impl Into<crate::dataplane_resources::EncryptedRxSink>,
         mut shutdown_rx: Option<&mut watch::Receiver<bool>>,
         mut reader_ready_tx: Option<oneshot::Sender<bool>>,
     ) -> Result<()> {
         use crate::dataplane_resources::{VecOperation, VecSite};
 
+        let inbound_tx = inbound_tx.into();
         let mut buf = crate::dataplane_resources::FixedReadBuffer::udp(self.resource_capture());
 
         loop {
@@ -1780,38 +1788,41 @@ impl UdpTransport {
                 );
             }
             inbound_tx
-                .send(ReceivedEncryptedPacket {
-                    physical_ingress,
-                    original_relay_read: None,
-                    original_udp_read: Some(ingress_origin::OriginalUdpIngressSource::capture(
-                        self,
-                        &socket,
-                        socket_index,
-                        publication_owner,
-                        network_generation,
-                        udp_received,
-                        transport_queue_send_started,
-                    )),
-                    source: Some(source),
-                    local_endpoint,
-                    relay_endpoint: None,
-                    relay_connection_id: None,
-                    relay_peer_id: None,
-                    socket_index: Some(socket_index),
-                    direct_socket: (socket_index >= DYNAMIC_SOCKET_INDEX_BASE)
-                        .then(|| socket.clone()),
-                    // The token is sampled at enqueue time, not when the
-                    // WireGuard worker later decrypts this datagram. A
-                    // publication replacement can therefore reject a queued
-                    // packet from the retired reader instead of treating it
-                    // as evidence for the replacement socket.
-                    udp_transport_owner: Some(publication_owner),
-                    network_generation: Some(network_generation),
-                    profile_sampled,
-                    udp_received: Some(udp_received),
-                    transport_queue_send_started: Some(transport_queue_send_started),
-                    wire_bytes,
-                })
+                .send_with_capture(
+                    ReceivedEncryptedPacket {
+                        physical_ingress,
+                        original_relay_read: None,
+                        original_udp_read: Some(ingress_origin::OriginalUdpIngressSource::capture(
+                            self,
+                            &socket,
+                            socket_index,
+                            publication_owner,
+                            network_generation,
+                            udp_received,
+                            transport_queue_send_started,
+                        )),
+                        source: Some(source),
+                        local_endpoint,
+                        relay_endpoint: None,
+                        relay_connection_id: None,
+                        relay_peer_id: None,
+                        socket_index: Some(socket_index),
+                        direct_socket: (socket_index >= DYNAMIC_SOCKET_INDEX_BASE)
+                            .then(|| socket.clone()),
+                        // The token is sampled at enqueue time, not when the
+                        // WireGuard worker later decrypts this datagram. A
+                        // publication replacement can therefore reject a queued
+                        // packet from the retired reader instead of treating it
+                        // as evidence for the replacement socket.
+                        udp_transport_owner: Some(publication_owner),
+                        network_generation: Some(network_generation),
+                        profile_sampled,
+                        udp_received: Some(udp_received),
+                        transport_queue_send_started: Some(transport_queue_send_started),
+                        wire_bytes,
+                    },
+                    self.resource_capture(),
+                )
                 .await
                 .map_err(|_| {
                     DaemonError::Network("received encrypted packet channel closed".to_string())

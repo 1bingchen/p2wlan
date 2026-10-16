@@ -13,6 +13,21 @@ fn runtime_resource_busy_and_damaged_readouts_keep_unavailable_values_null() {
     let lease = ResidencyLease::observe(capture, ResidencyStage::RawChannel, &bytes).unwrap();
     let _udp = super::super::FixedReadBuffer::udp(Some(capture));
     let _tun = super::super::FixedReadBuffer::tun(Some(capture));
+    let rx: Vec<_> = [
+        ResidencyStage::RxWireAdmission,
+        ResidencyStage::RxWireChannel,
+        ResidencyStage::RxWireActive,
+        ResidencyStage::RxParsedPayload,
+        ResidencyStage::RxAuthenticatedPlaintext,
+        ResidencyStage::RxPlaintextAdmission,
+        ResidencyStage::RxPlaintextChannel,
+        ResidencyStage::RxPlaintextActive,
+        ResidencyStage::RxTunPacket,
+        ResidencyStage::RxTunNormalized,
+    ]
+    .into_iter()
+    .map(|stage| super::super::RxOwned::observe(vec![0; 17], Some(capture), stage))
+    .collect();
     // Deterministic writer-entry hold, using the real ledger's bounded reader.
     capture.residency.writers.store(1, Ordering::SeqCst);
     let busy = run.readout();
@@ -30,10 +45,11 @@ fn runtime_resource_busy_and_damaged_readouts_keep_unavailable_values_null() {
     for stage in owners["stages"].as_array().unwrap() {
         assert!(stage["totals"].is_null() && stage["scope_observed"].is_null());
     }
+    assert_eq!(owners["stages"].as_array().unwrap().len(), 22);
     capture.residency.writers.store(0, Ordering::SeqCst);
     assert_eq!(
         run.readout()["capture"]["observed_owner_residency"]["total"]["live_buffers"],
-        3
+        13
     );
     capture.residency.gap(RecordDisposition::CounterOverflow);
     let damaged = run.readout();
@@ -42,6 +58,10 @@ fn runtime_resource_busy_and_damaged_readouts_keep_unavailable_values_null() {
     assert_eq!(owners["valid"], false);
     assert!(owners["total"].is_null());
     assert_ne!(owners["gap_bits"], 0);
+    for stage in owners["stages"].as_array().unwrap() {
+        assert!(stage["totals"].is_null());
+    }
+    drop(rx);
     drop(lease);
 }
 

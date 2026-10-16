@@ -534,9 +534,10 @@ impl RelayTransport {
     pub(crate) async fn run_inbound_for_read<I: RelayReadItem>(
         self,
         mut relay_rx: mpsc::Receiver<I>,
-        inbound_tx: mpsc::Sender<ReceivedEncryptedPacket>,
+        inbound_tx: impl Into<crate::dataplane_resources::EncryptedRxSink>,
         relay_selection: Option<Arc<tokio::sync::RwLock<RelaySelectionDiagnostics>>>,
     ) -> Result<()> {
+        let inbound_tx = inbound_tx.into();
         while let Some(delivery) = relay_rx.recv().await {
             let (message, original_read) = delivery.into_parts();
             match message {

@@ -9,7 +9,7 @@ struct RelayInboundSpawnContext {
     relay_selection: Arc<RwLock<RelaySelectionDiagnostics>>,
     relay_available_tx: tokio::sync::watch::Sender<bool>,
     timeline: Arc<crate::connection_timeline::ConnectionTimeline>,
-    inbound_tx: mpsc::Sender<ReceivedEncryptedPacket>,
+    inbound_tx: crate::dataplane_resources::EncryptedRxSink,
     control: ControlClient,
     android_network_change_rx: Option<AndroidNetworkChangeReceiver>,
     allow_insecure_plaintext: bool,

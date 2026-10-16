@@ -187,8 +187,11 @@ fn relay_assisted_punch_delay(punch_at_ms: Option<u64>) -> Duration {
     Duration::ZERO
 }
 
-async fn log_inbound_packets_without_tun(mut inbound_rx: mpsc::Receiver<InboundPacket>) {
-    while let Some(packet) = inbound_rx.recv().await {
+async fn log_inbound_packets_without_tun(
+    mut inbound_rx: crate::dataplane_resources::PlaintextRxReceiver,
+    capture: Option<Arc<crate::dataplane_resources::ResourceCapture>>,
+) {
+    while let Some(packet) = inbound_rx.recv(capture.as_ref()).await {
         debug!(
             "Dropping {} decrypted inbound bytes from peer {} because TUN is disabled",
             packet.packet.len(),

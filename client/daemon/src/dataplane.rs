@@ -42,3 +42,7 @@ mod resource_capture_admission_wait_tests {
 #[cfg(test)]
 #[path = "dataplane/resource_residency_tests.rs"]
 mod resource_residency_tests;
+
+#[cfg(test)]
+#[path = "dataplane/rx_ownership_tests.rs"]
+mod rx_ownership_tests;

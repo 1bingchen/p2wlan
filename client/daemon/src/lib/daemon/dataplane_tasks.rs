@@ -2,7 +2,7 @@ impl Daemon {
     async fn spawn_dataplane_tasks(
         &self,
         tun: Option<TunDevice>,
-        network_inbound_rx: mpsc::Receiver<ReceivedEncryptedPacket>,
+        network_inbound_rx: crate::dataplane_resources::EncryptedRxReceiver,
     ) {
         let local_sources = if self.config.network.network_id.starts_with("room-") {
             tokio::task::spawn_blocking(|| {
@@ -168,7 +168,11 @@ impl Daemon {
                 .await;
             info!("validate_overlay: mock-TUN overlay dataplane is up at {local_vip}");
         } else {
-            let (inbound_tx, inbound_rx) = mpsc::channel(1024);
+            let resource_capture = self.transport.resource_capture().cloned();
+            let (inbound_tx, inbound_rx) = crate::dataplane_resources::PlaintextRxSink::channel(
+                1024,
+                resource_capture.clone(),
+            );
             let inbound_transport = self.transport.clone();
             let inbound_peers = self.peers.clone();
             let inbound_udp_updates = self.udp_transport_publication.subscribe();
@@ -194,7 +198,7 @@ impl Daemon {
                 .spawn(
                     "tun-disabled-inbound-log",
                     false,
-                    log_inbound_packets_without_tun(inbound_rx),
+                    log_inbound_packets_without_tun(inbound_rx, resource_capture),
                 )
                 .await;
         }

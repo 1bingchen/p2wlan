@@ -254,7 +254,7 @@ pub struct UdpTransport {
     /// Aggregate socket counters remain available for topology-free diagnostics,
     /// but they must never be used as evidence for a single peer's timeout.
     peer_probe_rx_diagnostics: PeerProbeRxDiagnostics,
-    inbound_tx: Option<mpsc::Sender<ReceivedEncryptedPacket>>,
+    inbound_tx: Option<crate::dataplane_resources::EncryptedRxSink>,
     /// Owner of the daemon publication currently allowed to turn an
     /// authenticated UDP envelope into Direct-path state. Socket readers
     /// stamp this on every envelope; WireGuard inbound compares it with the

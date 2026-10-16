@@ -15,7 +15,7 @@ pub(super) fn test_supervisor(ticket_cache: Option<Arc<RelayTicketCache>>) -> Re
         relay_selection: Arc::new(RwLock::new(RelaySelectionDiagnostics::default())),
         relay_available_tx,
         timeline: crate::connection_timeline::ConnectionTimeline::new("node-a", 0),
-        inbound_tx,
+        inbound_tx: inbound_tx.into(),
         android_network_change_rx: None,
         ticket_cache,
         relay_ticket: None,

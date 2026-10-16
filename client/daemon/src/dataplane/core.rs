@@ -68,7 +68,7 @@ pub struct DataPlane<T> {
     request_route_test_gate: Option<Arc<RequestRouteTestGate>>,
     peers: Arc<PeerManager>,
     outbound_tx: RawOutboundSink,
-    inbound_rx: Option<mpsc::Receiver<InboundPacket>>,
+    inbound_rx: Option<crate::dataplane_resources::PlaintextRxReceiver>,
     local_feedback_rx: Option<tokio::sync::broadcast::Receiver<Vec<u8>>>,
     acl: Option<Arc<RwLock<AclEngine>>>,
     local_node_id: Option<String>,
@@ -93,14 +93,16 @@ where
     ) -> (
         Self,
         crate::request_carriage::RawOutboundReceiver,
-        mpsc::Sender<InboundPacket>,
+        crate::dataplane_resources::PlaintextRxSink,
     ) {
         if !track_requests && capture.is_none() {
             let (plane, receiver, inbound) = Self::new_bidirectional(tun, peers);
-            return (plane, receiver.into(), inbound);
+            return (plane, receiver.into(), inbound.into());
         }
-        let (mut plane, receiver, inbound) =
-            Self::new_bidirectional_with_request_carriage(tun, peers);
+        let (mut plane, receiver) = Self::new_with_request_carriage(tun, peers);
+        let (inbound, inbound_rx) =
+            crate::dataplane_resources::PlaintextRxSink::channel(1024, capture.clone());
+        plane.inbound_rx = Some(inbound_rx);
         if let Some(capture) = capture {
             plane.outbound_tx = plane.outbound_tx.with_resource_capture(capture.clone());
             plane.resource_capture = Some(capture);
@@ -180,7 +182,7 @@ where
                 tun,
                 peers,
                 RawOutboundSink::Legacy(outbound_tx),
-                Some(inbound_rx),
+                Some(inbound_rx.into()),
             ),
             outbound_rx,
             inbound_tx,
@@ -199,6 +201,7 @@ where
         )
     }
 
+    #[cfg(test)] // Original tracked fixture API; runtime selects one RX channel above.
     pub(crate) fn new_bidirectional_with_request_carriage(
         tun: T,
         peers: Arc<PeerManager>,
@@ -214,7 +217,7 @@ where
                 tun,
                 peers,
                 RawOutboundSink::Tracked(outbound_tx),
-                Some(inbound_rx),
+                Some(inbound_rx.into()),
             ),
             outbound_rx,
             inbound_tx,
@@ -225,7 +228,7 @@ where
         tun: T,
         peers: Arc<PeerManager>,
         outbound_tx: RawOutboundSink,
-        inbound_rx: Option<mpsc::Receiver<InboundPacket>>,
+        inbound_rx: Option<crate::dataplane_resources::PlaintextRxReceiver>,
     ) -> Self {
         let local_feedback_rx = peers.subscribe_local_mtu_feedback();
         Self {
@@ -319,6 +322,7 @@ where
     /// Run the packet pump until the TUN device closes or an unrecoverable error occurs.
     pub async fn run(&mut self) -> Result<()> {
         let mut buf = crate::dataplane_resources::FixedReadBuffer::tun(self.resource_capture());
+        let resource_capture = self.resource_capture().cloned();
         let mut local_feedback_rx = self
             .local_feedback_rx
             .take()
@@ -343,13 +347,15 @@ where
                             .await?;
                         }
                     }
-                    inbound = inbound_rx.recv() => {
+                    inbound = inbound_rx.recv(resource_capture.as_ref()) => {
                         let Some(packet) = inbound else {
                             warn!("Inbound data plane channel closed; continuing outbound-only");
                             break;
                         };
                         let profiler = global_dataplane_profiler();
-                        let mut packet = packet;
+                        let parts = packet.into_parts();
+                        let resources = parts.0;
+                        let mut packet = parts.1;
                         if let Some(trace) = packet.trace.as_mut() {
                             trace.inbound_queue_dequeued = Some(std::time::Instant::now());
                             profiler.record_value(
@@ -376,7 +382,7 @@ where
                                 );
                             }
                         }
-                        self.write_inbound(packet).await?;
+                        self.write_inbound(crate::dataplane_resources::RxOwned::from_parts(packet, resources)).await?;
                     }
                     feedback = local_feedback_rx.recv(), if local_feedback_open => {
                         match feedback {
@@ -770,9 +776,21 @@ where
         Ok(())
     }
 
-    async fn write_inbound(&mut self, packet: InboundPacket) -> Result<()> {
+    async fn write_inbound(
+        &mut self,
+        packet: impl Into<crate::dataplane_resources::RxOwned<InboundPacket>>,
+    ) -> Result<()> {
         use crate::dataplane_resources::{VecOperation, VecSite};
 
+        let mut owned = packet.into();
+        owned.align(
+            self.resource_capture(),
+            crate::dataplane_resources::ResidencyStage::RxPlaintextActive,
+            true,
+        );
+        let parts = owned.into_parts();
+        let _plaintext_resources = parts.0;
+        let packet = parts.1;
         let trace = packet.trace.clone();
         let validation_started = std::time::Instant::now();
         let parsed = match IpPacket::new(&packet.packet) {
@@ -788,7 +806,7 @@ where
 
         let protocol = parsed.protocol();
         let total_len = parsed.total_len().min(packet.packet.len());
-        let mut inbound_packet = packet.packet[..total_len].to_vec();
+        let inbound_packet = packet.packet[..total_len].to_vec();
         if let Some(capture) = self.resource_capture() {
             capture.observe_vec(
                 VecSite::RxTunPacketCopy,
@@ -799,6 +817,11 @@ where
         }
         let src_ip = parsed.src_addr_string();
         let dst_ip = parsed.dst_addr_string();
+        let mut inbound_packet = crate::dataplane_resources::RxOwned::observe(
+            inbound_packet,
+            self.resource_capture(),
+            crate::dataplane_resources::ResidencyStage::RxTunPacket,
+        );
 
         let Some(peer) = self.peers.get_connection(&packet.peer_id).await else {
             warn!(
@@ -837,7 +860,13 @@ where
                 &dst_ip,
                 protocol,
             ) {
-                Some(normalized) => inbound_packet = normalized,
+                Some(normalized) => {
+                    inbound_packet = crate::dataplane_resources::RxOwned::observe(
+                        normalized,
+                        self.resource_capture(),
+                        crate::dataplane_resources::ResidencyStage::RxTunNormalized,
+                    )
+                }
                 None => return Ok(()),
             }
         }

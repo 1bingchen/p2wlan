@@ -110,7 +110,7 @@ fn fixed_reader_storage_exports_distinct_stages_and_retains_rx_payload_exclusion
     assert!(readout["capture"]["coverage"]["excludes"]
         .as_array()
         .unwrap()
-        .contains(&serde_json::json!("rx_ownership")));
+        .contains(&serde_json::json!("rx_outside_observed_handoffs")));
     assert_eq!(
         readout["capture"]["coverage"]["whole_pipeline_bytes_measured"],
         false

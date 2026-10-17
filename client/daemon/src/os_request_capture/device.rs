@@ -51,7 +51,6 @@ impl KernelRead {
     pub(super) fn at(&self) -> Instant {
         self.at
     }
-    #[cfg(unix)]
     pub(super) fn monotonic_ns(&self) -> u64 {
         self.monotonic_ns
     }

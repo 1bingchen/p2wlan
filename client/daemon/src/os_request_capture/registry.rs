@@ -19,6 +19,8 @@ use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 use std::time::Instant;
 
+mod full;
+
 #[cfg(any(target_os = "linux", all(unix, test)))]
 static NEXT_SCOPE: AtomicU64 = AtomicU64::new(1);
 
@@ -41,6 +43,7 @@ pub(crate) struct CaptureSession {
 struct RegistryState {
     flows: Vec<FlowState>,
     original_device: Option<Arc<KernelRead>>,
+    full_history: full::FullHistory,
     #[cfg(unix)]
     requests: usize,
     #[cfg(unix)]
@@ -75,6 +78,8 @@ pub(crate) struct KernelReadBinding {
     packet_len: usize,
     packet_sha256: [u8; 32],
     plan: Arc<RegisteredFlowPlan>,
+    spans: Vec<full::ReadFrameSpan>,
+    physical_publication: crate::overlay_requests::PhysicalSendPublication,
 }
 
 #[cfg(unix)]
@@ -93,6 +98,7 @@ pub(super) struct ReadSnapshot {
     active: bool,
     gaps: u64,
     requests: Vec<RequestSnapshot>,
+    historical_full_packets: Vec<full::FullPacketSnapshot>,
     daemon_registration_verified: bool,
     physical_send_verified: bool,
     canonical_current_owner_verified: bool,
@@ -115,6 +121,7 @@ struct RequestSnapshot {
     last_read_monotonic_ns: Option<u64>,
     kernel_frame_read_complete: bool,
     flow_invalid: bool,
+    historical_frame_full_complete: bool,
 }
 
 #[cfg(any(target_os = "linux", all(unix, test)))]
@@ -156,6 +163,7 @@ impl CaptureSession {
             state: Mutex::new(RegistryState {
                 flows: Vec::new(),
                 original_device: None,
+                full_history: full::FullHistory::new(),
                 requests: 0,
                 revision: 0,
                 producers: std::collections::BTreeSet::new(),
@@ -326,12 +334,14 @@ impl CaptureSession {
             return Err(CaptureFailure::FrameConflict);
         }
         let mut slots = Vec::with_capacity(MAX_BINDINGS_PER_PACKET);
+        let mut spans = Vec::with_capacity(MAX_BINDINGS_PER_PACKET);
         if let Some(parsed) = udp {
             if plan.protocol != Protocol::Udp || parsed.payload_bytes != plan.payload_bytes {
                 return Ok(None);
             }
             if let Some(slot) = plan.requests.iter().position(|key| *key == parsed.key) {
                 slots.push(slot);
+                spans.push(full::ReadFrameSpan::new(slot, 0, 1));
                 flow.requests[slot].udp_complete = true;
             }
         } else if let Some(segment) = tcp {
@@ -396,6 +406,10 @@ impl CaptureSession {
                     flow.invalid = true;
                     return Err(CaptureFailure::FrameConflict);
                 }
+                let (start, end) = coverage
+                    .matching_span(&segment)
+                    .ok_or(CaptureFailure::FrameConflict)?;
+                spans.push(full::ReadFrameSpan::new(*slot, start, end));
             }
         }
         if slots.is_empty() {
@@ -420,6 +434,8 @@ impl CaptureSession {
             packet_len: packet.len(),
             packet_sha256: Sha256::digest(packet).into(),
             plan,
+            spans,
+            physical_publication: crate::overlay_requests::PhysicalSendPublication::new(),
         }))
     }
 
@@ -460,6 +476,12 @@ impl CaptureSession {
                         && (read.udp_complete
                             || read.tcp.as_ref().is_some_and(|tcp| tcp.is_complete())),
                     flow_invalid: flow.invalid,
+                    historical_frame_full_complete: !flow.invalid
+                        && state.full_history.frame_complete(
+                            flow_index,
+                            key.sequence as usize,
+                            plan,
+                        ),
                 });
             }
         }
@@ -477,6 +499,7 @@ impl CaptureSession {
             active: self.is_live(Instant::now()),
             gaps: self.gaps.load(Ordering::Relaxed),
             requests,
+            historical_full_packets: state.full_history.snapshot(),
             // These remain false: registration data and completed system reads
             // are not a complete original OS-write/daemon/physical/once chain.
             daemon_registration_verified: false,

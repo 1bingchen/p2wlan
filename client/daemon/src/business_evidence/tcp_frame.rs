@@ -231,6 +231,26 @@ impl TcpFrameCoverage {
     pub(crate) fn is_complete(&self) -> bool {
         !self.conflicted && self.covered == self.plan.wire_len
     }
+
+    /// A range of this original segment whose bytes match the registered
+    /// frame. The caller must separately retain its sealed read and actual
+    /// physical Full; this pure range is never a physical-send fact.
+    pub(crate) fn matching_span(&self, segment: &TcpSegment<'_>) -> Option<(u16, u16)> {
+        if self.conflicted || segment.flow != self.plan.flow || segment.is_control_only() {
+            return None;
+        }
+        let offset = i64::from(segment.sequence.wrapping_sub(self.first_sequence) as i32);
+        let start = offset.max(0) as usize;
+        let end = (offset + segment.payload.len() as i64)
+            .min(self.plan.wire_len as i64)
+            .max(0) as usize;
+        if start >= end {
+            return None;
+        }
+        let source = (start as i64 - offset) as usize;
+        (segment.payload[source..source + end - start] == self.plan.wire[start..end])
+            .then_some((start as u16, end as u16))
+    }
 }
 
 #[cfg(test)]

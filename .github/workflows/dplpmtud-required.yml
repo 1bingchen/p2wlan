@@ -332,6 +332,24 @@ jobs:
           pattern: dplpmtud-live-component-${{ github.run_id }}-*
           path: ${{ runner.temp }}/dplpmtud-component-downloads
           merge-multiple: false
+      - name: Load artifact layout helper from workflow revision
+        id: layout_helper
+        if: always()
+        timeout-minutes: 2
+        env:
+          WORKFLOW_HEAD_SHA: ${{ github.workflow_sha }}
+          SOURCE_HEAD_SHA: ${{ steps.identity.outputs.source_head_sha }}
+        run: |
+          set -euo pipefail
+          [[ "$WORKFLOW_HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]
+          test "$(git rev-parse HEAD)" = "$SOURCE_HEAD_SHA"
+          git fetch --no-tags --no-recurse-submodules --depth=1 origin "$WORKFLOW_HEAD_SHA"
+          set -o noclobber
+          git show "$WORKFLOW_HEAD_SHA:scripts/quality/restore_artifact_layout.py" > "$RUNNER_TEMP/restore-artifact-layout.py"
+          helper_blob="$(git rev-parse "$WORKFLOW_HEAD_SHA:scripts/quality/restore_artifact_layout.py")"
+          test "$(git hash-object --no-filters "$RUNNER_TEMP/restore-artifact-layout.py")" = "$helper_blob"
+          test "$(git rev-parse HEAD)" = "$SOURCE_HEAD_SHA"
+          echo "artifact_layout_helper_workflow_sha=$WORKFLOW_HEAD_SHA blob_sha=$helper_blob"
       - name: Restore artifact-name directories for downloaded components
         id: layout
         if: always()
@@ -340,7 +358,8 @@ jobs:
           RUN_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
           set -euo pipefail
-          python3 scripts/quality/restore_artifact_layout.py \
+          test -s "$RUNNER_TEMP/restore-artifact-layout.py"
+          python3 "$RUNNER_TEMP/restore-artifact-layout.py" \
             --repository "$GITHUB_REPOSITORY" \
             --run-id "$GITHUB_RUN_ID" \
             --run-head-sha "$RUN_HEAD_SHA" \
@@ -403,6 +422,7 @@ jobs:
           CONTRACT_RESULT: ${{ needs.contract.result }}
           LIVE_RESULT: ${{ needs.live_evidence.result }}
           DOWNLOAD_OUTCOME: ${{ steps.download.outcome }}
+          LAYOUT_HELPER_OUTCOME: ${{ steps.layout_helper.outcome }}
           LAYOUT_OUTCOME: ${{ steps.layout.outcome }}
           SELECT_OUTCOME: ${{ steps.select.outcome }}
           AGGREGATE_OUTCOME: ${{ steps.aggregate.outcome }}
@@ -411,6 +431,7 @@ jobs:
           test "$CONTRACT_RESULT" = "success"
           test "$LIVE_RESULT" = "success"
           test "$DOWNLOAD_OUTCOME" = "success"
+          test "$LAYOUT_HELPER_OUTCOME" = "success"
           test "$LAYOUT_OUTCOME" = "success"
           test "$SELECT_OUTCOME" = "success"
           test "$AGGREGATE_OUTCOME" = "success"

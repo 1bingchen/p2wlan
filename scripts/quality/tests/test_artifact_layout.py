@@ -3,6 +3,8 @@ import io
 import json
 import os
 import stat
+import subprocess
+import textwrap
 import sys
 import tempfile
 import unittest
@@ -322,7 +324,8 @@ class WorkflowLayoutTests(unittest.TestCase):
             with self.subTest(workflow=filename):
                 text = (ROOT / ".github/workflows" / filename).read_text()
                 block = text.split(f"\n  {job}:\n", 1)[1].split("\n  required:\n", 1)[0]
-                restore_pos = block.index("python3 scripts/quality/restore_artifact_layout.py")
+                restore_command = ('python3 "$RUNNER_TEMP/restore-artifact-layout.py"' if filename == "dplpmtud-required.yml" else "python3 scripts/quality/restore_artifact_layout.py")
+                restore_pos = block.index(restore_command)
                 self.assertLess(restore_pos, block.index(f"python3 {selector}"))
                 for staging in downloads:
                     self.assertLess(block.index(f"path: ${{{{ runner.temp }}}}/{staging}\n"), restore_pos)
@@ -336,6 +339,102 @@ class WorkflowLayoutTests(unittest.TestCase):
                 self.assertIn('RUN_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}', block)
                 self.assertIn('--run-head-sha "$RUN_HEAD_SHA"', block)
                 self.assertIn('actions: read', text)
+
+
+@unittest.skipIf(os.name == "nt", "DPL aggregate loader runs on Ubuntu/Bash")
+class WorkflowRevisionLoaderTests(unittest.TestCase):
+    def setUp(self):
+        self.git_env = dict(os.environ, GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull,
+                            GIT_TERMINAL_PROMPT="0")
+        for name in ["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE"]:
+            self.git_env.pop(name, None)
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.origin = self.root / "origin"
+        self.checkout = self.root / "validation"
+        self.origin.mkdir()
+        self.git(self.origin, "init", "--initial-branch=main")
+        self.git(self.origin, "config", "user.email", "test@example.invalid")
+        self.git(self.origin, "config", "user.name", "Fixture")
+        for name in ["scripts/dplpmtud/select_component_artifact.py", "contracts/dplpmtud_acceptance.json"]:
+            target = self.origin / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes((ROOT / name).read_bytes())
+        workflow = self.origin / ".github/workflows/dplpmtud-required.yml"
+        workflow.parent.mkdir(parents=True)
+        workflow.write_text("name: historical source fixture\n")
+        self.git(self.origin, "add", ".")
+        self.git(self.origin, "commit", "-m", "historical source without layout helper")
+        self.target = self.git(self.origin, "rev-parse", "HEAD").strip()
+        self.git(self.origin, "branch", "validation-target", self.target)
+        helper = self.origin / "scripts/quality/restore_artifact_layout.py"
+        helper.parent.mkdir(parents=True)
+        helper.write_bytes((ROOT / "scripts/quality/restore_artifact_layout.py").read_bytes())
+        workflow.write_bytes((ROOT / ".github/workflows/dplpmtud-required.yml").read_bytes())
+        self.git(self.origin, "add", ".")
+        self.git(self.origin, "commit", "-m", "workflow machinery")
+        self.workflow = self.git(self.origin, "rev-parse", "HEAD").strip()
+        self.git(self.root, "clone", "--no-checkout", "--single-branch", "--branch", "validation-target",
+                 "--depth=1", self.origin.as_uri(), str(self.checkout))
+        self.git(self.checkout, "checkout", "--detach", self.target)
+        absent = subprocess.run(["git", "cat-file", "-e", self.workflow + "^{commit}"],
+                                cwd=self.checkout, env=self.git_env, capture_output=True, timeout=30)
+        self.assertNotEqual(absent.returncode, 0, "fixture must really lack the workflow commit")
+        self.assertFalse((self.checkout / "scripts/quality/restore_artifact_layout.py").exists())
+        text = (ROOT / ".github/workflows/dplpmtud-required.yml").read_text()
+        block = text.split("      - name: Load artifact layout helper from workflow revision\n", 1)[1]
+        block = block.split("      - name: Restore artifact-name directories", 1)[0]
+        self.assertIn("WORKFLOW_HEAD_SHA: ${{ github.workflow_sha }}", block)
+        self.assertIn("timeout-minutes: 2", block)
+        self.script = textwrap.dedent(block.split("        run: |\n", 1)[1])
+        self.assertIn('LAYOUT_HELPER_OUTCOME: ${{ steps.layout_helper.outcome }}', text)
+        self.assertIn('test "$LAYOUT_HELPER_OUTCOME" = "success"', text)
+
+    def git(self, cwd, *args):
+        result = subprocess.run(["git", *args], cwd=cwd, env=self.git_env, capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result.stdout
+
+    def execute(self, workflow, directory):
+        directory.mkdir()
+        env = dict(self.git_env, WORKFLOW_HEAD_SHA=workflow, SOURCE_HEAD_SHA=self.target, RUNNER_TEMP=str(directory))
+        return subprocess.run(["bash", "-c", self.script], cwd=self.checkout, env=env,
+                              capture_output=True, text=True, timeout=30)
+
+    def unchanged_target(self):
+        self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD").strip(), self.target)
+        self.assertEqual(self.git(self.checkout, "status", "--porcelain"), "")
+        self.assertFalse((self.checkout / "scripts/quality/restore_artifact_layout.py").exists())
+
+    def test_loads_exact_workflow_blob_while_historical_target_lacks_the_helper(self):
+        directory = self.root / "helper"
+        result = self.execute(self.workflow, directory)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        path = directory / "restore-artifact-layout.py"
+        self.assertEqual(path.read_bytes(), (ROOT / "scripts/quality/restore_artifact_layout.py").read_bytes())
+        blob = self.git(self.checkout, "rev-parse", self.workflow + ":scripts/quality/restore_artifact_layout.py").strip()
+        self.assertIn(f"artifact_layout_helper_workflow_sha={self.workflow} blob_sha={blob}", result.stdout)
+        self.unchanged_target()
+
+    def test_invalid_revision_or_missing_workflow_blob_fails_without_source_change(self):
+        for index, revision in enumerate(["", "refs/heads/main", self.target]):
+            with self.subTest(revision=revision):
+                result = self.execute(revision, self.root / f"failed-{index}")
+                self.assertNotEqual(result.returncode, 0)
+                self.unchanged_target()
+
+    def test_existing_helper_is_not_overwritten(self):
+        directory = self.root / "occupied"
+        directory.mkdir()
+        path = directory / "restore-artifact-layout.py"
+        path.write_bytes(b"keep existing bytes")
+        env = dict(self.git_env, WORKFLOW_HEAD_SHA=self.workflow, SOURCE_HEAD_SHA=self.target, RUNNER_TEMP=str(directory))
+        result = subprocess.run(["bash", "-c", self.script], cwd=self.checkout, env=env,
+                                capture_output=True, timeout=30)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(path.read_bytes(), b"keep existing bytes")
+        self.unchanged_target()
 
 
 if __name__ == "__main__":

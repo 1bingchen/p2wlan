@@ -1,3 +1,9 @@
+#[cfg(test)]
+tokio::task_local! {
+    static PRIMARY_READER_READY_FOR_TEST:
+        std::cell::RefCell<Option<oneshot::Sender<bool>>>;
+}
+
 fn matched_ack_validation_observation(
     admission: DirectValidationAdmission,
 ) -> crate::connection_timeline::HotPathObservation {
@@ -150,6 +156,23 @@ impl UdpTransport {
         self.run_inbound_with_sink(inbound_tx.into()).await
     }
 
+    /// Scope one readiness receipt to this original supervisor's primary
+    /// reader. The receipt is emitted only by the first actual Pending socket
+    /// poll; spawning a task or consuming an unrelated packet is insufficient.
+    #[cfg(test)]
+    pub(crate) async fn run_inbound_with_reader_ready_for_test(
+        self,
+        inbound_tx: mpsc::Sender<ReceivedEncryptedPacket>,
+        ready: oneshot::Sender<bool>,
+    ) -> Result<()> {
+        PRIMARY_READER_READY_FOR_TEST
+            .scope(
+                std::cell::RefCell::new(Some(ready)),
+                self.run_inbound(inbound_tx),
+            )
+            .await
+    }
+
     pub(crate) async fn run_inbound_with_sink(
         self,
         inbound_tx: crate::dataplane_resources::EncryptedRxSink,
@@ -159,7 +182,33 @@ impl UdpTransport {
         for (socket_index, socket) in sockets.into_iter().enumerate() {
             let transport = self.clone();
             let inbound_tx = inbound_tx.clone();
+            #[cfg(test)]
+            let fixture_ready = if socket_index == 0 {
+                PRIMARY_READER_READY_FOR_TEST
+                    .try_with(|slot| slot.borrow_mut().take())
+                    .ok()
+                    .flatten()
+            } else {
+                None
+            };
             readers.spawn(async move {
+                #[cfg(test)]
+                if let Some(ready) = fixture_ready {
+                    // Keep the fixture-only shutdown sender alive while the
+                    // original reader uses its existing readiness handshake.
+                    let (lifetime, mut shutdown) = watch::channel(false);
+                    let result = transport
+                        .run_inbound_socket_inner(
+                            socket_index,
+                            socket,
+                            inbound_tx,
+                            Some(&mut shutdown),
+                            Some(ready),
+                        )
+                        .await;
+                    drop(lifetime);
+                    return result;
+                }
                 transport
                     .run_inbound_socket(socket_index, socket, inbound_tx)
                     .await

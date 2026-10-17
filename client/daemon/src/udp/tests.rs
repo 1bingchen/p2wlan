@@ -166,3 +166,6 @@ mod direct_origin;
 
 #[path = "tests/rx_ownership.rs"]
 mod rx_ownership;
+
+#[path = "tests/hard_hard_rejection_cost.rs"]
+mod hard_hard_rejection_cost;

@@ -1,4 +1,11 @@
 use super::*;
+#[path = "measurement_batch.rs"]
+mod measurement_batch;
+pub(super) use measurement_batch::last_mapping_send_is_unobserved;
+use measurement_batch::{
+    ordered_mapping_request_timeout, primary_mapping_tail_after_gap, trace_mapping_observations,
+};
+const MAPPING_OBSERVATION_TARGET: &str = module_path!();
 
 #[cfg(test)]
 #[path = "tests/dynamic_mapping.rs"]
@@ -134,58 +141,6 @@ pub(super) struct FreshMappingMeasurementBatch {
     pub(super) observations: Vec<MappingObservation>,
     pub(super) attempts: Vec<p2pnet_nat::AllocationAttempt>,
     pub(super) stats: HardHardMeasurementStats,
-}
-
-pub(super) fn last_mapping_send_is_unobserved(attempts: &[p2pnet_nat::AllocationAttempt]) -> bool {
-    attempts
-        .iter()
-        .rev()
-        .find(|attempt| attempt.outcome != p2pnet_nat::AllocationAttemptOutcome::SendFailed)
-        .is_some_and(|attempt| {
-            attempt.outcome == p2pnet_nat::AllocationAttemptOutcome::SentUnobserved
-        })
-}
-
-fn primary_mapping_tail_after_gap(
-    attempts: &[p2pnet_nat::AllocationAttempt],
-    primary: SocketAddr,
-    observers: &[SocketAddr],
-    request_limit: usize,
-) -> Option<Vec<SocketAddr>> {
-    if attempts.last()?.outcome == p2pnet_nat::AllocationAttemptOutcome::Observed {
-        return None;
-    }
-    // A timed-out or failed pair is never retried as a fresh allocation. The
-    // successful suffix must use three still-uncontacted primary destinations.
-    let mut used = attempts
-        .iter()
-        .filter(|attempt| attempt.local_endpoint == primary)
-        .map(|attempt| attempt.destination)
-        .collect::<HashSet<_>>();
-    let tail = observers
-        .iter()
-        .copied()
-        .filter(|observer| used.insert(*observer))
-        .take(3)
-        .collect::<Vec<_>>();
-    (tail.len() == 3 && attempts.len().saturating_add(tail.len()) <= request_limit).then_some(tail)
-}
-
-fn ordered_mapping_request_timeout(
-    per_sample_cap: Duration,
-    started_ms: u64,
-    now_ms: u64,
-    remaining_requests: usize,
-) -> Option<Duration> {
-    let remaining_ms = FRESH_MAPPING_MEASURE_BUDGET
-        .as_millis()
-        .saturating_sub(u128::from(now_ms.saturating_sub(started_ms)));
-    let timeout = per_sample_cap.min(Duration::from_millis(
-        remaining_ms
-            .checked_div(remaining_requests as u128)?
-            .min(u128::from(u64::MAX)) as u64,
-    ));
-    (!timeout.is_zero()).then_some(timeout)
 }
 
 #[derive(Debug)]
@@ -620,6 +575,7 @@ impl UdpTransport {
             false,
             None,
             Some(ordinary_cost),
+            None,
         )
         .await
     }
@@ -637,11 +593,12 @@ impl UdpTransport {
         cancellation: Option<&Arc<crate::PunchSessionCancellation>>,
         scheduled_delay: Duration,
         max_scheduled_delay: Duration,
+        measurement_out: Option<&mut Option<HardHardMeasurementStats>>,
     ) -> FreshMappingOutcome {
         if scheduled_delay > max_scheduled_delay {
             return FreshMappingOutcome::Rejected(FreshMappingRejection::BatchStale);
         }
-        self.run_fresh_mapping_generation_internal(
+        self.run_fresh_mapping_generation_internal_observed(
             peer_id,
             observers,
             stun_timeout,
@@ -654,10 +611,13 @@ impl UdpTransport {
                 monotonic_millis().saturating_add(scheduled_delay.as_millis() as u64),
                 max_scheduled_delay.as_millis() as u64,
             )),
+            None,
+            measurement_out,
         )
         .await
     }
 
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn run_fresh_mapping_generation_internal(
         &self,
@@ -682,6 +642,7 @@ impl UdpTransport {
             measure_only,
             scheduled_send,
             None,
+            None,
         )
         .await
     }
@@ -699,6 +660,7 @@ impl UdpTransport {
         measure_only: bool,
         scheduled_send: Option<(u64, u64)>,
         ordinary_cost: Option<&OrdinaryProbeCost>,
+        measurement_out: Option<&mut Option<HardHardMeasurementStats>>,
     ) -> FreshMappingOutcome {
         if !self.peers.local_nat_requires_fresh_mapping_punch().await {
             return FreshMappingOutcome::Rejected(FreshMappingRejection::StableLocalNat);
@@ -818,6 +780,9 @@ impl UdpTransport {
                     && self.peers.current_network_generation_sync() == network_generation
             })
             .await;
+        if let Some(output) = measurement_out {
+            *output = Some(measurement.stats);
+        }
         let finished_ms = monotonic_millis();
         if self
             .abort_generation_if_cancelled(cancellation, peer_id, socket_index)
@@ -835,26 +800,7 @@ impl UdpTransport {
         };
         let sample_count = batch.successful_samples();
 
-        for observation in &batch.observations {
-            debug!(
-                event = "fresh_mapping_observer",
-                peer_id = %peer_id,
-                network_generation = network_generation,
-                punch_generation = punch_generation,
-                socket_local = %observation.local_endpoint,
-                sequence = observation.sequence,
-                observer = %observation.observer,
-                srflx = %observation.observed,
-                rtt_ms = observation.rtt_ms().unwrap_or(0),
-                "fresh_mapping_observer peer_id={} punch_generation={} seq={} observer={} srflx={} rtt_ms={}",
-                peer_id,
-                punch_generation,
-                observation.sequence,
-                observation.observer,
-                observation.observed,
-                observation.rtt_ms().unwrap_or(0)
-            );
-        }
+        trace_mapping_observations(peer_id, network_generation, punch_generation, &batch);
 
         if sample_count < 3 {
             // Direct confirmation, session cancellation and generation

@@ -41,6 +41,7 @@ async fn prepare(
             None,
             Duration::from_millis(3_500),
             Duration::from_millis(3_500),
+            None,
         )
         .await
         .unwrap_or_else(|error| panic!("measurement should retain a fresh primary tail: {error:?}"))
@@ -197,6 +198,7 @@ async fn check_slow_observer_interruption(change_network: bool) {
         Some(&cancellation),
         Duration::from_millis(3_500),
         Duration::from_millis(3_500),
+        None,
     ));
     // The NAT records the third syscall before delaying its response. Wait on
     // that actual event instead of guessing when the collector is suspended.

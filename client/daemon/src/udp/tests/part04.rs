@@ -816,6 +816,7 @@ async fn hard_hard_measurement_sweeps_from_the_same_exact_socket() {
             None,
             Duration::from_millis(500),
             Duration::from_millis(3_500),
+            None,
         )
         .await;
     let result = match outcome {

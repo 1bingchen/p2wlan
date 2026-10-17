@@ -17,6 +17,8 @@ include!("hard_hard/diagnostics.rs");
 include!("hard_hard/wire_v2.rs");
 include!("hard_hard/cleanup.rs");
 include!("hard_hard/probe.rs");
+include!("hard_hard/local_measurement.rs");
+include!("hard_hard/measurement_observation.rs");
 include!("hard_hard/prepared.rs");
 include!("hard_hard/agreement.rs");
 include!("hard_hard/confirmation.rs");

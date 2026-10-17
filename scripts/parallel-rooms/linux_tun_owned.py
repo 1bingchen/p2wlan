@@ -75,7 +75,7 @@ class OwnedGroups:
         owner["anchor"] = anchor
         wait_ready(anchor, time.monotonic() + 2)
         inherited = {"pass_fds": pass_fds} if pass_fds else {}
-        if pass_fds:
+        if pass_fds or env.get("P2WLAN_OS_REQUEST_CONTROL_SOCKET"):
             owner["child_spawn_requested_monotonic_ns"] = time.monotonic_ns()
         child = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=output, stderr=output,
                                  env=env, text=True, shell=False, process_group=anchor.pid, **inherited)

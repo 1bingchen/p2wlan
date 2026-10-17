@@ -118,31 +118,52 @@ impl CanonicalOverlayRequest {
 /// Sealed Weak identity carried only by a genuine local request injection.
 /// An arbitrary public Any value cannot construct this private field.
 #[derive(Clone)]
-pub(crate) struct RequestSendToken {
-    request: Weak<CanonicalOverlayRequest>,
-    echo: Option<Arc<OriginalEchoInput>>,
+enum RequestIdentity {
+    Canonical(Weak<CanonicalOverlayRequest>),
+    Echo(Arc<OriginalEchoInput>),
+    Kernel(Arc<crate::os_request_capture::KernelReadBinding>),
 }
 
-// Decoding only identifies the original record. The carriage consumer checks
-// bytes/peer/VIP/owner/TTL separately; this grants no native ACK authority.
-#[allow(dead_code)]
+#[derive(Clone)]
+pub(crate) struct RequestSendToken {
+    identity: RequestIdentity,
+}
+
+// Each private type has its own real mint. Decoding identifies an immutable
+// carrier; it does not promote registration labels into physical/ACK credit.
 impl RequestSendToken {
     pub(crate) fn from_read_context(context: PacketReadContext) -> Option<Self> {
-        context.downcast::<Self>().ok().map(|token| *token)
+        match context.downcast::<Self>() {
+            Ok(token) => Some(*token),
+            Err(context) => context
+                .downcast::<crate::os_request_capture::KernelReadBinding>()
+                .ok()
+                .map(|binding| Self {
+                    identity: RequestIdentity::Kernel(Arc::new(*binding)),
+                }),
+        }
     }
-
     pub(crate) fn request(&self) -> Option<Arc<CanonicalOverlayRequest>> {
-        self.request.upgrade()
+        match &self.identity {
+            RequestIdentity::Canonical(request) => request.upgrade(),
+            _ => None,
+        }
     }
-
     pub(crate) fn echo(&self) -> Option<&Arc<OriginalEchoInput>> {
-        self.echo.as_ref()
+        match &self.identity {
+            RequestIdentity::Echo(echo) => Some(echo),
+            _ => None,
+        }
     }
-
+    pub(crate) fn kernel(&self) -> Option<&Arc<crate::os_request_capture::KernelReadBinding>> {
+        match &self.identity {
+            RequestIdentity::Kernel(kernel) => Some(kernel),
+            _ => None,
+        }
+    }
     pub(crate) fn original_echo(input: OriginalEchoInput) -> Self {
         Self {
-            request: Weak::new(),
-            echo: Some(Arc::new(input)),
+            identity: RequestIdentity::Echo(Arc::new(input)),
         }
     }
 }
@@ -194,8 +215,7 @@ async fn inject_request(
         physical_publication: PhysicalSendPublication::new(),
     });
     let context = Box::new(RequestSendToken {
-        request: Arc::downgrade(&request),
-        echo: None,
+        identity: RequestIdentity::Canonical(Arc::downgrade(&request)),
     });
     controller.inject_with_context(packet, context).await?;
     #[cfg(test)]

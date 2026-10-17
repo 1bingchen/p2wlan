@@ -1588,6 +1588,7 @@ async fn candidate_receipt_and_slow_work_do_not_head_of_line_block_responder_off
     daemon.relay_available_tx.send_replace(true);
     let control = daemon.control.clone();
     let peers = daemon.peers.clone();
+    let timeline = daemon.timeline.clone();
     let pending = daemon.pending_handshakes.clone();
     let transport = daemon.transport.clone();
     let shutdown = daemon.shutdown_sender();
@@ -1790,7 +1791,7 @@ async fn candidate_receipt_and_slow_work_do_not_head_of_line_block_responder_off
         "candidate contention may produce only one exact Answer"
     );
     assert!(transport.has_session(peer_id).await);
-    timeout(Duration::from_secs(2), async {
+    let candidate_completion = timeout(Duration::from_secs(2), async {
         loop {
             let candidate_committed =
                 peers
@@ -1810,8 +1811,25 @@ async fn candidate_receipt_and_slow_work_do_not_head_of_line_block_responder_off
             tokio::task::yield_now().await;
         }
     })
-    .await
-    .expect("candidate owner must retry, finish its handover transaction, and release the epoch");
+    .await;
+    if candidate_completion.is_err() {
+        // Observe only after the original timeout. No new wait or mutation
+        // changes the original two-second exit condition.
+        let connections = peers.connection_map_for_test();
+        let connection = connections.try_read().map(|connections| {
+            connections.get(peer_id).map(|connection| {
+                (
+                    connection.candidates.clone(),
+                    connection.last_candidate_generation(),
+                )
+            })
+        });
+        let owner_present = pending.lock().candidate_offer_workers.contains_key(peer_id);
+        eprintln!("candidate completion timeout: connection={connection:?} owner_present={owner_present} timeline={:?}", timeline.snapshot().events);
+    }
+    candidate_completion.expect(
+        "candidate owner must retry, finish its handover transaction, and release the epoch",
+    );
     assert!(
         peers.network_epoch_gate().try_lock().is_ok(),
         "candidate follow-up leaked the network epoch guard"

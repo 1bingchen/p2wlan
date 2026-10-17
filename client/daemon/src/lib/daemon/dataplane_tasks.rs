@@ -1,9 +1,10 @@
 impl Daemon {
     async fn spawn_dataplane_tasks(
         &self,
-        tun: Option<TunDevice>,
+        tun: Option<crate::os_request_capture::SystemTun>,
         network_inbound_rx: crate::dataplane_resources::EncryptedRxReceiver,
-    ) {
+        capture_setup: Option<crate::os_request_capture::CaptureSetup>,
+    ) -> Result<()> {
         let local_sources = if self.config.network.network_id.starts_with("room-") {
             tokio::task::spawn_blocking(|| {
                 p2pnet_nat::gather_local_addresses()
@@ -19,13 +20,24 @@ impl Daemon {
         } else {
             Vec::new()
         };
-        if let Some(tun) = tun {
+        if let Some(mut tun) = tun {
+            if let Some(setup) = capture_setup {
+                tun = tun.with_capture(setup.session);
+                self.task_manager
+                    .spawn_result("os-request-capture", false, async move {
+                        setup.channel.run().await.map_err(|error| {
+                            DaemonError::Network(format!("OS request capture retired: {error}"))
+                        })
+                    })
+                    .await;
+            }
+            let track_registered_reads = tun.tracks_registered_reads();
             let peers = self.peers.clone();
             let transport = self.transport.clone();
             let (dataplane, outbound_rx, inbound_tx) = DataPlane::new_bidirectional_for_daemon(
                 tun,
                 peers,
-                false,
+                track_registered_reads,
                 self.transport.resource_capture().cloned(),
             );
             let mut dataplane = dataplane
@@ -202,5 +214,6 @@ impl Daemon {
                 )
                 .await;
         }
+        Ok(())
     }
 }

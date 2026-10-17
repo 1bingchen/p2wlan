@@ -217,7 +217,7 @@ impl Daemon {
         let resource_capture =
             crate::dataplane_resources::RuntimeResourceCapture::from_config(&config.diagnostics);
         let (transport, outbound_rx) = WireGuardTransport::new_for_daemon(
-            config.network.validate_overlay,
+            config.network.validate_overlay || crate::os_request_capture::requested_from_env(),
             resource_capture.as_ref().map(|run| run.capture().clone()),
         );
         let acl_engine = AclEngine::from_config(&config.acl);

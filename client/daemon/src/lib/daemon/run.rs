@@ -1,6 +1,21 @@
 impl Daemon {
     /// Run the daemon main loop.
     pub async fn run(&mut self) -> Result<()> {
+        // Explicit diagnostic descriptors are validated before any new worker
+        // starts. No environment setting means no control fd, task or wait.
+        let os_capture_setup = crate::os_request_capture::CaptureSetup::from_env(&self.peers)
+            .await
+            .map_err(|error| DaemonError::Network(format!("OS request capture setup: {error}")))?;
+        if os_capture_setup.is_some() && !self.transport.accepts_request_carriage() {
+            return Err(DaemonError::Network(
+                "OS request capture was enabled after transport construction".into(),
+            ));
+        }
+        if os_capture_setup.is_some() && std::env::var("P2WLAN_DISABLE_TUN").as_deref() == Ok("1") {
+            return Err(DaemonError::Network(
+                "OS request capture requires a system TUN".into(),
+            ));
+        }
         info!("P2WLAN daemon v{} starting...", env!("CARGO_PKG_VERSION"));
         #[cfg(target_os = "android")]
         self.spawn_android_network_change_control_watcher().await;
@@ -516,7 +531,8 @@ impl Daemon {
                     .await;
             }
         }
-        self.spawn_dataplane_tasks(tun, network_inbound_rx).await;
+        self.spawn_dataplane_tasks(tun, network_inbound_rx, os_capture_setup)
+            .await?;
 
         let local_candidate_sources = self.local_candidate_sources.clone();
         let udp_direct_context = UdpDirectTaskContext {

@@ -15,6 +15,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -157,28 +158,55 @@ class InputControls(unittest.TestCase):
 
     def test_file_mutation_and_replacement_during_read_close_owned_descriptor(self):
         original_fstat = os.fstat
+        original_lstat = Path.lstat
         for replacement in [False, True]:
             self.path.write_text(json.dumps(document(self.config, "udp")))
             before = self.path.stat()
             calls = []
+            path_checks = []
 
             def fstat(descriptor):
                 calls.append(descriptor)
-                if len(calls) == 2:
-                    if replacement:
+                if len(calls) == 2 and not replacement:
+                    os.utime(self.path, ns=(before.st_atime_ns, before.st_mtime_ns + 1000000))
+                return original_fstat(descriptor)
+
+            def lstat(path, *args, **kwargs):
+                if path == self.path:
+                    path_checks.append(path)
+                    if replacement and len(path_checks) == 2:
+                        # Windows can forbid replacing an open descriptor.
+                        # Replace at the final path check, after owned close.
+                        with self.assertRaises(OSError):
+                            original_fstat(calls[0])
                         other = self.path.with_name("replacement")
                         other.write_text("{}")
                         os.replace(other, self.path)
-                    else:
-                        os.utime(self.path, ns=(before.st_atime_ns, before.st_mtime_ns + 1000000))
-                return original_fstat(descriptor)
+                return original_lstat(path, *args, **kwargs)
 
-            with self.subTest(replacement=replacement), patch.object(plans.os, "fstat", side_effect=fstat):
+            with self.subTest(replacement=replacement), patch.object(plans.os, "fstat", side_effect=fstat), patch.object(Path, "lstat", lstat):
                 with self.assertRaises(ValueError):
                     plans.read_bounded_file(self.path)
             self.assertEqual(len(calls), 2)
             with self.assertRaises(OSError):
                 original_fstat(calls[0])
+
+    def test_windows_cross_api_birth_identity_retains_both_ctime_change_fences(self):
+        fields = dict(st_dev=1, st_ino=2, st_mode=stat.S_IFREG | 0o600,
+                      st_size=10, st_mtime_ns=20, st_birthtime_ns=30, st_ctime_ns=30)
+        by_path = SimpleNamespace(**fields)
+        by_fd = SimpleNamespace(**dict(fields, st_ctime_ns=40))
+        with patch.object(plans.os, "name", "nt"):
+            self.assertEqual(plans.cross_api_identity(by_path), plans.cross_api_identity(by_fd))
+            self.assertNotEqual(plans.file_identity(by_path), plans.file_identity(by_fd))
+            for field in ["st_dev", "st_ino", "st_mode", "st_size", "st_mtime_ns", "st_birthtime_ns"]:
+                changed = SimpleNamespace(**dict(vars(by_fd), **{field: getattr(by_fd, field) + 1}))
+                with self.subTest(field=field):
+                    self.assertNotEqual(plans.cross_api_identity(by_path), plans.cross_api_identity(changed))
+            changed_fd = SimpleNamespace(**dict(vars(by_fd), st_ctime_ns=41))
+            changed_path = SimpleNamespace(**dict(vars(by_path), st_ctime_ns=31))
+            self.assertNotEqual(plans.file_identity(by_fd), plans.file_identity(changed_fd))
+            self.assertNotEqual(plans.file_identity(by_path), plans.file_identity(changed_path))
 
     def test_invalid_plan_never_opens_udp_or_tcp_socket(self):
         for tool, transport, boundary in [(udp, "udp", "open_socket"), (tcp, "tcp", "bound_socket")]:

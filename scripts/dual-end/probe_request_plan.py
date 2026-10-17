@@ -36,7 +36,15 @@ def lower_hex(value: object, size: int) -> bool:
 
 
 def file_identity(value: os.stat_result) -> tuple:
-    return value.st_dev, value.st_ino, value.st_mode, value.st_size, value.st_mtime_ns, value.st_ctime_ns
+    return (*cross_api_identity(value), value.st_ctime_ns)
+
+
+def cross_api_identity(value: os.stat_result) -> tuple:
+    # Windows path stat can expose creation time as ctime while descriptor
+    # fstat exposes change time (CPython #157671). Compare birth time across
+    # APIs; still check each API's full ctime before/after independently.
+    stamp = getattr(value, "st_birthtime_ns", None) if os.name == "nt" else value.st_ctime_ns
+    return value.st_dev, value.st_ino, value.st_mode, value.st_size, value.st_mtime_ns, stamp
 
 
 def read_bounded_file(path: Path) -> bytes:
@@ -49,7 +57,7 @@ def read_bounded_file(path: Path) -> bytes:
     descriptor = os.open(path, flags)
     with os.fdopen(descriptor, "rb") as stream:
         before = os.fstat(stream.fileno())
-        if file_identity(before) != file_identity(original):
+        if cross_api_identity(before) != cross_api_identity(original):
             raise ValueError("request plan changed before reading")
         raw = stream.read(MAX_PLAN_BYTES + 1)
         after = os.fstat(stream.fileno())

@@ -7,12 +7,27 @@ import struct
 import threading
 import time
 import unittest
+from unittest.mock import patch
 
 import tcp_business_probe as tool
 from udp_business_probe import Config, UNVERIFIED
 
 
 class TcpControls(unittest.TestCase):
+    def test_early_sleep_wakeup_waits_original_target_and_total_deadline(self):
+        for planned, end in [(10_000_000, 50_000_000), (50_000_000, 10_000_000)]:
+            now = [0]
+            sleeps = []
+
+            def early_sleep(seconds):
+                sleeps.append(seconds)
+                now[0] += 6_000_000 if len(sleeps) == 1 else 4_000_000
+
+            with self.subTest(planned=planned, end=end), patch.object(tool.time, "monotonic_ns", side_effect=lambda: now[0]), patch.object(tool.time, "sleep", side_effect=early_sleep):
+                tool.wait_scheduled(planned, end)
+            self.assertEqual(sleeps, [.01, .004])
+            self.assertEqual(now[0], min(planned, end))
+
     def fixture(self, count=2, timeout_ms=200):
         client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)

@@ -107,6 +107,12 @@ def bound_socket(config: Config, supplied: socket.socket | None) -> socket.socke
         raise
 
 
+def wait_scheduled(planned: int, end: int) -> None:
+    target = min(planned, end)
+    while time.monotonic_ns() < target:
+        time.sleep(max(0, target - time.monotonic_ns()) / 1_000_000_000)
+
+
 def run_probe(config: Config, supplied_socket: socket.socket | None = None,
               request_plan: Path | None = None) -> dict:
     config.validate()
@@ -133,8 +139,7 @@ def run_probe(config: Config, supplied_socket: socket.socket | None = None,
             raise OSError("connected TCP peer differs from explicit target")
         for record in records:
             planned = started + record["planned_offset_ns"]
-            if time.monotonic_ns() < planned:
-                time.sleep(max(0, min(planned, end) - time.monotonic_ns()) / 1_000_000_000)
+            wait_scheduled(planned, end)
             if time.monotonic_ns() >= end:
                 termination = "duration_deadline"
                 break

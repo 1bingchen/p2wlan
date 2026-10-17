@@ -1,7 +1,9 @@
 //! Read-only identity of this actual process and Linux monotonic clock.
 //! Received PIDs, JSON labels and remote timestamps never create this value.
+#[cfg(unix)]
 use serde::Serialize;
 
+#[cfg(unix)]
 #[derive(Clone, Serialize)]
 pub(super) struct NativeClockScope {
     clock_name: &'static str,
@@ -13,6 +15,7 @@ pub(super) struct NativeClockScope {
     net_namespace: String,
 }
 
+#[cfg(unix)]
 impl NativeClockScope {
     #[cfg(target_os = "linux")]
     pub(super) fn capture() -> Option<Self> {

@@ -248,6 +248,10 @@ impl PeerTransportSessions {
 }
 
 impl WireGuardTransport {
+    pub(crate) fn accepts_request_carriage(&self) -> bool {
+        self.outbound_tx.is_tracked()
+    }
+
     /// Select the original channel capacity before any worker or clone exists.
     /// Tracked envelopes can carry only observer metadata, without a request
     /// binding; enabling observations never mints delivery authority.

@@ -6,6 +6,11 @@ impl Daemon {
         let os_capture_setup = crate::os_request_capture::CaptureSetup::from_env(&self.peers)
             .await
             .map_err(|error| DaemonError::Network(format!("OS request capture setup: {error}")))?;
+        if os_capture_setup.is_some() && !self.transport.accepts_request_carriage() {
+            return Err(DaemonError::Network(
+                "OS request capture was enabled after transport construction".into(),
+            ));
+        }
         if os_capture_setup.is_some() && std::env::var("P2WLAN_DISABLE_TUN").as_deref() == Ok("1") {
             return Err(DaemonError::Network(
                 "OS request capture requires a system TUN".into(),

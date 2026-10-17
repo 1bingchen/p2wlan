@@ -34,19 +34,24 @@ pub(super) struct KernelRead {
 
 impl KernelRead {
     pub(super) fn is_current(&self) -> bool {
-        self.device
-            .upgrade()
-            .is_some_and(|device| device.live.load(Ordering::Acquire))
+        self.ordinal != 0
+            && self.monotonic_ns != 0
+            && self
+                .device
+                .upgrade()
+                .is_some_and(|device| device.live.load(Ordering::Acquire))
     }
     pub(super) fn same_device(&self, other: &Self) -> bool {
         Weak::ptr_eq(&self.device, &other.device)
     }
+    #[cfg(unix)]
     pub(super) fn ordinal(&self) -> u64 {
         self.ordinal
     }
     pub(super) fn at(&self) -> Instant {
         self.at
     }
+    #[cfg(unix)]
     pub(super) fn monotonic_ns(&self) -> u64 {
         self.monotonic_ns
     }

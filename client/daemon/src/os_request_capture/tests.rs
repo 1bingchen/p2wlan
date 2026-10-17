@@ -41,6 +41,8 @@ fn full128_fields_and_protocol_remain_distinct_labels() {
     let mut value = plan();
     value["flows"][0]["request_nonces"][0] = json!("a5555555555555555555555555555555");
     let parsed = decode(&value).unwrap();
+    assert_eq!(parsed.capture_id, [0x11; 16]);
+    assert_eq!(parsed.producer_scope, [0x22; 16]);
     assert_eq!(parsed.flows[0].requests[0].request_nonce[0], 0xa5);
     assert_eq!(parsed.flows[0].requests[0].request_nonce[15], 0x55);
     let mut other = value["flows"][0].clone();

@@ -1,3 +1,4 @@
+#[cfg(unix)]
 use super::clock::{monotonic_ns, NativeClockScope};
 use super::device::KernelRead;
 use super::plan::{CaptureFailure, Protocol, RegisteredFlowPlan, MAX_BINDINGS_PER_PACKET};
@@ -9,6 +10,7 @@ use crate::business_evidence::tcp_frame::{
 };
 use crate::dataplane::OutboundPacket;
 use crate::peer::PeerManager;
+#[cfg(unix)]
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -21,12 +23,16 @@ use std::time::Instant;
 static NEXT_SCOPE: AtomicU64 = AtomicU64::new(1);
 
 pub(crate) struct CaptureSession {
+    #[cfg(unix)]
     owner: u64,
     active: AtomicBool,
     expires: Instant,
     peers: Weak<PeerManager>,
+    #[cfg(unix)]
     capture_id: [u8; 16],
+    #[cfg(unix)]
     producer_scope: [u8; 16],
+    #[cfg(unix)]
     clock_scope: Option<NativeClockScope>,
     state: Mutex<RegistryState>,
     gaps: AtomicU64,
@@ -35,12 +41,16 @@ pub(crate) struct CaptureSession {
 struct RegistryState {
     flows: Vec<FlowState>,
     original_device: Option<Arc<KernelRead>>,
+    #[cfg(unix)]
     requests: usize,
+    #[cfg(unix)]
     revision: u64,
+    #[cfg(unix)]
     producers: std::collections::BTreeSet<[u8; 16]>,
 }
 struct FlowState {
     plan: Arc<RegisteredFlowPlan>,
+    #[cfg(unix)]
     producer_scope: [u8; 16],
     tcp_open: Option<u32>,
     invalid: bool,
@@ -67,6 +77,7 @@ pub(crate) struct KernelReadBinding {
     plan: Arc<RegisteredFlowPlan>,
 }
 
+#[cfg(unix)]
 #[derive(Serialize)]
 pub(super) struct ReadSnapshot {
     pub(super) schema_version: u8,
@@ -86,6 +97,7 @@ pub(super) struct ReadSnapshot {
     physical_send_verified: bool,
     canonical_current_owner_verified: bool,
 }
+#[cfg(unix)]
 #[derive(Serialize)]
 struct RequestSnapshot {
     flow: usize,
@@ -240,6 +252,7 @@ impl CaptureSession {
     pub(crate) fn retire(&self) {
         self.active.store(false, Ordering::Release);
     }
+    #[cfg(unix)]
     pub(super) fn expires(&self) -> Instant {
         self.expires
     }
@@ -410,6 +423,7 @@ impl CaptureSession {
         }))
     }
 
+    #[cfg(unix)]
     pub(super) fn snapshot(&self) -> Result<ReadSnapshot, CaptureFailure> {
         let state = self
             .state

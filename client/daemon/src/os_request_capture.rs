@@ -10,7 +10,7 @@ mod device;
 mod plan;
 mod registry;
 
-pub(crate) use control::CaptureSetup;
+pub(crate) use control::{requested_from_env, CaptureSetup};
 pub(crate) use device::SystemTun;
 pub(crate) use registry::KernelReadBinding;
 

@@ -11,6 +11,13 @@ use std::sync::Arc;
 
 const FD_ENV: &str = "P2WLAN_OS_REQUEST_CONTROL_FD";
 const SOCKET_ENV: &str = "P2WLAN_OS_REQUEST_CONTROL_SOCKET";
+
+/// Select envelope capacity before constructing the original transport.
+/// Presence alone grants no capture authority; setup still validates the
+/// platform, descriptor, peer and registration before any worker starts.
+pub(crate) fn requested_from_env() -> bool {
+    std::env::var_os(FD_ENV).is_some() || std::env::var_os(SOCKET_ENV).is_some()
+}
 #[cfg(unix)]
 const MAX_CONTROL_BYTES: usize = 4 * 1024 * 1024;
 #[cfg(unix)]

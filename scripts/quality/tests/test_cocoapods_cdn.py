@@ -4,6 +4,7 @@ import io
 import json
 import os
 from pathlib import Path
+import signal
 import sys
 import tempfile
 import unittest
@@ -86,11 +87,20 @@ class CocoaPodsCDNTests(unittest.TestCase):
         self.assertEqual(self.exported.read_text(), "EXISTING=yes\n")
 
     def test_timeout_reaps_owned_group_and_keeps_each_failed_attempt(self):
-        with patch.object(CDN, "REQUEST_TIMEOUT_SECONDS", 1), patch.object(CDN, "TERMINATE_GRACE_SECONDS", 0.1):
+        limit_files = CDN.limit_metadata_files
+        parent_handler = signal.getsignal(signal.SIGTERM)
+
+        def prepare_child():
+            limit_files()
+            # Ignored signals survive exec, including slow interpreter startup.
+            signal.signal(signal.SIGTERM, signal.SIG_IGN)
+
+        with patch.object(CDN, "limit_metadata_files", prepare_child), patch.object(CDN, "REQUEST_TIMEOUT_SECONDS", 1), patch.object(CDN, "TERMINATE_GRACE_SECONDS", 0.1):
             result = self.run_prepare("timeout")
         self.assertFalse(result["passed"])
         self.assertEqual(len(result["attempts"]), 3)
-        self.assertTrue(all(r["timed_out"] and r["forced"] and r["wait_completed"] and r["returncode"] < 0 for r in result["attempts"]))
+        self.assertTrue(all(r["timed_out"] and r["forced"] and r["wait_completed"] and r["returncode"] < 0 for r in result["attempts"]), json.dumps(result, sort_keys=True))
+        self.assertIs(signal.getsignal(signal.SIGTERM), parent_handler)
         self.assertEqual(self.exported.read_text(), "EXISTING=yes\n")
 
     def test_missing_tool_fails_before_creating_evidence(self):

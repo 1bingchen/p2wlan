@@ -66,7 +66,7 @@ impl Certificates {
             .map_err(|error| error.to_string())?;
         for (path, bytes) in [
             (&owned.certificate, certified.cert.pem()),
-            (&owned.key, certified.key_pair.serialize_pem()),
+            (&owned.key, certified.signing_key.serialize_pem()),
         ] {
             use std::io::Write;
             let mut options = std::fs::OpenOptions::new();

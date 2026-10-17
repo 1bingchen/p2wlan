@@ -28,7 +28,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       - name: Archive exact tracked source
         run: git archive --format=tar.gz HEAD -o "${RUNNER_TEMP}/p2wlan-room-source.tar.gz"
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: p2wlan-room-source-${{ github.sha }}
           path: ${{ runner.temp }}/p2wlan-room-source.tar.gz
@@ -54,7 +54,7 @@ jobs:
         run: |
           go mod vendor
           tar -czf "${RUNNER_TEMP}/p2wlan-go-vendor.tar.gz" vendor
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         if: github.ref == 'refs/heads/feat/friend-rooms-20260907'
         with:
           name: p2wlan-go-vendor-${{ github.sha }}

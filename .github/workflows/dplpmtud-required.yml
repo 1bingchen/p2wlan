@@ -221,7 +221,7 @@ jobs:
         run: bash scripts/dplpmtud/run_acceptance.sh "$RUNNER_TEMP/p2wlan-dplpmtud-live"
       - name: Upload live component evidence
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: dplpmtud-live-component-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/p2wlan-dplpmtud-live/**
@@ -324,14 +324,47 @@ jobs:
       - name: Download every live component attempt of this run
         id: download
         if: always()
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
         with:
           # A partial re-run uploads nothing new: the component artifact stays
           # under the attempt that produced it. Fetch every attempt of this run
           # and let the selector decide which one may be consumed.
           pattern: dplpmtud-live-component-${{ github.run_id }}-*
-          path: ${{ runner.temp }}/dplpmtud-component
+          path: ${{ runner.temp }}/dplpmtud-component-downloads
           merge-multiple: false
+      - name: Load artifact layout helper from workflow revision
+        id: layout_helper
+        if: always()
+        timeout-minutes: 2
+        env:
+          WORKFLOW_HEAD_SHA: ${{ github.workflow_sha }}
+          SOURCE_HEAD_SHA: ${{ steps.identity.outputs.source_head_sha }}
+        run: |
+          set -euo pipefail
+          [[ "$WORKFLOW_HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]
+          test "$(git rev-parse HEAD)" = "$SOURCE_HEAD_SHA"
+          git fetch --no-tags --no-recurse-submodules --depth=1 origin "$WORKFLOW_HEAD_SHA"
+          set -o noclobber
+          git show "$WORKFLOW_HEAD_SHA:scripts/quality/restore_artifact_layout.py" > "$RUNNER_TEMP/restore-artifact-layout.py"
+          helper_blob="$(git rev-parse "$WORKFLOW_HEAD_SHA:scripts/quality/restore_artifact_layout.py")"
+          test "$(git hash-object --no-filters "$RUNNER_TEMP/restore-artifact-layout.py")" = "$helper_blob"
+          test "$(git rev-parse HEAD)" = "$SOURCE_HEAD_SHA"
+          echo "artifact_layout_helper_workflow_sha=$WORKFLOW_HEAD_SHA blob_sha=$helper_blob"
+      - name: Restore artifact-name directories for downloaded components
+        id: layout
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          set -euo pipefail
+          test -s "$RUNNER_TEMP/restore-artifact-layout.py"
+          python3 "$RUNNER_TEMP/restore-artifact-layout.py" \
+            --repository "$GITHUB_REPOSITORY" \
+            --run-id "$GITHUB_RUN_ID" \
+            --run-head-sha "$RUN_HEAD_SHA" \
+            --download "dplpmtud-live-component-$GITHUB_RUN_ID-*" "$RUNNER_TEMP/dplpmtud-component-downloads" \
+            --output-root "$RUNNER_TEMP/dplpmtud-component"
       - name: Select the component evidence this aggregate may consume
         id: select
         if: always()
@@ -377,7 +410,7 @@ jobs:
             --output "$RUNNER_TEMP/dplpmtud-aggregate.json"
       - name: Upload DPLPMTUD aggregate
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: dplpmtud-aggregate-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/dplpmtud-aggregate.json
@@ -389,6 +422,8 @@ jobs:
           CONTRACT_RESULT: ${{ needs.contract.result }}
           LIVE_RESULT: ${{ needs.live_evidence.result }}
           DOWNLOAD_OUTCOME: ${{ steps.download.outcome }}
+          LAYOUT_HELPER_OUTCOME: ${{ steps.layout_helper.outcome }}
+          LAYOUT_OUTCOME: ${{ steps.layout.outcome }}
           SELECT_OUTCOME: ${{ steps.select.outcome }}
           AGGREGATE_OUTCOME: ${{ steps.aggregate.outcome }}
         run: |
@@ -396,6 +431,8 @@ jobs:
           test "$CONTRACT_RESULT" = "success"
           test "$LIVE_RESULT" = "success"
           test "$DOWNLOAD_OUTCOME" = "success"
+          test "$LAYOUT_HELPER_OUTCOME" = "success"
+          test "$LAYOUT_OUTCOME" = "success"
           test "$SELECT_OUTCOME" = "success"
           test "$AGGREGATE_OUTCOME" = "success"
 

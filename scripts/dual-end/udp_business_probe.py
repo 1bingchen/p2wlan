@@ -138,6 +138,17 @@ def base_report(config: Config, role: str) -> dict:
     }
 
 
+def prepare_request_plan(config: Config, path: Path | None, transport: str, tool_sha256: str):
+    if path is None:
+        return None
+    try:
+        from probe_request_plan import load_plan
+    except ImportError as error:
+        raise ValueError("explicit request plan requires probe_request_plan.py beside the tool") from error
+    shared = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+    return load_plan(path, config, transport, tool_sha256, shared)
+
+
 def open_socket(config: Config, supplied: socket.socket | None) -> socket.socket:
     if supplied is None:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -194,11 +205,16 @@ def observe_reply(config: Config, records: list[dict], data: bytes, source: tupl
     return "accepted"
 
 
-def run_probe(config: Config, supplied_socket: socket.socket | None = None) -> dict:
+def run_probe(config: Config, supplied_socket: socket.socket | None = None,
+              request_plan: Path | None = None) -> dict:
     config.validate()
     report = base_report(config, "probe")
+    prepared = prepare_request_plan(config, request_plan, "udp", report["tool_sha256"])
+    if prepared is not None:
+        report["request_plan"] = prepared.evidence()
     records = [{
-        "sequence": sequence, "request_nonce": secrets.token_hex(16),
+        "sequence": sequence,
+        "request_nonce": prepared.nonces[sequence] if prepared else secrets.token_hex(16),
         "planned_offset_ns": sequence * config.interval_ms * NS_PER_MS,
         "sent_offset_ns": None, "completed_offset_ns": None, "rtt_ns": None,
         "status": "not_sent", "reason": "scheduled",
@@ -393,6 +409,9 @@ def main(argv: list[str] | None = None) -> int:
         sub.add_argument("--duration-ms", type=int, default=10_000)
         sub.add_argument("--payload-bytes", type=int, default=128)
         sub.add_argument("--output", required=True, type=Path)
+        if command == "probe":
+            sub.add_argument("--request-plan", type=Path,
+                             help="use an exact prepared input plan before the original measurement clock")
     args = parser.parse_args(argv)
     if args.command == "new-nonces":
         # These nonces are public correlation IDs, not authentication credentials.
@@ -405,7 +424,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         config.validate()
         validate_output_path(args.output)
-        report = run_probe(config) if args.command == "probe" else run_echo(
+        report = run_probe(config, request_plan=args.request_plan) if args.command == "probe" else run_echo(
             config, on_ready=lambda: print(json.dumps({"scope": SCOPE, "event": "echo_ready"}), flush=True))
         write_report(args.output, report)
     except (OSError, ValueError) as error:

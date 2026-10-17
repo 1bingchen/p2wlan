@@ -240,8 +240,11 @@ class LoopbackTests(unittest.TestCase):
             echo_config = replace(config, bind=config.target, target=config.bind)
             wire = probe.encode(config, 0, "3" * 32, probe.REQUEST)
             client.sendto(wire, config.target)
+            # Establish the first real input before injecting selector events.
+            self.assertEqual(probe.select.select([server], [], [], config.timeout_ms / 1000)[0], [server])
             with patch.object(probe.select, "select", side_effect=[([server], [], []), OSError("closed")]):
                 report = probe.run_echo(echo_config, server)
+            self.assertEqual(report["responses_sent"], 1, report)
             client.settimeout(1)
             self.assertEqual(probe.decode(client.recvfrom(probe.MAX_DATAGRAM_BYTES)[0])[0], probe.RESPONSE)
         self.assertEqual(report["termination_reason"], "udp_receive_failed")
@@ -342,6 +345,12 @@ class AccountingTests(unittest.TestCase):
             with patch.object(probe.time, "monotonic_ns", side_effect=lambda: clock[0]), \
                     patch.object(probe.select, "select", side_effect=resumed_after_deadline):
                 report = probe.run_probe(config, client)
+            # Observe the original completed send after restoring the real
+            # selector. This does not resend or extend the simulated clock.
+            readable, _, _ = probe.select.select([server], [], [], config.timeout_ms / 1000)
+            self.assertEqual(readable, [server], [(r["status"], r["sent_offset_ns"],
+                                                  r.get("errno")) for r in report["requests"]])
+            self.assertEqual(report["requests"][0]["sent_offset_ns"], 0)
             server.setblocking(False)
             self.assertEqual(probe.decode(server.recvfrom(probe.MAX_DATAGRAM_BYTES)[0])[3], 0)
             with self.assertRaises(BlockingIOError):

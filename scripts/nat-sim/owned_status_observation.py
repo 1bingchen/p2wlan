@@ -12,19 +12,39 @@ import time
 
 from launch_identity import read_bound_process_birth
 from monotonic_clock import monotonic_ns
+from owned_sample_timer import SampleSleeper
 from owned_tcp_manifest import image_from_manifest, private_object, verify_curl
 from owned_tcp_protocol import Channel, Unavailable, check_fifo
 
 
-def wait_for_sample(target_ns, cutoff_ns, cancelled, *, clock=monotonic_ns, sleeper=time.sleep):
+def wait_for_sample(target_ns, cutoff_ns, cancelled, *, clock=monotonic_ns, sleeper=None, trace=None):
     """Wait for one fixed sample point; cancellation never grants a query permit."""
     limit = min(target_ns, cutoff_ns)
+    sleeper = SampleSleeper() if sleeper is None else sleeper
+    if trace is not None:
+        trace.update(target_ns=target_ns, fixed_cutoff_ns=cutoff_ns, sleep_count=0,
+                     sleeps=[], omitted_sleeps=0)
     while not cancelled():
-        remaining = limit - clock()
+        now = clock()
+        remaining = limit - now
         if remaining <= 0:
+            if trace is not None:
+                trace["due_observed_monotonic_ns"] = now
             break
-        sleeper(min(remaining / 1e9, 0.005))
-    return not cancelled()
+        duration = min(remaining / 1e9, 0.005)
+        result = sleeper(duration)
+        if trace is not None:
+            ended = clock()
+            trace["sleep_count"] += 1
+            if len(trace["sleeps"]) < 64:
+                trace["sleeps"].append(dict(started_monotonic_ns=now, requested_ns=remaining if remaining < 5_000_000 else 5_000_000,
+                    ended_monotonic_ns=ended, timer=result if isinstance(result, dict) else {"backend": "injected"}))
+            else:
+                trace["omitted_sleeps"] += 1
+    active = not cancelled()
+    if trace is not None:
+        trace["cancelled"] = not active
+    return active
 
 
 class Cancelled(BaseException):
@@ -132,9 +152,14 @@ class Observation:
             if initial["usable"] and value["ppid"] == os.getpid():
                 birth = value["birth_seconds"], value["birth_microseconds"]
             self.record["actual_curl_initial_identity_available"] = birth is not None
+            sleeper = SampleSleeper()
+            self.record["sample_waits"] = []
             for offset in (0, 25, 75, 125, 175):
                 target = began + offset * 1_000_000
-                if not wait_for_sample(target, self.cutoff_ns, lambda: self.cancelled):
+                wait_trace = {"scheduled_offset_ms": offset}
+                self.record["sample_waits"].append(wait_trace)
+                if not wait_for_sample(target, self.cutoff_ns, lambda: self.cancelled,
+                                       sleeper=sleeper, trace=wait_trace):
                     raise Cancelled()
                 for name, channel, pid, fence in [
                     ("server", self.server_channel, self.target["pid"], self._server_birth()),

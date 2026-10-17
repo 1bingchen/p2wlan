@@ -101,7 +101,7 @@ jobs:
       - name: Check fixed sample scheduling decisions
         run: |
           set -euo pipefail
-          python -B -m unittest discover -s scripts/nat-sim -p 'test_owned_sample_schedule.py' -v \
+          python -B -m unittest discover -s scripts/nat-sim -p 'test_owned_sample_*.py' -v \
             2>&1 | tee "$RUNNER_TEMP/p2wlan-final-owned-sample-schedule.log"
       - name: Check original concurrent owned status observers
         env:

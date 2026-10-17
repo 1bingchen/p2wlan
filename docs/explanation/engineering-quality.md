@@ -111,6 +111,12 @@ Business MTU Linux 验证也使用该包装器：workspace 步骤显式传入 `-
 
 原 Cargo 退出后，两条输出流合计最多等待 5 秒收尾，避免后代继承管道导致 EOF 永不抵达；这不改变测试运行期限。到期记录 `stream_not_closed_after_cargo_exit`，日志标为不完整，不宣称最终摘要或已绑定的失败程序。泵线程停止接受新数据，残留阻塞读取随包装器进程退出关闭；不等待不归包装器直接所有的后代，也不向它们发送信号。原 Cargo 非零退出码仍保留；原退出为零而采证失败时包装器失败。
 
+## 依赖审计输出
+
+Rust 依赖摘要由 `scripts/security/dependency_reports.py` 的 `rust` 子命令生成。工作流分别保留 cargo-deny 的 stdout 与 stderr，并通过 `--root-deny-stderr`、`--fuzz-deny-stderr` 一起提交诊断；有效的 stdout-only JSON 输出也可使用。摘要分别记录两条输出流的记录数量及 advisories、bans、licenses、sources 完成计数，不推断跨流时间顺序。
+
+每套依赖图必须有且只有一份覆盖上述四项的完成总结。输出为空、无法解析、记录结构不完整、含错误诊断或总结报告错误时，即使工具退出状态为零也不能通过。重复版本等警告仍按 `deny.toml` 原策略分类，不添加豁免。每套图两条流合计最多读取 16 MiB 和 65,536 条非空记录；超限使证据失败，不把截断内容当作完整扫描结果。
+
 ## 变更审查
 
 涉及连接、并发或数据面的 PR 至少回答：

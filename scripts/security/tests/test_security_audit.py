@@ -586,9 +586,16 @@ class DependencyReportTests(unittest.TestCase):
         fuzz_audit = root / "fuzz-audit.json"
         fuzz_audit.write_text(audit.read_text(encoding="utf-8"), encoding="utf-8")
         deny = root / "deny.jsonl"
-        deny.write_text("", encoding="utf-8")
+        completed = {
+            "type": "summary",
+            "fields": {
+                check: {"errors": 0, "warnings": 0, "notes": 0, "helps": 0}
+                for check in ["advisories", "bans", "licenses", "sources"]
+            },
+        }
+        deny.write_text(json.dumps(completed) + "\n", encoding="utf-8")
         fuzz_deny = root / "fuzz-deny.jsonl"
-        fuzz_deny.write_text("", encoding="utf-8")
+        fuzz_deny.write_text(deny.read_text(encoding="utf-8"), encoding="utf-8")
         return type(
             "Args",
             (),

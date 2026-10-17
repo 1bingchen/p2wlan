@@ -144,6 +144,8 @@ jobs:
             --fuzz-audit "$evidence/cargo-audit-fuzz.json" \
             --root-deny "$evidence/cargo-deny-root.jsonl" \
             --fuzz-deny "$evidence/cargo-deny-fuzz.jsonl" \
+            --root-deny-stderr "$evidence/cargo-deny-root.stderr" \
+            --fuzz-deny-stderr "$evidence/cargo-deny-fuzz.stderr" \
             --deny-config deny.toml \
             --advisory-exceptions security/advisory-exceptions.json \
             --root-audit-status "$root_audit_status" \

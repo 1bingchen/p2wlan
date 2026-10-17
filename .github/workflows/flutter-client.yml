@@ -279,6 +279,17 @@ jobs:
       - name: Flutter pub get
         run: flutter pub get
 
+      - name: Prepare CocoaPods CDN metadata
+        working-directory: .
+        timeout-minutes: 2
+        env:
+          P2WLAN_COCOAPODS_SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: >-
+          python3 scripts/release/prepare_cocoapods_cdn.py
+          --evidence-dir "${{ runner.temp }}/p2wlan-cocoapods"
+          --github-env "$GITHUB_ENV"
+          --source-sha "$P2WLAN_COCOAPODS_SOURCE_SHA"
+
       - name: Build macOS release app
         run: flutter build macos --release
 

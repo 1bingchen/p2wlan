@@ -266,6 +266,9 @@ jobs:
     name: NAT Topology Required
     if: always()
     needs: [macos-clock, unit, direct, relay]
+    permissions:
+      contents: read
+      actions: read
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -296,7 +299,7 @@ jobs:
           # Every attempt is fetched so a partial re-run can still be
           # aggregated and so a failing attempt stays available afterwards.
           pattern: nat-topology-direct-${{ github.run_id }}-*
-          path: ${{ runner.temp }}/nat-topology-artifacts
+          path: ${{ runner.temp }}/nat-direct-downloads
           merge-multiple: false
 
       - name: Download every Relay attempt of this run
@@ -305,8 +308,24 @@ jobs:
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
         with:
           pattern: nat-topology-relay-${{ github.run_id }}-*-of-5
-          path: ${{ runner.temp }}/nat-topology-artifacts
+          path: ${{ runner.temp }}/nat-relay-downloads
           merge-multiple: false
+
+      - name: Restore artifact-name directories for every downloaded attempt
+        id: layout
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_HEAD_SHA: ${{ steps.identity.outputs.source_head_sha }}
+        run: |
+          set -euo pipefail
+          python3 scripts/quality/restore_artifact_layout.py \
+            --repository "$GITHUB_REPOSITORY" \
+            --run-id "$GITHUB_RUN_ID" \
+            --source-head-sha "$SOURCE_HEAD_SHA" \
+            --download "nat-topology-direct-$GITHUB_RUN_ID-*" "$RUNNER_TEMP/nat-direct-downloads" \
+            --download "nat-topology-relay-$GITHUB_RUN_ID-*-of-5" "$RUNNER_TEMP/nat-relay-downloads" \
+            --output-root "$RUNNER_TEMP/nat-topology-artifacts"
 
       - name: Lay out one attempt of evidence per scenario
         id: select
@@ -349,6 +368,7 @@ jobs:
           RELAY_RESULT: ${{ needs.relay.result }}
           DOWNLOAD_DIRECT_OUTCOME: ${{ steps.download_direct.outcome }}
           DOWNLOAD_RELAY_OUTCOME: ${{ steps.download_relay.outcome }}
+          LAYOUT_OUTCOME: ${{ steps.layout.outcome }}
           SELECT_OUTCOME: ${{ steps.select.outcome }}
           AGGREGATE_OUTCOME: ${{ steps.aggregate.outcome }}
         run: |
@@ -359,6 +379,7 @@ jobs:
           test "$RELAY_RESULT" = "success"
           test "$DOWNLOAD_DIRECT_OUTCOME" = "success"
           test "$DOWNLOAD_RELAY_OUTCOME" = "success"
+          test "$LAYOUT_OUTCOME" = "success"
           test "$SELECT_OUTCOME" = "success"
           test "$AGGREGATE_OUTCOME" = "success"
           echo "all required NAT topology profiles and actual-execution evidence passed"

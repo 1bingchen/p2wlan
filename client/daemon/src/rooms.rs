@@ -108,11 +108,14 @@ impl RoomAuthorization {
         let Ok(mut snapshot) = self.snapshot.lock() else {
             return false;
         };
+        // A shorter deadline retires queued permits from the longer grant.
+        // Ordinary renewal keeps each queued packet's original deadline.
         let live = match snapshot.as_ref() {
             Some(old)
                 if old.local_ip == local_ip
                     && old.peers == allowed
-                    && old.expires_at > Instant::now() =>
+                    && old.expires_at > Instant::now()
+                    && expires_at >= old.expires_at =>
             {
                 old.live.clone()
             }
@@ -282,6 +285,70 @@ mod send_permit_tests {
         assert!(fresh.is_valid());
         drop(auth);
         assert!(!fresh.is_valid());
+    }
+
+    #[test]
+    fn shorter_room_lease_retires_original_queued_permit() {
+        let auth = RoomAuthorization::new("room-shorter-lease");
+        let roster = || [("b".to_string(), "10.21.1.3".to_string())];
+        let started = Instant::now();
+        assert!(auth.replace("10.21.1.2", roster(), started, 30));
+        let original = auth.send_permit("b", "10.21.1.3", "10.21.1.2").unwrap();
+        assert!(original.is_valid());
+        assert!(auth.replace("10.21.1.2", roster(), started, 10));
+        let current = auth.send_permit("b", "10.21.1.3", "10.21.1.2").unwrap();
+        assert!(auth.allows("b", "10.21.1.3", "10.21.1.2"));
+        assert!(current.is_valid());
+        assert!(!original.is_valid());
+    }
+
+    #[test]
+    fn older_room_lease_deadline_retires_original_queued_permit() {
+        let auth = RoomAuthorization::new("room-older-lease");
+        let roster = || [("b".to_string(), "10.21.1.3".to_string())];
+        let started = Instant::now();
+        assert!(auth.replace("10.21.1.2", roster(), started, 30));
+        let original = auth.send_permit("b", "10.21.1.3", "10.21.1.2").unwrap();
+        assert!(auth.replace("10.21.1.2", roster(), started - Duration::from_secs(10), 30));
+        let current = auth.send_permit("b", "10.21.1.3", "10.21.1.2").unwrap();
+        assert!(current.is_valid());
+        assert!(!original.is_valid());
+    }
+
+    #[test]
+    fn equal_room_lease_keeps_queued_permit_and_traffic() {
+        let auth = RoomAuthorization::new("room-equal-lease");
+        let roster = || [("b".to_string(), "10.21.1.3".to_string())];
+        let started = Instant::now();
+        assert!(auth.replace("10.21.1.2", roster(), started, 30));
+        let original = auth.send_permit("b", "10.21.1.3", "10.21.1.2").unwrap();
+        auth.record_packet("b", true);
+        assert!(auth.replace("10.21.1.2", roster(), started, 30));
+        assert!(original.is_valid());
+        assert_eq!(
+            auth.diagnostics("10.21.1.2").unwrap().peers[0].rx_delivered_packets,
+            1
+        );
+        auth.invalidate();
+        assert!(!original.is_valid());
+    }
+
+    #[test]
+    fn longer_room_lease_keeps_original_queued_deadline() {
+        let auth = RoomAuthorization::new("room-longer-lease");
+        let roster = || [("b".to_string(), "10.21.1.3".to_string())];
+        let started = Instant::now();
+        assert!(auth.replace("10.21.1.2", roster(), started, 10));
+        let original = auth.send_permit("b", "10.21.1.3", "10.21.1.2").unwrap();
+        assert!(auth.replace("10.21.1.2", roster(), started, 30));
+        let current = auth.send_permit("b", "10.21.1.3", "10.21.1.2").unwrap();
+        assert_eq!(original.expires_at, started + Duration::from_secs(10));
+        assert_eq!(current.expires_at, started + Duration::from_secs(30));
+        assert!(original.is_valid());
+        assert!(current.is_valid());
+        auth.invalidate();
+        assert!(!original.is_valid());
+        assert!(!current.is_valid());
     }
 }
 

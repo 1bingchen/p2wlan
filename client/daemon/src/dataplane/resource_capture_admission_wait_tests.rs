@@ -33,6 +33,7 @@ enum Case {
     ReceiverClosed,
     Handoff,
     RoomRevoked,
+    RoomLeaseShortened,
 }
 
 struct Fixture {
@@ -145,6 +146,7 @@ struct Evidence {
     fifo_exact: bool,
     actual_packet: Option<RawRequestDelivery>,
     actual_permit_valid_at_receive: bool,
+    fresh_after_shortening: bool,
 }
 
 async fn exercise(case: Case) {
@@ -185,6 +187,7 @@ async fn exercise(case: Case) {
                 let mut fifo_exact = true;
                 let mut actual_packet = None;
                 let mut actual_permit_valid_at_receive = false;
+                let mut fresh_after_shortening = false;
                 let route_result = match case {
                     Case::Cancel => {
                         drop(route);
@@ -194,9 +197,19 @@ async fn exercise(case: Case) {
                         drop(fixture.receiver.take());
                         Some(route.await)
                     }
-                    Case::Handoff | Case::RoomRevoked => {
+                    Case::Handoff | Case::RoomRevoked | Case::RoomLeaseShortened => {
                         if matches!(case, Case::RoomRevoked) {
                             fixture.auth.invalidate();
+                        }
+                        if matches!(case, Case::RoomLeaseShortened)
+                            && (!fixture.auth.replace(
+                                LOCAL_VIP,
+                                [("peer-wait".into(), PEER_VIP.into())],
+                                Instant::now(),
+                                10,
+                            ) || !fixture.auth.allows("peer-wait", PEER_VIP, LOCAL_VIP))
+                        {
+                            return Err("shortened room grant is not currently valid".into());
                         }
                         let receiver = fixture.receiver.as_mut().unwrap();
                         fifo_exact &= receiver
@@ -215,7 +228,10 @@ async fn exercise(case: Case) {
                     .receiver
                     .as_ref()
                     .map_or(0, RawOutboundReceiver::len);
-                if matches!(case, Case::Handoff | Case::RoomRevoked) {
+                if matches!(
+                    case,
+                    Case::Handoff | Case::RoomRevoked | Case::RoomLeaseShortened
+                ) {
                     let receiver = fixture.receiver.as_mut().unwrap();
                     for sequence in 1..1024u16 {
                         fifo_exact &= receiver
@@ -231,6 +247,28 @@ async fn exercise(case: Case) {
                             .is_some_and(|permit| permit.is_valid());
                     }
                     fifo_exact &= receiver.try_recv().is_err();
+                    if matches!(case, Case::RoomLeaseShortened) {
+                        fixture
+                            .controller
+                            .inject(fixture.packet.clone())
+                            .await
+                            .map_err(|error| format!("fresh MockTun inject: {error}"))?;
+                        plane
+                            .read_and_route_once(&mut read_buffer)
+                            .await
+                            .map_err(|error| format!("fresh route after shortening: {error}"))?;
+                        let fresh = receiver.try_recv().ok();
+                        fresh_after_shortening = fresh.as_ref().is_some_and(|packet| {
+                            packet.packet == original_packet
+                                && packet.peer_id == "peer-wait"
+                                && packet
+                                    .room_authorization
+                                    .as_ref()
+                                    .is_some_and(|permit| permit.is_valid())
+                        });
+                        drop(fresh);
+                        fifo_exact &= receiver.try_recv().is_err();
+                    }
                 }
                 Ok::<_, String>(Evidence {
                     held,
@@ -244,6 +282,7 @@ async fn exercise(case: Case) {
                     fifo_exact,
                     actual_packet,
                     actual_permit_valid_at_receive,
+                    fresh_after_shortening,
                 })
             })
             .catch_unwind(),
@@ -333,7 +372,7 @@ async fn exercise(case: Case) {
             if matches!(channel, Channel::Tracked) {
                 match case {
                     Case::ReceiverClosed => 0,
-                    Case::RoomRevoked => 1023,
+                    Case::RoomRevoked | Case::RoomLeaseShortened => 1023,
                     _ => 1024,
                 }
             } else {
@@ -366,10 +405,13 @@ async fn exercise(case: Case) {
                 assert!(evidence.actual_permit_valid_at_receive);
                 assert!(!actual.room_authorization.as_ref().unwrap().is_valid());
             }
-            Case::RoomRevoked => {
+            Case::RoomRevoked | Case::RoomLeaseShortened => {
                 assert!(matches!(evidence.route_result, Some(Ok(()))));
                 assert_eq!(evidence.after_queue_len, 1023);
                 assert!(evidence.actual_packet.is_none());
+                if matches!(case, Case::RoomLeaseShortened) {
+                    assert!(evidence.fresh_after_shortening);
+                }
             }
         }
         assert_eq!(capture.residency_snapshot().total.unwrap().live_buffers, 0);
@@ -410,4 +452,9 @@ async fn actual_channel_dequeue_handoff_ends_wait_lease_before_queued_packet_is_
 #[tokio::test]
 async fn actual_room_revoke_during_reserve_rejects_handoff_and_releases_wait_owner() {
     exercise(Case::RoomRevoked).await;
+}
+
+#[tokio::test]
+async fn actual_shorter_room_lease_rejects_old_reserve_and_allows_fresh_packet() {
+    exercise(Case::RoomLeaseShortened).await;
 }

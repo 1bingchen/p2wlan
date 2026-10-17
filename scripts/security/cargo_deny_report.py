@@ -8,6 +8,7 @@ from typing import Any
 
 MAX_OUTPUT_BYTES = 16 * 1024 * 1024
 MAX_RECORDS = 65_536
+MAX_JSON_DEPTH = 256
 CHECKS = frozenset({"advisories", "bans", "licenses", "sources"})
 COUNTERS = frozenset({"errors", "warnings", "notes", "helps"})
 
@@ -17,6 +18,30 @@ class DenyOutput:
     records: list[dict[str, Any]]
     channels: dict[str, int]
     checks: dict[str, dict[str, int]] | None
+
+
+def bounded_json_record(line: str) -> Any:
+    """Bound container nesting independently of the Python decoder's stack."""
+    depth = 0
+    quoted = False
+    escaped = False
+    for char in line:
+        if quoted:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                quoted = False
+        elif char == '"':
+            quoted = True
+        elif char in "[{":
+            depth += 1
+            if depth > MAX_JSON_DEPTH:
+                raise ValueError("JSON container nesting exceeds 256 levels")
+        elif char in "]}":
+            depth -= 1
+    return json.loads(line)
 
 
 def read_output(
@@ -57,7 +82,7 @@ def read_output(
                 break
             seen_lines += 1
             try:
-                record = json.loads(line)
+                record = bounded_json_record(line)
             except (ValueError, RecursionError) as error:
                 reject("invalid_cargo_deny_jsonl", f"{channel} {path}:{number}: {error}")
                 continue

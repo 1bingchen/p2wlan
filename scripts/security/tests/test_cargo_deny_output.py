@@ -166,6 +166,27 @@ class CargoDenyOutputTests(unittest.TestCase):
         self.assertEqual(report["result"], "fail")
         self.assertIn("invalid_cargo_deny_jsonl", {row["code"] for row in report["findings"]})
 
+    def test_explicit_nesting_boundary_is_enforced(self) -> None:
+        from cargo_deny_report import MAX_JSON_DEPTH
+        record = diagnostic()
+        nested = None
+        for _ in range(MAX_JSON_DEPTH - 2):
+            nested = [nested]
+        record["fields"]["context"] = nested
+        write_records(self.args.root_deny_stderr, record, summary(warnings=1))
+        self.assertEqual(self.report()["result"], "pass")
+        record["fields"]["context"] = [nested]
+        write_records(self.args.root_deny_stderr, record, summary(warnings=1))
+        report = self.report()
+        self.assertEqual(report["result"], "fail")
+        self.assertIn("invalid_cargo_deny_jsonl", {row["code"] for row in report["findings"]})
+
+    def test_quoted_brackets_and_escaped_quotes_are_not_nesting(self) -> None:
+        record = diagnostic()
+        record["fields"]["message"] = '[]{}"\\' * 512
+        write_records(self.args.root_deny_stderr, record, summary(warnings=1))
+        self.assertEqual(self.report()["result"], "pass")
+
 
 if __name__ == "__main__":
     unittest.main()

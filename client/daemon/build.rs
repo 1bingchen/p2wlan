@@ -35,7 +35,10 @@ fn git_head(repo_root: &Path) -> Option<String> {
 }
 
 fn git_output(repo_root: &Path, args: &[&str]) -> Option<String> {
+    // Identity queries are read-only: `git status` must not refresh the
+    // watched index and invalidate the Cargo build that is reading it.
     let output = Command::new("git")
+        .env("GIT_OPTIONAL_LOCKS", "0")
         .current_dir(repo_root)
         .args(args)
         .output()
@@ -46,34 +49,59 @@ fn git_output(repo_root: &Path, args: &[&str]) -> Option<String> {
     Some(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
-/// Print the concrete git ref that backs `HEAD` as a Cargo input.
-///
-/// Watching `.git/HEAD` alone is insufficient on a normal branch: a commit
-/// updates `.git/refs/heads/<branch>` while `.git/HEAD` continues to contain
-/// the same symbolic-ref text. Watching only the refs directory is also not
-/// recursive, so Cargo can reuse a build script result and embed the previous
-/// commit identity after a commit or checkout. The concrete ref closes that
-/// identity gap while the HEAD/packed-refs watches retain detached-head and
-/// packed-ref coverage.
+/// Let Git resolve per-worktree and shared metadata instead of assuming
+/// that `.git` is a directory inside this checkout.
+fn git_path(repo_root: &Path, name: &str) -> Option<PathBuf> {
+    let path = git_output(repo_root, &["rev-parse", "--git-path", name])?;
+    let path = PathBuf::from(path.trim());
+    if path.as_os_str().is_empty() {
+        return None;
+    }
+    Some(if path.is_absolute() {
+        path
+    } else {
+        repo_root.join(path)
+    })
+}
+
+fn print_git_watch(repo_root: &Path, name: &str, optional: bool) {
+    let Some(path) = git_path(repo_root, name) else {
+        if !optional {
+            // A failed lookup must remain conservative, including when a
+            // linked worktree's .git file cannot be resolved temporarily.
+            println!(
+                "cargo:rerun-if-changed={}",
+                repo_root.join(".git").join(name).display()
+            );
+        }
+        return;
+    };
+    if optional && !path.exists() {
+        // Watching an absent packed-refs file makes every Cargo invocation
+        // dirty. HEAD and the current loose-ref path cover later packing.
+        return;
+    }
+    // A packed branch may acquire a loose ref on the next commit. Watch its
+    // nearest existing parent until that ref exists, retaining that fence
+    // without registering a permanently missing Cargo input.
+    if let Some(existing) = path.ancestors().find(|entry| entry.exists()) {
+        println!("cargo:rerun-if-changed={}", existing.display());
+    }
+}
+
+/// Track HEAD/index, existing packed refs, and the current branch ref. A
+/// normal branch commit changes the ref while leaving HEAD's text unchanged.
 fn print_git_identity_watchers() {
     let Some(repo_root) = git_root() else {
         return;
     };
-    for path in [".git/HEAD", ".git/index", ".git/packed-refs"] {
-        println!("cargo:rerun-if-changed={}", repo_root.join(path).display());
-    }
-    if let Some(symbolic_ref) =
-        git_output(&repo_root, &["symbolic-ref", "--quiet", "--short", "HEAD"])
-    {
+    print_git_watch(&repo_root, "HEAD", false);
+    print_git_watch(&repo_root, "index", false);
+    print_git_watch(&repo_root, "packed-refs", true);
+    if let Some(symbolic_ref) = git_output(&repo_root, &["symbolic-ref", "--quiet", "HEAD"]) {
         let symbolic_ref = symbolic_ref.trim();
         if !symbolic_ref.is_empty() {
-            println!(
-                "cargo:rerun-if-changed={}",
-                repo_root
-                    .join(".git/refs/heads")
-                    .join(symbolic_ref)
-                    .display()
-            );
+            print_git_watch(&repo_root, symbolic_ref, false);
         }
     }
 }

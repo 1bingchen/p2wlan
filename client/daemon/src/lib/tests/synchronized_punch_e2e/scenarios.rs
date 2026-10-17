@@ -2445,10 +2445,13 @@ async fn hard_hard_birthday_levels_report_requested_and_actual_socket_counts() {
             .udp_a
             .run_hard_hard_birthday_generation(
                 HARD_HARD_B,
-                &observers,
-                Duration::from_millis(300),
-                requested_level,
-                &format!("level-{requested_level}"),
+                crate::udp::HardHardBirthdayRequest {
+                    observers: &observers,
+                    stun_timeout: Duration::from_millis(300),
+                    level: requested_level,
+                    session_token: &format!("level-{requested_level}"),
+                    cancellation: None,
+                },
                 None,
             )
             .await
@@ -2593,10 +2596,13 @@ async fn hard_hard_birthday_levels_report_requested_and_actual_socket_counts() {
         .udp_a
         .run_hard_hard_birthday_generation(
             HARD_HARD_B,
-            &observers,
-            Duration::from_millis(300),
-            256,
-            token,
+            crate::udp::HardHardBirthdayRequest {
+                observers: &observers,
+                stun_timeout: Duration::from_millis(300),
+                level: 256,
+                session_token: token,
+                cancellation: None,
+            },
             None,
         )
         .await

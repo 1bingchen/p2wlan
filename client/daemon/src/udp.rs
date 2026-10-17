@@ -387,7 +387,7 @@ use dynamic_punch::{
 #[cfg(test)]
 use birthday::hard_hard_birthday_candidates;
 
-pub(crate) use birthday::hard_hard_birthday_socket_count;
+pub(crate) use birthday::{hard_hard_birthday_socket_count, HardHardBirthdayRequest};
 
 #[cfg(test)]
 use birthday::hard_hard_birthday_capacity_plan;

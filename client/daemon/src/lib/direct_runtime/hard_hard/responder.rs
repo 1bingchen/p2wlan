@@ -462,8 +462,10 @@ pub(crate) async fn spawn_hard_hard_responder(
                     HardHardA0Stage::LocalMeasurement,
                     HardHardA0Reason::MeasurementRejected,
                 );
-                let failure_class = hard_hard_measurement_failure_class(&rejection);
-                let reason = rejection.label();
+                let failure_class = hard_hard_measurement_failure_class(&rejection.rejection);
+                let reason = rejection.rejection.label();
+                let observation =
+                    hard_hard_rejected_measurement_observation(&peers, &rejection, punch_at_ms);
                 let _ = record_hard_hard_pre_session_failure(
                     &peers,
                     &peer_id,
@@ -472,7 +474,7 @@ pub(crate) async fn spawn_hard_hard_responder(
                     &coordination.token,
                     "responder",
                     0,
-                    None,
+                    observation.as_ref(),
                     failure_class,
                     reason,
                 )

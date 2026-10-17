@@ -17,15 +17,6 @@ fn hard_hard_socket_identity(
     }
 }
 
-enum HardHardLocalMeasurement {
-    Predictable {
-        result: Box<FreshMappingResult>,
-        handoff: Box<ProvisionalSocketGuard>,
-    },
-    Birthday(Box<HardHardBirthdayResult>),
-    Prepared(Box<crate::udp::HardHardPreparedMeasurement>),
-}
-
 struct HardHardMeasurementPayload {
     v2_offer: Option<crate::peer::HardHardOfferParameters>,
     candidates: Vec<String>,
@@ -38,63 +29,6 @@ struct HardHardMeasurementPayload {
 
 fn hard_hard_bounded_u32(value: usize) -> u32 {
     u32::try_from(value).unwrap_or(u32::MAX)
-}
-
-fn hard_hard_measurement_stats(
-    measurement: &HardHardLocalMeasurement,
-) -> crate::udp::HardHardMeasurementStats {
-    match measurement {
-        HardHardLocalMeasurement::Predictable { result, .. } => result.measurement,
-        HardHardLocalMeasurement::Birthday(result) => result.measurement,
-        HardHardLocalMeasurement::Prepared(result) => result.measurement_cost(),
-    }
-}
-
-fn hard_hard_measurement_observation(
-    peers: &PeerManager,
-    measurement: &HardHardLocalMeasurement,
-    measurement_completed_at_ms: Option<u64>,
-    punch_at_ms: u64,
-) -> crate::peer::HardHardMeasurementObservation {
-    let stats = hard_hard_measurement_stats(measurement);
-    let timeline_now_ms = peers.timeline_uptime_ms();
-    let transport_now_ms = crate::udp::monotonic_millis();
-    let measurement_started_at_ms = hard_hard_translate_transport_time(
-        stats.measurement_started_at_ms,
-        transport_now_ms,
-        timeline_now_ms,
-    );
-    let last_measurement_send_at_ms = hard_hard_translate_transport_time(
-        stats.last_measurement_send_at_ms,
-        transport_now_ms,
-        timeline_now_ms,
-    );
-    let measurement_completed_at_ms = hard_hard_translate_transport_time(
-        stats.measurement_completed_at_ms,
-        transport_now_ms,
-        timeline_now_ms,
-    )
-    .or(measurement_completed_at_ms);
-    let wall_now_ms = hard_hard_now_ms();
-    let planned_send_at_ms = timeline_now_ms.map(|timeline_now| {
-        if punch_at_ms >= wall_now_ms {
-            timeline_now.saturating_add(punch_at_ms - wall_now_ms)
-        } else {
-            timeline_now.saturating_sub(wall_now_ms - punch_at_ms)
-        }
-    });
-    crate::peer::HardHardMeasurementObservation {
-        measurement_started_at_ms,
-        last_measurement_send_at_ms,
-        measurement_completed_at_ms,
-        planned_send_at_ms,
-        stun_datagrams_sent: stats.stun_datagrams_sent,
-        stun_bytes_sent: stats.stun_bytes_sent,
-        stun_send_errors: stats.stun_send_errors,
-        stun_send_error_bytes: stats.stun_send_error_bytes,
-        stun_responses: stats.stun_responses,
-        ..crate::peer::HardHardMeasurementObservation::default()
-    }
 }
 
 fn hard_hard_apply_candidate_contract(
@@ -1028,89 +962,6 @@ async fn hard_hard_birthday_level(peers: &PeerManager, peer_id: &str) -> usize {
         peers.is_android_platform(),
         peers.recovery_stage_for(peer_id).await,
     )
-}
-
-/// Borrowed inputs for a single measurement; cancellation and the scheduled
-/// send remain owned by the existing rendezvous session.
-struct HardHardMeasurementRequest<'a> {
-    observers: &'a [SocketAddr],
-    stun_timeout: Duration,
-    session_token: &'a str,
-    cancellation: Option<&'a Arc<crate::PunchSessionCancellation>>,
-    punch_at_ms: u64,
-    coordinated: bool,
-}
-
-async fn run_hard_hard_local_measurement(
-    udp: &UdpTransport,
-    peers: &PeerManager,
-    peer_id: &str,
-    request: HardHardMeasurementRequest<'_>,
-) -> std::result::Result<HardHardLocalMeasurement, FreshMappingRejection> {
-    let HardHardMeasurementRequest {
-        observers,
-        stun_timeout,
-        session_token,
-        cancellation,
-        punch_at_ms,
-        coordinated,
-    } = request;
-    if coordinated {
-        let level = hard_hard_birthday_level(peers, peer_id).await;
-        return udp
-            .run_hard_hard_prepared_generation(
-                peer_id,
-                observers,
-                stun_timeout,
-                level,
-                session_token,
-                cancellation,
-                Duration::from_millis(punch_at_ms.saturating_sub(hard_hard_now_ms())),
-                HARD_HARD_PUNCH_LEAD,
-            )
-            .await
-            .map(|result| HardHardLocalMeasurement::Prepared(Box::new(result)));
-    }
-    if peers
-        .hard_hard_plan_uses_birthday(peer_id)
-        .await
-        .unwrap_or(false)
-    {
-        let level = hard_hard_birthday_level(peers, peer_id).await;
-        return udp
-            .run_hard_hard_birthday_generation(
-                peer_id,
-                observers,
-                stun_timeout,
-                level,
-                session_token,
-                cancellation,
-            )
-            .await
-            .map(|result| HardHardLocalMeasurement::Birthday(Box::new(result)));
-    }
-    match udp
-        .run_hard_hard_fresh_mapping_generation(
-            peer_id,
-            observers,
-            stun_timeout,
-            cancellation,
-            Duration::from_millis(punch_at_ms.saturating_sub(hard_hard_now_ms())),
-            HARD_HARD_PUNCH_LEAD,
-        )
-        .await
-    {
-        FreshMappingOutcome::Accepted(result, handoff) => {
-            if !udp
-                .tag_hard_hard_socket(peer_id, result.socket_index, session_token)
-                .await
-            {
-                return Err(FreshMappingRejection::Superseded);
-            }
-            Ok(HardHardLocalMeasurement::Predictable { result, handoff })
-        }
-        FreshMappingOutcome::Rejected(rejection) => Err(rejection),
-    }
 }
 
 fn hard_hard_measurement_payload(

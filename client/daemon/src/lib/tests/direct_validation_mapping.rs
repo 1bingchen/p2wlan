@@ -164,14 +164,23 @@ async fn ordinary_validation_preflight_authenticates_return_mapping_without_chas
     // JoinSet owns every fixture task, including assertion/panic paths.
     // Neither node installs an automatic validation trigger: only A's one
     // explicit owner runs, so B cannot accidentally supply a second path.
+    // Readiness and the original owner assertions share one original 3s
+    // deadline. Reader setup cannot extend the evidence window.
+    let evidence_deadline = tokio::time::Instant::now() + Duration::from_secs(3);
     let mut tasks = JoinSet::new();
+    let (a_ready_tx, a_ready_rx) = oneshot::channel();
+    let (b_ready_tx, b_ready_rx) = oneshot::channel();
     let a_reader = udp_a.clone();
     tasks.spawn(async move {
-        let _ = a_reader.run_inbound(udp_tx_a).await;
+        let _ = a_reader
+            .run_inbound_with_reader_ready_for_test(udp_tx_a, a_ready_tx)
+            .await;
     });
     let b_reader = udp_b.clone();
     tasks.spawn(async move {
-        let _ = b_reader.run_inbound(udp_tx_b).await;
+        let _ = b_reader
+            .run_inbound_with_reader_ready_for_test(udp_tx_b, b_ready_tx)
+            .await;
     });
     let (ip_tx_a, _ip_rx_a) = mpsc::channel(64);
     let (ip_tx_b, _ip_rx_b) = mpsc::channel(64);
@@ -190,12 +199,28 @@ async fn ordinary_validation_preflight_authenticates_return_mapping_without_chas
             .await;
     });
 
+    let (proxy_ready_tx, proxy_ready_rx) = oneshot::channel();
     let (request_tx, request_rx) = oneshot::channel();
     let (release_ack_tx, release_ack_rx) = oneshot::channel();
     let (forwarded_tx, forwarded_rx) = oneshot::channel();
     tasks.spawn(async move {
         let mut packet = vec![0u8; 2048];
-        let (len, source) = original.recv_from(&mut packet).await.unwrap();
+        let (len, source) = {
+            let receive = original.recv_from(&mut packet);
+            tokio::pin!(receive);
+            let mut ready = Some(proxy_ready_tx);
+            std::future::poll_fn(|context| {
+                let result = std::future::Future::poll(receive.as_mut(), context);
+                if result.is_pending() {
+                    if let Some(ready) = ready.take() {
+                        let _ = ready.send(());
+                    }
+                }
+                result
+            })
+            .await
+            .unwrap()
+        };
         eprintln!(
             "mapping_boundary phase=proxy_probe_received elapsed_us={}",
             fixture_clock.elapsed().as_micros()
@@ -288,6 +313,22 @@ async fn ordinary_validation_preflight_authenticates_return_mapping_without_chas
         forwarded_tx.send(()).unwrap();
     });
 
+    // No validation packet has been sent yet. Establish actual Pending
+    // receives on both original UDP readers and the proxy before starting
+    // the unchanged 150ms preflight; never wait for authentication to turn true.
+    tokio::time::timeout_at(evidence_deadline, async {
+        let (a, b, proxy) = tokio::join!(a_ready_rx, b_ready_rx, proxy_ready_rx);
+        assert!(a.expect("A's original reader must publish readiness"));
+        assert!(b.expect("B's original reader must publish readiness"));
+        proxy.expect("the proxy must reach its original pending receive");
+    })
+    .await
+    .expect("reader readiness must fit the original 3s evidence deadline");
+    eprintln!(
+        "mapping_boundary phase=all_readers_pending elapsed_us={}",
+        fixture_clock.elapsed().as_micros()
+    );
+
     let worker_udp = udp_a.clone();
     let worker_peers = peers_a.clone();
     let (completed_tx, completed_rx) = oneshot::channel();
@@ -315,7 +356,7 @@ async fn ordinary_validation_preflight_authenticates_return_mapping_without_chas
         .with_subscriber(subscriber),
     );
 
-    timeout(Duration::from_secs(3), async {
+    tokio::time::timeout_at(evidence_deadline, async {
         let request = request_rx
             .await
             .expect("proxy must observe the first request/ACK");

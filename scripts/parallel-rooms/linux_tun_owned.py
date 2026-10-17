@@ -46,7 +46,20 @@ class OwnedGroups:
         self.cleaned: list[dict] | None = None
 
     def spawn(self, role: str, argv: list[str], log: Path, *, env: dict[str, str],
-              token: str | None = None, socket_tool: bool = False) -> subprocess.Popen:
+              token: str | None = None, socket_tool: bool = False,
+              pass_fds: tuple[int, ...] = ()) -> subprocess.Popen:
+        if pass_fds:
+            if os.name != "posix":
+                raise ValueError("original_pipe_inheritance_requires_POSIX")
+            import fcntl
+            import stat
+            if (type(pass_fds) is not tuple or len(pass_fds) != 1
+                    or type(pass_fds[0]) is not int or pass_fds[0] < 3):
+                raise ValueError("one_original_pipe_writer_required")
+            flags = fcntl.fcntl(pass_fds[0], fcntl.F_GETFL)
+            if (not stat.S_ISFIFO(os.fstat(pass_fds[0]).st_mode)
+                    or flags & os.O_ACCMODE != os.O_WRONLY or not flags & os.O_NONBLOCK):
+                raise ValueError("original_nonblocking_pipe_writer_required")
         if self.cleaned is not None or len(self.owners) >= MAX_GROUPS:
             raise RuntimeError("original process registry closed or full")
         if any(owner["role"] == role for owner in self.owners):
@@ -61,8 +74,11 @@ class OwnedGroups:
                                   stderr=subprocess.DEVNULL, process_group=0)
         owner["anchor"] = anchor
         wait_ready(anchor, time.monotonic() + 2)
+        inherited = {"pass_fds": pass_fds} if pass_fds else {}
+        if pass_fds:
+            owner["child_spawn_requested_monotonic_ns"] = time.monotonic_ns()
         child = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=output, stderr=output,
-                                 env=env, text=True, shell=False, process_group=anchor.pid)
+                                 env=env, text=True, shell=False, process_group=anchor.pid, **inherited)
         owner["child"] = child
         if token is not None:
             child.stdin.write(token + "\n")

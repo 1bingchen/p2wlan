@@ -46,6 +46,18 @@ jobs:
           else
             python3 scripts/dual-end/test_probe_write_facts.py -v
           fi
+      - name: Original owned probe pipe capture controls
+        shell: bash
+        env:
+          P2WLAN_CAPTURE_TEST_ARTIFACT_DIR: ${{ runner.temp }}/owned-probe-capture-fixtures
+        run: |
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            python scripts/dual-end/test_probe_write_stream.py -v
+            python scripts/parallel-rooms/test_linux_tun_probe_capture.py -v
+          else
+            python3 scripts/dual-end/test_probe_write_stream.py -v
+            python3 scripts/parallel-rooms/test_linux_tun_probe_capture.py -v
+          fi
       - uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2
         with:
           channel: stable
@@ -63,6 +75,14 @@ jobs:
       - name: Parallel lifecycle and native route inventory tests
         working-directory: apps/flutter_client
         run: flutter test test/parallel_rooms_test.dart test/room_route_inventory_test.dart
+      - name: Retain original owned probe fixtures on failure
+        if: failure() && runner.os != 'Windows'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: owned-probe-fixtures-${{ runner.os }}-${{ github.sha }}
+          path: ${{ runner.temp }}/owned-probe-capture-fixtures/
+          if-no-files-found: warn
+          retention-days: 7
 
   linux_live:
     name: Parallel rooms real TUN (Linux)
@@ -106,17 +126,20 @@ jobs:
         timeout-minutes: 8
         run: |
           sudo --preserve-env=GITHUB_RUN_ID,GITHUB_RUN_ATTEMPT python3 scripts/parallel-rooms/linux_tun_evidence.py \
+            --write-facts \
             --daemon target/debug/p2wlan-daemon \
             --control target/debug/p2wlan-control \
             --head "$(git rev-parse HEAD)" \
             --output-dir "$RUNNER_TEMP/linux-tun-application"
           sudo --preserve-env=GITHUB_RUN_ID,GITHUB_RUN_ATTEMPT python3 scripts/parallel-rooms/linux_tun_evidence.py \
+            --write-facts \
             --daemon target/debug/p2wlan-daemon \
             --control target/debug/p2wlan-control \
             --head "$(git rev-parse HEAD)" \
             --fault-recovery \
             --output-dir "$RUNNER_TEMP/linux-tun-recovery"
           sudo --preserve-env=GITHUB_RUN_ID,GITHUB_RUN_ATTEMPT python3 scripts/parallel-rooms/linux_tun_evidence.py \
+            --write-facts \
             --daemon target/debug/p2wlan-daemon \
             --control target/debug/p2wlan-control \
             --head "$(git rev-parse HEAD)" \

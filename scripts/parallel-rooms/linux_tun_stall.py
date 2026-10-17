@@ -132,7 +132,7 @@ def observe_probe_terminal(entry: dict, child, *, now=time.monotonic_ns) -> None
 
 
 def collect_paused_samples(lab, owner, entry, probe, paused_samples: list, hold_end: int,
-                           *, now=time.monotonic_ns, sleep=time.sleep) -> None:
+                           *, now=time.monotonic_ns, sleep=time.sleep, capture=None) -> None:
     sampling_end = hold_end - CONT_RESERVE_NS
     while len(paused_samples) < contract.MAX_SAMPLES:
         sample_end = now() + PAUSED_SAMPLE_BUDGET_NS
@@ -143,8 +143,14 @@ def collect_paused_samples(lab, owner, entry, probe, paused_samples: list, hold_
             break
         if owner.observe()["state"] != "T":
             raise RuntimeError("stall_original_application_not_stopped_during_sample")
+        if capture is not None:
+            capture.drain()
+            if now() >= sample_end:
+                raise TimeoutError("stall_admitted_diagnostics_sample_deadline")
         observe_probe_terminal(entry, probe, now=now)
         paused_samples.append(sample(lab, sample_end))
+        if capture is not None:
+            capture.drain()
         if now() >= sample_end:
             raise TimeoutError("stall_admitted_diagnostics_sample_deadline")
         if owner.observe()["state"] != "T":
@@ -193,19 +199,28 @@ def measure(harness, lab, groups, report: dict, out: Path, snapshots: dict, slot
         bind = (plan["source_ip"], entry["source_port"])
         target = (plan["target_ip"], entry["target_port"])
         path = out / (entry["phase"] + "-probe.json")
+        capture = harness.prepare_write_capture(groups, entry, "udp", bind, target,
+                                                "udp-" + entry["phase"], lab.ns("a"))
+        argv = harness.tool_argv(harness.DUAL / "udp_business_probe.py", "probe", bind, target, entry, path)
+        if capture is not None:
+            argv.extend(capture.arguments())
         entry["probe_spawn_requested_monotonic_ns"] = time.monotonic_ns()
         child = groups.spawn("udp-" + entry["phase"] + "-probe", ["ip", "netns", "exec", lab.ns("a"),
-            *harness.tool_argv(harness.DUAL / "udp_business_probe.py", "probe", bind, target, entry, path)],
-            out / (entry["phase"] + "-probe.log"), env=clean, socket_tool=True)
+            *argv], out / (entry["phase"] + "-probe.log"), env=clean, socket_tool=True,
+            pass_fds=(capture.writer,) if capture else ())
         entry["outcome"] = "started"
-        return child, path, bind, target
+        if capture is not None:
+            capture.bind(groups, child)
+        return child, path, bind, target, capture
 
-    def collect_probe(entry, child, path, bind, target):
-        code = harness.wait_child(child, echo_end / 1_000_000_000)
+    def collect_probe(entry, child, path, bind, target, capture):
+        code = harness.wait_child(child, echo_end / 1_000_000_000, capture=capture)
         result, _ = harness.udp_summary.read_report(path)
         harness.udp_summary.validate_report(result)
         harness.attach(entry, result, result["requests"], bind, target, harness.digest(harness.DUAL / "udp_business_probe.py"))
         entry.update(probe_exit=code, report_sha256=harness.digest(path))
+        if capture is not None:
+            entry["original_write_stream"] = capture.finish(result)
 
     paused_samples = details["paused_samples"] = []
     try:
@@ -213,21 +228,25 @@ def measure(harness, lab, groups, report: dict, out: Path, snapshots: dict, slot
         hold_end = owner.evidence["stopped_monotonic_ns"] + contract.HOLD_NS
         if hold_end + 2_000_000_000 >= echo_end:
             raise TimeoutError("stall_original_echo_budget_cannot_fit_both_phases")
-        probe, path, bind, target = start_probe(entries[0])
+        probe, path, bind, target, capture = start_probe(entries[0])
         # Fixed capacity and bounded complete samples, with the original hold
         # end and CONT reserve. Admitted failures remain in the evidence.
-        collect_paused_samples(lab, owner, entries[0], probe, paused_samples, hold_end)
+        collect_paused_samples(lab, owner, entries[0], probe, paused_samples, hold_end, capture=capture)
         while time.monotonic_ns() < hold_end:
-            time.sleep(min(.01, (hold_end - time.monotonic_ns()) / 1_000_000_000))
+            if capture is not None:
+                capture.drain()
+            time.sleep(max(0, min(.01, (hold_end - time.monotonic_ns()) / 1_000_000_000)))
         if owner.observe()["state"] != "T":
             raise RuntimeError("stall_original_application_not_stopped_before_resume")
+        if capture is not None:
+            capture.drain()
         observe_probe_terminal(entries[0], probe)
     finally:
         owner.resume(echo_end)
     details["paused_request_window"] = contract.paused_request_window(entries[0], owner.evidence)
-    collect_probe(entries[0], probe, path, bind, target)
-    probe, path, bind, target = start_probe(entries[1])
-    collect_probe(entries[1], probe, path, bind, target)
+    collect_probe(entries[0], probe, path, bind, target, capture)
+    probe, path, bind, target, capture = start_probe(entries[1])
+    collect_probe(entries[1], probe, path, bind, target, capture)
     details["echo_exit"] = harness.wait_child(echo, echo_end / 1_000_000_000)
     details["echo"] = read_object(server_report)
     if (details["echo"].get("process_id") != echo.pid or details["echo"].get("manifest_sha256") != expected_plan_sha

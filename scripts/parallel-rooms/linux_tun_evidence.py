@@ -158,14 +158,23 @@ def same_endpoint(before: dict, after: dict) -> None:
         raise RuntimeError("original endpoint/process/TUN/route identity changed during requests")
 
 
-def wait_child(child: subprocess.Popen, deadline: float) -> int:
+def wait_child(child: subprocess.Popen, deadline: float, *, capture=None) -> int:
     # Reaping the measured child is safe: its original unreaped anchor pins PGID.
     while time.monotonic() < deadline:
+        if capture is not None:
+            capture.drain()
+            if time.monotonic() >= deadline:
+                break
         result = child.poll()
         if result is not None:
             return result
         time.sleep(.02)
     raise TimeoutError("original application child deadline")
+
+
+def prepare_write_capture(groups, entry, protocol, bind, target, stem, namespace):
+    captures = getattr(groups, "write_captures", None)
+    return captures.prepare(groups, entry, protocol, bind, target, stem, namespace) if captures else None
 
 
 def tool_argv(tool: Path, role: str, bind: tuple, target: tuple, entry: dict, output: Path) -> list[str]:
@@ -206,11 +215,19 @@ def measure(lab: EvidenceLab, groups: OwnedGroups, entry: dict, out: Path, snaps
         time.sleep(.02)
     else:
         raise TimeoutError("original echo socket readiness")
-    probe = groups.spawn(stem + "-probe", ["ip", "netns", "exec", lab.ns(lab.daemons[source]["namespace"]),
-                                          *tool_argv(tool, "probe", bind, destination, entry, probe_report)],
-                         probe_log, env=clean, socket_tool=True)
+    namespace = lab.ns(lab.daemons[source]["namespace"])
+    capture = prepare_write_capture(groups, entry, protocol, bind, destination, stem, namespace)
+    probe_argv = tool_argv(tool, "probe", bind, destination, entry, probe_report)
+    if capture is not None:
+        probe_argv.extend(capture.arguments())
+    probe = groups.spawn(stem + "-probe", ["ip", "netns", "exec", namespace, *probe_argv],
+                         probe_log, env=clean, socket_tool=True,
+                         pass_fds=(capture.writer,) if capture else ())
     entry["outcome"] = "started"
-    probe_exit = wait_child(probe, time.monotonic() + 12)
+    original_probe_end = time.monotonic() + 12
+    if capture is not None:
+        capture.bind(groups, probe)
+    probe_exit = wait_child(probe, original_probe_end, capture=capture)
     report, _ = udp_summary.read_report(probe_report)
     if protocol == "udp":
         udp_summary.validate_report(report)
@@ -221,6 +238,8 @@ def measure(lab: EvidenceLab, groups: OwnedGroups, entry: dict, out: Path, snaps
     if "phase" in entry:
         entry["probe_observed_complete_monotonic_ns"] = time.monotonic_ns()
     echo_exit = wait_child(echo, time.monotonic() + 12)
+    if capture is not None:
+        entry["original_write_stream"] = capture.finish(report)
     entry.update(probe_exit=probe_exit, echo_exit=echo_exit,
                  report_sha256=digest(probe_report), echo_report_sha256=digest(echo_report))
     if expected_fault:
@@ -348,6 +367,8 @@ def main() -> int:
     parser.add_argument("--control", type=lambda x: Path(x).resolve(), required=True)
     parser.add_argument("--head", required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--write-facts", action="store_true",
+                        help="observe original child OS writes in bounded owned pipes; no daemon/TUN authority")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--fault-recovery", action="store_true",
                         help="independent fixed32 application DROP/clear/fresh scope; original baseline unchanged")
@@ -392,7 +413,22 @@ def main() -> int:
         report["limits"].update(pause_pidfds=1, paused_samples=stall_contract.MAX_SAMPLES,
                                application_requests=16, configured_keepalive_interval_secs=1)
     error = None
+    captures = None
     try:
+        if args.write_facts:
+            from linux_tun_probe_capture import WriteCaptures
+            captures = WriteCaptures(args.output_dir, len(report["manifest"]))
+            groups.write_captures = captures
+            groups.owned_namespace_names = lab.namespaces
+            report["limits"].update(write_capture_parent_pipe_fds=2, write_capture_child_pipe_fds=2,
+                                    write_capture_simultaneous_probes=1,
+                                    write_capture_raw_bytes_per_probe=4 * 1024 * 1024,
+                                    write_capture_read_bytes_per_poll=4096,
+                                    write_capture_probes=len(report["manifest"]))
+            for path in [Path(__file__).with_name("linux_tun_probe_capture.py"),
+                         DUAL / "probe_request_plan.py", DUAL / "probe_write_facts.py",
+                         DUAL / "probe_process_identity.py", DUAL / "probe_write_stream.py"]:
+                report["source_sha256"][str(path.relative_to(ROOT))] = digest(path)
         report["binary_sha256"] = {"daemon": digest(args.daemon), "control": digest(args.control)}
         for path, expected in report["source_sha256"].items():
             committed = subprocess.check_output(["git", "-C", str(ROOT), "show", args.head + ":" + path], timeout=20)
@@ -413,6 +449,8 @@ def main() -> int:
         # A second cancellation must not interrupt cleanup of original owners.
         signal.signal(signal.SIGINT, signal.SIG_IGN)
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        if captures is not None:
+            captures.close()
         if stall_slot is not None:
             try:
                 report["pause_cleanup"] = linux_tun_stall.restore_before_cleanup(stall_slot)
@@ -423,6 +461,9 @@ def main() -> int:
                                              {"complete": True, "admitted": False, "original_namespace_fd_closed": True}) if args.fault_recovery else None,
                               summary=stall_contract.summarize if args.server_stall else fault_contract.summarize if args.fault_recovery else summarize,
                               requested_count=16 if args.server_stall else 32)
+        if captures is not None:
+            captures.persist_interrupted()
+            report["original_write_observations"] = captures.summary(report["manifest"])
         try:
             lab.preserve_logs()
         except Exception as capture_error:
@@ -454,9 +495,13 @@ def main() -> int:
             uid, gid = int(os.environ["SUDO_UID"]), int(os.environ["SUDO_GID"])
             for path in [*args.output_dir.rglob("*"), args.output_dir]:
                 os.chown(path, uid, gid)
-    print(json.dumps({"scope": report["scope"], "passed": report["passed"], "requests": 16 if args.server_stall else 32,
-                      "success_requests": report["application"]["success_requests"], "cleanup_complete": report["cleanup_complete"]}))
-    return int(not report["passed"])
+    result = {"scope": report["scope"], "passed": report["passed"], "requests": 16 if args.server_stall else 32,
+              "success_requests": report["application"]["success_requests"], "cleanup_complete": report["cleanup_complete"]}
+    if args.write_facts:
+        result["original_write_observations_passed"] = report.get("original_write_observations", {}).get("passed", False)
+    print(json.dumps(result))
+    return int(not report["passed"] or (args.write_facts and not
+               report.get("original_write_observations", {}).get("passed", False)))
 
 
 if __name__ == "__main__":

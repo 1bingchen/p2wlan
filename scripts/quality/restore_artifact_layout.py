@@ -26,7 +26,6 @@ from pathlib import Path
 MAX_ARTIFACTS = 1000
 MAX_RESPONSE = 2 * 1024 * 1024
 MAX_ENTRIES = 100000
-MAX_BYTES = 2 * 1024 * 1024 * 1024
 SAFE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,254}")
 
 
@@ -129,7 +128,11 @@ def matching_artifacts(inventory: list[dict], pattern: str, run_id: int, run_hea
 
 
 def inspect_tree(root: Path, budget: list[int]) -> None:
-    """Reject links/special entries and bound work without reading binary bodies."""
+    """Bound stat/traversal work, without reading or copying binary bodies.
+
+    Payload bytes are already downloaded. Their sizes are counted only; a
+    combined byte limit here would reject valid multi-scenario evidence.
+    """
     pending = [root]
     files = 0
     while pending:
@@ -147,8 +150,6 @@ def inspect_tree(root: Path, budget: list[int]) -> None:
         elif stat.S_ISREG(mode):
             budget[1] += path.stat().st_size
             files += 1
-            if budget[1] > MAX_BYTES:
-                raise LayoutError("artifact_byte_limit")
         else:
             raise LayoutError("artifact_link_or_special_entry")
     if not files:

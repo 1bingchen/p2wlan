@@ -2,6 +2,7 @@ import importlib.util
 import io
 import json
 import os
+import stat
 import sys
 import tempfile
 import unittest
@@ -143,7 +144,7 @@ class LayoutTests(unittest.TestCase):
         with self.assertRaisesRegex(layout.LayoutError, "payload_empty"):
             self.restore()
         self.payload()
-        for key, value in [("MAX_BYTES", 1), ("MAX_ENTRIES", 1), ("MAX_ARTIFACTS", 0)]:
+        for key, value in [("MAX_ENTRIES", 1), ("MAX_ARTIFACTS", 0)]:
             with patch.object(layout, key, value), self.assertRaises(layout.LayoutError):
                 self.restore()
             self.assertFalse(self.output.exists())
@@ -209,6 +210,28 @@ class LayoutTests(unittest.TestCase):
         chosen = nat.lay_out(self.output, self.root / "selected", RUN, max_attempt=1)
         self.assertEqual(chosen, {kind: 1 for kind in nat.expected_scenarios()})
         self.assertEqual(len(chosen), 6)
+
+    def test_six_large_program_sizes_do_not_change_directory_or_payload_identity(self):
+        rows = [artifact(i) for i in range(1, 7)]
+        for row in rows:
+            self.payload(self.download / row["name"])
+        actual_stat = Path.stat
+
+        def program_size(path, **kwargs):
+            result = actual_stat(path, **kwargs)
+            if stat.S_ISREG(result.st_mode):
+                fields = list(result)
+                fields[6] = 404939622
+                return os.stat_result(fields)
+            return result
+
+        # Model six already downloaded program payloads over 2 GiB in total.
+        # The normalizer only needs metadata and rename; it must not read bodies.
+        with patch.object(Path, "stat", program_size), patch.object(Path, "open", side_effect=AssertionError("payload read")):
+            self.restore(rows)
+        self.assertEqual({p.name for p in self.output.iterdir()}, {row["name"] for row in rows})
+        for row in rows:
+            self.assertEqual((self.output / row["name"] / "evidence.json").read_bytes(), b"original evidence")
 
     def test_flat_component_fails_original_selector_then_same_bytes_pass_after_layout(self):
         contract = {"repository": "yhan-sun/p2wlan", "component": "dplpmtud-live-dataplane"}

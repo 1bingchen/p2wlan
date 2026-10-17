@@ -462,16 +462,24 @@ async fn observe(owners: &mut Owners, budget: Budget) -> Check<Observation> {
         request.seq,
     )
     .ok_or("original pending echo construction failed")?;
+    let room = Arc::new(crate::rooms::RoomAuthorization::new("default"));
     let input = crate::overlay_requests::OriginalEchoInput::capture(
         &original_peer_owner,
         &wireguard,
         &original_udp_slot,
         &original_relay_slot,
+        &room,
+        None,
         request,
         source,
         &echo.packet,
     )
     .ok_or("actual original echo input capture failed")?;
+    let room_lifetime = Arc::downgrade(&room);
+    drop(room);
+    if room_lifetime.upgrade().is_some() {
+        return Err("unrestricted original input kept a room owner alive".into());
+    }
     // The exact production entrance used before native REQUEST echo injection.
     // No custom guard/source factory or relabeled outer publication is used.
     let native_guard = input.qualify_before_injection(&wireguard);

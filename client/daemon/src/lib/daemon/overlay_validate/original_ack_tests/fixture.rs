@@ -23,6 +23,11 @@ use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
 type Check = Result<(), String>;
+#[path = "room_permit.rs"]
+mod room_permit;
+#[path = "room_request.rs"]
+mod room_request;
+pub(super) use room_permit::RoomCase;
 #[path = "managed_dynamic.rs"]
 mod managed_dynamic;
 pub(super) use managed_dynamic::{exercise_publication, PublicationCase, PublicationMode};
@@ -92,6 +97,7 @@ pub(super) enum Scenario {
     PublicationOrder,
     RelayEchoAfterDirect,
     RuntimeVip(RuntimeVipCase),
+    Room(RoomCase),
 }
 
 fn require(condition: bool, reason: &str) -> Check {
@@ -412,6 +418,7 @@ impl Endpoint {
             None,
             publication_mode,
             false,
+            None,
         )
         .await
     }
@@ -446,6 +453,7 @@ impl Endpoint {
             common_hub,
             None,
             false,
+            None,
         )
         .await
     }
@@ -473,6 +481,7 @@ impl Endpoint {
             None,
             None,
             true,
+            None,
         )
         .await
     }
@@ -493,6 +502,7 @@ impl Endpoint {
         common_hub: Option<&str>,
         publication_mode: Option<PublicationMode>,
         supervised: bool,
+        original_room: Option<Arc<crate::rooms::RoomAuthorization>>,
     ) -> Result<Self, String> {
         let mut config =
             Config::generate_default("http://ctrl.test", "default").map_err(|e| e.to_string())?;
@@ -638,11 +648,15 @@ impl Endpoint {
         };
         let udp = Arc::new(RwLock::new(udp_transport.clone()));
         let relay = Arc::new(RwLock::new(relay_transport.clone()));
-        let room = Arc::new(crate::rooms::RoomAuthorization::new("default"));
+        let room = original_room
+            .unwrap_or_else(|| Arc::new(crate::rooms::RoomAuthorization::new("default")));
         let timeline = ConnectionTimeline::new(node, 0);
         let (tun, controller) = MockTunDevice::new_pair(node, 1420, vip);
         let (mut plane, routed, inbound_tx) =
             DataPlane::new_bidirectional_with_request_carriage(tun, peers.clone());
+        if room.enabled() {
+            plane = plane.with_room_authorization(room.clone());
+        }
         owners.spawn("actual bidirectional DataPlane", async move {
             plane.run().await.map_err(|e| e.to_string())
         });
@@ -1617,29 +1631,46 @@ async fn exercise_rounds(
         a.node == NODE_A && b.node == NODE_B,
         "actual fixture endpoint roles changed",
     )?;
+    if let Scenario::Room(case) = scenario {
+        // Keep the new room fixture's state out of every pre-existing case's
+        // inline future. The original thread stack and body end stay unchanged.
+        return Box::pin(room_permit::exercise_room(a, b, path, case, budget)).await;
+    }
     if let Scenario::RuntimeVip(case) = scenario {
-        return runtime_vip::exercise_runtime_vip(a, b, path, case, budget).await;
+        return Box::pin(runtime_vip::exercise_runtime_vip(a, b, path, case, budget)).await;
     }
     if scenario == Scenario::Contention {
-        return contention::exercise_conflicts(a, b, path, budget).await;
+        return Box::pin(contention::exercise_conflicts(a, b, path, budget)).await;
     }
     if let Scenario::AckContention(case) = scenario {
-        return ack_contention::exercise_native_ack_contention(a, b, path, case, budget).await;
+        return Box::pin(ack_contention::exercise_native_ack_contention(
+            a, b, path, case, budget,
+        ))
+        .await;
     }
     if let Scenario::RequestContention(case) = scenario {
-        return request_contention::exercise_request_contention(a, b, path, case, budget).await;
+        return Box::pin(request_contention::exercise_request_contention(
+            a, b, path, case, budget,
+        ))
+        .await;
     }
     if let Scenario::Lifecycle(case) = scenario {
-        return lifecycle::exercise_lifecycle(a, b, path, case, budget).await;
+        return Box::pin(lifecycle::exercise_lifecycle(a, b, path, case, budget)).await;
     }
     if let Scenario::Identity(case) = scenario {
-        return identity::exercise_identity(a, b, path, case, budget).await;
+        return Box::pin(identity::exercise_identity(a, b, path, case, budget)).await;
     }
     if let Scenario::EchoTransfer(case) = scenario {
-        return echo_transfer::exercise_echo_transfer(a, b, path, case, budget).await;
+        return Box::pin(echo_transfer::exercise_echo_transfer(
+            a, b, path, case, budget,
+        ))
+        .await;
     }
     if let Scenario::EchoContention(case) = scenario {
-        return echo_contention::exercise_echo_contention(a, b, path, case, budget).await;
+        return Box::pin(echo_contention::exercise_echo_contention(
+            a, b, path, case, budget,
+        ))
+        .await;
     }
     let (request, echo, ack) = original_request_and_echo(a, b, path, budget).await?;
     if scenario == Scenario::MissingSource {
@@ -1755,41 +1786,85 @@ async fn exercise_with_runtime_vip(
             } else {
                 None
             };
-            let (vip_a, vip_b) = if keep_bootstrap_vip {
+            let (vip_a, vip_b) = if matches!(scenario, Scenario::Room(_)) {
+                ("10.21.1.2", "10.21.1.3")
+            } else if keep_bootstrap_vip {
                 ("10.20.0.2", "10.20.0.3")
             } else {
                 (VIP_A, VIP_B)
             };
-            let mut a = Endpoint::create_inner(
-                NODE_A,
-                vip_a,
-                NODE_B,
-                vip_b,
-                path,
-                hub.as_deref(),
-                &mut owners,
-                budget,
-                keep_bootstrap_vip,
-                scenario == Scenario::RelayEchoAfterDirect,
-                1,
-                None,
-            )
-            .await?;
-            let mut b = Endpoint::create_inner(
-                NODE_B,
-                vip_b,
-                NODE_A,
-                vip_a,
-                path,
-                hub.as_deref(),
-                &mut owners,
-                budget,
-                keep_bootstrap_vip,
-                scenario == Scenario::RelayEchoAfterDirect,
-                1,
-                None,
-            )
-            .await?;
+            let mut a = if matches!(scenario, Scenario::Room(_)) {
+                Endpoint::create_inner_with_publication(
+                    NODE_A,
+                    vip_a,
+                    NODE_B,
+                    vip_b,
+                    path,
+                    hub.as_deref(),
+                    &mut owners,
+                    budget,
+                    false,
+                    false,
+                    1,
+                    None,
+                    None,
+                    false,
+                    Some(room_permit::authorization(vip_a, vip_b, NODE_B)?),
+                )
+                .await?
+            } else {
+                Endpoint::create_inner(
+                    NODE_A,
+                    vip_a,
+                    NODE_B,
+                    vip_b,
+                    path,
+                    hub.as_deref(),
+                    &mut owners,
+                    budget,
+                    keep_bootstrap_vip,
+                    scenario == Scenario::RelayEchoAfterDirect,
+                    1,
+                    None,
+                )
+                .await?
+            };
+            let mut b = if matches!(scenario, Scenario::Room(_)) {
+                Endpoint::create_inner_with_publication(
+                    NODE_B,
+                    vip_b,
+                    NODE_A,
+                    vip_a,
+                    path,
+                    hub.as_deref(),
+                    &mut owners,
+                    budget,
+                    false,
+                    false,
+                    1,
+                    None,
+                    None,
+                    false,
+                    Some(room_permit::authorization(vip_b, vip_a, NODE_A)?),
+                )
+                .await?
+            } else {
+                Endpoint::create_inner(
+                    NODE_B,
+                    vip_b,
+                    NODE_A,
+                    vip_a,
+                    path,
+                    hub.as_deref(),
+                    &mut owners,
+                    budget,
+                    keep_bootstrap_vip,
+                    scenario == Scenario::RelayEchoAfterDirect,
+                    1,
+                    None,
+                )
+                .await?
+            };
             let (session_a, session_b, a_key, b_key) = session_pair_for(&a.identity, &b.identity)?;
             let udp_a = a.local_udp().await?;
             let udp_b = b.local_udp().await?;
@@ -1807,7 +1882,7 @@ async fn exercise_with_runtime_vip(
                 publication_order::exercise_publication_order(&mut a, &mut b, &mut owners, budget)
                     .await
             } else {
-                exercise_rounds(&mut a, &mut b, path, scenario, budget).await
+                Box::pin(exercise_rounds(&mut a, &mut b, path, scenario, budget)).await
             }
         }),
     ))

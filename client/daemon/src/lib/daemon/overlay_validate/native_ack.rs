@@ -35,9 +35,6 @@ async fn handle_native_overlay_request(
         OverlayCreditUnknown as Unknown,
     };
     use OriginalRequestEchoOutcome::*;
-    if owners.room.enabled() {
-        return Rejected(Credit::Unknown(Unknown::RoomAuthority));
-    }
     let Some(request) = OriginalOverlayAck::parse_request(&event.packet, &event.peer_id) else {
         return Rejected(Credit::Stale(Stale::Identity));
     };
@@ -71,11 +68,21 @@ async fn handle_native_overlay_request(
     ) else {
         return Rejected(Credit::Stale(Stale::Identity));
     };
+    let original_room = match owners.room.try_capture_original_send_permit(
+        &request.peer_id,
+        &request.source_vip,
+        &request.local_vip,
+    ) {
+        Ok(permit) => permit,
+        Err(reason) => return Rejected(reason.into()),
+    };
     let Some(input) = crate::overlay_requests::OriginalEchoInput::capture(
         peers,
         &owners.wireguard,
         udp,
         &owners.relay,
+        &owners.room,
+        original_room,
         request,
         source,
         &echo.packet,

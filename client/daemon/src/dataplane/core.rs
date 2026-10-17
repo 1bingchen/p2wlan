@@ -615,22 +615,44 @@ where
         };
 
         let normalized_src_ip = parsed.src_addr_string();
-        let room_authorization = match self
-            .room_authorization
-            .as_ref()
-            .filter(|auth| auth.enabled())
-        {
-            Some(auth) => match auth.send_permit(&peer_id, &dst_ip, &normalized_src_ip) {
-                Some(permit) => Some(permit),
-                None => {
-                    let reason = auth
-                        .denial_reason(&peer_id, &dst_ip, &normalized_src_ip)
-                        .unwrap_or(crate::rooms::RoomDropReason::AuthorizationChanged);
-                    auth.record_drop(reason, "tx", &peer_id, &normalized_src_ip, &dst_ip);
+        let original_echo = binding.as_ref().and_then(|binding| binding.token().echo());
+        let room_authorization = if let Some(echo) = original_echo {
+            match echo.original_room_permit_for_route(
+                self.room_authorization.as_ref(),
+                &peer_id,
+                &dst_ip,
+                &normalized_src_ip,
+            ) {
+                Ok(permit) => permit,
+                Err(_) => {
+                    self.record_room_drop(
+                        crate::rooms::RoomDropReason::AuthorizationChanged,
+                        "tx",
+                        &peer_id,
+                        &normalized_src_ip,
+                        &dst_ip,
+                    );
                     return Ok(());
                 }
-            },
-            None => None,
+            }
+        } else {
+            match self
+                .room_authorization
+                .as_ref()
+                .filter(|auth| auth.enabled())
+            {
+                Some(auth) => match auth.send_permit(&peer_id, &dst_ip, &normalized_src_ip) {
+                    Some(permit) => Some(permit),
+                    None => {
+                        let reason = auth
+                            .denial_reason(&peer_id, &dst_ip, &normalized_src_ip)
+                            .unwrap_or(crate::rooms::RoomDropReason::AuthorizationChanged);
+                        auth.record_drop(reason, "tx", &peer_id, &normalized_src_ip, &dst_ip);
+                        return Ok(());
+                    }
+                },
+                None => None,
+            }
         };
 
         if !self

@@ -94,6 +94,7 @@ pub(crate) enum OverlayCreditUnknown {
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum OverlayCreditStale {
+    RoomAuthority,
     Identity,
     Generation,
     Lifecycle,
@@ -108,6 +109,7 @@ pub(crate) enum OverlayCreditStale {
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum OverlayCreditLockSite {
+    RoomAuthority,
     Emit,
     Epoch,
     Sessions,
@@ -141,6 +143,22 @@ pub(crate) enum OverlayCreditOutcome {
     Unknown(OverlayCreditUnknown),
     Stale(OverlayCreditStale),
     Contended(OverlayCreditLockSite),
+}
+
+impl From<crate::rooms::OriginalRoomSendFailure> for OverlayCreditOutcome {
+    fn from(reason: crate::rooms::OriginalRoomSendFailure) -> Self {
+        match reason {
+            crate::rooms::OriginalRoomSendFailure::MissingOriginal => {
+                Self::Unknown(OverlayCreditUnknown::RoomAuthority)
+            }
+            crate::rooms::OriginalRoomSendFailure::Contended => {
+                Self::Contended(OverlayCreditLockSite::RoomAuthority)
+            }
+            crate::rooms::OriginalRoomSendFailure::Stale => {
+                Self::Stale(OverlayCreditStale::RoomAuthority)
+            }
+        }
+    }
 }
 
 impl CanonicalOverlayRequest {

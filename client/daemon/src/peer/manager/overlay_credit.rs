@@ -111,14 +111,28 @@ impl PeerManager {
         source: Option<&crate::transport::OriginalOverlayIngressSource>,
     ) -> OverlayCreditOutcome {
         use OverlayCreditOutcome::{Contended, Stale, Unknown};
-        if owners.room.enabled() {
-            return Unknown(CreditUnknown::RoomAuthority);
-        }
         let Some(source) = source else {
             return Unknown(CreditUnknown::OriginalSource);
         };
         let Some(record) = request.physical_publication.record() else {
             return Unknown(CreditUnknown::OriginalPublication);
+        };
+        let room = match owners.room.try_original_send_guard(
+            record.room_authorization(),
+            &request.peer_id,
+            request.target_vip(),
+            request.local_vip(),
+        ) {
+            Ok(guard) => guard,
+            Err(crate::rooms::OriginalRoomSendFailure::MissingOriginal) => {
+                return Unknown(CreditUnknown::RoomAuthority)
+            }
+            Err(crate::rooms::OriginalRoomSendFailure::Contended) => {
+                return Contended(CreditLock::RoomAuthority)
+            }
+            Err(crate::rooms::OriginalRoomSendFailure::Stale) => {
+                return Stale(CreditStale::RoomAuthority)
+            }
         };
         if !ack.is_echo()
             || request.original_peer_owner(self).is_none()
@@ -252,6 +266,7 @@ impl PeerManager {
                 source,
                 record,
                 &session,
+                &room,
                 NetworkPath::Direct,
                 None,
                 rx.received_at(),
@@ -309,6 +324,7 @@ impl PeerManager {
                 source,
                 record,
                 &session,
+                &room,
                 NetworkPath::Relay,
                 Some(endpoint),
                 rx.completed_at(),
@@ -326,6 +342,7 @@ impl PeerManager {
         source: &crate::transport::OriginalOverlayIngressSource,
         record: &crate::overlay_requests::PhysicalSendRecord,
         session: &crate::transport::OriginalOverlaySessionGuard<'_>,
+        room: &crate::rooms::OriginalRoomSendGuard<'_>,
         path: NetworkPath,
         endpoint: Option<&str>,
         read_at: Instant,
@@ -358,6 +375,9 @@ impl PeerManager {
         // Policy evaluation precedes the last time-based checks. No earlier
         // timestamp can extend the original window while guards are acquired.
         let commit_at = Instant::now();
+        if !room.is_current_at(commit_at) {
+            return Stale(CreditStale::RoomAuthority);
+        }
         if !session.is_current() {
             return Stale(CreditStale::Session);
         }

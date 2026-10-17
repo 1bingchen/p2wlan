@@ -787,3 +787,6 @@ async fn pr212_equal_remote_request_on_other_socket_uses_verified_return_and_nat
 ) -> Result<(), String> {
     fixture::exercise_equal_remote_distinct_socket().await
 }
+
+#[path = "original_ack_tests/room_cases.rs"]
+mod room_cases;

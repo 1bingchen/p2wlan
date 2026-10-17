@@ -170,6 +170,7 @@ pub(crate) struct PreparedPhysicalPublication {
     pub(super) binding: RequestBindingState,
     pub(super) encryption: OriginalEncryptionSource,
     pub(super) encryption_generation: u64,
+    room_authorization: Option<crate::rooms::RoomSendPermit>,
     wire: (usize, Option<u64>, u64),
 }
 impl PreparedPhysicalPublication {
@@ -200,6 +201,7 @@ impl PreparedPhysicalPublication {
             binding: binding.state(),
             encryption,
             encryption_generation: actual_generation,
+            room_authorization: packet.room_authorization.clone(),
             wire: (
                 packet.wire_bytes.len(),
                 crate::transport::wire_counter(&packet.wire_bytes),
@@ -247,6 +249,7 @@ pub(crate) struct PhysicalSendRecord {
     binding: RequestBindingState,
     encryption: OriginalEncryptionSource,
     encryption_generation: u64,
+    room_authorization: Option<crate::rooms::RoomSendPermit>,
     transport: PhysicalTransportFact,
 }
 #[allow(dead_code)] // Read-only intrinsic evidence; current-owner guards are separate.
@@ -259,6 +262,9 @@ impl PhysicalSendRecord {
     }
     pub(crate) fn encryption_generation(&self) -> u64 {
         self.encryption_generation
+    }
+    pub(crate) fn room_authorization(&self) -> Option<&crate::rooms::RoomSendPermit> {
+        self.room_authorization.as_ref()
     }
     pub(crate) fn udp(&self) -> Option<&UdpFullSendFact> {
         match &self.transport {
@@ -390,6 +396,7 @@ impl PhysicalRequestPublisher {
             binding: prepared.binding,
             encryption: prepared.encryption,
             encryption_generation: prepared.encryption_generation,
+            room_authorization: prepared.room_authorization,
             transport,
         };
         publication

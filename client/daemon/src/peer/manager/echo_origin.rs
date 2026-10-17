@@ -142,6 +142,7 @@ impl PeerManager {
         if !std::ptr::eq(input.owner().as_ptr(), self) {
             return Err(Stale(CreditStale::Identity));
         }
+        input.qualify_original_room()?;
         let session = wireguard
             .try_original_overlay_ingress_session_guard(input.peer_id(), input.source().session())
             .map_err(|failure| match failure {

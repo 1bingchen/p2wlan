@@ -21,3 +21,11 @@
 | p2wlan update | 按当前安装源更新 |
 
 准确参数以 p2wlan help 和当前 Release 内的 CLI 为准。登录、配置和查询不要使用 sudo；创建 TUN、路由和 systemd 服务可能需要权限。
+
+## OS UDP/TCP 请求计划
+
+`python3 scripts/dual-end/probe_request_plan.py prepare --help` 提供请求计划生成入口。`--transport udp` 或 `tcp` 选择工具，地址、端口、run/round nonce 及时间配置须与后续 probe 一致；`--capture-id` 与 `--producer-scope` 均为 32 位小写十六进制关联 ID。`--output` 必须是 Git 检出外的新绝对路径，POSIX 文件权限为 0600。准备计划只生成输入文件，不打开 socket。
+
+随后为 `udp_business_probe.py probe` 或 `tcp_business_probe.py probe` 添加 `--request-plan /absolute/new-plan.json`。需同时分发 `probe_request_plan.py`、`udp_business_probe.py` 和对应 TCP 工具；计划核对工具指纹、完整请求 nonce、流、数量及时间配置，不匹配时在打开 socket 前失败。未提供计划时仍使用随机请求 nonce，旧的双文件分发方式保持可用。
+
+默认仍是 8 个请求、100ms 间隔、1000ms 单请求超时、10000ms 总期限及 128 字节负载。计划加载发生在原测量时钟之前，不延长期限或重发请求；TCP 保持一次连接。报告中的 `prepared_probe_input_only` 仅表明使用了计划输入，`daemon_registration_verified` 保持 false，不能据此确认真实 TUN、Direct 或当前连接归属。

@@ -17,7 +17,7 @@ import struct
 import time
 from typing import Callable
 
-from udp_business_probe import Config, NS_PER_MS, UNVERIFIED, validate_output_path, write_report
+from udp_business_probe import Config, NS_PER_MS, UNVERIFIED, prepare_request_plan, validate_output_path, write_report
 
 SCOPE = "os_tcp_echo"
 MAGIC = b"P2WTCE1\x00"
@@ -107,10 +107,21 @@ def bound_socket(config: Config, supplied: socket.socket | None) -> socket.socke
         raise
 
 
-def run_probe(config: Config, supplied_socket: socket.socket | None = None) -> dict:
+def wait_scheduled(planned: int, end: int) -> None:
+    target = min(planned, end)
+    while time.monotonic_ns() < target:
+        time.sleep(max(0, target - time.monotonic_ns()) / 1_000_000_000)
+
+
+def run_probe(config: Config, supplied_socket: socket.socket | None = None,
+              request_plan: Path | None = None) -> dict:
     config.validate()
     report = base_report(config, "probe")
-    records = [{"sequence": i, "request_nonce": secrets.token_hex(16),
+    prepared = prepare_request_plan(config, request_plan, "tcp", report["tool_sha256"])
+    if prepared is not None:
+        report["request_plan"] = prepared.evidence()
+    records = [{"sequence": i,
+                "request_nonce": prepared.nonces[i] if prepared else secrets.token_hex(16),
                 "planned_offset_ns": i * config.interval_ms * NS_PER_MS,
                 "sent_offset_ns": None, "completed_offset_ns": None, "rtt_ns": None,
                 "status": "not_sent", "reason": "scheduled"} for i in range(config.count)]
@@ -128,8 +139,7 @@ def run_probe(config: Config, supplied_socket: socket.socket | None = None) -> d
             raise OSError("connected TCP peer differs from explicit target")
         for record in records:
             planned = started + record["planned_offset_ns"]
-            if time.monotonic_ns() < planned:
-                time.sleep(max(0, min(planned, end) - time.monotonic_ns()) / 1_000_000_000)
+            wait_scheduled(planned, end)
             if time.monotonic_ns() >= end:
                 termination = "duration_deadline"
                 break
@@ -311,6 +321,8 @@ def main() -> int:
                           ("duration-ms", 10000), ("payload-bytes", 128)):
         parser.add_argument("--" + name, type=int, default=default)
     parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument("--request-plan", type=Path,
+                        help="probe only: exact prepared input plan before the original measurement clock")
     args = parser.parse_args()
     config = Config((args.bind_ip, args.bind_port), (args.target_ip, args.target_port),
                     args.run_nonce, args.round_nonce, args.count, args.interval_ms,
@@ -318,8 +330,10 @@ def main() -> int:
     try:
         config.validate()
         validate_output_path(args.output)
+        if args.role == "echo" and args.request_plan is not None:
+            raise ValueError("request plans apply only to the probe role")
         if args.role == "probe":
-            report = run_probe(config)
+            report = run_probe(config, request_plan=args.request_plan)
             validate_probe(report)
         else:
             report = run_echo(config, on_ready=lambda: print('{"event":"echo_ready","scope":"os_tcp_echo"}', flush=True))

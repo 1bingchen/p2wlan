@@ -1637,28 +1637,40 @@ async fn exercise_rounds(
         return Box::pin(room_permit::exercise_room(a, b, path, case, budget)).await;
     }
     if let Scenario::RuntimeVip(case) = scenario {
-        return runtime_vip::exercise_runtime_vip(a, b, path, case, budget).await;
+        return Box::pin(runtime_vip::exercise_runtime_vip(a, b, path, case, budget)).await;
     }
     if scenario == Scenario::Contention {
-        return contention::exercise_conflicts(a, b, path, budget).await;
+        return Box::pin(contention::exercise_conflicts(a, b, path, budget)).await;
     }
     if let Scenario::AckContention(case) = scenario {
-        return ack_contention::exercise_native_ack_contention(a, b, path, case, budget).await;
+        return Box::pin(ack_contention::exercise_native_ack_contention(
+            a, b, path, case, budget,
+        ))
+        .await;
     }
     if let Scenario::RequestContention(case) = scenario {
-        return request_contention::exercise_request_contention(a, b, path, case, budget).await;
+        return Box::pin(request_contention::exercise_request_contention(
+            a, b, path, case, budget,
+        ))
+        .await;
     }
     if let Scenario::Lifecycle(case) = scenario {
-        return lifecycle::exercise_lifecycle(a, b, path, case, budget).await;
+        return Box::pin(lifecycle::exercise_lifecycle(a, b, path, case, budget)).await;
     }
     if let Scenario::Identity(case) = scenario {
-        return identity::exercise_identity(a, b, path, case, budget).await;
+        return Box::pin(identity::exercise_identity(a, b, path, case, budget)).await;
     }
     if let Scenario::EchoTransfer(case) = scenario {
-        return echo_transfer::exercise_echo_transfer(a, b, path, case, budget).await;
+        return Box::pin(echo_transfer::exercise_echo_transfer(
+            a, b, path, case, budget,
+        ))
+        .await;
     }
     if let Scenario::EchoContention(case) = scenario {
-        return echo_contention::exercise_echo_contention(a, b, path, case, budget).await;
+        return Box::pin(echo_contention::exercise_echo_contention(
+            a, b, path, case, budget,
+        ))
+        .await;
     }
     let (request, echo, ack) = original_request_and_echo(a, b, path, budget).await?;
     if scenario == Scenario::MissingSource {
@@ -1870,7 +1882,7 @@ async fn exercise_with_runtime_vip(
                 publication_order::exercise_publication_order(&mut a, &mut b, &mut owners, budget)
                     .await
             } else {
-                exercise_rounds(&mut a, &mut b, path, scenario, budget).await
+                Box::pin(exercise_rounds(&mut a, &mut b, path, scenario, budget)).await
             }
         }),
     ))

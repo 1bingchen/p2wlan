@@ -16,6 +16,17 @@ from owned_tcp_manifest import image_from_manifest, private_object, verify_curl
 from owned_tcp_protocol import Channel, Unavailable, check_fifo
 
 
+def wait_for_sample(target_ns, cutoff_ns, cancelled, *, clock=monotonic_ns, sleeper=time.sleep):
+    """Wait for one fixed sample point; cancellation never grants a query permit."""
+    limit = min(target_ns, cutoff_ns)
+    while not cancelled():
+        remaining = limit - clock()
+        if remaining <= 0:
+            break
+        sleeper(min(remaining / 1e9, 0.005))
+    return not cancelled()
+
+
 class Cancelled(BaseException):
     pass
 
@@ -123,9 +134,7 @@ class Observation:
             self.record["actual_curl_initial_identity_available"] = birth is not None
             for offset in (0, 25, 75, 125, 175):
                 target = began + offset * 1_000_000
-                while not self.cancelled and monotonic_ns() < min(target, self.cutoff_ns):
-                    time.sleep(max(0, min((target - monotonic_ns()) / 1e9, 0.005)))
-                if self.cancelled:
+                if not wait_for_sample(target, self.cutoff_ns, lambda: self.cancelled):
                     raise Cancelled()
                 for name, channel, pid, fence in [
                     ("server", self.server_channel, self.target["pid"], self._server_birth()),

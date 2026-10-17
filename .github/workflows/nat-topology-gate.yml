@@ -98,6 +98,11 @@ jobs:
           set -euo pipefail
           python -B -m unittest discover -s scripts/nat-sim -p 'test_process_birth.py' -v \
             2>&1 | tee "$RUNNER_TEMP/p2wlan-final-native-birth.log"
+      - name: Check fixed sample scheduling decisions
+        run: |
+          set -euo pipefail
+          python -B -m unittest discover -s scripts/nat-sim -p 'test_owned_sample_*.py' -v \
+            2>&1 | tee "$RUNNER_TEMP/p2wlan-final-owned-sample-schedule.log"
       - name: Check original concurrent owned status observers
         env:
           P2WLAN_NAT_SIM_TCP_EVIDENCE_DIR: ${{ runner.temp }}/p2wlan-final-owned-tcp-fixture
@@ -117,6 +122,7 @@ jobs:
             ${{ runner.temp }}/p2wlan-final-native-birth.log
             ${{ runner.temp }}/p2wlan-final-owned-tcp-fixture/
             ${{ runner.temp }}/p2wlan-final-owned-tcp.log
+            ${{ runner.temp }}/p2wlan-final-owned-sample-schedule.log
           if-no-files-found: error
           retention-days: 14
 

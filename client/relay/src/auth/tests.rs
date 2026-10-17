@@ -538,3 +538,5 @@ fn test_new_error_codes() {
         );
     }
 }
+
+include!("tests/maintenance_m08_interop.rs");

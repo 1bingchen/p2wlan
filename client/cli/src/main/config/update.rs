@@ -144,7 +144,7 @@ fn verify_archive_checksum(archive: &Path, checksum_file: &Path) -> Result<(), S
         return Err("更新包校验和格式无效".to_string());
     }
     let bytes = fs::read(archive).map_err(|error| format!("无法读取更新包：{error}"))?;
-    let actual = format!("{:x}", Sha256::digest(bytes));
+    let actual = hex::encode(Sha256::digest(bytes));
     if actual != expected {
         return Err(format!(
             "更新包 SHA-256 不匹配：期望 {expected}，实际 {actual}"
@@ -208,4 +208,58 @@ fn run_install_command(args: Vec<OsString>) -> Result<(), String> {
         return Err(format!("安装文件失败（{elevated}）"));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod dependency_checksum_tests {
+    use super::*;
+    struct OwnedChecksumDirectory(std::path::PathBuf);
+    impl Drop for OwnedChecksumDirectory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+    #[test]
+    fn m08_download_checksum_keeps_independent_bytes_and_rejections() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "p2wlan-m08-checksum-{}-{nonce}",
+            std::process::id()
+        ));
+        // Exclusive creation proves ownership before the cleanup guard exists.
+        fs::create_dir(&path).unwrap();
+        let directory = OwnedChecksumDirectory(path);
+        let archive = directory.0.join("asset.tar.gz");
+        let checksum = directory.0.join("SHA256SUMS");
+        fs::write(&archive, [0u8, 1, 2]).unwrap();
+        // Independently identical Python hashlib and Go crypto/sha256 bytes.
+        let expected = "ae4b3280e56e2faf83f414a6e3dabe9d5fbe18976544c05fed121accb85b53fc";
+        for digest in [expected.to_owned(), expected.to_ascii_uppercase()] {
+            fs::write(&checksum, format!("{digest} *asset.tar.gz\n")).unwrap();
+            assert!(verify_archive_checksum(&archive, &checksum).is_ok());
+        }
+        fs::write(
+            &checksum,
+            format!(
+                "{}  other.tar.gz\n{expected}  asset.tar.gz\n",
+                "0".repeat(64)
+            ),
+        )
+        .unwrap();
+        assert!(verify_archive_checksum(&archive, &checksum).is_ok());
+        fs::write(&checksum, format!("{}  asset.tar.gz\n", "0".repeat(64))).unwrap();
+        assert!(verify_archive_checksum(&archive, &checksum)
+            .unwrap_err()
+            .contains("SHA-256 不匹配"));
+        fs::write(&checksum, "invalid  asset.tar.gz\n").unwrap();
+        assert!(verify_archive_checksum(&archive, &checksum)
+            .unwrap_err()
+            .contains("格式无效"));
+        fs::write(&checksum, format!("{expected}  asset.tar.gz\n")).unwrap();
+        fs::write(&archive, [0u8, 1, 3]).unwrap();
+        assert!(verify_archive_checksum(&archive, &checksum).is_err());
+    }
 }

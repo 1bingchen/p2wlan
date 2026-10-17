@@ -132,9 +132,9 @@ pub(crate) struct FreshPredictionSnapshot {
 /// The fingerprint identifies the exact payload (candidates + sources +
 /// expiry) a fresh identity was committed with, so a retry's payload can be
 /// compared against the committed snapshot without shipping the whole
-/// candidate set around.  The digest is a fixed-key BLAKE2b-256 over the
+/// candidate set around.  The digest is an unkeyed BLAKE2b-256 over the
 /// normalized (sorted) payload: it is byte-stable across processes and
-/// machines, and 256 bits of keyed-away digest are immune to the
+/// machines, and the 256-bit digest avoids the
 /// accidental-collision concerns of a 64-bit `DefaultHasher` (whose output
 /// must never be the sole identity of a payload a receiver acts on).
 pub(crate) fn fresh_payload_hash(
@@ -142,27 +142,23 @@ pub(crate) fn fresh_payload_hash(
     candidate_sources: &HashMap<String, String>,
     candidates_expires_at_ms: Option<u64>,
 ) -> [u8; 32] {
-    use blake2::digest::{Update, VariableOutput};
-    let mut hasher = blake2::Blake2bVar::new(32).expect("blake2b-256 output size");
+    use blake2::Digest;
+    let mut hasher = blake2::Blake2b256::new();
     let mut sorted = candidates.to_vec();
     sorted.sort();
     for candidate in &sorted {
         hasher.update(candidate.as_bytes());
-        hasher.update(&[0xff]);
+        hasher.update([0xff]);
         if let Some(source) = candidate_sources.get(candidate) {
             hasher.update(source.as_bytes());
         }
-        hasher.update(&[0xfe]);
+        hasher.update([0xfe]);
     }
     match candidates_expires_at_ms {
-        Some(expires_at) => hasher.update(&expires_at.to_be_bytes()),
-        None => hasher.update(&[0x00]),
+        Some(expires_at) => hasher.update(expires_at.to_be_bytes()),
+        None => hasher.update([0x00]),
     }
-    let mut digest = [0u8; 32];
-    hasher
-        .finalize_variable(&mut digest)
-        .expect("blake2b-256 finalize");
-    digest
+    hasher.finalize().into()
 }
 
 /// Shared peer-connection state one fresh apply overwrote, captured at apply
@@ -1171,4 +1167,57 @@ pub struct FreshMappingDiag {
     pub hit_top6: bool,
     pub hit_top24: bool,
     pub hit_top96: bool,
+}
+
+#[cfg(test)]
+mod dependency_output_tests {
+    use super::fresh_payload_hash;
+    use std::collections::HashMap;
+
+    #[test]
+    fn m08_payload_fingerprint_matches_independent_go_and_python() {
+        // Fixed byte vectors checked with Python hashlib and Go x/crypto.
+        // The digest uses the 32-byte BLAKE2b parameter, not a 64-byte digest
+        // truncated afterward and not the keyed/MAC constructor.
+        assert_eq!(
+            hex::encode(fresh_payload_hash(&[], &HashMap::new(), None)),
+            "03170a2e7597b7b7e3d84c05391d139a62b157e78786d8c082f29dcf4c111314"
+        );
+        let candidates = vec!["[::1]:5000".to_owned(), "127.0.0.1:4000".to_owned()];
+        let sources = HashMap::from([
+            ("127.0.0.1:4000".to_owned(), "host".to_owned()),
+            ("[::1]:5000".to_owned(), "predicted_fresh:100:2".to_owned()),
+        ]);
+        assert_eq!(
+            hex::encode(fresh_payload_hash(&candidates, &sources, None)),
+            "439a58c9168aa6ce43dca70970479f4fe1bed3c56a82ac5da0e2a83aa270ffe2"
+        );
+        assert_eq!(
+            hex::encode(fresh_payload_hash(
+                &candidates,
+                &sources,
+                Some(1_700_000_000_123)
+            )),
+            "7101fd5f337e4d4bf5e13300b38d7d45da246113b620e960d323170f0ca47dcc"
+        );
+        let mut reordered = candidates;
+        reordered.reverse();
+        assert_eq!(
+            hex::encode(fresh_payload_hash(
+                &reordered,
+                &sources,
+                Some(1_700_000_000_123)
+            )),
+            "7101fd5f337e4d4bf5e13300b38d7d45da246113b620e960d323170f0ca47dcc"
+        );
+    }
+
+    #[test]
+    fn m08_sha256_matches_independent_go_and_python() {
+        use sha2::Digest;
+        assert_eq!(
+            hex::encode(sha2::Sha256::digest([0u8, 1, 2])),
+            "ae4b3280e56e2faf83f414a6e3dabe9d5fbe18976544c05fed121accb85b53fc"
+        );
+    }
 }

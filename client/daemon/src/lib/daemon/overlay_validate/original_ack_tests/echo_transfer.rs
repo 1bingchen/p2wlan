@@ -9,7 +9,7 @@ pub(in super::super) enum EchoCase {
     UdpOwnerWithdraw,
 }
 
-async fn rejected_original_send(
+pub(super) async fn rejected_original_send(
     b: &Endpoint,
     echo: RawRequestDelivery,
     path: PathKind,

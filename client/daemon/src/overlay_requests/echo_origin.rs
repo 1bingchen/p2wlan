@@ -14,8 +14,11 @@ pub(crate) struct OriginalEchoInput {
     owner: Weak<PeerManager>,
     udp: Weak<RwLock<Option<crate::udp::UdpTransport>>>,
     relay: Weak<RwLock<Option<crate::relay::RelayTransport>>>,
+    room: Weak<crate::rooms::RoomAuthorization>,
+    room_authorization: Option<crate::rooms::RoomSendPermit>,
     peer_id: String,
     target_vip: String,
+    local_vip: String,
     generation: u64,
     read_at: Instant,
     packet: Box<[u8]>,
@@ -52,11 +55,14 @@ impl OriginalEchoInput {
         wireguard: &WireGuardTransport,
         udp: &Arc<RwLock<Option<crate::udp::UdpTransport>>>,
         relay: &Arc<RwLock<Option<crate::relay::RelayTransport>>>,
+        room: &Arc<crate::rooms::RoomAuthorization>,
+        room_authorization: Option<crate::rooms::RoomSendPermit>,
         request: OriginalOverlayAck,
         source: OriginalOverlayIngressSource,
         echo: &[u8],
     ) -> Option<Self> {
-        if request.is_echo()
+        if room.enabled() != room_authorization.is_some()
+            || request.is_echo()
             || !source.session().belongs_to(wireguard)
             || source.session().original_role() != OriginalSessionRole::Active
             || source.session().peer_id() != request.peer_id
@@ -79,12 +85,78 @@ impl OriginalEchoInput {
             owner: Arc::downgrade(peers),
             udp: Arc::downgrade(udp),
             relay: Arc::downgrade(relay),
+            room: Arc::downgrade(room),
+            room_authorization,
             peer_id: request.peer_id,
             target_vip: request.source_vip,
+            local_vip: request.local_vip,
             generation,
             read_at,
             packet: echo.into(),
         })
+    }
+
+    pub(crate) fn room_authorization(&self) -> Option<&crate::rooms::RoomSendPermit> {
+        self.room_authorization.as_ref()
+    }
+
+    /// Only this synchronous operation retains the current room snapshot.
+    /// The sealed input keeps a Weak owner, never a room-owner keeper.
+    fn with_current_room<T>(
+        &self,
+        operation: impl FnOnce(Option<&crate::rooms::OriginalRoomSendGuard<'_>>) -> T,
+    ) -> Result<T, OverlayCreditOutcome> {
+        // Unrestricted input was captured only from a disabled room owner.
+        // It must not acquire a new room-object lifetime/lock dependency.
+        if self.room_authorization.is_none() {
+            return Ok(operation(None));
+        }
+        let owner = self.room.upgrade().ok_or(OverlayCreditOutcome::Stale(
+            super::OverlayCreditStale::RoomAuthority,
+        ))?;
+        let guard = owner
+            .try_original_send_guard(
+                self.room_authorization.as_ref(),
+                &self.peer_id,
+                &self.target_vip,
+                &self.local_vip,
+            )
+            .map_err(OverlayCreditOutcome::from)?;
+        Ok(operation(Some(&guard)))
+    }
+
+    pub(crate) fn qualify_original_room(&self) -> Result<(), OverlayCreditOutcome> {
+        self.with_current_room(|_| ())
+    }
+
+    pub(crate) fn original_room_permit_for_route(
+        &self,
+        current: Option<&Arc<crate::rooms::RoomAuthorization>>,
+        peer: &str,
+        target: &str,
+        local: &str,
+    ) -> Result<Option<crate::rooms::RoomSendPermit>, OverlayCreditOutcome> {
+        use super::OverlayCreditStale as Stale;
+        if (peer, target, local)
+            != (
+                self.peer_id.as_str(),
+                self.target_vip.as_str(),
+                self.local_vip.as_str(),
+            )
+        {
+            return Err(OverlayCreditOutcome::Stale(Stale::Identity));
+        }
+        if self.room_authorization.is_none() {
+            return if current.is_some_and(|current| current.enabled()) {
+                Err(OverlayCreditOutcome::Stale(Stale::RoomAuthority))
+            } else {
+                Ok(None)
+            };
+        }
+        if current.is_none_or(|current| !self.room.ptr_eq(&Arc::downgrade(current))) {
+            return Err(OverlayCreditOutcome::Stale(Stale::RoomAuthority));
+        }
+        self.with_current_room(|_| self.room_authorization.clone())
     }
 
     pub(crate) fn exact_input(
@@ -107,6 +179,7 @@ impl OriginalEchoInput {
         self.exact_input(peers, &packet.packet, now)
             && packet.peer_id == self.peer_id
             && packet.dst_ip == self.target_vip
+            && packet.room_authorization.as_ref() == self.room_authorization()
     }
 
     pub(crate) fn exact_route_for_owner(
@@ -119,6 +192,7 @@ impl OriginalEchoInput {
             && self.packet.as_ref() == packet.packet
             && packet.peer_id == self.peer_id
             && packet.dst_ip == self.target_vip
+            && packet.room_authorization.as_ref() == self.room_authorization()
             && crate::request_carriage::in_original_window(self.read_at, now)
     }
 
@@ -138,7 +212,10 @@ impl OriginalEchoInput {
         emit: Weak<OwnedMutexGuard<()>>,
         packet: &crate::transport::EncryptedPeerPacket,
     ) -> Option<Arc<OriginalEchoPrewrite>> {
-        if packet.peer_id != self.peer_id || tx.peer_id() != self.peer_id {
+        if packet.peer_id != self.peer_id
+            || tx.peer_id() != self.peer_id
+            || packet.room_authorization.as_ref() != self.room_authorization()
+        {
             return None;
         }
         Some(Arc::new(OriginalEchoPrewrite {
@@ -164,6 +241,7 @@ pub(crate) struct OriginalEchoPrewrite {
 impl OriginalEchoPrewrite {
     pub(crate) fn matches_packet(&self, packet: &crate::transport::EncryptedPeerPacket) -> bool {
         packet.peer_id == self.input.peer_id
+            && packet.room_authorization.as_ref() == self.input.room_authorization()
             && self.wire
                 == (
                     packet.wire_bytes.len(),
@@ -172,6 +250,8 @@ impl OriginalEchoPrewrite {
                 )
     }
     /// The original caller owns epoch and current UDP slot through this syscall.
+    /// Hold the room snapshot only across this one existing nonblocking write,
+    /// so revocation cannot pass its final check. No await, sleep or retry.
     pub(crate) fn try_send_direct_in_epoch(
         &self,
         udp: &crate::udp::UdpTransport,
@@ -180,36 +260,40 @@ impl OriginalEchoPrewrite {
         endpoint: std::net::SocketAddr,
     ) -> Result<usize, crate::udp::DirectBusinessUdpSendError> {
         use crate::udp::DirectBusinessUdpSendError as Error;
-        if !self.matches_packet(packet) {
-            return Err(Error::StaleToken);
-        }
-        let _emit = self.emit.upgrade().ok_or(Error::StaleToken)?;
-        let peers = self.input.owner.upgrade().ok_or(Error::StaleToken)?;
-        let peer = peers
-            .try_original_echo_peer_in_epoch(&self.input, &self.tx)
-            .map_err(|_| Error::StaleToken)?;
-        let read = self
-            .input
-            .source
-            .original_udp_read()
-            .ok_or(Error::StaleToken)?;
-        let source = self.input.source.source().ok_or(Error::StaleToken)?;
-        let verified_local = peer.verified_direct_return_local(&self.input, endpoint);
-        // A current owned return can differ in local socket even when its
-        // remote endpoint equals the observed REQUEST source. Legacy
-        // equal-source compatibility still uses only the original RX socket.
-        if source != endpoint && verified_local.is_none() {
-            return Err(Error::StaleToken);
-        }
-        udp.try_send_original_echo_on_receive_socket(
-            read,
-            self.input.generation,
-            prepared,
-            packet,
-            endpoint,
-            verified_local,
-            &peer.session,
-        )
+        self.input
+            .with_current_room(|_room| {
+                if !self.matches_packet(packet) {
+                    return Err(Error::StaleToken);
+                }
+                let _emit = self.emit.upgrade().ok_or(Error::StaleToken)?;
+                let peers = self.input.owner.upgrade().ok_or(Error::StaleToken)?;
+                let peer = peers
+                    .try_original_echo_peer_in_epoch(&self.input, &self.tx)
+                    .map_err(|_| Error::StaleToken)?;
+                let read = self
+                    .input
+                    .source
+                    .original_udp_read()
+                    .ok_or(Error::StaleToken)?;
+                let source = self.input.source.source().ok_or(Error::StaleToken)?;
+                let verified_local = peer.verified_direct_return_local(&self.input, endpoint);
+                // A current owned return can differ in local socket even when its
+                // remote endpoint equals the observed REQUEST source. Legacy
+                // equal-source compatibility still uses only the original RX socket.
+                if source != endpoint && verified_local.is_none() {
+                    return Err(Error::StaleToken);
+                }
+                udp.try_send_original_echo_on_receive_socket(
+                    read,
+                    self.input.generation,
+                    prepared,
+                    packet,
+                    endpoint,
+                    verified_local,
+                    &peer.session,
+                )
+            })
+            .map_err(|_| Error::StaleToken)?
     }
     pub(crate) fn peer_guard(
         &self,
@@ -233,38 +317,43 @@ impl OriginalEchoPrewrite {
         id: u64,
         actual_live: &Arc<std::sync::Mutex<bool>>,
     ) -> bool {
-        let Ok(peer) = self.peer_guard() else {
-            return false;
-        };
-        let Some(slot) = self.input.relay.upgrade() else {
-            return false;
-        };
-        let Ok(slot) = slot.try_read() else {
-            return false;
-        };
-        let Some(relay) = slot.as_ref() else {
-            return false;
-        };
-        let (Some(read), Some(original_id), Some(endpoint)) = (
-            self.input.source.original_relay_read(),
-            self.input.source.relay_connection_id(),
-            self.input.source.relay_reader_endpoint(),
-        ) else {
-            return false;
-        };
-        let Ok(member) = relay.try_original_echo_reader_member_guard_under_live(
-            read,
-            endpoint,
-            original_id,
-            actual_client,
-            id,
-            actual_live,
-        ) else {
-            return false;
-        };
-        let Ok(_open) = member.try_open_guard() else {
-            return false;
-        };
-        peer.current.session.is_current()
+        self.input
+            .with_current_room(|_room| {
+                let Ok(peer) = self.peer_guard() else {
+                    return false;
+                };
+                let Some(slot) = self.input.relay.upgrade() else {
+                    return false;
+                };
+                let Ok(slot) = slot.try_read() else {
+                    return false;
+                };
+                let Some(relay) = slot.as_ref() else {
+                    return false;
+                };
+                let (Some(read), Some(original_id), Some(endpoint)) = (
+                    self.input.source.original_relay_read(),
+                    self.input.source.relay_connection_id(),
+                    self.input.source.relay_reader_endpoint(),
+                ) else {
+                    return false;
+                };
+                let Ok(member) = relay.try_original_echo_reader_member_guard_under_live(
+                    read,
+                    endpoint,
+                    original_id,
+                    actual_client,
+                    id,
+                    actual_live,
+                ) else {
+                    return false;
+                };
+                let Ok(_open) = member.try_open_guard() else {
+                    return false;
+                };
+                _room.is_none_or(|room| room.is_current_at(Instant::now()))
+                    && peer.current.session.is_current()
+            })
+            .unwrap_or(false)
     }
 }

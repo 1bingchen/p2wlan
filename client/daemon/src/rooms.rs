@@ -4,6 +4,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+mod original_send;
+pub(crate) use original_send::{OriginalRoomSendFailure, OriginalRoomSendGuard};
+
 #[derive(Debug)]
 pub struct RoomAuthorization {
     enabled: bool,

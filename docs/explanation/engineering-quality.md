@@ -157,6 +157,10 @@ Rust 依赖摘要由 `scripts/security/dependency_reports.py` 的 `rust` 子命�
 
 日志用于解释事件，metrics/status 用于机器判定。高频数据面不得为每个正常包输出 info/warn；正常热路径仅保留采样或 debug/trace 诊断。状态变化日志应包含稳定 reason code 和必要 identity，但不能记录密钥、token、完整凭据或可还原业务载荷。
 
+Linux 原系统 TUN 验收的 `scripts/parallel-rooms/linux_tun_evidence.py --write-facts --kernel-read-facts` 使用原父进程拥有的两个 daemon 控制连接，按启动后的原 probe 计划追加预期输入。每个 daemon 最多登记 1000 个请求，作用域最多 120 秒，两条控制流各最多收发 4 MiB；注册只能追加，不能替换或重新计时。父进程在原 daemon 首次 poll/wait 前绑定原 Popen 出生身份与 Unix peer credentials；daemon 只读取自身 Linux 出生身份、网络 namespace、boot ID 与 CLOCK_MONOTONIC。具体系统设备完成真实 read 后才创建私有来源，注册 JSON、Any 与 Mock 输入不能创建该来源。
+
+读取记录保留完整 128 位 run/round/request nonce。TCP 以原 SYN 序号和有界字节覆盖处理分段、合并与重传；每包最多关联八帧，冲突使该流不具备完整覆盖。父进程将实际读取与原子进程写入流、原请求截止时间分别比较，保留原 normal32/fault32/stall16、未发送 TCP 与晚到回程。该记录不证明实际 UDP/Relay Full、当前连接 owner 或最终 once；这些资格仍须由原物理发送来源和唯一 PeerManager 事务提供。采集结束只关闭实际拥有的连接，进程清理后不再查询 PID 或补取控制记录。
+
 新增关键状态机时，同时考虑：当前状态、最后一次转移原因、失败计数、队列/任务规模和版本 identity 是否能从现有诊断入口获得。可观测性不是在出现事故后再补日志。
 
 NAT 仿真的 `NAT_SIM_PROCESS_BIRTH=1` 可选开启原生进程出生身份记录；默认关闭。`launch_identity.py exec --process-birth` 在同一进程原始 exec 前读取自己的 Darwin 原生身份，以私有、最多 4 KiB 的 `.birth` sidecar 绑定原启动记录摘要、源码、角色和产物摘要，不读取 token stdin。原 schema 1 启动记录与严格收集器保持不变。其他平台或原生查询失败会保留不可用原因，诊断写入失败不能阻止原 exec。该记录只为后续受归属约束的观察提供出生身份 fence，不能证明 exec 成功、当前 PID 仍对应原实例或 TCP 已建立；原 exec 失败会使该绑定不可用，禁止按晚到的 PID 查询补造原实例身份。固定四例策略测量会将显式 opt-in 纳入各例原环境，保持原预算与分母。

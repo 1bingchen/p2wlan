@@ -195,12 +195,19 @@ def measure(harness, lab, groups, report: dict, out: Path, snapshots: dict, slot
     slot.append(owner)  # Externally owned before the first STOP syscall.
     details["pause"] = owner.evidence
 
+    kernel_records = {}
+
     def start_probe(entry):
         bind = (plan["source_ip"], entry["source_port"])
         target = (plan["target_ip"], entry["target_port"])
         path = out / (entry["phase"] + "-probe.json")
         capture = harness.prepare_write_capture(groups, entry, "udp", bind, target,
                                                 "udp-" + entry["phase"], lab.ns("a"))
+        kernel = (harness.prepare_kernel_capture(lab, groups, entry, capture, "a1", "b1", snapshots,
+                                                deadline=echo_end / 1_000_000_000)
+                  if getattr(groups, "kernel_captures", None) is not None else None)
+        if kernel is not None:
+            kernel_records[id(entry)] = kernel
         argv = harness.tool_argv(harness.DUAL / "udp_business_probe.py", "probe", bind, target, entry, path)
         if capture is not None:
             argv.extend(capture.arguments())
@@ -221,6 +228,9 @@ def measure(harness, lab, groups, report: dict, out: Path, snapshots: dict, slot
         entry.update(probe_exit=code, report_sha256=harness.digest(path))
         if capture is not None:
             entry["original_write_stream"] = capture.finish(result)
+        kernel = kernel_records.pop(id(entry), None)
+        if kernel is not None:
+            groups.kernel_captures.finish(kernel, deadline=echo_end / 1_000_000_000)
 
     paused_samples = details["paused_samples"] = []
     try:

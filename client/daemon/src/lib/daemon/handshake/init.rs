@@ -1,5 +1,10 @@
 impl Daemon {
-    fn init_tun_with(&mut self, vip: &str, netmask: &str, mtu: u32) -> Result<Option<TunDevice>> {
+    fn init_tun_with(
+        &mut self,
+        vip: &str,
+        netmask: &str,
+        mtu: u32,
+    ) -> Result<Option<crate::os_request_capture::SystemTun>> {
         if std::env::var("P2WLAN_DISABLE_TUN").as_deref() == Ok("1") {
             warn!("TUN creation disabled via P2WLAN_DISABLE_TUN=1");
             return Ok(None);
@@ -15,10 +20,12 @@ impl Daemon {
                     "Android VPN TUN fd was not supplied by VpnService".to_string(),
                 )
             })?;
-            let tun = TunDevice::from_raw_fd_with_mode(fd, &config, self.android_tun_mode)
-                .map_err(|e| {
-                    DaemonError::Network(format!("failed to attach Android VPN TUN: {e}"))
-                })?;
+            let tun = crate::os_request_capture::SystemTun::from_raw_fd_with_mode(
+                fd,
+                &config,
+                self.android_tun_mode,
+            )
+            .map_err(|e| DaemonError::Network(format!("failed to attach Android VPN TUN: {e}")))?;
             info!(
                 "Android VPN TUN {} is attached at logical address {} MTU {} mode={:?}",
                 tun.name(),
@@ -31,7 +38,7 @@ impl Daemon {
 
         #[cfg(not(target_os = "android"))]
         {
-            let tun = TunDevice::create(&config).map_err(|e| {
+            let tun = crate::os_request_capture::SystemTun::create(&config).map_err(|e| {
                 error!("[tun] startup failed: {e}");
                 DaemonError::Network(format!("TUN startup failed: {e}"))
             })?;

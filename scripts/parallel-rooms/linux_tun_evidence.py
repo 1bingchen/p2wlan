@@ -61,9 +61,14 @@ class EvidenceLab(original.Lab):
                 "argv_sha256": hashlib.sha256(json.dumps(command, separators=(",", ":")).encode()).hexdigest(),
                 "default_keepalive_cycle_verified": False,
             }
+        kernel = getattr(self.groups, "kernel_captures", None) if command[:1] == [str(self.args.daemon)] else None
+        if kernel is not None:
+            clean.update(kernel.environment())
         child = self.groups.spawn(name, ["ip", "netns", "exec", self.ns(label), *command],
                                   self.root / (name + ".console"), env=clean, token=token)
         self.processes.append(child)
+        if kernel is not None:
+            kernel.bind(self.groups, child, self.ns(label))
         return child
 
 
@@ -177,6 +182,11 @@ def prepare_write_capture(groups, entry, protocol, bind, target, stem, namespace
     return captures.prepare(groups, entry, protocol, bind, target, stem, namespace) if captures else None
 
 
+def prepare_kernel_capture(lab, groups, entry, capture, source, target, snapshots, *, deadline=None):
+    kernel = getattr(groups, "kernel_captures", None)
+    return kernel.prepare(lab, entry, capture, source, target, snapshots, deadline=deadline) if kernel else None
+
+
 def tool_argv(tool: Path, role: str, bind: tuple, target: tuple, entry: dict, output: Path) -> list[str]:
     return [sys.executable, "-u", str(tool), role, "--bind-ip", bind[0], "--bind-port", str(bind[1]),
             "--target-ip", target[0], "--target-port", str(target[1]), "--run-nonce", entry["run_nonce"],
@@ -217,6 +227,7 @@ def measure(lab: EvidenceLab, groups: OwnedGroups, entry: dict, out: Path, snaps
         raise TimeoutError("original echo socket readiness")
     namespace = lab.ns(lab.daemons[source]["namespace"])
     capture = prepare_write_capture(groups, entry, protocol, bind, destination, stem, namespace)
+    kernel = prepare_kernel_capture(lab, groups, entry, capture, source, target, snapshots)
     probe_argv = tool_argv(tool, "probe", bind, destination, entry, probe_report)
     if capture is not None:
         probe_argv.extend(capture.arguments())
@@ -240,6 +251,8 @@ def measure(lab: EvidenceLab, groups: OwnedGroups, entry: dict, out: Path, snaps
     echo_exit = wait_child(echo, time.monotonic() + 12)
     if capture is not None:
         entry["original_write_stream"] = capture.finish(report)
+    if kernel is not None:
+        groups.kernel_captures.finish(kernel, deadline=original_probe_end)
     entry.update(probe_exit=probe_exit, echo_exit=echo_exit,
                  report_sha256=digest(probe_report), echo_report_sha256=digest(echo_report))
     if expected_fault:
@@ -369,12 +382,16 @@ def main() -> int:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--write-facts", action="store_true",
                         help="observe original child OS writes in bounded owned pipes; no daemon/TUN authority")
+    parser.add_argument("--kernel-read-facts", action="store_true",
+                        help="collect actual original daemon system reads against original write plans/deadlines; no physical/current-owner credit")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--fault-recovery", action="store_true",
                         help="independent fixed32 application DROP/clear/fresh scope; original baseline unchanged")
     mode.add_argument("--server-stall", action="store_true",
                       help="independent UDP fixed16 original echo STOP/CONT; explicit keepalive interval1")
     args = parser.parse_args()
+    if args.kernel_read_facts and not args.write_facts:
+        parser.error("--kernel-read-facts requires the original --write-facts plans")
     if sys.platform != "linux" or os.geteuid() != 0 or not Path("/dev/net/tun").exists():
         parser.error("Linux root and kernel /dev/net/tun required; no mock downgrade")
     if original.run(["git", "-C", str(ROOT), "rev-parse", "HEAD"]).stdout.strip() != args.head:
@@ -414,6 +431,7 @@ def main() -> int:
                                application_requests=16, configured_keepalive_interval_secs=1)
     error = None
     captures = None
+    kernel_captures = None
     try:
         if args.write_facts:
             from linux_tun_probe_capture import WriteCaptures
@@ -429,6 +447,16 @@ def main() -> int:
                          DUAL / "probe_request_plan.py", DUAL / "probe_write_facts.py",
                          DUAL / "probe_process_identity.py", DUAL / "probe_write_stream.py"]:
                 report["source_sha256"][str(path.relative_to(ROOT))] = digest(path)
+        if args.kernel_read_facts:
+            from linux_tun_kernel_capture import KernelCaptures
+            kernel_captures = KernelCaptures(lab.root, args.output_dir, captures.capture_id, len(report["manifest"]))
+            groups.kernel_captures = kernel_captures
+            report["limits"].update(kernel_control_parent_socket_fds=3, kernel_control_daemon_socket_fds=2,
+                                    kernel_control_bytes_per_stream=4 * 1024 * 1024,
+                                    kernel_registered_requests_per_daemon=1000, kernel_capture_TTL_seconds=120,
+                                    kernel_capture_additional_process_groups=0)
+            path = Path(__file__).with_name("linux_tun_kernel_capture.py")
+            report["source_sha256"][str(path.relative_to(ROOT))] = digest(path)
         report["binary_sha256"] = {"daemon": digest(args.daemon), "control": digest(args.control)}
         for path, expected in report["source_sha256"].items():
             committed = subprocess.check_output(["git", "-C", str(ROOT), "show", args.head + ":" + path], timeout=20)
@@ -451,6 +479,8 @@ def main() -> int:
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
         if captures is not None:
             captures.close()
+        if kernel_captures is not None:
+            report["kernel_control_cleanup"] = kernel_captures.close()
         if stall_slot is not None:
             try:
                 report["pause_cleanup"] = linux_tun_stall.restore_before_cleanup(stall_slot)
@@ -464,6 +494,12 @@ def main() -> int:
         if captures is not None:
             captures.persist_interrupted()
             report["original_write_observations"] = captures.summary(report["manifest"])
+        if kernel_captures is not None:
+            try:
+                kernel_captures.persist()
+                report["original_kernel_read_observations"] = kernel_captures.summary(report["manifest"])
+            except (OSError, ValueError) as kernel_error:
+                report["original_kernel_read_observations"] = {"passed": False, "gap_reason": type(kernel_error).__name__}
         try:
             lab.preserve_logs()
         except Exception as capture_error:
@@ -499,9 +535,13 @@ def main() -> int:
               "success_requests": report["application"]["success_requests"], "cleanup_complete": report["cleanup_complete"]}
     if args.write_facts:
         result["original_write_observations_passed"] = report.get("original_write_observations", {}).get("passed", False)
+    if args.kernel_read_facts:
+        result["original_kernel_read_observations_passed"] = report.get("original_kernel_read_observations", {}).get("passed", False)
     print(json.dumps(result))
     return int(not report["passed"] or (args.write_facts and not
-               report.get("original_write_observations", {}).get("passed", False)))
+               report.get("original_write_observations", {}).get("passed", False)) or (args.kernel_read_facts and not
+               (report.get("original_kernel_read_observations", {}).get("passed", False)
+                and report.get("kernel_control_cleanup", {}).get("complete", False))))
 
 
 if __name__ == "__main__":

@@ -58,6 +58,14 @@ jobs:
             python3 scripts/dual-end/test_probe_write_stream.py -v
             python3 scripts/parallel-rooms/test_linux_tun_probe_capture.py -v
           fi
+      - name: Original daemon kernel-read control stream checks
+        shell: bash
+        run: |
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            python scripts/parallel-rooms/test_linux_tun_kernel_capture.py -v
+          else
+            python3 scripts/parallel-rooms/test_linux_tun_kernel_capture.py -v
+          fi
       - uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2
         with:
           channel: stable
@@ -127,12 +135,14 @@ jobs:
         run: |
           sudo --preserve-env=GITHUB_RUN_ID,GITHUB_RUN_ATTEMPT python3 scripts/parallel-rooms/linux_tun_evidence.py \
             --write-facts \
+            --kernel-read-facts \
             --daemon target/debug/p2wlan-daemon \
             --control target/debug/p2wlan-control \
             --head "$(git rev-parse HEAD)" \
             --output-dir "$RUNNER_TEMP/linux-tun-application"
           sudo --preserve-env=GITHUB_RUN_ID,GITHUB_RUN_ATTEMPT python3 scripts/parallel-rooms/linux_tun_evidence.py \
             --write-facts \
+            --kernel-read-facts \
             --daemon target/debug/p2wlan-daemon \
             --control target/debug/p2wlan-control \
             --head "$(git rev-parse HEAD)" \
@@ -140,6 +150,7 @@ jobs:
             --output-dir "$RUNNER_TEMP/linux-tun-recovery"
           sudo --preserve-env=GITHUB_RUN_ID,GITHUB_RUN_ATTEMPT python3 scripts/parallel-rooms/linux_tun_evidence.py \
             --write-facts \
+            --kernel-read-facts \
             --daemon target/debug/p2wlan-daemon \
             --control target/debug/p2wlan-control \
             --head "$(git rev-parse HEAD)" \

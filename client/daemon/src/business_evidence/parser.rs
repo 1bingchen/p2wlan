@@ -92,14 +92,14 @@ pub(crate) fn parse_os_udp(raw: &[u8]) -> Result<ParsedOsUdp, ParseErrorKind> {
     })
 }
 
-fn word_sum(bytes: &[u8]) -> u32 {
+pub(super) fn word_sum(bytes: &[u8]) -> u32 {
     bytes
         .chunks(2)
         .map(|pair| u32::from(pair[0]) * 256 + u32::from(pair.get(1).copied().unwrap_or(0)))
         .sum()
 }
 
-fn fold_sum(mut sum: u32) -> u32 {
+pub(super) fn fold_sum(mut sum: u32) -> u32 {
     while sum >> 16 != 0 {
         sum = (sum & 0xffff) + (sum >> 16);
     }

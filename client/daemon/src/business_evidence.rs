@@ -12,6 +12,7 @@ use std::time::Instant;
 mod hooks;
 mod parser;
 mod recorder;
+pub(crate) mod tcp_frame;
 #[allow(unused_imports)]
 pub(crate) use parser::{parse_os_udp, ParseErrorKind, ParsedOsUdp};
 #[allow(unused_imports)]

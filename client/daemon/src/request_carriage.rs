@@ -38,6 +38,7 @@ pub(crate) enum RequestBindingFailure {
     RouteIdentity,
     RouteBytes,
     Expired,
+    OriginalKernelSource,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -50,6 +51,8 @@ pub(crate) enum RequestBindingState {
 #[allow(dead_code)] // Staged input qualifier; final receipt/credit is separate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RequestInputEligibility {
+    /// A real registered system read only; never native ACK/send authority.
+    KernelReadOnly,
     PendingInjection,
     AcceptedInput,
     Invalid(RequestBindingFailure),
@@ -73,6 +76,14 @@ impl RequestBinding {
         observed_at: Instant,
     ) -> Option<Self> {
         let token = RequestSendToken::from_read_context(context?)?;
+        if let Some(kernel) = token.kernel() {
+            let state = if kernel.exact_input(peers, packet, observed_at) {
+                RequestBindingState::ReadExact
+            } else {
+                RequestBindingState::Invalid(RequestBindingFailure::OriginalKernelSource)
+            };
+            return Some(Self { token, state });
+        }
         if let Some(echo) = token.echo() {
             let state = if echo.exact_input(peers, packet, observed_at) {
                 RequestBindingState::ReadExact
@@ -109,6 +120,14 @@ impl RequestBinding {
         observed_at: Instant,
     ) {
         if self.state != RequestBindingState::ReadExact {
+            return;
+        }
+        if let Some(kernel) = self.token.kernel() {
+            self.state = if kernel.exact_route(peers, packet, observed_at) {
+                RequestBindingState::RoutedExact
+            } else {
+                RequestBindingState::Invalid(RequestBindingFailure::OriginalKernelSource)
+            };
             return;
         }
         if let Some(echo) = self.token.echo() {
@@ -157,6 +176,13 @@ impl RequestBinding {
     pub(crate) fn eligibility_at(&self, observed_at: Instant) -> RequestInputEligibility {
         if let RequestBindingState::Invalid(reason) = self.state {
             return RequestInputEligibility::Invalid(reason);
+        }
+        if let Some(kernel) = self.token.kernel() {
+            return if kernel.is_current_at(observed_at) {
+                RequestInputEligibility::KernelReadOnly
+            } else {
+                RequestInputEligibility::Retired
+            };
         }
         let Some(request) = self.token.request() else {
             return RequestInputEligibility::Retired;

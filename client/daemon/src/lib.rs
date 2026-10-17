@@ -49,6 +49,7 @@ pub mod gateway_mapping;
 pub mod incarnation;
 pub mod netenv;
 mod network_outbound;
+mod os_request_capture;
 mod overlay_requests;
 pub(crate) mod path_commit;
 pub mod peer;
@@ -146,7 +147,7 @@ use network_outbound::{
 };
 #[cfg(target_os = "android")]
 use p2pnet_tun::AndroidTunMode;
-use p2pnet_tun::{InterfaceConfig, Ipv4Packet, TunDevice, VirtualInterface};
+use p2pnet_tun::{InterfaceConfig, Ipv4Packet, VirtualInterface};
 use p2pnet_wireguard::{
     HandshakeInitiator, HandshakeResponder, MessageInitiation, MessageResponse, TransportKeyPair,
     TransportSession,

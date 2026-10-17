@@ -337,13 +337,13 @@ jobs:
         if: always()
         env:
           GH_TOKEN: ${{ github.token }}
-          SOURCE_HEAD_SHA: ${{ steps.identity.outputs.source_head_sha }}
+          RUN_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
           set -euo pipefail
           python3 scripts/quality/restore_artifact_layout.py \
             --repository "$GITHUB_REPOSITORY" \
             --run-id "$GITHUB_RUN_ID" \
-            --source-head-sha "$SOURCE_HEAD_SHA" \
+            --run-head-sha "$RUN_HEAD_SHA" \
             --download "dplpmtud-live-component-$GITHUB_RUN_ID-*" "$RUNNER_TEMP/dplpmtud-component-downloads" \
             --output-root "$RUNNER_TEMP/dplpmtud-component"
       - name: Select the component evidence this aggregate may consume

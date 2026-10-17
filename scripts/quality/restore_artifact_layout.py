@@ -4,7 +4,8 @@
 Use separate, empty download destinations with merge-multiple:false. v8
 flattens a single match, but nests multiple matches. The authenticated run
 inventory determines which layout to expect; payload names never determine
-artifact identity. This only restores directories: the original consumers
+artifact identity. Bind inventory to the workflow run head, which can differ
+from a manually selected validation checkout. This only restores directories: the original consumers
 still verify evidence source, workflow, attempt, digest and producer result.
 """
 
@@ -90,11 +91,11 @@ def fetch_inventory(repository: str, run_id: int, token: str) -> list[dict]:
     raise LayoutError("artifact_query_page_limit")
 
 
-def matching_artifacts(inventory: list[dict], pattern: str, run_id: int, source: str) -> list[dict]:
+def matching_artifacts(inventory: list[dict], pattern: str, run_id: int, run_head_sha: str) -> list[dict]:
     if not re.fullmatch(r"[A-Za-z0-9_.*-]+", pattern) or f"-{run_id}-" not in pattern:
         raise LayoutError("artifact_pattern_invalid")
-    if not re.fullmatch(r"[0-9a-f]{40}", source) or run_id < 1:
-        raise LayoutError("artifact_source_invalid")
+    if not re.fullmatch(r"[0-9a-f]{40}", run_head_sha) or run_id < 1:
+        raise LayoutError("artifact_run_head_invalid")
     if len(inventory) > MAX_ARTIFACTS:
         raise LayoutError("artifact_inventory_limit")
     matches = []
@@ -111,7 +112,7 @@ def matching_artifacts(inventory: list[dict], pattern: str, run_id: int, source:
         if not SAFE_NAME.fullmatch(name) or type(artifact_id) is not int or artifact_id < 1:
             raise LayoutError("artifact_identity_invalid")
         run = row.get("workflow_run")
-        if not isinstance(run, dict) or run.get("id") != run_id or run.get("head_sha") != source:
+        if not isinstance(run, dict) or run.get("id") != run_id or run.get("head_sha") != run_head_sha:
             raise LayoutError("artifact_run_source_mismatch")
         if row.get("expired") is not False:
             raise LayoutError("artifact_expired_or_unknown")
@@ -155,7 +156,7 @@ def inspect_tree(root: Path, budget: list[int]) -> None:
 
 
 def restore(inventory: list[dict], downloads: list[tuple[str, Path]], output: Path,
-            *, run_id: int, source: str) -> list[dict]:
+            *, run_id: int, run_head_sha: str) -> list[dict]:
     if not 1 <= len(downloads) <= 8:
         raise LayoutError("artifact_download_group_limit")
     if output.exists() or output.is_symlink():
@@ -176,7 +177,7 @@ def restore(inventory: list[dict], downloads: list[tuple[str, Path]], output: Pa
         if any(root == prior or root in prior.parents or prior in root.parents for prior in roots):
             raise LayoutError("artifact_download_roots_overlap")
         roots.append(root)
-        matches = matching_artifacts(inventory, pattern, run_id, source)
+        matches = matching_artifacts(inventory, pattern, run_id, run_head_sha)
         if len(matches) > 1 and {entry.name for entry in root.iterdir()} != {row["name"] for row in matches}:
             raise LayoutError("artifact_download_names_mismatch")
         for row in matches:
@@ -212,14 +213,14 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repository", required=True)
     parser.add_argument("--run-id", required=True, type=int)
-    parser.add_argument("--source-head-sha", required=True)
+    parser.add_argument("--run-head-sha", required=True)
     parser.add_argument("--download", required=True, nargs=2, action="append", metavar=("PATTERN", "ROOT"))
     parser.add_argument("--output-root", required=True, type=Path)
     args = parser.parse_args(argv)
     try:
         inventory = fetch_inventory(args.repository, args.run_id, os.environ.get("GH_TOKEN", ""))
         receipt = restore(inventory, [(pattern, Path(root)) for pattern, root in args.download],
-                          args.output_root, run_id=args.run_id, source=args.source_head_sha)
+                          args.output_root, run_id=args.run_id, run_head_sha=args.run_head_sha)
     except (LayoutError, OSError) as error:
         print(f"artifact layout failed: {error}", file=sys.stderr)
         return 1

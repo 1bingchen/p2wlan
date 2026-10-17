@@ -316,13 +316,13 @@ jobs:
         if: always()
         env:
           GH_TOKEN: ${{ github.token }}
-          SOURCE_HEAD_SHA: ${{ steps.identity.outputs.source_head_sha }}
+          RUN_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
           set -euo pipefail
           python3 scripts/quality/restore_artifact_layout.py \
             --repository "$GITHUB_REPOSITORY" \
             --run-id "$GITHUB_RUN_ID" \
-            --source-head-sha "$SOURCE_HEAD_SHA" \
+            --run-head-sha "$RUN_HEAD_SHA" \
             --download "nat-topology-direct-$GITHUB_RUN_ID-*" "$RUNNER_TEMP/nat-direct-downloads" \
             --download "nat-topology-relay-$GITHUB_RUN_ID-*-of-5" "$RUNNER_TEMP/nat-relay-downloads" \
             --output-root "$RUNNER_TEMP/nat-topology-artifacts"

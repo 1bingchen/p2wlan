@@ -56,7 +56,7 @@ class LayoutTests(unittest.TestCase):
     def restore(self, rows=None, downloads=None):
         return layout.restore(rows if rows is not None else [artifact()],
                               downloads if downloads is not None else [(PATTERN, self.download)],
-                              self.output, run_id=RUN, source=SOURCE)
+                              self.output, run_id=RUN, run_head_sha=SOURCE)
 
     def test_single_match_wraps_flat_payload_and_preserves_bytes(self):
         self.payload()
@@ -231,6 +231,27 @@ class LayoutTests(unittest.TestCase):
         with self.assertRaisesRegex(dpl.SelectionError, "component_job_not_success"):
             dpl.select(self.output, **dict(options, component_result="failure"))
 
+    def test_dispatch_target_source_is_distinct_from_authenticated_workflow_run_head(self):
+        contract = {"repository": "yhan-sun/p2wlan", "component": "dplpmtud-live-dataplane"}
+        target, workflow = "c" * 40, "f" * 40
+        component = {"schema_version": 1, **contract, "source_head_sha": target,
+                     "workflow_sha": workflow, "run_id": RUN, "run_attempt": 1,
+                     "contract_sha256": dpl._canonical_sha256(contract), "result": "pass"}
+        component["report_digest"] = dpl._canonical_sha256(component)
+        raw = json.dumps(component).encode()
+        (self.download / dpl.COMPONENT_FILE).write_bytes(raw)
+        # The inventory belongs to the workflow's actual launch head. A valid
+        # target payload must not authorize an artifact from another run head.
+        with self.assertRaisesRegex(layout.LayoutError, "run_source_mismatch"):
+            self.restore([artifact(workflow_run={"id": RUN, "head_sha": target})])
+        self.restore()
+        options = dict(contract=contract, source_head_sha=target, workflow_sha=workflow,
+                       run_id=RUN, current_attempt=1, component_result="success", attempt_jobs=lambda _: [])
+        selected = dpl.select(self.output, **options)
+        self.assertEqual(Path(selected["component"]).read_bytes(), raw)
+        with self.assertRaisesRegex(dpl.SelectionError, "component_source_head_mismatch"):
+            dpl.select(self.output, **dict(options, source_head_sha=SOURCE))
+
 
 class InventoryTests(unittest.TestCase):
     def response(self, rows, total=None):
@@ -289,6 +310,8 @@ class WorkflowLayoutTests(unittest.TestCase):
                 self.assertIn('LAYOUT_OUTCOME: ${{ steps.layout.outcome }}', block)
                 self.assertIn('test "$LAYOUT_OUTCOME" = "success"', block)
                 self.assertIn('GH_TOKEN: ${{ github.token }}', block)
+                self.assertIn('RUN_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}', block)
+                self.assertIn('--run-head-sha "$RUN_HEAD_SHA"', block)
                 self.assertIn('actions: read', text)
 
 

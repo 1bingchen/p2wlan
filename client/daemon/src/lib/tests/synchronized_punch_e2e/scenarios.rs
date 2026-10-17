@@ -3053,8 +3053,31 @@ async fn hard_hard_two_peer_partial_reachability_never_stays_asymmetric_direct()
     let _clock = HardHardClockReset;
     let harness = build_two_peer_harness(true, false, false).await;
     harness.link.set_drop_b_to_a(true);
+    // This case requires both local sweeps to execute. An earlier incoming
+    // authenticated Probe may otherwise select the receiver's exact winner
+    // before its first send and legitimately stop that scatter. Hold only
+    // these packets until both real outbound directions have been observed.
+    harness.link.set_hold_authenticated_punch(true);
     trigger_hard_hard_protocol_attempt(&harness).await;
-    let reports = wait_for_both_sweep_failures(&harness).await;
+    // One deadline covers setup and the original terminal-report wait.
+    let evidence_deadline = tokio::time::Instant::now() + HARD_HARD_E2E_TIMEOUT;
+    let reports = tokio::time::timeout_at(evidence_deadline, async {
+        loop {
+            let (a_to_b, b_to_a) = harness.link.held_authenticated_punch_counts();
+            if a_to_b > 0 && b_to_a > 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        harness.link.set_hold_authenticated_punch(false);
+        harness
+            .link
+            .release_held_authenticated_punches(&harness.udp_a, &harness.udp_b)
+            .await;
+        wait_for_both_sweep_failures(&harness).await
+    })
+    .await
+    .expect("both real sweeps and their failure reports must meet the original deadline");
     for report in reports {
         assert_eq!(report.mode, "predictable");
         assert!(

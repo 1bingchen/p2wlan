@@ -265,27 +265,6 @@ def _read_json(
         return None
 
 
-def _read_json_lines(
-    path: Path, findings: list[dict[str, str]], code: str
-) -> list[Any]:
-    values: list[Any] = []
-    try:
-        lines = path.read_text(encoding="utf-8").splitlines()
-    except (OSError, UnicodeDecodeError) as error:
-        findings.append({"code": code, "message": f"{path}: {error}"})
-        return values
-    for number, line in enumerate(lines, 1):
-        if not line.strip():
-            continue
-        try:
-            values.append(json.loads(line))
-        except json.JSONDecodeError as error:
-            findings.append(
-                {"code": code, "message": f"{path}:{number}: {error}"}
-            )
-    return values
-
-
 def _read_json_stream(
     path: Path, findings: list[dict[str, str]], code: str
 ) -> list[Any]:
@@ -372,11 +351,13 @@ def rust_summary(args: argparse.Namespace) -> dict[str, Any]:
     )
     root_vulns, root_warnings = _audit_counts(root_audit)
     fuzz_vulns, fuzz_warnings = _audit_counts(fuzz_audit)
-    root_deny = _read_json_lines(
-        args.root_deny, findings, "invalid_cargo_deny_jsonl"
+    from cargo_deny_report import read_output
+
+    root_deny = read_output(
+        args.root_deny, getattr(args, "root_deny_stderr", None), findings, "root"
     )
-    fuzz_deny = _read_json_lines(
-        args.fuzz_deny, findings, "invalid_cargo_deny_jsonl"
+    fuzz_deny = read_output(
+        args.fuzz_deny, getattr(args, "fuzz_deny_stderr", None), findings, "fuzz"
     )
     advisory_ignores = load_advisory_exception_contract(
         args.deny_config, args.advisory_exceptions, findings
@@ -419,9 +400,11 @@ def rust_summary(args: argparse.Namespace) -> dict[str, Any]:
                 "total": root_warnings + fuzz_warnings,
             },
             "cargo_deny_record_counts": {
-                "root": len(root_deny),
-                "fuzz": len(fuzz_deny),
+                "root": len(root_deny.records),
+                "fuzz": len(fuzz_deny.records),
             },
+            "cargo_deny_output_channels": {"root": root_deny.channels, "fuzz": fuzz_deny.channels},
+            "cargo_deny_completion_checks": {"root": root_deny.checks, "fuzz": fuzz_deny.checks},
             "advisory_exception_count": len(advisory_ignores),
             "advisory_exception_ids": advisory_exception_ids,
         },
@@ -437,9 +420,11 @@ def rust_summary(args: argparse.Namespace) -> dict[str, Any]:
             "total": root_warnings + fuzz_warnings,
         },
         cargo_deny_record_counts={
-            "root": len(root_deny),
-            "fuzz": len(fuzz_deny),
+            "root": len(root_deny.records),
+            "fuzz": len(fuzz_deny.records),
         },
+        cargo_deny_output_channels={"root": root_deny.channels, "fuzz": fuzz_deny.channels},
+        cargo_deny_completion_checks={"root": root_deny.checks, "fuzz": fuzz_deny.checks},
         advisory_exception_count=len(advisory_ignores),
         advisory_exception_ids=advisory_exception_ids,
         advisory_ignores=advisory_ignores,
@@ -640,6 +625,8 @@ def main() -> int:
     rust.add_argument("--fuzz-audit", type=Path, required=True)
     rust.add_argument("--root-deny", type=Path, required=True)
     rust.add_argument("--fuzz-deny", type=Path, required=True)
+    rust.add_argument("--root-deny-stderr", type=Path)
+    rust.add_argument("--fuzz-deny-stderr", type=Path)
     rust.add_argument("--deny-config", type=Path, required=True)
     rust.add_argument("--advisory-exceptions", type=Path, required=True)
     rust.add_argument("--root-audit-status", type=int, required=True)

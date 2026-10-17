@@ -107,9 +107,17 @@ CI 的通用 workspace 套件由 `scripts/quality/run_cargo_test.py` 执行一�
 
 Business MTU Linux 验证也使用该包装器：workspace 步骤显式传入 `--all-features`，保留原 feature 和 target 范围；`--hard-hard-lib` 固定执行 daemon lib 的 `hard_hard_` 子集，在同一个原生测试进程中串行运行，保留共享状态竞争覆盖。该模式拒绝与 `--all-targets` 或 `--all-features` 混用，零执行或仅 ignored 的成功输出不能通过。CI 其他 Hard↔Hard 精确选择器仍使用原来的隔离入口。
 
+Path State Machine 的 Linux workspace 步骤使用包装器的默认 target 范围，包含原 doctest；Hard↔Hard 步骤使用 `--hard-hard-lib`，保留同一进程中的串行共享状态覆盖。任一步骤失败时，CI 上传该次执行的源码、工具链、原退出状态、有界日志和可确定身份的原生失败程序，保留 7 天；采证不触发重跑，成功的采证不会覆盖原测试失败。
+
 证据目录必须是仓库外尚不存在的目录。原生测试失败时，仅从同一次 Cargo 的 compiler-artifact 与最终 Running 记录绑定程序，并校验文件身份、大小与摘要后留存实际字节。构建失败、doctest 未报告可执行文件、身份变化或容量超限时明确记录不可用，不扫描 target 猜测，也不重建旧失败产物。每条输出流最多归档 64 MiB、解析行最多 2 MiB、构建记录最多 512 个，失败程序最多 1 GiB；超限继续排空原 Cargo 输出，并使证据资格失败。通用 CI 与 Business MTU Linux 原生套件失败时上传上述证据；其他工作流和精确选择器需使用各自证据入口。
 
 原 Cargo 退出后，两条输出流合计最多等待 5 秒收尾，避免后代继承管道导致 EOF 永不抵达；这不改变测试运行期限。到期记录 `stream_not_closed_after_cargo_exit`，日志标为不完整，不宣称最终摘要或已绑定的失败程序。泵线程停止接受新数据，残留阻塞读取随包装器进程退出关闭；不等待不归包装器直接所有的后代，也不向它们发送信号。原 Cargo 非零退出码仍保留；原退出为零而采证失败时包装器失败。
+
+## 依赖审计输出
+
+Rust 依赖摘要由 `scripts/security/dependency_reports.py` 的 `rust` 子命令生成。工作流分别保留 cargo-deny 的 stdout 与 stderr，并通过 `--root-deny-stderr`、`--fuzz-deny-stderr` 一起提交诊断；有效的 stdout-only JSON 输出也可使用。摘要分别记录两条输出流的记录数量及 advisories、bans、licenses、sources 完成计数，不推断跨流时间顺序。
+
+每套依赖图必须有且只有一份覆盖上述四项的完成总结。输出为空、无法解析、记录结构不完整、含错误诊断或总结报告错误时，即使工具退出状态为零也不能通过。重复版本等警告仍按 `deny.toml` 原策略分类，不添加豁免。每套图两条流合计最多读取 16 MiB 和 65,536 条非空记录，单条 JSON 的容器嵌套最多 256 层；字符串中的括号不计入嵌套。超限使证据失败，不把截断内容当作完整扫描结果。
 
 ## 变更审查
 

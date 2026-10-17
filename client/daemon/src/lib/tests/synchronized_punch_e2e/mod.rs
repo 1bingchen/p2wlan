@@ -1,5 +1,4 @@
-// Split out of the former flat include!-ed test file so the module is a
-// real Rust scope. Everything below is unchanged test code.
+// Shared real-UDP Hard/Hard end-to-end harness and lifecycle assertions.
 use super::*;
 use std::fs;
 use std::path::PathBuf;
@@ -1058,16 +1057,23 @@ impl NatPacketLink {
         self.hold_authenticated_punch.store(hold, Ordering::Release);
     }
 
-    fn held_authenticated_punch_count(&self) -> usize {
-        self.held_punch_a_to_b
+    fn held_authenticated_punch_counts(&self) -> (usize, usize) {
+        let a_to_b = self
+            .held_punch_a_to_b
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .len()
-            + self
-                .held_punch_b_to_a
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .len()
+            .unwrap_or_else(|p| p.into_inner())
+            .len();
+        let b_to_a = self
+            .held_punch_b_to_a
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .len();
+        (a_to_b, b_to_a)
+    }
+
+    fn held_authenticated_punch_count(&self) -> usize {
+        let (a_to_b, b_to_a) = self.held_authenticated_punch_counts();
+        a_to_b + b_to_a
     }
 
     async fn release_held_authenticated_punches(&self, udp_a: &UdpTransport, udp_b: &UdpTransport) {
@@ -1193,6 +1199,7 @@ struct TwoPeerHarness {
     signals_b: Arc<StdMutex<Vec<TestControlSignal>>>,
     signal_hook_a_to_b: Arc<StdMutex<Option<TestSignalHook>>>,
     signal_hook_b_to_a: Arc<StdMutex<Option<TestSignalHook>>>,
+    signal_post_hook_b_to_a: TestSignalHookSlot,
     shutdown_a: watch::Sender<bool>,
     shutdown_b: watch::Sender<bool>,
     control_tasks: Vec<tokio::task::JoinHandle<()>>,
@@ -1208,6 +1215,12 @@ struct TwoPeerHarness {
 }
 
 type TestSignalHook = Arc<dyn Fn(&TestControlSignal) + Send + Sync>;
+type TestSignalHookSlot = Arc<StdMutex<Option<TestSignalHook>>>;
+
+struct TestSignalHooks {
+    before_enqueue: TestSignalHookSlot,
+    after_enqueue: TestSignalHookSlot,
+}
 
 impl TwoPeerHarness {
     async fn shutdown(mut self) {
@@ -1371,9 +1384,13 @@ fn install_signal_forwarder(
     from_node_id: &str,
     from_public_key: String,
     log: Arc<StdMutex<Vec<TestControlSignal>>>,
-    signal_hook: Arc<StdMutex<Option<TestSignalHook>>>,
+    signal_hooks: TestSignalHooks,
     advance_clock_on_response: bool,
 ) {
+    let TestSignalHooks {
+        before_enqueue,
+        after_enqueue,
+    } = signal_hooks;
     let event_tx = to.control.event_sender();
     let expected_to_node_id = to.config.node.node_id.clone();
     let from_node_id = from_node_id.to_string();
@@ -1392,11 +1409,11 @@ fn install_signal_forwarder(
                     set_hard_hard_test_now_ms(Some(punch_at_ms));
                 }
             }
-            if let Some(hook) = signal_hook
+            let before_hook = before_enqueue
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .clone()
-            {
+                .clone();
+            if let Some(hook) = before_hook {
                 hook(&signal);
             }
             let logged_signal = signal.clone();
@@ -1419,7 +1436,14 @@ fn install_signal_forwarder(
             // original response.
             log.lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .push(logged_signal);
+                .push(logged_signal.clone());
+            let after_hook = after_enqueue
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone();
+            if let Some(hook) = after_hook {
+                hook(&logged_signal);
+            }
         }),
     );
 }
@@ -1624,13 +1648,18 @@ async fn build_two_peer_harness_with_stun_mode(
     let signals_b = Arc::new(StdMutex::new(Vec::new()));
     let signal_hook_a_to_b = Arc::new(StdMutex::new(None));
     let signal_hook_b_to_a = Arc::new(StdMutex::new(None));
+    let signal_post_hook_a_to_b = Arc::new(StdMutex::new(None));
+    let signal_post_hook_b_to_a = Arc::new(StdMutex::new(None));
     install_signal_forwarder(
         &mut daemon_a,
         &daemon_b,
         HARD_HARD_A,
         a_public_key,
         signals_b.clone(),
-        signal_hook_a_to_b.clone(),
+        TestSignalHooks {
+            before_enqueue: signal_hook_a_to_b.clone(),
+            after_enqueue: signal_post_hook_a_to_b,
+        },
         advance_clock_on_response,
     );
     install_signal_forwarder(
@@ -1639,7 +1668,10 @@ async fn build_two_peer_harness_with_stun_mode(
         HARD_HARD_B,
         b_public_key,
         signals_a.clone(),
-        signal_hook_b_to_a.clone(),
+        TestSignalHooks {
+            before_enqueue: signal_hook_b_to_a.clone(),
+            after_enqueue: signal_post_hook_b_to_a.clone(),
+        },
         advance_clock_on_response,
     );
 
@@ -1752,6 +1784,7 @@ async fn build_two_peer_harness_with_stun_mode(
         signals_b,
         signal_hook_a_to_b,
         signal_hook_b_to_a,
+        signal_post_hook_b_to_a,
         shutdown_a,
         shutdown_b,
         control_tasks: vec![control_task_a, control_task_b],
@@ -2650,4 +2683,5 @@ async fn build_hard_hard_ordinary_fallback_fixture_with_policy(
     (daemon, peers, udp, control)
 }
 
+mod early_probe;
 mod scenarios;

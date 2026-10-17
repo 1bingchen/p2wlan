@@ -72,12 +72,25 @@ jobs:
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
       - name: Cargo workspace tests except Hard-Hard E2E
+        id: general_tests
         env:
           RUST_TEST_THREADS: "1"
-        run: cargo test --workspace -- --test-threads=1 --skip hard_hard_
+        run: python3 scripts/quality/run_cargo_test.py --evidence-dir "${{ runner.temp }}/p2wlan-path-general"
 
       - name: Hard-Hard E2E tests
-        run: cargo test -p p2wlan-daemon --lib hard_hard_ -- --test-threads=1
+        id: hard_hard_tests
+        run: python3 scripts/quality/run_cargo_test.py --hard-hard-lib --evidence-dir "${{ runner.temp }}/p2wlan-path-hard-hard"
+
+      - name: Retain original Path Rust failure
+        if: ${{ failure() && (steps.general_tests.outcome == 'failure' || steps.hard_hard_tests.outcome == 'failure') }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: path-rust-first-failure-linux-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/p2wlan-path-general/
+            ${{ runner.temp }}/p2wlan-path-hard-hard/
+          if-no-files-found: error
+          retention-days: 7
 
   windows_path_state_machine:
     name: Path state machine Windows tests

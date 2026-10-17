@@ -69,7 +69,7 @@ jobs:
 
       - name: Upload repository-policy evidence
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: security-audit-policy-${{ github.run_id }}
           path: ${{ runner.temp }}/security-policy/
@@ -158,7 +158,7 @@ jobs:
 
       - name: Upload Rust audit evidence
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: security-audit-rust-${{ github.run_id }}
           path: ${{ runner.temp }}/security-rust/
@@ -229,7 +229,7 @@ jobs:
 
       - name: Upload Go audit evidence
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: security-audit-go-${{ github.run_id }}
           path: ${{ runner.temp }}/security-go/
@@ -320,7 +320,7 @@ jobs:
 
       - name: Upload Flutter audit evidence
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: security-audit-flutter-${{ github.run_id }}
           path: ${{ runner.temp }}/security-flutter/
@@ -428,7 +428,7 @@ jobs:
 
       - name: Upload release verification evidence
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: security-audit-release-${{ github.run_id }}
           path: ${{ runner.temp }}/security-release/
@@ -467,7 +467,7 @@ jobs:
       - name: Download repository-policy evidence
         id: download_policy
         if: always()
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
         with:
           name: security-audit-policy-${{ github.run_id }}
           path: ${{ runner.temp }}/security-audit-components
@@ -475,7 +475,7 @@ jobs:
       - name: Download Rust evidence
         id: download_rust
         if: always()
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
         with:
           name: security-audit-rust-${{ github.run_id }}
           path: ${{ runner.temp }}/security-audit-components
@@ -483,7 +483,7 @@ jobs:
       - name: Download Go evidence
         id: download_go
         if: always()
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
         with:
           name: security-audit-go-${{ github.run_id }}
           path: ${{ runner.temp }}/security-audit-components
@@ -491,7 +491,7 @@ jobs:
       - name: Download Flutter evidence
         id: download_flutter
         if: always()
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
         with:
           name: security-audit-flutter-${{ github.run_id }}
           path: ${{ runner.temp }}/security-audit-components
@@ -499,7 +499,7 @@ jobs:
       - name: Download release evidence
         id: download_release
         if: always()
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
         with:
           name: security-audit-release-${{ github.run_id }}
           path: ${{ runner.temp }}/security-audit-components
@@ -535,7 +535,7 @@ jobs:
 
       - name: Upload aggregate evidence
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: security-audit-evidence-${{ github.run_id }}
           path: ${{ runner.temp }}/security-audit-evidence.json

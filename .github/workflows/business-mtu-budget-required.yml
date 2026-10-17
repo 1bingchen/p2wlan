@@ -118,7 +118,7 @@ jobs:
 
       - name: Retain original failed Linux test program
         if: failure() && (steps.workspace_tests.outcome == 'failure' || steps.hard_hard_tests.outcome == 'failure')
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: business-mtu-linux-failure-${{ env.P2WLAN_VALIDATION_SHA }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
@@ -169,7 +169,7 @@ jobs:
 
       - name: Upload production-path evidence
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: business-mtu-e2e-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.replica }}-of-5
           path: ${{ runner.temp }}/business-mtu-e2e-${{ matrix.replica }}.log

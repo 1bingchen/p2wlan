@@ -112,7 +112,7 @@ jobs:
             2>&1 | tee "$RUNNER_TEMP/p2wlan-final-owned-tcp.log"
       - name: Preserve original native fixture artifacts and output
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: nat-final-native-capture-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
@@ -137,7 +137,7 @@ jobs:
         run: bash scripts/nat-sim/run-ci-topology.sh unit
       - name: Upload unit evidence
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: nat-topology-unit-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/p2wlan-nat-topology-*.log
@@ -172,7 +172,7 @@ jobs:
         run: bash scripts/nat-sim/run-ci-topology.sh direct
       - name: Upload Direct evidence
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: nat-topology-direct-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
@@ -221,7 +221,7 @@ jobs:
         run: bash scripts/nat-sim/run-ci-topology.sh relay
       - name: Upload Relay evidence
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: nat-topology-relay-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.run }}-of-5
           path: |
@@ -253,7 +253,7 @@ jobs:
         run: bash scripts/nat-sim/run-ci-topology.sh fail-closed
       - name: Upload failure-injection evidence
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: nat-topology-fail-closed-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
@@ -291,7 +291,7 @@ jobs:
       - name: Download every Direct attempt of this run
         id: download_direct
         if: always()
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
         with:
           # Every attempt is fetched so a partial re-run can still be
           # aggregated and so a failing attempt stays available afterwards.
@@ -302,7 +302,7 @@ jobs:
       - name: Download every Relay attempt of this run
         id: download_relay
         if: always()
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
         with:
           pattern: nat-topology-relay-${{ github.run_id }}-*-of-5
           path: ${{ runner.temp }}/nat-topology-artifacts
@@ -334,7 +334,7 @@ jobs:
 
       - name: Upload actual-execution NAT aggregate
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: nat-topology-aggregate-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/nat-topology-aggregate.json

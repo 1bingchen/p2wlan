@@ -221,7 +221,7 @@ jobs:
         run: bash scripts/dplpmtud/run_acceptance.sh "$RUNNER_TEMP/p2wlan-dplpmtud-live"
       - name: Upload live component evidence
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: dplpmtud-live-component-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/p2wlan-dplpmtud-live/**
@@ -324,7 +324,7 @@ jobs:
       - name: Download every live component attempt of this run
         id: download
         if: always()
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
         with:
           # A partial re-run uploads nothing new: the component artifact stays
           # under the attempt that produced it. Fetch every attempt of this run
@@ -377,7 +377,7 @@ jobs:
             --output "$RUNNER_TEMP/dplpmtud-aggregate.json"
       - name: Upload DPLPMTUD aggregate
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: dplpmtud-aggregate-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/dplpmtud-aggregate.json

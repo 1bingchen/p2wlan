@@ -22,6 +22,8 @@ use std::time::Instant;
 #[cfg(unix)]
 mod control_lock;
 mod full;
+#[cfg(any(target_os = "linux", all(unix, test)))]
+mod full_completion;
 mod full_loss;
 #[cfg(unix)]
 use control_lock::ControlState as RegistryMutex;
@@ -55,6 +57,8 @@ pub(crate) struct CaptureSession {
     read_complete: AtomicBool,
     full_complete: AtomicBool,
     full_loss: FullRetentionLoss,
+    #[cfg(any(target_os = "linux", all(unix, test)))]
+    pending_full: full_completion::CompletionSignal,
     expires: Instant,
     peers: Weak<PeerManager>,
     #[cfg(unix)]
@@ -73,7 +77,6 @@ struct RegistryState {
     flows: Vec<FlowState>,
     original_device: Option<Arc<KernelRead>>,
     system_device: Option<Weak<DeviceLease>>,
-    full_history: full::FullHistory,
     // Actual original read order includes unresolved and failed publications.
     // A later duplicate Full cannot replace an earlier uncertain producer.
     read_history: Vec<Arc<KernelReadBinding>>,
@@ -122,7 +125,9 @@ pub(crate) struct KernelReadBinding {
     plan: Arc<RegisteredFlowPlan>,
     spans: Vec<full::ReadFrameSpan>,
     physical_publication: crate::overlay_requests::PhysicalSendPublication,
-    full_retained_ns: OnceLock<u64>,
+    full_retained_ns: AtomicU64,
+    #[cfg(any(target_os = "linux", all(unix, test)))]
+    full_completion_pending: AtomicBool,
     original_publication_ns: OnceLock<u64>,
     original_peers: Vec<Arc<read_peer::FirstReadPeer>>,
     original_responses: Vec<Arc<ingress::ResponseCapture>>,
@@ -221,6 +226,7 @@ impl CaptureSession {
             read_complete: AtomicBool::new(true),
             full_complete: AtomicBool::new(true),
             full_loss: FullRetentionLoss::new(),
+            pending_full: full_completion::CompletionSignal::new(),
             expires,
             peers: Arc::downgrade(peers),
             capture_id: plan.capture_id,
@@ -232,7 +238,6 @@ impl CaptureSession {
                 flows: Vec::new(),
                 original_device: None,
                 system_device: None,
-                full_history: full::FullHistory::new(),
                 read_history: Vec::new(),
                 inbound_history: ingress::InboundHistory::new(),
                 requests: 0,
@@ -569,7 +574,9 @@ impl CaptureSession {
             plan,
             spans,
             physical_publication: crate::overlay_requests::PhysicalSendPublication::new(),
-            full_retained_ns: OnceLock::new(),
+            full_retained_ns: AtomicU64::new(0),
+            #[cfg(any(target_os = "linux", all(unix, test)))]
+            full_completion_pending: AtomicBool::new(false),
             original_publication_ns: OnceLock::new(),
             original_peers,
             original_responses,
@@ -637,7 +644,8 @@ impl CaptureSession {
                     flow_invalid: flow.invalid,
                     historical_frame_full_complete: self.full_complete.load(Ordering::Acquire)
                         && !flow.invalid
-                        && state.full_history.frame_complete(
+                        && full::frame_complete(
+                            &state.read_history,
                             flow_index,
                             key.sequence as usize,
                             plan,
@@ -698,7 +706,7 @@ impl CaptureSession {
             active: self.is_live(Instant::now()),
             gaps: self.gaps.load(Ordering::Relaxed),
             requests,
-            historical_full_packets: state.full_history.snapshot(),
+            historical_full_packets: full::snapshot(&state.read_history),
             system_tun_full_writes: state.inbound_history.snapshot(),
             // Registration alone leaves these false. Only the sole native
             // current-owner/once transaction can make every frame verified;

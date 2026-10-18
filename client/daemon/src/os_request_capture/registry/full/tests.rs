@@ -3,7 +3,7 @@ use super::*;
 use crate::os_request_capture::plan::RegistrationPlan;
 use serde_json::json;
 
-async fn descriptor_scope() -> (
+pub(in crate::os_request_capture::registry) async fn descriptor_scope() -> (
     crate::os_request_capture::control::CaptureSetup,
     std::os::unix::net::UnixStream,
 ) {

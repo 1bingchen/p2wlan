@@ -167,7 +167,7 @@ impl OriginalKernelExchange {
                         index,
                         read.spans.as_slice(),
                         read.physical_publication.state(),
-                        read.full_retained_ns.get().is_some(),
+                        read.full_observed_ns().is_some(),
                     )
                 }),
         )?
@@ -305,7 +305,7 @@ impl OriginalKernelExchange {
                     .is_none_or(|at| !self.window.contains(*at))
                 || !self
                     .window
-                    .contains(*read.full_retained_ns.get().ok_or(unknown())?)
+                    .contains(read.full_observed_ns().ok_or(unknown())?)
             {
                 return Err(Outcome::Stale(Stale::OriginalWindow));
             }

@@ -11,12 +11,14 @@ use tokio::sync::Notify;
 pub(super) struct ControlState<T> {
     inner: Mutex<T>,
     changed: Notify,
+    completion_released: Notify,
     waiting: AtomicBool,
 }
 
 pub(super) struct StateGuard<'a, T> {
     inner: Option<MutexGuard<'a, T>>,
     changed: &'a Notify,
+    completion_released: &'a Notify,
 }
 
 struct Waiter<'a>(&'a AtomicBool);
@@ -32,6 +34,7 @@ impl<T> ControlState<T> {
         Self {
             inner: Mutex::new(value),
             changed: Notify::new(),
+            completion_released: Notify::new(),
             waiting: AtomicBool::new(false),
         }
     }
@@ -40,6 +43,7 @@ impl<T> ControlState<T> {
         StateGuard {
             inner: Some(inner),
             changed: &self.changed,
+            completion_released: &self.completion_released,
         }
     }
 
@@ -51,6 +55,11 @@ impl<T> ControlState<T> {
                 self.wrap(error.into_inner()),
             ))),
         }
+    }
+
+    #[cfg(any(target_os = "linux", all(unix, test)))]
+    pub(super) async fn completion_released(&self) {
+        self.completion_released.notified().await;
     }
 
     #[cfg(test)]
@@ -117,6 +126,9 @@ impl<T> Drop for StateGuard<'_, T> {
         drop(self.inner.take());
         // Waking can call an executor's waker; release the metadata first.
         self.changed.notify_one();
+        // A distinct listener cannot consume the original command waiter's
+        // release notification. Neither wake grants any native permission.
+        self.completion_released.notify_one();
     }
 }
 

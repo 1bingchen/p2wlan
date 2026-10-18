@@ -12,6 +12,8 @@ use std::sync::Arc;
 const FD_ENV: &str = "P2WLAN_OS_REQUEST_CONTROL_FD";
 const SOCKET_ENV: &str = "P2WLAN_OS_REQUEST_CONTROL_SOCKET";
 #[cfg(unix)]
+mod completion;
+#[cfg(unix)]
 mod deadline;
 
 /// Select envelope capacity before constructing the original transport.
@@ -281,11 +283,12 @@ impl ControlChannel {
             if tokio::time::Instant::now() >= end {
                 return Ok(());
             }
-            let line = match read_line(
+            let line = match completion::next_line(
                 &mut self.stream,
                 &mut self.pending,
                 &mut self.input_bytes,
                 end,
+                &self.session,
             )
             .await
             {

@@ -29,6 +29,8 @@ const RELAY_TICKET_REFRESH_MARGIN_SECS: i64 = 60;
 
 mod original_member;
 pub(crate) use original_member::RelayMemberFailure;
+#[cfg(any(target_os = "linux", all(unix, test)))]
+pub(crate) use original_member::RelayMemberGuard;
 mod read_origin;
 pub(crate) use read_origin::RelayReadItem;
 mod send_origin;

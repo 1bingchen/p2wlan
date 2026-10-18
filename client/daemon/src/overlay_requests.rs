@@ -31,8 +31,12 @@ pub(crate) use ack_credit::{
     OverlayCreditStale, OverlayCreditUnknown,
 };
 pub(crate) use echo_origin::{OriginalEchoInput, OriginalEchoPrewrite};
+#[cfg(any(target_os = "linux", all(unix, test)))]
+pub(crate) use send_publication::OriginalNonDeliveryFence;
 #[cfg(test)]
-pub(crate) use send_publication::{PhysicalInputQualification, PhysicalPublicationState};
+pub(crate) use send_publication::PhysicalInputQualification;
+#[cfg(any(target_os = "linux", test))]
+pub(crate) use send_publication::PhysicalPublicationState;
 pub(crate) use send_publication::{
     PhysicalRequestPublisher, PhysicalSendPublication, PhysicalSendRecord,
     PreparedPhysicalPublication,
@@ -136,10 +140,10 @@ impl RequestSendToken {
         match context.downcast::<Self>() {
             Ok(token) => Some(*token),
             Err(context) => context
-                .downcast::<crate::os_request_capture::KernelReadBinding>()
+                .downcast::<Arc<crate::os_request_capture::KernelReadBinding>>()
                 .ok()
                 .map(|binding| Self {
-                    identity: RequestIdentity::Kernel(Arc::new(*binding)),
+                    identity: RequestIdentity::Kernel(*binding),
                 }),
         }
     }

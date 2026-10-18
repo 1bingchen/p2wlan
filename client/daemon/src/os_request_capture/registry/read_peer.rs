@@ -19,6 +19,11 @@ pub(super) struct ReadPeerSnapshot {
 }
 
 impl FirstReadPeer {
+    #[cfg(any(target_os = "linux", all(unix, test)))]
+    pub(super) fn original(&self) -> Result<&OriginalKernelReadPeer, OverlayCreditOutcome> {
+        self.original.as_ref().map_err(|reason| *reason)
+    }
+
     pub(super) fn is_known(&self) -> bool {
         self.original.is_ok()
     }

@@ -211,7 +211,24 @@ impl UdpTransport {
         received: Option<&OriginalUdpIngressSource>,
         sent: Option<&UdpFullSendFact>,
     ) -> Result<DirectOriginPublicationGuard<'_>, DirectOriginFailure> {
-        self.try_original_direct_publication_guard_with_prepared(
+        self.try_original_direct_publication_batch_guard(
+            peer,
+            generation,
+            received.as_slice(),
+            sent.as_slice(),
+        )
+    }
+
+    /// All fragments share one acquisition of the original socket/publication
+    /// owners. Calling the single-packet guard repeatedly would self-contend.
+    pub(crate) fn try_original_direct_publication_batch_guard(
+        &self,
+        peer: &str,
+        generation: u64,
+        received: &[&OriginalUdpIngressSource],
+        sent: &[&UdpFullSendFact],
+    ) -> Result<DirectOriginPublicationGuard<'_>, DirectOriginFailure> {
+        self.try_original_direct_publication_batch_with_prepared(
             peer, generation, received, sent, None,
         )
     }
@@ -224,14 +241,36 @@ impl UdpTransport {
         sent: Option<&UdpFullSendFact>,
         prepared: Option<&super::PreparedDirectBusinessSend>,
     ) -> Result<DirectOriginPublicationGuard<'_>, DirectOriginFailure> {
-        if (received.is_none() && sent.is_none())
-            || sent.is_some_and(|fact| fact.fence() == UdpSendFence::LegacyUnknown)
+        self.try_original_direct_publication_batch_with_prepared(
+            peer,
+            generation,
+            received.as_slice(),
+            sent.as_slice(),
+            prepared,
+        )
+    }
+
+    fn try_original_direct_publication_batch_with_prepared(
+        &self,
+        peer: &str,
+        generation: u64,
+        received: &[&OriginalUdpIngressSource],
+        sent: &[&UdpFullSendFact],
+        prepared: Option<&super::PreparedDirectBusinessSend>,
+    ) -> Result<DirectOriginPublicationGuard<'_>, DirectOriginFailure> {
+        if (received.is_empty() && sent.is_empty())
+            || sent
+                .iter()
+                .any(|fact| fact.fence() == UdpSendFence::LegacyUnknown)
         {
             return Err(DirectOriginFailure::Unknown);
         }
         // Do not call the legacy blocking membership predicate under our UDP
         // locks. Unknown membership can never be an unsupported/legacy bypass.
-        let lan_capable = if sent.is_some_and(|fact| fact.fence() == UdpSendFence::LanPublication) {
+        let lan_capable = if sent
+            .iter()
+            .any(|fact| fact.fence() == UdpSendFence::LanPublication)
+        {
             match self.peers.try_peer_dplpmtud_capability(peer) {
                 crate::peer::PeerDplpmtudCapability::Contended => {
                     return Err(DirectOriginFailure::ContendedMembership)
@@ -246,8 +285,8 @@ impl UdpTransport {
             false
         };
         let dynamic = |index| index >= DYNAMIC_SOCKET_INDEX_BASE && index != IPV6_SOCKET_INDEX;
-        let sockets = if received.is_some_and(|fact| dynamic(fact.socket_index))
-            || sent.is_some_and(|fact| dynamic(fact.socket_index()))
+        let sockets = if received.iter().any(|fact| dynamic(fact.socket_index))
+            || sent.iter().any(|fact| dynamic(fact.socket_index()))
             || prepared.is_some_and(|prepared| dynamic(prepared.socket_index))
         {
             Some(
@@ -285,7 +324,7 @@ impl UdpTransport {
                 self.active_sockets().get(index)
             }
         };
-        if let Some(fact) = received {
+        for fact in received {
             if !fact.belongs_to_transport(self)
                 || fact.publication_owner != owner
                 || fact.network_generation != generation
@@ -309,7 +348,7 @@ impl UdpTransport {
                 return Err(DirectOriginFailure::Stale);
             }
         }
-        if let Some(fact) = sent {
+        for fact in sent {
             if !fact.belongs_to_registry(self)
                 || fact.transport_instance() != self.transport_instance_id()
                 || fact.publication_owner() != Some(owner)

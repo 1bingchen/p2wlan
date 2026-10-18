@@ -22,6 +22,14 @@ impl Daemon {
         };
         if let Some(mut tun) = tun {
             let room_authorization = self.control.room_authorization().await;
+            if let Some(setup) = &capture_setup {
+                setup.session.bind_original_current_owners(
+                    &self.transport,
+                    &self.udp_transport,
+                    &self.relay_transport,
+                    &room_authorization,
+                );
+            }
             let kernel_runtime = capture_setup
                 .as_ref()
                 .map(|setup| setup.session.inbound_runtime(&room_authorization));

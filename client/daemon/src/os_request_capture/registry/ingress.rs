@@ -81,6 +81,7 @@ pub(super) struct WriteSnapshot {
     packet_sha256: String,
     network_generation: Option<u64>,
     session_instance: u64,
+    peer_lifecycle: Option<u64>,
     original_session_role: &'static str,
     original_room_captured: Vec<bool>,
     original_room_restricted: Vec<bool>,
@@ -175,7 +176,19 @@ impl CaptureSession {
                 .write
                 .set(original)
                 .map_err(|_| CaptureFailure::DuplicateWrite)?;
+            #[cfg(any(target_os = "linux", all(unix, test)))]
+            let (flow, count, mut slots) = (
+                binding.flow,
+                binding.spans.len(),
+                [0; MAX_BINDINGS_PER_PACKET],
+            );
+            #[cfg(any(target_os = "linux", all(unix, test)))]
+            for (slot, span) in slots.iter_mut().zip(&binding.spans) {
+                *slot = span.slot();
+            }
             state.inbound_history.writes.push(binding);
+            #[cfg(any(target_os = "linux", all(unix, test)))]
+            self.try_complete_original_frames(&mut state, flow, &slots[..count]);
             Ok(())
         };
         if retain().is_err() {
@@ -405,6 +418,31 @@ impl KernelCaptureRuntime {
     }
 }
 
+#[cfg(any(target_os = "linux", all(unix, test)))]
+impl KernelIngressBinding {
+    pub(crate) fn original_source(&self) -> &OriginalOverlayIngressSource {
+        &self.source
+    }
+    pub(super) fn original_write(&self) -> Option<&KernelWrite> {
+        self.write.get()
+    }
+    pub(super) fn frame_spans(&self) -> &[ReadFrameSpan] {
+        &self.spans
+    }
+    pub(super) fn frame_flow(&self) -> usize {
+        self.flow
+    }
+    pub(super) fn original_rooms(&self) -> &[Arc<OriginalIncomingRoom>] {
+        &self.original_rooms
+    }
+    pub(super) fn original_scope(&self) -> &Weak<CaptureSession> {
+        &self.scope
+    }
+    pub(super) fn authenticated_ns(&self) -> Option<u64> {
+        self.authenticated_observed_monotonic_ns
+    }
+}
+
 impl KernelIngressBinding {
     fn exact_input(&self, scope: &CaptureSession, packet: &[u8], at: Instant) -> bool {
         scope.is_live(at)
@@ -438,6 +476,10 @@ impl KernelIngressBinding {
 }
 
 impl InboundHistory {
+    #[cfg(any(target_os = "linux", all(unix, test)))]
+    pub(super) fn original_packets(&self) -> &[Arc<KernelIngressBinding>] {
+        &self.writes
+    }
     #[cfg(any(target_os = "linux", all(unix, test)))]
     pub(super) fn new() -> Self {
         Self { writes: Vec::new() }
@@ -478,6 +520,11 @@ impl InboundHistory {
                     packet_sha256: hex::encode(binding.packet_sha256),
                     network_generation: binding.source.network_generation(),
                     session_instance: binding.source.session().session_instance(),
+                    peer_lifecycle: binding
+                        .source
+                        .session()
+                        .authorized_peer_lifecycle()
+                        .map(|life| life.value()),
                     original_session_role: match binding.source.session().original_role() {
                         OriginalSessionRole::Active => "active",
                         OriginalSessionRole::Pending => "pending",

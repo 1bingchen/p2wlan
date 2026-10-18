@@ -33,6 +33,12 @@ pub(super) struct WriteWindow {
     canonical_current_owner_verified: bool,
 }
 
+impl WriteWindow {
+    pub(super) fn contains(&self, now: u64) -> bool {
+        self.original_sent_ns <= now && now < self.original_deadline_ns
+    }
+}
+
 impl WireWriteWindow {
     /// Both daemon endpoints receive the initiator's original REQUEST write
     /// window. Match its exact tool bytes, including the full run/round/nonce
@@ -111,7 +117,7 @@ impl CaptureSession {
     /// Only an already-owned control channel can deliver this observation.
     /// Receipt before the existing deadline is mandatory; no fresh clock starts.
     pub(in crate::os_request_capture) fn observe_original_write_window(
-        &self,
+        self: &Arc<Self>,
         wire: WireWriteWindow,
     ) -> Result<(), CaptureFailure> {
         let now = monotonic_ns().ok_or(CaptureFailure::InvalidPlan)?;
@@ -131,8 +137,9 @@ impl CaptureSession {
         let mut flows = state
             .flows
             .iter_mut()
-            .filter(|f| f.producer_scope == producer);
-        let flow = flows.next().ok_or(CaptureFailure::InvalidPlan)?;
+            .enumerate()
+            .filter(|(_, f)| f.producer_scope == producer);
+        let (flow_index, flow) = flows.next().ok_or(CaptureFailure::InvalidPlan)?;
         if flows.next().is_some() || flow.requests.len() != 8 || flow.plan.payload_bytes != 128 {
             return Err(CaptureFailure::InvalidPlan);
         }
@@ -175,6 +182,8 @@ impl CaptureSession {
             native_os_write_verified: false,
             canonical_current_owner_verified: false,
         });
+        let slot = wire.sequence as usize;
+        self.try_complete_original_frames(&mut state, flow_index, &[slot]);
         Ok(())
     }
 }

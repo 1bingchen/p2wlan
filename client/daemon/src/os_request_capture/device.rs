@@ -130,6 +130,12 @@ impl SystemTun {
     }
 
     pub(crate) fn with_capture(mut self, capture: Arc<CaptureSession>) -> Self {
+        // A live concrete owner cannot be rebound to a new capture lease.
+        // Retained weak read/write sources must never inherit another scope.
+        if self.capture.is_some() || self.device.is_some() {
+            capture.retire();
+            return self;
+        }
         if self.created_system_device {
             let device = Arc::new(DeviceLease {
                 live: AtomicBool::new(true),

@@ -12,7 +12,7 @@ use std::time::Instant;
 
 // One scope, at most 1000 registered requests, and an independent packet-fact
 // capacity. Fragmentation/retransmission cannot grow retained metadata forever.
-const MAX_FULL_PACKETS: usize = 1024;
+pub(super) const MAX_FULL_PACKETS: usize = 1024;
 const MAX_FRAME_WIRE_BYTES: usize = 1204;
 
 /// A negative observation guard, never a Full or current-owner permission.
@@ -83,6 +83,7 @@ impl ReadFrameSpan {
     }
 }
 
+#[derive(Clone)]
 pub(super) struct FrameSpanCoverage {
     slot: usize,
     length: usize,
@@ -162,12 +163,14 @@ pub(super) struct FullPacketSnapshot {
     read_ordinal: u64,
     read_monotonic_ns: u64,
     full_observed_monotonic_ns: u64,
+    publication_observed_monotonic_ns: Option<u64>,
     packet_len: usize,
     packet_sha256: String,
     spans: Vec<ReadFrameSpan>,
     attempt_id: u64,
     encryption_generation: u64,
     encryption_session_instance: u64,
+    encryption_peer_lifecycle: Option<u64>,
     physical_path: &'static str,
 }
 
@@ -209,6 +212,9 @@ impl FullHistory {
             read: read.clone(),
             observed_monotonic_ns,
         });
+        read.full_retained_ns
+            .set(observed_monotonic_ns)
+            .map_err(|_| CaptureFailure::InvalidPlan)?;
         Ok(())
     }
 
@@ -241,12 +247,17 @@ impl FullHistory {
                     read_ordinal: read.read.ordinal(),
                     read_monotonic_ns: read.read.monotonic_ns(),
                     full_observed_monotonic_ns: packet.observed_monotonic_ns,
+                    publication_observed_monotonic_ns: read.original_publication_ns.get().copied(),
                     packet_len: read.packet_len,
                     packet_sha256: hex::encode(read.packet_sha256),
                     spans: read.spans.clone(),
                     attempt_id: record.attempt_id(),
                     encryption_generation: record.encryption_generation(),
                     encryption_session_instance: record.encryption().session_instance(),
+                    encryption_peer_lifecycle: record
+                        .encryption()
+                        .authorized_peer_lifecycle()
+                        .map(|life| life.value()),
                     physical_path: if record.udp().is_some() {
                         "udp"
                     } else {
@@ -259,6 +270,18 @@ impl FullHistory {
 }
 
 impl KernelReadBinding {
+    /// The sole actual Full producer calls this just before publishing its
+    /// Instant observation. This clock precedes that boundary; later retention
+    /// time is a different upper bound and must not stand in for publication.
+    pub(crate) fn observe_original_publication_clock(&self) {
+        let saved = monotonic_ns()
+            .filter(|at| *at != 0)
+            .is_some_and(|at| self.original_publication_ns.set(at).is_ok());
+        if !saved {
+            self.original_full_retention_lost();
+        }
+    }
+
     pub(crate) fn original_full_observation(&self) -> OriginalFullObservation {
         OriginalFullObservation {
             scope: self.scope.clone(),
@@ -319,7 +342,10 @@ impl KernelReadBinding {
                 .state
                 .try_lock()
                 .map_err(|_| CaptureFailure::Contended)?;
-            state.full_history.retain(self, observed)
+            state.full_history.retain(self, observed)?;
+            #[cfg(any(target_os = "linux", all(unix, test)))]
+            scope.try_complete_original_frames(&mut state, self.flow, &self.slots);
+            Ok(())
         };
         if retain().is_err() {
             scope.original_full_retention_lost();

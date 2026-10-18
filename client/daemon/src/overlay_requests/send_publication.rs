@@ -49,7 +49,37 @@ pub(crate) struct PhysicalSendPublication {
     #[cfg(test)]
     recorded_observation_hook: std::sync::Mutex<Option<Box<dyn FnOnce() + Send + 'static>>>,
 }
+
+/// Captured only from the original producer's proven non-delivery terminal.
+/// A reopen changes the attempt word, so it cannot masquerade as this fence.
+#[cfg(any(target_os = "linux", all(unix, test)))]
+pub(crate) struct OriginalNonDeliveryFence {
+    owner: usize,
+    word: u64,
+}
+
+#[cfg(any(target_os = "linux", all(unix, test)))]
+impl OriginalNonDeliveryFence {
+    pub(crate) fn attempt_id(&self) -> u64 {
+        self.word >> 3
+    }
+}
 impl PhysicalSendPublication {
+    #[cfg(any(target_os = "linux", all(unix, test)))]
+    pub(crate) fn original_non_delivery_fence(&self) -> Option<OriginalNonDeliveryFence> {
+        let word = self.phase.load(Ordering::Acquire);
+        (state(word) == PhysicalPublicationState::DefinitelyNotHanded).then_some(
+            OriginalNonDeliveryFence {
+                owner: self as *const Self as usize,
+                word,
+            },
+        )
+    }
+    #[cfg(any(target_os = "linux", all(unix, test)))]
+    pub(crate) fn still_original_non_delivery(&self, original: &OriginalNonDeliveryFence) -> bool {
+        original.owner == self as *const Self as usize
+            && self.phase.load(Ordering::Acquire) == original.word
+    }
     pub(crate) fn new() -> Self {
         Self {
             phase: AtomicU64::new(0),
@@ -519,6 +549,7 @@ impl PhysicalRequestPublisher {
                 hook();
             }
         }
+        request.before_recorded();
         let _ = publication.recorded_observed_at.set(Instant::now());
         // Log only after the original observation exists. Logging must not
         // move that boundary or manufacture a fact for an earlier ACK read.

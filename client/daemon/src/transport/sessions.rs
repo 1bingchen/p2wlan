@@ -2,11 +2,15 @@ use super::*;
 
 mod decryption;
 mod encryption;
+mod kernel_owner;
 mod overlay_credit;
 pub(crate) use encryption::{
     EncryptedOutboundWithSource, OriginalEchoSessionGuard, OriginalEncryptionSource,
     SessionBoundEncryptionWithSource,
 };
+#[cfg(any(target_os = "linux", all(unix, test)))]
+pub(crate) use kernel_owner::OriginalKernelTransportCurrent;
+pub(crate) use kernel_owner::OriginalKernelTransportOwners;
 pub(crate) use overlay_credit::{OriginalOverlaySessionFailure, OriginalOverlaySessionGuard};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

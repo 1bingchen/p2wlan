@@ -60,6 +60,11 @@ impl OriginalPhysicalInput {
 }
 
 impl OriginalPhysicalInputOwner {
+    pub(super) fn before_recorded(&self) {
+        if let Self::Kernel(read) = self {
+            read.observe_original_publication_clock();
+        }
+    }
     pub(super) fn publication(&self) -> &PhysicalSendPublication {
         match self {
             Self::Canonical(request) => &request.physical_publication,

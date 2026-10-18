@@ -14,6 +14,18 @@ use fixture::{
 };
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn original_udp_batch_guard_checks_every_real_full_and_read_without_relocking(
+) -> Result<(), String> {
+    exercise(PathKind::Direct, Scenario::BatchPublication).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn original_relay_batch_guard_checks_every_real_full_and_read_without_relocking(
+) -> Result<(), String> {
+    exercise(PathKind::Relay, Scenario::BatchPublication).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pr219_original_relay_request_echo_survives_real_direct_promotion() -> Result<(), String> {
     exercise(PathKind::Relay, Scenario::RelayEchoAfterDirect).await
 }

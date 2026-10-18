@@ -14,13 +14,20 @@ use crate::peer::PeerManager;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 #[cfg(any(target_os = "linux", all(unix, test)))]
 use std::time::Duration;
 use std::time::Instant;
 
 mod full;
+#[cfg(any(target_os = "linux", all(unix, test)))]
+mod native;
+mod owners;
 pub(crate) use full::OriginalFullObservation;
+#[cfg(any(target_os = "linux", all(unix, test)))]
+pub(crate) use native::{OriginalKernelExchange, OriginalKernelOnce};
+#[cfg(any(target_os = "linux", all(unix, test)))]
+pub(crate) use owners::OriginalKernelCurrentOwners;
 mod ingress;
 mod read_peer;
 mod read_room;
@@ -51,11 +58,15 @@ pub(crate) struct CaptureSession {
 }
 
 struct RegistryState {
+    current_owners: Option<owners::OriginalKernelOwners>,
     original_room_owner: Option<Weak<crate::rooms::RoomAuthorization>>,
     flows: Vec<FlowState>,
     original_device: Option<Arc<KernelRead>>,
     system_device: Option<Weak<DeviceLease>>,
     full_history: full::FullHistory,
+    // Actual original read order includes unresolved and failed publications.
+    // A later duplicate Full cannot replace an earlier uncertain producer.
+    read_history: Vec<Arc<KernelReadBinding>>,
     inbound_history: ingress::InboundHistory,
     #[cfg(unix)]
     requests: usize,
@@ -74,6 +85,8 @@ struct FlowState {
     inbound: ingress::InboundFlow,
 }
 struct RequestReadState {
+    #[cfg(any(target_os = "linux", all(unix, test)))]
+    native_credit: Option<native::NativeFrameOutcome>,
     first_request_room: Option<Arc<ingress::OriginalIncomingRoom>>,
     #[cfg(any(target_os = "linux", all(unix, test)))]
     original_write_window: Option<write_window::WriteWindow>,
@@ -99,6 +112,8 @@ pub(crate) struct KernelReadBinding {
     plan: Arc<RegisteredFlowPlan>,
     spans: Vec<full::ReadFrameSpan>,
     physical_publication: crate::overlay_requests::PhysicalSendPublication,
+    full_retained_ns: OnceLock<u64>,
+    original_publication_ns: OnceLock<u64>,
     original_peers: Vec<Arc<read_peer::FirstReadPeer>>,
     original_responses: Vec<Arc<ingress::ResponseCapture>>,
     original_request_rooms: Vec<Arc<ingress::OriginalIncomingRoom>>,
@@ -128,10 +143,13 @@ pub(super) struct ReadSnapshot {
     incoming_provenance_complete: bool,
     original_read_observation_complete: bool,
     original_full_retention_complete: bool,
+    retained_original_reads: usize,
 }
 #[cfg(unix)]
 #[derive(Serialize)]
 struct RequestSnapshot {
+    #[cfg(any(target_os = "linux", all(unix, test)))]
+    native_credit: Option<native::NativeFrameSnapshot>,
     flow: usize,
     producer_scope: String,
     sequence: u32,
@@ -197,11 +215,13 @@ impl CaptureSession {
             producer_scope: plan.producer_scope,
             clock_scope: NativeClockScope::capture(),
             state: Mutex::new(RegistryState {
+                current_owners: None,
                 original_room_owner: None,
                 flows: Vec::new(),
                 original_device: None,
                 system_device: None,
                 full_history: full::FullHistory::new(),
+                read_history: Vec::new(),
                 inbound_history: ingress::InboundHistory::new(),
                 requests: 0,
                 revision: 0,
@@ -265,6 +285,7 @@ impl CaptureSession {
                     .requests
                     .iter()
                     .map(|_| RequestReadState {
+                        native_credit: None,
                         first_request_room: None,
                         original_write_window: None,
                         first_peer: None,
@@ -336,7 +357,7 @@ impl CaptureSession {
         self: &Arc<Self>,
         original: KernelRead,
         packet: &[u8],
-    ) -> Option<KernelReadBinding> {
+    ) -> Option<Arc<KernelReadBinding>> {
         if !original.is_current()
             || !self.is_live(original.at())
             || !self.read_complete.load(Ordering::Acquire)
@@ -359,7 +380,7 @@ impl CaptureSession {
         self: &Arc<Self>,
         original: KernelRead,
         packet: &[u8],
-    ) -> Result<Option<KernelReadBinding>, CaptureFailure> {
+    ) -> Result<Option<Arc<KernelReadBinding>>, CaptureFailure> {
         let udp = parse_os_udp(packet).ok();
         let tcp = parse_tcp_segment(packet).ok();
         let mut state = self
@@ -500,7 +521,14 @@ impl CaptureSession {
             read.last_read = Some(original.clone());
         }
         let original_responses = self.first_response_inputs(&mut state, index, &slots, &original);
-        Ok(Some(KernelReadBinding {
+        if state.read_history.len() >= full::MAX_FULL_PACKETS {
+            return Err(CaptureFailure::Capacity);
+        }
+        state
+            .read_history
+            .try_reserve(1)
+            .map_err(|_| CaptureFailure::Capacity)?;
+        let binding = Arc::new(KernelReadBinding {
             scope: Arc::downgrade(self),
             read: original,
             flow: index,
@@ -510,10 +538,14 @@ impl CaptureSession {
             plan,
             spans,
             physical_publication: crate::overlay_requests::PhysicalSendPublication::new(),
+            full_retained_ns: OnceLock::new(),
+            original_publication_ns: OnceLock::new(),
             original_peers,
             original_responses,
             original_request_rooms,
-        }))
+        });
+        state.read_history.push(binding.clone());
+        Ok(Some(binding))
     }
 
     #[cfg(unix)]
@@ -527,6 +559,11 @@ impl CaptureSession {
             let plan = &flow.plan;
             for (key, read) in plan.requests.iter().zip(&flow.requests) {
                 requests.push(RequestSnapshot {
+                    #[cfg(any(target_os = "linux", all(unix, test)))]
+                    native_credit: read
+                        .native_credit
+                        .as_ref()
+                        .map(native::NativeFrameOutcome::snapshot),
                     flow: flow_index,
                     producer_scope: hex::encode(flow.producer_scope),
                     sequence: key.sequence,
@@ -581,9 +618,30 @@ impl CaptureSession {
                 });
             }
         }
+        #[cfg(any(target_os = "linux", all(unix, test)))]
+        let native_verified = state.requests != 0
+            && self.read_complete.load(Ordering::Acquire)
+            && self.inbound_complete.load(Ordering::Acquire)
+            && self.full_complete.load(Ordering::Acquire)
+            && state
+                .flows
+                .iter()
+                .all(|flow| !flow.invalid && !flow.inbound.invalid)
+            && state
+                .flows
+                .iter()
+                .flat_map(|flow| &flow.requests)
+                .all(|request| {
+                    request
+                        .native_credit
+                        .as_ref()
+                        .is_some_and(native::NativeFrameOutcome::verified)
+                });
+        #[cfg(not(any(target_os = "linux", all(unix, test))))]
+        let native_verified = false;
         Ok(ReadSnapshot {
-            schema_version: 1,
-            scope: "registered_kernel_read_only",
+            schema_version: 2,
+            scope: "registered_native_frame_capture",
             owner: self.owner,
             capture_id: hex::encode(self.capture_id),
             producer_scope: hex::encode(self.producer_scope),
@@ -597,14 +655,16 @@ impl CaptureSession {
             requests,
             historical_full_packets: state.full_history.snapshot(),
             system_tun_full_writes: state.inbound_history.snapshot(),
-            // These remain false: registration data and completed system reads
-            // are not a complete original OS-write/daemon/physical/once chain.
-            daemon_registration_verified: false,
-            physical_send_verified: false,
-            canonical_current_owner_verified: false,
+            // Registration alone leaves these false. Only the sole native
+            // current-owner/once transaction can make every frame verified;
+            // original application OS-write qualification stays separate.
+            daemon_registration_verified: native_verified,
+            physical_send_verified: native_verified,
+            canonical_current_owner_verified: native_verified,
             incoming_provenance_complete: self.inbound_complete.load(Ordering::Acquire),
             original_read_observation_complete: self.read_complete.load(Ordering::Acquire),
             original_full_retention_complete: self.full_complete.load(Ordering::Acquire),
+            retained_original_reads: state.read_history.len(),
         })
     }
 }

@@ -15,6 +15,15 @@ pub(crate) use device::SystemTun;
 pub(crate) use registry::{
     KernelCaptureRuntime, KernelIngressBinding, KernelReadBinding, OriginalFullObservation,
 };
+#[cfg(any(target_os = "linux", all(unix, test)))]
+pub(crate) use registry::{
+    OriginalKernelCurrentOwners, OriginalKernelExchange, OriginalKernelOnce,
+};
+
+#[cfg(any(target_os = "linux", all(unix, test)))]
+pub(crate) fn original_kernel_monotonic_ns() -> Option<u64> {
+    clock::monotonic_ns()
+}
 
 #[cfg(test)]
 mod tests;

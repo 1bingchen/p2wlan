@@ -9,6 +9,7 @@ pub(crate) enum OriginalOverlaySessionFailure {
 }
 
 pub(crate) struct OriginalOverlaySessionGuard<'a> {
+    owner: Weak<Mutex<HashMap<String, PeerTransportSessions>>>,
     sessions: tokio::sync::MutexGuard<'a, HashMap<String, PeerTransportSessions>>,
     peer_id: &'a str,
     session_instance: u64,
@@ -16,6 +17,18 @@ pub(crate) struct OriginalOverlaySessionGuard<'a> {
 }
 
 impl OriginalOverlaySessionGuard<'_> {
+    pub(crate) fn matches_original_sources(
+        &self,
+        tx: &OriginalEncryptionSource,
+        rx: &OriginalSessionSource,
+    ) -> bool {
+        self.owner.ptr_eq(&rx.owner)
+            && tx.matches_original_receive_source(rx)
+            && rx.peer_id() == self.peer_id
+            && rx.session_instance() == self.session_instance
+            && rx.authorized_peer_lifecycle() == Some(self.lifecycle)
+    }
+
     pub(crate) fn lifecycle(&self) -> PeerSessionGeneration {
         self.lifecycle
     }
@@ -31,6 +44,39 @@ impl OriginalOverlaySessionGuard<'_> {
                     && active.authorized_peer_lifecycle == Some(self.lifecycle)
                     && !active.session.is_expired()
             })
+    }
+}
+
+#[cfg(any(target_os = "linux", all(unix, test)))]
+impl<'a> OriginalOverlaySessionGuard<'a> {
+    pub(in crate::transport) fn try_original_registry(
+        registry: &'a Arc<Mutex<HashMap<String, PeerTransportSessions>>>,
+        peer_id: &'a str,
+        tx: &OriginalEncryptionSource,
+        rx: &OriginalSessionSource,
+    ) -> std::result::Result<Self, OriginalOverlaySessionFailure> {
+        use OriginalOverlaySessionFailure as Failure;
+        if !rx.owner.ptr_eq(&Arc::downgrade(registry))
+            || rx.peer_id() != peer_id
+            || rx.original_role() != OriginalSessionRole::Active
+        {
+            return Err(Failure::Stale);
+        }
+        let lifecycle = tx
+            .authorized_peer_lifecycle()
+            .filter(|life| *life != PeerSessionGeneration::UNBOUND)
+            .ok_or(Failure::UnknownAuthorization)?;
+        if !tx.matches_original_receive_source(rx) {
+            return Err(Failure::Stale);
+        }
+        let guard = Self {
+            owner: Arc::downgrade(registry),
+            sessions: registry.try_lock().map_err(|_| Failure::Contended)?,
+            peer_id,
+            session_instance: rx.session_instance(),
+            lifecycle,
+        };
+        guard.is_current().then_some(guard).ok_or(Failure::Stale)
     }
 }
 
@@ -53,6 +99,7 @@ impl WireGuardTransport {
             .ok_or(Failure::UnknownAuthorization)?;
         let sessions = self.sessions.try_lock().map_err(|_| Failure::Contended)?;
         let guard = OriginalOverlaySessionGuard {
+            owner: Arc::downgrade(&self.sessions),
             sessions,
             peer_id,
             session_instance: rx.session_instance(),
@@ -89,6 +136,10 @@ impl WireGuardTransport {
         if rx.authorized_peer_lifecycle() != Some(lifecycle) {
             return Err(Failure::Stale);
         }
-        self.try_original_overlay_ingress_session_guard(peer_id, rx)
+        let guard = self.try_original_overlay_ingress_session_guard(peer_id, rx)?;
+        if !guard.matches_original_sources(tx, rx) {
+            return Err(Failure::Stale);
+        }
+        Ok(guard)
     }
 }

@@ -383,7 +383,7 @@ def main() -> int:
     parser.add_argument("--write-facts", action="store_true",
                         help="observe original child OS writes in bounded owned pipes; no daemon/TUN authority")
     parser.add_argument("--kernel-read-facts", action="store_true",
-                        help="collect actual original daemon system reads against original write plans/deadlines; no physical/current-owner credit")
+                        help="compare original owned writes with actual daemon kernel/Full/current-owner transactions in their original deadlines")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--fault-recovery", action="store_true",
                         help="independent fixed32 application DROP/clear/fresh scope; original baseline unchanged")
@@ -455,7 +455,7 @@ def main() -> int:
                                     kernel_control_bytes_per_stream=4 * 1024 * 1024,
                                     kernel_registered_requests_per_daemon=1000, kernel_capture_TTL_seconds=120,
                                     kernel_capture_additional_process_groups=0)
-            for name in ["linux_tun_kernel_capture.py", "linux_tun_live_window.py"]:
+            for name in ["linux_tun_kernel_capture.py", "linux_tun_live_window.py", "linux_tun_native_transaction.py"]:
                 path = Path(__file__).with_name(name)
                 report["source_sha256"][str(path.relative_to(ROOT))] = digest(path)
         report["binary_sha256"] = {"daemon": digest(args.daemon), "control": digest(args.control)}
@@ -525,6 +525,12 @@ def main() -> int:
             application_ok = report["application"]["all_responses_observed"]
         report["passed"] = (error is None and complete and "debug_capture_error" not in report
                             and application_ok)
+        if args.kernel_read_facts:
+            original_kernel = report.get("original_kernel_read_observations", {})
+            qualified = original_kernel.get("passed") is True and original_kernel.get("full128_owner_evidence_complete") is True
+            report["kernel_environment_verified"] = qualified
+            report["canonical_current_owner_verified"] = qualified and original_kernel.get("canonical_current_owner_verified") is True
+            report["passed"] = report["passed"] and qualified
         udp.write_report(args.report, report)
         # Preserve 0600 files while making only this non-secret output readable
         # by the invoking CI runner for upload; private Lab credentials were removed.

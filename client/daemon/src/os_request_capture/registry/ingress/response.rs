@@ -22,6 +22,18 @@ struct KernelResponseInput {
     room: Arc<OriginalIncomingRoom>,
 }
 
+#[cfg(any(target_os = "linux", all(unix, test)))]
+impl ResponseCapture {
+    pub(in crate::os_request_capture::registry) fn original_sources(
+        &self,
+    ) -> Outcome<&[Arc<KernelIngressBinding>]> {
+        self.original
+            .as_ref()
+            .map(|input| input.sources.as_slice())
+            .map_err(|reason| *reason)
+    }
+}
+
 #[cfg(unix)]
 #[derive(Serialize)]
 pub(in crate::os_request_capture::registry) struct ResponseSnapshot {

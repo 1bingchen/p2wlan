@@ -13,6 +13,103 @@ fn labels() -> WireWriteWindow {
     .unwrap()
 }
 
+// Frozen from the unchanged OS tool encode functions, including TCP's actual
+// four-byte write_frame prefix. Pure byte vectors are not native I/O facts.
+const UDP_REQUESTS: [&str; 8] = [
+    "3112ea4c5b2a36e2de4f99fd4140e170673d4b220c857e7d0710b825e408eec6",
+    "0d5eabb0225e6ca59eedc3a7471aa60d1959b0ab83f09aa27948b82cd933f383",
+    "8ecfe63fa08518e853ffc69d63da7a78f08d6279d6b657b18adc75c32ee539c6",
+    "6fe88609a190f263f1f30d2ea9187ff67b19e8aae554fdbf7074428af756c9a8",
+    "5434bd1871cf0f075e65198ab4e8022dacba897dde38b50825f6b9d54e59462e",
+    "1baa01009717eaed60b0ae4641cae2a67f9c95aa6a239f8dd6e1332ea68be4b7",
+    "5405bb370c14cf7fcf2d31576927c66a6a70557b494b9d52070ec91628a7f11a",
+    "97de10839d6de064cdac6663f092b9dc3c12ecaa07bac3893ec0eb575d8c3a8d",
+];
+const TCP_REQUESTS: [&str; 8] = [
+    "9ba4a048a07d756abf2a6889fd5353355bcfc2d6b5e7b8f690a3ec5ecd6cd4c6",
+    "229f2e8f77d28e9ecebb8d5a092c43578e6b3a60417352daa65970d4eaf56054",
+    "9639fb6bd42490052cc0bcad5c4c45034a1687f879ef0bf88839c1e79911ad3a",
+    "86fce90c0aa3adbfb0e905d9b05bda35e7adb24a99a7ca807f21816aed09d2bf",
+    "9dc72e3c403f5c3d0182e4be6bea57e7dee505aa028c8e7f34ae199dc8e96f96",
+    "623ddf8017aa4fe662a9c2fe5921c48b30f503bfb83fbbe53890f7dd569a6035",
+    "bcc41c565f2587f2cbf5ce21779e4f5fbba4a66e9f9e018391a7d52f411e87de",
+    "888177e98379c842ef47bc4466092ee1dae673521278f5f6312a0883d082cf15",
+];
+
+fn registered(protocol: &str, kind: &str) -> RegisteredFlowPlan {
+    let value = serde_json::json!({"schema_version":1,"capture_id":"11111111111111111111111111111111",
+        "producer_scope":"22222222222222222222222222222222","flows":[{
+            "protocol":protocol,"kind":kind,"peer_id":"window-frame-peer",
+            "run_nonce":"33".repeat(16),"round_nonce":"44".repeat(16),
+            "bind_ip":"10.21.1.2","bind_port":32123,"target_ip":"10.21.1.3","target_port":43210,
+            "payload_bytes":128,"request_nonces":(1..=8).map(|i|format!("{i:032x}")).collect::<Vec<_>>()}]});
+    super::super::super::plan::RegistrationPlan::decode(&serde_json::to_vec(&value).unwrap())
+        .unwrap()
+        .flows
+        .remove(0)
+}
+
+#[test]
+fn original_write_window_digest_matches_tool_requests_in_both_registered_directions() {
+    for (protocol, digests) in [("udp", UDP_REQUESTS), ("tcp", TCP_REQUESTS)] {
+        for kind in ["request", "response"] {
+            let plan = registered(protocol, kind);
+            for (slot, digest) in digests.iter().enumerate() {
+                let mut wire = labels();
+                wire.sequence = slot as u32;
+                wire.frame_sha256 = (*digest).into();
+                assert!(
+                    wire.matches_registered_request_frame(&plan),
+                    "{protocol}/{kind}/{slot}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn original_write_window_digest_binds_run_round_full_nonce_sequence_and_protocol() {
+    let mut wire = labels();
+    wire.frame_sha256 = UDP_REQUESTS[0].into();
+    assert!(wire.matches_registered_request_frame(&registered("udp", "request")));
+    for index in [0usize, 8, 15] {
+        for field in 0..3 {
+            let mut plan = registered("udp", "request");
+            match field {
+                0 => plan.requests[0].run[index] ^= 1,
+                1 => plan.requests[0].round[index] ^= 1,
+                _ => plan.requests[0].request_nonce[index] ^= 1,
+            }
+            assert!(!wire.matches_registered_request_frame(&plan));
+        }
+    }
+    assert!(!wire.matches_registered_request_frame(&registered("tcp", "request")));
+    wire.sequence = 1;
+    assert!(!wire.matches_registered_request_frame(&registered("udp", "request")));
+    wire.sequence = 8;
+    assert!(!wire.matches_registered_request_frame(&registered("udp", "request")));
+}
+
+#[test]
+fn original_write_window_digest_rejects_unmatched_bytes_and_payload_contract() {
+    let mut wire = labels();
+    // A syntactically valid 64-byte digest alone is never an exact frame match.
+    assert!(!wire.matches_registered_request_frame(&registered("udp", "request")));
+    for digest in [
+        "f".repeat(64),
+        "0".repeat(64),
+        UDP_REQUESTS[7].into(),
+        TCP_REQUESTS[0].into(),
+    ] {
+        wire.frame_sha256 = digest;
+        assert!(!wire.matches_registered_request_frame(&registered("udp", "request")));
+    }
+    wire.frame_sha256 = UDP_REQUESTS[0].into();
+    let mut plan = registered("udp", "request");
+    plan.payload_bytes = 127;
+    assert!(!wire.matches_registered_request_frame(&plan));
+}
+
 #[test]
 fn original_write_window_keeps_original_half_open_deadline_and_frame_size() {
     let wire = labels();

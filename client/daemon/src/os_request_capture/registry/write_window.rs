@@ -34,6 +34,39 @@ pub(super) struct WriteWindow {
 }
 
 impl WireWriteWindow {
+    /// Both daemon endpoints receive the initiator's original REQUEST write
+    /// window. Match its exact tool bytes, including the full run/round/nonce
+    /// and TCP length prefix; the target's registered RESPONSE kind is not the
+    /// initiator's write. This remains a metadata constraint, never OS proof.
+    fn matches_registered_request_frame(&self, plan: &RegisteredFlowPlan) -> bool {
+        let Some(key) = plan.requests.get(self.sequence as usize) else {
+            return false;
+        };
+        if plan.payload_bytes != 128 {
+            return false;
+        }
+        let mut supplied = [0; 32];
+        if hex::decode_to_slice(&self.frame_sha256, &mut supplied).is_err() {
+            return false;
+        }
+        let mut expected = Sha256::new();
+        if plan.protocol == Protocol::Tcp {
+            expected.update(191_u32.to_be_bytes());
+        }
+        expected.update(match plan.protocol {
+            Protocol::Udp => b"P2WUDE1\0",
+            Protocol::Tcp => b"P2WTCE1\0",
+        });
+        expected.update([0]); // The original initiator's REQUEST.
+        expected.update(key.run);
+        expected.update(key.round);
+        expected.update(key.sequence.to_be_bytes());
+        expected.update(key.request_nonce);
+        expected.update(plan.payload_bytes.to_be_bytes());
+        expected.update([0xa5; 128]);
+        supplied == <[u8; 32]>::from(expected.finalize())
+    }
+
     fn validate(
         &self,
         now: u64,
@@ -119,6 +152,9 @@ impl CaptureSession {
             .ok_or(CaptureFailure::InvalidPlan)?
             .request_nonce;
         wire.validate(now, frame_bytes, &expected_nonce)?;
+        if !wire.matches_registered_request_frame(&flow.plan) {
+            return Err(CaptureFailure::FrameConflict);
+        }
         let request = flow
             .requests
             .get_mut(wire.sequence as usize)

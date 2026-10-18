@@ -1,6 +1,6 @@
 //! Historical Fulls from the existing original physical-attempt producer.
 //! No current connection state or final once permission is owned here.
-use super::{CaptureSession, KernelReadBinding, RegisteredFlowPlan};
+use super::{CaptureSession, FullRetentionLossReason, KernelReadBinding, RegisteredFlowPlan};
 use crate::os_request_capture::clock::monotonic_ns;
 use crate::os_request_capture::plan::{CaptureFailure, Protocol};
 use crate::peer::PeerManager;
@@ -39,16 +39,17 @@ impl Drop for OriginalFullObservation {
     fn drop(&mut self) {
         if self.armed {
             if let Some(scope) = self.scope.upgrade() {
-                scope.original_full_retention_lost();
+                scope.original_full_retention_lost(FullRetentionLossReason::ObservationDropped);
             }
         }
     }
 }
 
 impl CaptureSession {
-    fn original_full_retention_lost(&self) {
+    fn original_full_retention_lost(&self, reason: FullRetentionLossReason) {
         // No lock or retry: loss must remain observable even when the history
         // mutex itself caused the miss. Later duplicates never rearm a scope.
+        self.full_loss.record(reason);
         self.full_complete.store(false, Ordering::Release);
         self.gap();
     }
@@ -274,11 +275,12 @@ impl KernelReadBinding {
     /// Instant observation. This clock precedes that boundary; later retention
     /// time is a different upper bound and must not stand in for publication.
     pub(crate) fn observe_original_publication_clock(&self) {
-        let saved = monotonic_ns()
-            .filter(|at| *at != 0)
-            .is_some_and(|at| self.original_publication_ns.set(at).is_ok());
-        if !saved {
-            self.original_full_retention_lost();
+        let Some(at) = monotonic_ns().filter(|at| *at != 0) else {
+            self.full_retention_lost(FullRetentionLossReason::PublicationClockUnavailable);
+            return;
+        };
+        if self.original_publication_ns.set(at).is_err() {
+            self.full_retention_lost(FullRetentionLossReason::PublicationClockAlreadyRecorded);
         }
     }
 
@@ -290,8 +292,12 @@ impl KernelReadBinding {
     }
 
     pub(crate) fn original_full_retention_lost(&self) {
+        self.full_retention_lost(FullRetentionLossReason::EncryptionCaptureFailed);
+    }
+
+    fn full_retention_lost(&self, reason: FullRetentionLossReason) {
         if let Some(scope) = self.scope.upgrade() {
-            scope.original_full_retention_lost();
+            scope.original_full_retention_lost(reason);
         }
     }
 
@@ -322,33 +328,37 @@ impl KernelReadBinding {
         let Some(scope) = self.scope.upgrade() else {
             return;
         };
-        let retain = || -> Result<(), CaptureFailure> {
+        let retain = || -> Result<(), FullRetentionLossReason> {
             let record = self
                 .physical_publication
                 .record()
-                .ok_or(CaptureFailure::InvalidPlan)?;
-            if !record.matches_original_kernel_read(self)
-                || self.physical_publication.recorded_observed_at().is_none()
-            {
-                return Err(CaptureFailure::InvalidPlan);
+                .ok_or(FullRetentionLossReason::PublicationMissing)?;
+            if !record.matches_original_kernel_read(self) {
+                return Err(FullRetentionLossReason::PublicationIdentityMismatch);
+            }
+            if self.physical_publication.recorded_observed_at().is_none() {
+                return Err(FullRetentionLossReason::PublicationObservationMissing);
             }
             // A native observation AFTER the actual original Full is an upper
             // bound, never a reconstructed syscall timestamp. The original
             // application deadline is compared separately, without rearming.
             let observed = monotonic_ns()
                 .filter(|at| *at != 0)
-                .ok_or(CaptureFailure::InvalidPlan)?;
+                .ok_or(FullRetentionLossReason::RetentionClockUnavailable)?;
             let mut state = scope
                 .state
                 .try_lock()
-                .map_err(|_| CaptureFailure::Contended)?;
-            state.full_history.retain(self, observed)?;
+                .map_err(|_| FullRetentionLossReason::HistoryContended)?;
+            state
+                .full_history
+                .retain(self, observed)
+                .map_err(FullRetentionLossReason::history)?;
             #[cfg(any(target_os = "linux", all(unix, test)))]
             scope.try_complete_original_frames(&mut state, self.flow, &self.slots);
             Ok(())
         };
-        if retain().is_err() {
-            scope.original_full_retention_lost();
+        if let Err(reason) = retain() {
+            scope.original_full_retention_lost(reason);
         }
     }
 }

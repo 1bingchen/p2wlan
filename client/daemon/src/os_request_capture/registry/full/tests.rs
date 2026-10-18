@@ -188,3 +188,79 @@ fn original_frame_spans_keep_udp_slots_distinct_and_bound_tcp_bitmap() {
     oversized.payload_bytes = MAX_FRAME_WIRE_BYTES as u16;
     assert!(FrameSpanCoverage::new(&oversized, 0).is_none());
 }
+
+#[tokio::test]
+async fn full_loss_diagnostic_keeps_first_site_without_restoring_credit() {
+    let (setup, _parent) = descriptor_scope().await;
+    assert!(setup.session.full_loss.snapshot().is_none());
+    setup
+        .session
+        .original_full_retention_lost(FullRetentionLossReason::HistoryContended);
+    let mut later = negative_observer(&setup.session);
+    later.arm();
+    drop(later);
+    let value = serde_json::to_value(setup.session.snapshot().unwrap()).unwrap();
+    assert_eq!(
+        value["first_original_full_retention_loss"],
+        "history_contended"
+    );
+    assert_eq!(setup.session.gaps.load(Ordering::Relaxed), 2);
+    assert_no_full_credit(&setup.session, false);
+}
+
+#[tokio::test]
+async fn full_loss_diagnostic_is_nonblocking_scoped_and_survives_retirement() {
+    let (first, _first_parent) = descriptor_scope().await;
+    let (second, _second_parent) = descriptor_scope().await;
+    let held = first.session.state.try_lock().unwrap();
+    let mut observer = negative_observer(&first.session);
+    observer.arm();
+    drop(observer);
+    first.session.retire();
+    assert_eq!(
+        first.session.full_loss.snapshot(),
+        Some(FullRetentionLossReason::ObservationDropped)
+    );
+    assert!(second.session.full_loss.snapshot().is_none());
+    drop(held);
+    assert_no_full_credit(&first.session, false);
+    assert_no_full_credit(&second.session, true);
+}
+
+#[test]
+fn full_loss_diagnostic_serializes_all_sites_without_publication_authority() {
+    use super::super::FullRetentionLoss;
+    use FullRetentionLossReason::*;
+    for (reason, expected) in [
+        (ObservationDropped, "observation_dropped"),
+        (EncryptionCaptureFailed, "encryption_capture_failed"),
+        (PublicationClockUnavailable, "publication_clock_unavailable"),
+        (
+            PublicationClockAlreadyRecorded,
+            "publication_clock_already_recorded",
+        ),
+        (PublicationMissing, "publication_missing"),
+        (PublicationIdentityMismatch, "publication_identity_mismatch"),
+        (
+            PublicationObservationMissing,
+            "publication_observation_missing",
+        ),
+        (RetentionClockUnavailable, "retention_clock_unavailable"),
+        (HistoryContended, "history_contended"),
+        (HistoryCapacity, "history_capacity"),
+        (HistoryInvalid, "history_invalid"),
+    ] {
+        let loss = FullRetentionLoss::new();
+        loss.record(reason);
+        loss.record(HistoryInvalid);
+        assert_eq!(serde_json::to_value(loss.snapshot()).unwrap(), expected);
+    }
+    assert_eq!(
+        FullRetentionLossReason::history(CaptureFailure::Capacity),
+        HistoryCapacity
+    );
+    assert_eq!(
+        FullRetentionLossReason::history(CaptureFailure::InvalidPlan),
+        HistoryInvalid
+    );
+}

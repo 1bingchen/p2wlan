@@ -22,8 +22,10 @@ use std::time::Instant;
 #[cfg(unix)]
 mod control_lock;
 mod full;
+mod full_loss;
 #[cfg(unix)]
 use control_lock::ControlState as RegistryMutex;
+use full_loss::{FullRetentionLoss, FullRetentionLossReason};
 #[cfg(not(unix))]
 use std::sync::Mutex as RegistryMutex;
 #[cfg(any(target_os = "linux", all(unix, test)))]
@@ -51,6 +53,7 @@ pub(crate) struct CaptureSession {
     inbound_complete: AtomicBool,
     read_complete: AtomicBool,
     full_complete: AtomicBool,
+    full_loss: FullRetentionLoss,
     expires: Instant,
     peers: Weak<PeerManager>,
     #[cfg(unix)]
@@ -149,6 +152,7 @@ pub(super) struct ReadSnapshot {
     incoming_provenance_complete: bool,
     original_read_observation_complete: bool,
     original_full_retention_complete: bool,
+    first_original_full_retention_loss: Option<FullRetentionLossReason>,
     retained_original_reads: usize,
 }
 #[cfg(unix)]
@@ -215,6 +219,7 @@ impl CaptureSession {
             inbound_complete: AtomicBool::new(true),
             read_complete: AtomicBool::new(true),
             full_complete: AtomicBool::new(true),
+            full_loss: FullRetentionLoss::new(),
             expires,
             peers: Arc::downgrade(peers),
             capture_id: plan.capture_id,
@@ -703,6 +708,7 @@ impl CaptureSession {
             incoming_provenance_complete: self.inbound_complete.load(Ordering::Acquire),
             original_read_observation_complete: self.read_complete.load(Ordering::Acquire),
             original_full_retention_complete: self.full_complete.load(Ordering::Acquire),
+            first_original_full_retention_loss: self.full_loss.snapshot(),
             retained_original_reads: state.read_history.len(),
         })
     }

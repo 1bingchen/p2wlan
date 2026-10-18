@@ -60,11 +60,12 @@ class DeadlineControls(unittest.TestCase):
         self.assertFalse(result["canonical_current_owner_verified"])
         self.assertEqual(entry["records"], before)
         self.assertEqual(result["request_count"], 8)
+        self.assertEqual(result["gap_reason"], "original_kernel_collection_failed:original_kernel_registration_unavailable")
 
 
 @unittest.skipUnless(hasattr(socket, "AF_UNIX"), "actual Unix control sockets required")
 class ActualStreamControls(unittest.TestCase):
-    def exchange(self, response, *, close=False):
+    def exchange(self, response, *, close=False, operation=None, inspect_request=None):
         parent, peer = socket.socketpair()
         endpoint = kernel.Endpoint(parent, None, None, "a" * 32, "b" * 32)
         failures = []
@@ -77,6 +78,8 @@ class ActualStreamControls(unittest.TestCase):
                     if not block:
                         return
                     data.extend(block)
+                if inspect_request is not None:
+                    inspect_request(json.loads(data), time.monotonic_ns())
                 if not close:
                     peer.sendall(response)
             except BaseException as error:
@@ -86,7 +89,7 @@ class ActualStreamControls(unittest.TestCase):
         worker = threading.Thread(target=serve)
         worker.start()
         try:
-            return endpoint.exchange({"op": "snapshot"})
+            return endpoint.exchange({"op": "snapshot"}) if operation is None else operation(endpoint)
         finally:
             endpoint.close()
             worker.join(timeout=3)
@@ -97,6 +100,37 @@ class ActualStreamControls(unittest.TestCase):
         value, _ = self.exchange(kernel.encode(dict(capture_id="a" * 32, owner=1, scope="registered_expected_inputs_only")))
         self.assertEqual(value["scope"], "registered_expected_inputs_only")
         self.assertNotIn("kernel_frame_read_complete", value)
+
+    def test_actual_control_exchange_supplies_only_its_original_one_second_deadline(self):
+        def inspect(value, received):
+            self.assertEqual(value["op"], "snapshot")
+            self.assertIs(type(value["original_deadline_ns"]), int)
+            self.assertGreater(value["original_deadline_ns"], received)
+            self.assertLessEqual(value["original_deadline_ns"] - received, 1_000_000_000)
+        self.exchange(kernel.encode(dict(capture_id="a" * 32, owner=1)), inspect_request=inspect)
+
+    def test_actual_reply_rejected_before_birth_validation_is_still_retained_as_raw_data(self):
+        raw = kernel.encode(dict(capture_id="a" * 32, owner=1, scope="registered_expected_inputs_only"))
+        def reject(endpoint):
+            with self.assertRaises(kernel.CaptureError) as caught:
+                endpoint.snapshot()
+            self.assertEqual(caught.exception.code, "kernel_original_daemon_birth_namespace_clock_mismatch")
+            self.assertEqual(endpoint.raw_snapshots, [raw])
+        self.exchange(raw, operation=reject)
+
+    def test_expired_original_exchange_sends_no_control_bytes(self):
+        parent, peer = socket.socketpair()
+        endpoint = kernel.Endpoint(parent, None, None, "a" * 32, "b" * 32)
+        try:
+            with self.assertRaises(kernel.CaptureError) as caught:
+                endpoint.exchange({"op": "snapshot"}, deadline=time.monotonic() - 1)
+            self.assertEqual(caught.exception.code, "kernel_control_original_deadline")
+            peer.setblocking(False)
+            with self.assertRaises(BlockingIOError):
+                peer.recv(1)
+        finally:
+            endpoint.close()
+            peer.close()
 
     def test_actual_socket_EOF_wrong_scope_and_duplicate_JSON_are_rejected(self):
         for raw, close in [(b"", True), (kernel.encode(dict(capture_id="c" * 32, owner=1)), False),

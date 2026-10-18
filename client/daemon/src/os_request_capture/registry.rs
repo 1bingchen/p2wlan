@@ -14,12 +14,18 @@ use crate::peer::PeerManager;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::sync::{Arc, OnceLock, Weak};
 #[cfg(any(target_os = "linux", all(unix, test)))]
 use std::time::Duration;
 use std::time::Instant;
 
+#[cfg(unix)]
+mod control_lock;
 mod full;
+#[cfg(unix)]
+use control_lock::ControlState as RegistryMutex;
+#[cfg(not(unix))]
+use std::sync::Mutex as RegistryMutex;
 #[cfg(any(target_os = "linux", all(unix, test)))]
 mod native;
 mod owners;
@@ -53,7 +59,7 @@ pub(crate) struct CaptureSession {
     producer_scope: [u8; 16],
     #[cfg(unix)]
     clock_scope: Option<NativeClockScope>,
-    state: Mutex<RegistryState>,
+    state: RegistryMutex<RegistryState>,
     gaps: AtomicU64,
 }
 
@@ -214,7 +220,7 @@ impl CaptureSession {
             capture_id: plan.capture_id,
             producer_scope: plan.producer_scope,
             clock_scope: NativeClockScope::capture(),
-            state: Mutex::new(RegistryState {
+            state: RegistryMutex::new(RegistryState {
                 current_owners: None,
                 original_room_owner: None,
                 flows: Vec::new(),
@@ -242,15 +248,34 @@ impl CaptureSession {
         &self,
         plan: RegistrationPlan,
     ) -> Result<RegistrationReceipt, CaptureFailure> {
+        let mut state = self
+            .state
+            .try_lock()
+            .map_err(|_| CaptureFailure::Contended)?;
+        self.register_in(plan, &mut state)
+    }
+
+    #[cfg(any(target_os = "linux", all(unix, test)))]
+    pub(super) async fn register_control(
+        &self,
+        plan: RegistrationPlan,
+        end: tokio::time::Instant,
+    ) -> Result<RegistrationReceipt, CaptureFailure> {
+        let mut state = self.state.lock_until(end).await?;
+        self.register_in(plan, &mut state)
+    }
+
+    #[cfg(any(target_os = "linux", all(unix, test)))]
+    fn register_in(
+        &self,
+        plan: RegistrationPlan,
+        state: &mut RegistryState,
+    ) -> Result<RegistrationReceipt, CaptureFailure> {
         if plan.capture_id != self.capture_id || plan.flows.is_empty() {
             return Err(CaptureFailure::InvalidPlan);
         }
         let producer = plan.producer_scope;
         let added: usize = plan.flows.iter().map(|flow| flow.requests.len()).sum();
-        let mut state = self
-            .state
-            .try_lock()
-            .map_err(|_| CaptureFailure::Contended)?;
         if !self.is_live(Instant::now()) {
             return Err(CaptureFailure::Expired);
         }
@@ -554,6 +579,20 @@ impl CaptureSession {
             .state
             .try_lock()
             .map_err(|_| CaptureFailure::Contended)?;
+        self.snapshot_in(&state)
+    }
+
+    #[cfg(unix)]
+    pub(super) async fn snapshot_control(
+        &self,
+        end: tokio::time::Instant,
+    ) -> Result<ReadSnapshot, CaptureFailure> {
+        let state = self.state.lock_until(end).await?;
+        self.snapshot_in(&state)
+    }
+
+    #[cfg(unix)]
+    fn snapshot_in(&self, state: &RegistryState) -> Result<ReadSnapshot, CaptureFailure> {
         let mut requests = Vec::new();
         for (flow_index, flow) in state.flows.iter().enumerate() {
             let plan = &flow.plan;

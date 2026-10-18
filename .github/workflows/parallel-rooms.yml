@@ -160,6 +160,17 @@ jobs:
             --head "$(git rev-parse HEAD)" \
             --server-stall \
             --output-dir "$RUNNER_TEMP/linux-tun-server-stall"
+      - name: Retain original Linux TUN failure programs
+        if: failure()
+        run: |
+          sudo --preserve-env=GITHUB_RUN_ID,GITHUB_RUN_ATTEMPT python3 scripts/parallel-rooms/retain_linux_tun_programs.py \
+            --daemon target/debug/p2wlan-daemon \
+            --control target/debug/p2wlan-control \
+            --head "$(git rev-parse HEAD)" \
+            --report "$RUNNER_TEMP/linux-tun-application/report.json" \
+            --report "$RUNNER_TEMP/linux-tun-recovery/report.json" \
+            --report "$RUNNER_TEMP/linux-tun-server-stall/report.json" \
+            --output "$RUNNER_TEMP/linux-tun-original-programs"
       - name: Upload non-secret network evidence
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
@@ -171,6 +182,7 @@ jobs:
             ${{ runner.temp }}/linux-tun-application/
             ${{ runner.temp }}/linux-tun-recovery/
             ${{ runner.temp }}/linux-tun-server-stall/
+            ${{ runner.temp }}/linux-tun-original-programs/
           if-no-files-found: error
           retention-days: 7
 

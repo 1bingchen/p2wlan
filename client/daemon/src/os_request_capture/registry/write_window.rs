@@ -116,11 +116,11 @@ impl WireWriteWindow {
 impl CaptureSession {
     /// Only an already-owned control channel can deliver this observation.
     /// Receipt before the existing deadline is mandatory; no fresh clock starts.
-    pub(in crate::os_request_capture) fn observe_original_write_window(
+    pub(in crate::os_request_capture) async fn observe_original_write_window(
         self: &Arc<Self>,
         wire: WireWriteWindow,
     ) -> Result<(), CaptureFailure> {
-        let now = monotonic_ns().ok_or(CaptureFailure::InvalidPlan)?;
+        let received = monotonic_ns().ok_or(CaptureFailure::InvalidPlan)?;
         if !self
             .clock_scope
             .as_ref()
@@ -129,10 +129,16 @@ impl CaptureSession {
         {
             return Err(CaptureFailure::InvalidPlan);
         }
-        let mut state = self
-            .state
-            .try_lock()
-            .map_err(|_| CaptureFailure::Contended)?;
+        // Reject impossible receipt times before waiting. The registered
+        // plan/frame/nonce are still checked under the sole metadata owner.
+        let supplied_nonce = super::super::plan::nonce(&wire.request_nonce)?;
+        wire.validate(received, wire.frame_bytes, &supplied_nonce)?;
+        let end = self.metadata_command_deadline(wire.original_deadline_ns)?;
+        let mut state = self.state.lock_until(end).await?;
+        let now = monotonic_ns().ok_or(CaptureFailure::InvalidPlan)?;
+        if !self.is_live(Instant::now()) {
+            return Err(CaptureFailure::Expired);
+        }
         let producer = super::super::plan::nonce(&wire.producer_scope)?;
         let mut flows = state
             .flows
@@ -176,7 +182,7 @@ impl CaptureSession {
             original_sent_ns: wire.original_sent_ns,
             original_deadline_ns: wire.original_deadline_ns,
             complete_returned_ns: wire.complete_returned_ns,
-            received_monotonic_ns: now,
+            received_monotonic_ns: received,
             frame_bytes: wire.frame_bytes,
             frame_sha256: wire.frame_sha256,
             native_os_write_verified: false,

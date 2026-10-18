@@ -26,9 +26,15 @@ MAX_ENDPOINTS = 2
 MAX_ENTRIES = 4
 
 
+class CaptureError(ValueError):
+    def __init__(self, code):
+        self.code = code
+        super().__init__(code)
+
+
 def require(ok, reason):
     if not ok:
-        raise ValueError(reason)
+        raise CaptureError(reason)
 
 
 def integer(value, minimum=0):
@@ -74,7 +80,12 @@ class Endpoint:
             raise
 
     def exchange(self, value, *, deadline=None):
-        end = min(time.monotonic() + 1, deadline) if deadline is not None else time.monotonic() + 1
+        end_ns = time.monotonic_ns() + 1_000_000_000
+        if deadline is not None:
+            end_ns = min(end_ns, int(deadline * 1_000_000_000))
+        end = end_ns / 1_000_000_000
+        if value.get("op") in {"snapshot", "register"}:
+            value = dict(value, original_deadline_ns=end_ns)
         self.send(value, end)
         while b"\n" not in self.pending:
             require(len(self.pending) < MAX_LINE and time.monotonic() < end, "kernel_control_reply_capacity_or_deadline")
@@ -113,6 +124,9 @@ class Endpoint:
     def snapshot(self, *, deadline=None):
         require(len(self.raw_snapshots) < MAX_ENTRIES, "original_kernel_snapshot_count_capacity")
         value, raw = self.exchange({"op": "snapshot"}, deadline=deadline)
+        # Retain the actual reply even if birth/scope validation rejects it.
+        # Raw bytes alone grant no authority; snapshot validation still fails.
+        self.raw_snapshots.append(raw + b"\n")
         expected = self.original
         clock = value.get("clock_scope")
         require(isinstance(clock, dict) and clock.get("clock_name") == "CLOCK_MONOTONIC"
@@ -129,7 +143,6 @@ class Endpoint:
                 and all(isinstance(row, dict) for row in value["requests"])
                 and all(type(value.get(k)) is bool for k in ["daemon_registration_verified", "physical_send_verified", "canonical_current_owner_verified"]),
                 "kernel_read_snapshot_scope_or_capacity")
-        self.raw_snapshots.append(raw + b"\n")
         return value
 
     def close(self):
@@ -224,7 +237,7 @@ class KernelCaptures:
             capture.enable_live_window_bridge(endpoints)
             record["endpoints"] = endpoints
         except (OSError, ValueError, KeyError) as error:
-            record["gap"] = "original_kernel_registration_failed:" + type(error).__name__
+            record["gap"] = "original_kernel_registration_failed:" + getattr(error, "code", type(error).__name__)
         return record
 
     def finish(self, record, *, deadline=None):
@@ -240,8 +253,8 @@ class KernelCaptures:
             require(writes.get("stream_complete") is True and writes.get("original_child_birth_namespace_matched") is True
                     and writes.get("original_same_boot_clock_matched") is True, "original_kernel_OS_write_stream_unavailable")
             bridge = capture.live_window_bridge.summary() if capture.live_window_bridge is not None else None
-            require(bridge is not None and bridge["gap_reason"] is None, "original_live_write_window_bridge_unavailable")
             result["original_live_write_windows"] = bridge
+            require(bridge is not None and bridge["gap_reason"] is None, "original_live_write_window_bridge_unavailable")
             pairs, native_pairs = [], []
             app = record["entry"].get("records")
             require(isinstance(app, list) and len(app) == 8, "original_kernel_original_application_records_missing")

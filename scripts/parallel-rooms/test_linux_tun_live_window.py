@@ -1,5 +1,6 @@
 """Actual control-socket and pure metadata controls, without TUN/native credit."""
 import json
+import os
 import socket
 from types import SimpleNamespace
 import unittest
@@ -8,9 +9,10 @@ from linux_tun_kernel_capture import Endpoint
 from linux_tun_live_window import OriginalWriteWindows
 
 
+@unittest.skipUnless(os.name == "posix" and hasattr(socket, "AF_UNIX"), "actual Unix control sockets required")
 class ControlSocketTests(unittest.TestCase):
     def pair(self):
-        left, right = socket.socketpair()
+        left, right = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
         self.addCleanup(right.close)
         endpoint = Endpoint(left, None, None, "a" * 32, "b" * 32)
         self.addCleanup(endpoint.close)

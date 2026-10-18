@@ -455,8 +455,9 @@ def main() -> int:
                                     kernel_control_bytes_per_stream=4 * 1024 * 1024,
                                     kernel_registered_requests_per_daemon=1000, kernel_capture_TTL_seconds=120,
                                     kernel_capture_additional_process_groups=0)
-            path = Path(__file__).with_name("linux_tun_kernel_capture.py")
-            report["source_sha256"][str(path.relative_to(ROOT))] = digest(path)
+            for name in ["linux_tun_kernel_capture.py", "linux_tun_live_window.py"]:
+                path = Path(__file__).with_name(name)
+                report["source_sha256"][str(path.relative_to(ROOT))] = digest(path)
         report["binary_sha256"] = {"daemon": digest(args.daemon), "control": digest(args.control)}
         for path, expected in report["source_sha256"].items():
             committed = subprocess.check_output(["git", "-C", str(ROOT), "show", args.head + ":" + path], timeout=20)

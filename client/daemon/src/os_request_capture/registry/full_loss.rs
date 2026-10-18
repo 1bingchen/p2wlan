@@ -15,8 +15,11 @@ pub(crate) enum FullRetentionLossReason {
     PublicationIdentityMismatch,
     PublicationObservationMissing,
     RetentionClockUnavailable,
+    // Deferred completion uses the Unix descriptor actor. Other platforms
+    // have no such lock failure; keep subsequent diagnostic byte codes fixed.
+    #[cfg(unix)]
     HistoryContended,
-    HistoryCapacity,
+    HistoryCapacity = 10,
     HistoryInvalid,
     InputScopeUnavailable,
     InputScopeNotLive,

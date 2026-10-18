@@ -167,5 +167,43 @@ class ComparisonControls(unittest.TestCase):
             self.rejects(values, "native_frame_original_non_delivery_fences")
 
 
+class PerRecordComparisonControls(unittest.TestCase):
+    def test_reported_relay_path_requires_the_same_original_full_path(self):
+        values = data()
+        values[1]["native_credit"]["physical_path"] = "relay"
+        values[0]["historical_full_packets"][0]["physical_path"] = "relay"
+        self.assertEqual(native.frame_comparison_or_gap(*values)["physical_path"], "relay")
+        values[1]["native_credit"]["physical_path"] = "udp"
+        self.assertEqual(native.frame_comparison_or_gap(*values),
+                         dict(matched=False, gap_reason="native_frame_original_full_identity_or_time"))
+
+    def test_one_terminal_gap_retains_all_eight_serialized_results_and_the_failure(self):
+        for status in ["unknown", "stale", "contended", "already_committed"]:
+            inputs = [data() for _ in range(8)]
+            inputs[2][1]["native_credit"].update(status=status, once_committed=False)
+            before = copy.deepcopy(inputs)
+            results = [native.frame_comparison_or_gap(*values) for values in inputs]
+            self.assertEqual(len(results), 8)
+            self.assertEqual([i for i, row in enumerate(results) if not row["matched"]], [2])
+            self.assertEqual(results[2], dict(matched=False, gap_reason="native_frame_original_once_missing"))
+            self.assertFalse(all(row["matched"] for row in results))
+            self.assertEqual(inputs, before)
+
+    def test_half_open_original_deadline_failure_is_kept_without_losing_later_slots(self):
+        inputs = [data() for _ in range(8)]
+        inputs[0][1]["native_credit"]["commit_monotonic_ns"] = 200
+        results = [native.frame_comparison_or_gap(*values) for values in inputs]
+        self.assertEqual(results[0], dict(matched=False, gap_reason="native_frame_original_commit_deadline"))
+        self.assertTrue(all(row["matched"] for row in results[1:]))
+        self.assertFalse(all(row["matched"] for row in results))
+        self.assertTrue(all(not any("verified" in key for key in row) for row in results))
+
+    def test_success_data_is_identical_and_unexpected_programming_errors_are_not_swallowed(self):
+        values = data()
+        self.assertEqual(native.frame_comparison_or_gap(*values), native.frame_comparison(*values))
+        with self.assertRaises(AttributeError):
+            native.frame_comparison_or_gap(values[0], None, values[2])
+
+
 if __name__ == "__main__":
     unittest.main()

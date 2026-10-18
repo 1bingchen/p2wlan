@@ -45,3 +45,6 @@ mod capability_publication;
 
 #[path = "tests/b28_direct_commit_sequence.rs"]
 mod b28_direct_commit_sequence;
+
+#[path = "tests/relay_only_diagnostics.rs"]
+mod relay_only_diagnostics;

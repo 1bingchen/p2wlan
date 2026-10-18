@@ -1,6 +1,6 @@
 //! Historical Fulls from the existing original physical-attempt producer.
 //! No current connection state or final once permission is owned here.
-use super::{CaptureSession, KernelReadBinding, RegisteredFlowPlan};
+use super::{CaptureSession, FullRetentionLossReason, KernelReadBinding, RegisteredFlowPlan};
 use crate::os_request_capture::clock::monotonic_ns;
 use crate::os_request_capture::plan::{CaptureFailure, Protocol};
 use crate::peer::PeerManager;
@@ -39,16 +39,17 @@ impl Drop for OriginalFullObservation {
     fn drop(&mut self) {
         if self.armed {
             if let Some(scope) = self.scope.upgrade() {
-                scope.original_full_retention_lost();
+                scope.original_full_retention_lost(FullRetentionLossReason::ObservationDropped);
             }
         }
     }
 }
 
 impl CaptureSession {
-    fn original_full_retention_lost(&self) {
+    pub(super) fn original_full_retention_lost(&self, reason: FullRetentionLossReason) {
         // No lock or retry: loss must remain observable even when the history
         // mutex itself caused the miss. Later duplicates never rearm a scope.
+        self.full_loss.record(reason);
         self.full_complete.store(false, Ordering::Release);
         self.gap();
     }
@@ -147,15 +148,6 @@ pub(super) fn spans_complete<'a>(
     coverage.is_complete()
 }
 
-struct FullPacketHistory {
-    read: Arc<KernelReadBinding>,
-    observed_monotonic_ns: u64,
-}
-
-pub(super) struct FullHistory {
-    packets: Vec<FullPacketHistory>,
-}
-
 #[cfg(unix)]
 #[derive(Serialize)]
 pub(super) struct FullPacketSnapshot {
@@ -174,111 +166,75 @@ pub(super) struct FullPacketSnapshot {
     physical_path: &'static str,
 }
 
-impl FullHistory {
-    #[cfg(any(target_os = "linux", all(unix, test)))]
-    pub(super) fn new() -> Self {
-        Self {
-            packets: Vec::new(),
-        }
-    }
-
-    fn retain(
-        &mut self,
-        read: &Arc<KernelReadBinding>,
-        observed_monotonic_ns: u64,
-    ) -> Result<(), CaptureFailure> {
-        if observed_monotonic_ns < read.read.monotonic_ns()
-            || read.spans.is_empty()
-            || !read.spans.iter().all(|span| span.fits(&read.plan))
-        {
-            return Err(CaptureFailure::InvalidPlan);
-        }
-        if self.packets.len() >= MAX_FULL_PACKETS {
-            return Err(CaptureFailure::Capacity);
-        }
-        // The publication's original CAS already permits one successful
-        // producer. This additional identity check makes retention idempotent.
-        if self
-            .packets
+// The bounded original-read index is installed by the actual read producer.
+// An indexed read is not a Full: only its sole physical producer can seal the
+// nonzero observation. Snapshots serialize that fact without completing it.
+#[cfg(unix)]
+pub(super) fn frame_complete(
+    reads: &[Arc<KernelReadBinding>],
+    flow: usize,
+    slot: usize,
+    plan: &RegisteredFlowPlan,
+) -> bool {
+    spans_complete(
+        reads
             .iter()
-            .any(|old| old.observed_monotonic_ns != 0 && Arc::ptr_eq(&old.read, read))
-        {
-            return Ok(());
-        }
-        self.packets
-            .try_reserve(1)
-            .map_err(|_| CaptureFailure::Capacity)?;
-        self.packets.push(FullPacketHistory {
-            read: read.clone(),
-            observed_monotonic_ns,
-        });
-        read.full_retained_ns
-            .set(observed_monotonic_ns)
-            .map_err(|_| CaptureFailure::InvalidPlan)?;
-        Ok(())
-    }
+            .filter(|read| read.flow == flow && read.full_observed_ns().is_some())
+            .flat_map(|read| &read.spans),
+        slot,
+        plan,
+    )
+}
 
-    #[cfg(unix)]
-    pub(super) fn frame_complete(
-        &self,
-        flow: usize,
-        slot: usize,
-        plan: &RegisteredFlowPlan,
-    ) -> bool {
-        spans_complete(
-            self.packets
-                .iter()
-                .filter(|packet| packet.read.flow == flow && packet.observed_monotonic_ns != 0)
-                .flat_map(|packet| &packet.read.spans),
-            slot,
-            plan,
-        )
-    }
-
-    #[cfg(unix)]
-    pub(super) fn snapshot(&self) -> Vec<FullPacketSnapshot> {
-        self.packets
-            .iter()
-            .filter_map(|packet| {
-                let read = &packet.read;
-                let record = read.physical_publication.record()?;
-                Some(FullPacketSnapshot {
-                    flow: read.flow,
-                    read_ordinal: read.read.ordinal(),
-                    read_monotonic_ns: read.read.monotonic_ns(),
-                    full_observed_monotonic_ns: packet.observed_monotonic_ns,
-                    publication_observed_monotonic_ns: read.original_publication_ns.get().copied(),
-                    packet_len: read.packet_len,
-                    packet_sha256: hex::encode(read.packet_sha256),
-                    spans: read.spans.clone(),
-                    attempt_id: record.attempt_id(),
-                    encryption_generation: record.encryption_generation(),
-                    encryption_session_instance: record.encryption().session_instance(),
-                    encryption_peer_lifecycle: record
-                        .encryption()
-                        .authorized_peer_lifecycle()
-                        .map(|life| life.value()),
-                    physical_path: if record.udp().is_some() {
-                        "udp"
-                    } else {
-                        "relay"
-                    },
-                })
+#[cfg(unix)]
+pub(super) fn snapshot(reads: &[Arc<KernelReadBinding>]) -> Vec<FullPacketSnapshot> {
+    reads
+        .iter()
+        .filter_map(|read| {
+            let observed_monotonic_ns = read.full_observed_ns()?;
+            let record = read.physical_publication.record()?;
+            Some(FullPacketSnapshot {
+                flow: read.flow,
+                read_ordinal: read.read.ordinal(),
+                read_monotonic_ns: read.read.monotonic_ns(),
+                full_observed_monotonic_ns: observed_monotonic_ns,
+                publication_observed_monotonic_ns: read.original_publication_ns.get().copied(),
+                packet_len: read.packet_len,
+                packet_sha256: hex::encode(read.packet_sha256),
+                spans: read.spans.clone(),
+                attempt_id: record.attempt_id(),
+                encryption_generation: record.encryption_generation(),
+                encryption_session_instance: record.encryption().session_instance(),
+                encryption_peer_lifecycle: record
+                    .encryption()
+                    .authorized_peer_lifecycle()
+                    .map(|life| life.value()),
+                physical_path: if record.udp().is_some() {
+                    "udp"
+                } else {
+                    "relay"
+                },
             })
-            .collect()
-    }
+        })
+        .collect()
 }
 
 impl KernelReadBinding {
+    #[cfg(unix)]
+    pub(super) fn full_observed_ns(&self) -> Option<u64> {
+        let at = self.full_retained_ns.load(Ordering::Acquire);
+        (at != 0).then_some(at)
+    }
     /// The sole actual Full producer calls this just before publishing its
     /// Instant observation. This clock precedes that boundary; later retention
     /// time is a different upper bound and must not stand in for publication.
     pub(crate) fn observe_original_publication_clock(&self) {
-        let saved = monotonic_ns()
-            .filter(|at| *at != 0)
-            .is_some_and(|at| self.original_publication_ns.set(at).is_ok());
-        if !saved {
-            self.original_full_retention_lost();
+        let Some(at) = monotonic_ns().filter(|at| *at != 0) else {
+            self.full_retention_lost(FullRetentionLossReason::PublicationClockUnavailable);
+            return;
+        };
+        if self.original_publication_ns.set(at).is_err() {
+            self.full_retention_lost(FullRetentionLossReason::PublicationClockAlreadyRecorded);
         }
     }
 
@@ -289,9 +245,13 @@ impl KernelReadBinding {
         }
     }
 
-    pub(crate) fn original_full_retention_lost(&self) {
+    pub(crate) fn original_full_retention_lost(&self, reason: FullRetentionLossReason) {
+        self.full_retention_lost(reason);
+    }
+
+    fn full_retention_lost(&self, reason: FullRetentionLossReason) {
         if let Some(scope) = self.scope.upgrade() {
-            scope.original_full_retention_lost();
+            scope.original_full_retention_lost(reason);
         }
     }
 
@@ -322,36 +282,50 @@ impl KernelReadBinding {
         let Some(scope) = self.scope.upgrade() else {
             return;
         };
-        let retain = || -> Result<(), CaptureFailure> {
+        let retain = || -> Result<(), FullRetentionLossReason> {
             let record = self
                 .physical_publication
                 .record()
-                .ok_or(CaptureFailure::InvalidPlan)?;
-            if !record.matches_original_kernel_read(self)
-                || self.physical_publication.recorded_observed_at().is_none()
-            {
-                return Err(CaptureFailure::InvalidPlan);
+                .ok_or(FullRetentionLossReason::PublicationMissing)?;
+            if !record.matches_original_kernel_read(self) {
+                return Err(FullRetentionLossReason::PublicationIdentityMismatch);
+            }
+            if self.physical_publication.recorded_observed_at().is_none() {
+                return Err(FullRetentionLossReason::PublicationObservationMissing);
             }
             // A native observation AFTER the actual original Full is an upper
             // bound, never a reconstructed syscall timestamp. The original
             // application deadline is compared separately, without rearming.
             let observed = monotonic_ns()
                 .filter(|at| *at != 0)
-                .ok_or(CaptureFailure::InvalidPlan)?;
-            let mut state = scope
-                .state
-                .try_lock()
-                .map_err(|_| CaptureFailure::Contended)?;
-            state.full_history.retain(self, observed)?;
+                .ok_or(FullRetentionLossReason::RetentionClockUnavailable)?;
+            if observed < self.read.monotonic_ns()
+                || self.spans.is_empty()
+                || !self.spans.iter().all(|span| span.fits(&self.plan))
+            {
+                return Err(FullRetentionLossReason::history(
+                    CaptureFailure::InvalidPlan,
+                ));
+            }
+            // No metadata lock, allocation or wait at the actual producer.
+            // The original read index is already bounded to MAX_FULL_PACKETS.
+            // Duplicates keep the first observation and cannot rearm a scope.
+            if self
+                .full_retained_ns
+                .compare_exchange(0, observed, Ordering::Release, Ordering::Relaxed)
+                .is_err()
+            {
+                return Ok(());
+            }
             #[cfg(any(target_os = "linux", all(unix, test)))]
-            scope.try_complete_original_frames(&mut state, self.flow, &self.slots);
+            self.complete_original_full_or_notify(&scope);
             Ok(())
         };
-        if retain().is_err() {
-            scope.original_full_retention_lost();
+        if let Err(reason) = retain() {
+            scope.original_full_retention_lost(reason);
         }
     }
 }
 
 #[cfg(all(unix, test))]
-mod tests;
+pub(super) mod tests;

@@ -3,7 +3,7 @@ use super::*;
 use crate::os_request_capture::plan::RegistrationPlan;
 use serde_json::json;
 
-async fn descriptor_scope() -> (
+pub(in crate::os_request_capture::registry) async fn descriptor_scope() -> (
     crate::os_request_capture::control::CaptureSetup,
     std::os::unix::net::UnixStream,
 ) {
@@ -187,4 +187,152 @@ fn original_frame_spans_keep_udp_slots_distinct_and_bound_tcp_bitmap() {
     oversized.protocol = Protocol::Tcp;
     oversized.payload_bytes = MAX_FRAME_WIRE_BYTES as u16;
     assert!(FrameSpanCoverage::new(&oversized, 0).is_none());
+}
+
+#[tokio::test]
+async fn full_loss_diagnostic_keeps_first_site_without_restoring_credit() {
+    let (setup, _parent) = descriptor_scope().await;
+    assert!(setup.session.full_loss.snapshot().is_none());
+    setup
+        .session
+        .original_full_retention_lost(FullRetentionLossReason::HistoryContended);
+    let mut later = negative_observer(&setup.session);
+    later.arm();
+    drop(later);
+    let value = serde_json::to_value(setup.session.snapshot().unwrap()).unwrap();
+    assert_eq!(
+        value["first_original_full_retention_loss"],
+        "history_contended"
+    );
+    assert_eq!(setup.session.gaps.load(Ordering::Relaxed), 2);
+    assert_no_full_credit(&setup.session, false);
+}
+
+#[tokio::test]
+async fn full_loss_diagnostic_is_nonblocking_scoped_and_survives_retirement() {
+    let (first, _first_parent) = descriptor_scope().await;
+    let (second, _second_parent) = descriptor_scope().await;
+    let held = first.session.state.try_lock().unwrap();
+    let mut observer = negative_observer(&first.session);
+    observer.arm();
+    drop(observer);
+    first.session.retire();
+    assert_eq!(
+        first.session.full_loss.snapshot(),
+        Some(FullRetentionLossReason::ObservationDropped)
+    );
+    assert!(second.session.full_loss.snapshot().is_none());
+    drop(held);
+    assert_no_full_credit(&first.session, false);
+    assert_no_full_credit(&second.session, true);
+}
+
+#[test]
+fn full_loss_diagnostic_serializes_all_sites_without_publication_authority() {
+    use super::super::FullRetentionLoss;
+    use FullRetentionLossReason::*;
+    for (reason, expected) in [
+        (ObservationDropped, "observation_dropped"),
+        (EncryptionCaptureFailed, "encryption_capture_failed"),
+        (PublicationClockUnavailable, "publication_clock_unavailable"),
+        (
+            PublicationClockAlreadyRecorded,
+            "publication_clock_already_recorded",
+        ),
+        (PublicationMissing, "publication_missing"),
+        (PublicationIdentityMismatch, "publication_identity_mismatch"),
+        (
+            PublicationObservationMissing,
+            "publication_observation_missing",
+        ),
+        (RetentionClockUnavailable, "retention_clock_unavailable"),
+        (HistoryContended, "history_contended"),
+        (HistoryCapacity, "history_capacity"),
+        (HistoryInvalid, "history_invalid"),
+    ] {
+        let loss = FullRetentionLoss::new();
+        loss.record(reason);
+        loss.record(HistoryInvalid);
+        assert_eq!(serde_json::to_value(loss.snapshot()).unwrap(), expected);
+    }
+    assert_eq!(
+        FullRetentionLossReason::history(CaptureFailure::Capacity),
+        HistoryCapacity
+    );
+    assert_eq!(
+        FullRetentionLossReason::history(CaptureFailure::InvalidPlan),
+        HistoryInvalid
+    );
+}
+
+#[test]
+fn encryption_capture_diagnostic_serializes_rejection_sites_without_authority() {
+    use super::super::FullRetentionLoss;
+    use FullRetentionLossReason::*;
+    for (reason, expected) in [
+        (InputScopeUnavailable, "input_scope_unavailable"),
+        (InputScopeNotLive, "input_scope_not_live"),
+        (
+            InputReadObservationIncomplete,
+            "input_read_observation_incomplete",
+        ),
+        (InputDeviceRetired, "input_device_retired"),
+        (InputClockBeforeRead, "input_clock_before_read"),
+        (InputRegistryContended, "input_registry_contended"),
+        (InputRegistryPoisoned, "input_registry_poisoned"),
+        (InputFlowInvalid, "input_flow_invalid"),
+        (InputRouteMismatch, "input_route_mismatch"),
+        (InputPeerMismatch, "input_peer_mismatch"),
+        (InputPeerOwnerUnavailable, "input_peer_owner_unavailable"),
+        (PeerEncryptionMismatch, "peer_encryption_mismatch"),
+        (ResponseEncryptionMismatch, "response_encryption_mismatch"),
+        (RoomPermitMismatch, "room_permit_mismatch"),
+        (CipherOwnerMismatch, "cipher_owner_mismatch"),
+        (EncryptionCopyFailed, "encryption_copy_failed"),
+        (InputBindingNotRouted, "input_binding_not_routed"),
+        (InputOwnerMismatch, "input_owner_mismatch"),
+        (InputReadPeerRejected, "input_read_peer_rejected"),
+        (InputPacketLengthMismatch, "input_packet_length_mismatch"),
+        (InputPacketDigestMismatch, "input_packet_digest_mismatch"),
+        (InputFrameBindingsInvalid, "input_frame_bindings_invalid"),
+        (RoutedPeerMismatch, "routed_peer_mismatch"),
+        (RoutedDestinationMismatch, "routed_destination_mismatch"),
+        (RoutedRoomPermitRejected, "routed_room_permit_rejected"),
+    ] {
+        let loss = FullRetentionLoss::new();
+        loss.record(reason);
+        assert_eq!(serde_json::to_value(loss.snapshot()).unwrap(), expected);
+    }
+}
+
+#[tokio::test]
+async fn encryption_capture_diagnostic_keeps_first_rejection_after_later_loss() {
+    let (setup, _parent) = descriptor_scope().await;
+    setup
+        .session
+        .original_full_retention_lost(FullRetentionLossReason::InputRegistryContended);
+    setup
+        .session
+        .original_full_retention_lost(FullRetentionLossReason::PeerEncryptionMismatch);
+    let value = serde_json::to_value(setup.session.snapshot().unwrap()).unwrap();
+    assert_eq!(
+        value["first_original_full_retention_loss"],
+        "input_registry_contended"
+    );
+    assert_eq!(setup.session.gaps.load(Ordering::Relaxed), 2);
+    assert_no_full_credit(&setup.session, false);
+}
+
+#[tokio::test]
+async fn encryption_capture_diagnostic_records_without_registry_lock_or_rearm() {
+    let (setup, _parent) = descriptor_scope().await;
+    let held = setup.session.state.try_lock().unwrap();
+    setup
+        .session
+        .original_full_retention_lost(FullRetentionLossReason::InputRegistryContended);
+    assert!(!setup.session.full_complete.load(Ordering::Acquire));
+    assert!(setup.session.read_complete.load(Ordering::Acquire));
+    assert!(setup.session.inbound_complete.load(Ordering::Acquire));
+    drop(held);
+    assert_no_full_credit(&setup.session, false);
 }

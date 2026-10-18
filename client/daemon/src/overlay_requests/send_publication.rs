@@ -216,11 +216,20 @@ impl PreparedPhysicalPublication {
         actual_generation: u64,
         packet: &crate::transport::EncryptedPeerPacket,
     ) -> Result<Option<Self>, PublicationFailure> {
-        let prepared =
-            Self::capture_original(binding, source, peers, transport, actual_generation, packet);
+        let mut rejected =
+            crate::os_request_capture::FullRetentionLossReason::EncryptionCaptureFailed;
+        let prepared = Self::capture_original(
+            binding,
+            source,
+            peers,
+            transport,
+            actual_generation,
+            packet,
+            &mut rejected,
+        );
         if !matches!(&prepared, Ok(Some(_))) {
             if let Some(read) = binding.token().kernel() {
-                read.original_full_retention_lost();
+                read.original_full_retention_lost(rejected);
             }
         }
         prepared
@@ -233,29 +242,44 @@ impl PreparedPhysicalPublication {
         transport: &crate::transport::WireGuardTransport,
         actual_generation: u64,
         packet: &crate::transport::EncryptedPeerPacket,
+        rejected: &mut crate::os_request_capture::FullRetentionLossReason,
     ) -> Result<Option<Self>, PublicationFailure> {
-        let Some((request, peer_owner)) =
-            OriginalPhysicalInput::capture(binding, peers, source.encrypted_at(), source.peer_id())
-        else {
+        use crate::os_request_capture::FullRetentionLossReason as Reason;
+        let Some((request, peer_owner)) = OriginalPhysicalInput::capture(
+            binding,
+            peers,
+            source.encrypted_at(),
+            source.peer_id(),
+            rejected,
+        ) else {
             return Ok(None);
         };
         // The original caller already owns epoch. Match immutable first-read
         // identity to the actual crypto source here; never try to acquire that
         // same epoch again through a route-time current-identity observer.
-        if binding.token().kernel().is_some_and(|read| {
-            !read.original_peer_matches_encryption(&peer_owner, actual_generation, source)
-                || !read.original_response_matches_encryption(source)
-                || !read.original_room_matches_permit(packet.room_authorization.as_ref())
-        }) {
-            return Ok(None);
+        if let Some(read) = binding.token().kernel() {
+            if !read.original_peer_matches_encryption(&peer_owner, actual_generation, source) {
+                *rejected = Reason::PeerEncryptionMismatch;
+                return Ok(None);
+            }
+            if !read.original_response_matches_encryption(source) {
+                *rejected = Reason::ResponseEncryptionMismatch;
+                return Ok(None);
+            }
+            if !read.original_room_matches_permit(packet.room_authorization.as_ref()) {
+                *rejected = Reason::RoomPermitMismatch;
+                return Ok(None);
+            }
         }
         if !source.belongs_to(transport) {
+            *rejected = Reason::CipherOwnerMismatch;
             return Ok(None);
         }
         // Copy may fail before Open. It cannot leave an orphan attempt.
-        let encryption = source
-            .try_copy_for_publication()
-            .map_err(|_| PublicationFailure::MetadataFailed)?;
+        let encryption = source.try_copy_for_publication().map_err(|_| {
+            *rejected = Reason::EncryptionCopyFailed;
+            PublicationFailure::MetadataFailed
+        })?;
         Ok(Some(Self {
             full_observation: binding
                 .token()

@@ -76,3 +76,42 @@ async fn poisoned_metadata_remains_terminal_without_waiting_for_a_new_owner() {
     ));
     assert!(!state.waiting.load(Ordering::Acquire));
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn full_metadata_release_listener_cannot_steal_original_command_wakeup() {
+    let state = Arc::new(ControlState::new(7usize));
+    let held = state.try_lock().unwrap();
+    let other = state.clone();
+    let end = tokio::time::Instant::now() + Duration::from_secs(1);
+    let child = tokio::spawn(async move { *other.lock_until(end).await.unwrap() });
+    tokio::task::yield_now().await;
+    let released = state.completion_released();
+    tokio::pin!(released);
+    assert!(
+        std::future::poll_fn(|cx| {
+            use std::future::Future;
+            assert!(released.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(true)
+        })
+        .await
+    );
+    drop(held);
+    tokio::time::timeout_at(end, released).await.unwrap();
+    assert_eq!(
+        tokio::time::timeout_at(end, child).await.unwrap().unwrap(),
+        7
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn full_metadata_release_does_not_refill_expired_command_deadline() {
+    let state = ControlState::new(7usize);
+    let end = tokio::time::Instant::now();
+    drop(state.try_lock().unwrap());
+    state.completion_released().await;
+    assert!(matches!(
+        state.lock_until(end).await,
+        Err(CaptureFailure::ControlNotReady)
+    ));
+    assert!(!state.waiting.load(Ordering::Acquire));
+}

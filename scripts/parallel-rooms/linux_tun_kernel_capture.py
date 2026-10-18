@@ -288,7 +288,7 @@ class KernelCaptures:
                     if application["status"] == "success":
                         require(all(snapshot.get(k) is True for k in ["incoming_provenance_complete", "original_read_observation_complete", "original_full_retention_complete"]),
                                 "original_native_capture_provenance_incomplete")
-                        comparisons.append(native.frame_comparison(snapshot, row, row["original_write_window"]))
+                        comparisons.append(native.frame_comparison_or_gap(snapshot, row, row["original_write_window"]))
                     else:
                         # Preserve failed/unsent application samples. A local
                         # kernel receipt alone never turns them into successes.

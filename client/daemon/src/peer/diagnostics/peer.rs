@@ -206,7 +206,12 @@ impl PeerDiagnostics {
             && conn.relay_first_confirmation_pending(local_generation, relay_available);
         let relay_first_business_pending = !on_link_direct_snapshot
             && conn.relay_first_business_pending(local_generation, relay_available);
-        let confirmed_direct_active = confirmed_direct_snapshot;
+        // An explicit RelayOnly decision is current policy, not an older
+        // selector racing a Direct ACK. A retained selected LAN pair cannot
+        // override that decision in current/last selection diagnostics.
+        let direct_disabled = current_selection
+            .is_some_and(|selection| selection.reason_code == REASON_PATH_DIRECT_DISABLED);
+        let confirmed_direct_active = confirmed_direct_snapshot && !direct_disabled;
         let mut active_path = match current_selection {
             Some(selection) => match selection.path {
                 Some(NetworkPath::Direct)
@@ -246,6 +251,7 @@ impl PeerDiagnostics {
         }
         let selected_pair = conn.selected_candidate_pair_for_diagnostics(local_generation);
         if active_path.is_none()
+            && !direct_disabled
             && conn.state == ConnectionState::Direct
             && selected_pair.is_some_and(|pair| !conn.is_overlay_candidate_pair(pair))
             && conn.direct_health.consecutive_failures == 0

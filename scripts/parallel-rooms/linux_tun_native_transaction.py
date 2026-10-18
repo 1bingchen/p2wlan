@@ -124,5 +124,13 @@ def frame_comparison(snapshot, row, window):
                     and pair[0] < max(read_ids) and pair[0] not in read_ids for pair in skipped)
             and [pair[0] for pair in skipped] == sorted(set(pair[0] for pair in skipped)),
             "native_frame_original_non_delivery_fences")
-    return dict(matched=True, commit_monotonic_ns=point, original_kernel_read_ordinals=read_ids,
+    return dict(matched=True, physical_path=credit["physical_path"], commit_monotonic_ns=point, original_kernel_read_ordinals=read_ids,
                 original_system_write_ordinals=write_ids, original_non_delivery_attempts=skipped)
+
+
+def frame_comparison_or_gap(snapshot, row, window):
+    """Preserve a typed data-comparison gap for this slot, never native credit."""
+    try:
+        return frame_comparison(snapshot, row, window)
+    except ComparisonError as error:
+        return dict(matched=False, gap_reason=error.code)

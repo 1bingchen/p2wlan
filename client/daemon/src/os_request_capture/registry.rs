@@ -19,11 +19,17 @@ use std::sync::{Arc, OnceLock, Weak};
 use std::time::Duration;
 use std::time::Instant;
 
+mod binding_rejection;
 #[cfg(unix)]
 mod control_lock;
 mod full;
+#[cfg(any(target_os = "linux", all(unix, test)))]
+mod full_completion;
+mod full_loss;
 #[cfg(unix)]
 use control_lock::ControlState as RegistryMutex;
+use full_loss::FullRetentionLoss;
+pub(crate) use full_loss::FullRetentionLossReason;
 #[cfg(not(unix))]
 use std::sync::Mutex as RegistryMutex;
 #[cfg(any(target_os = "linux", all(unix, test)))]
@@ -51,6 +57,9 @@ pub(crate) struct CaptureSession {
     inbound_complete: AtomicBool,
     read_complete: AtomicBool,
     full_complete: AtomicBool,
+    full_loss: FullRetentionLoss,
+    #[cfg(any(target_os = "linux", all(unix, test)))]
+    pending_full: full_completion::CompletionSignal,
     expires: Instant,
     peers: Weak<PeerManager>,
     #[cfg(unix)]
@@ -69,7 +78,6 @@ struct RegistryState {
     flows: Vec<FlowState>,
     original_device: Option<Arc<KernelRead>>,
     system_device: Option<Weak<DeviceLease>>,
-    full_history: full::FullHistory,
     // Actual original read order includes unresolved and failed publications.
     // A later duplicate Full cannot replace an earlier uncertain producer.
     read_history: Vec<Arc<KernelReadBinding>>,
@@ -118,7 +126,9 @@ pub(crate) struct KernelReadBinding {
     plan: Arc<RegisteredFlowPlan>,
     spans: Vec<full::ReadFrameSpan>,
     physical_publication: crate::overlay_requests::PhysicalSendPublication,
-    full_retained_ns: OnceLock<u64>,
+    full_retained_ns: AtomicU64,
+    #[cfg(any(target_os = "linux", all(unix, test)))]
+    full_completion_pending: AtomicBool,
     original_publication_ns: OnceLock<u64>,
     original_peers: Vec<Arc<read_peer::FirstReadPeer>>,
     original_responses: Vec<Arc<ingress::ResponseCapture>>,
@@ -149,6 +159,7 @@ pub(super) struct ReadSnapshot {
     incoming_provenance_complete: bool,
     original_read_observation_complete: bool,
     original_full_retention_complete: bool,
+    first_original_full_retention_loss: Option<FullRetentionLossReason>,
     retained_original_reads: usize,
 }
 #[cfg(unix)]
@@ -215,6 +226,8 @@ impl CaptureSession {
             inbound_complete: AtomicBool::new(true),
             read_complete: AtomicBool::new(true),
             full_complete: AtomicBool::new(true),
+            full_loss: FullRetentionLoss::new(),
+            pending_full: full_completion::CompletionSignal::new(),
             expires,
             peers: Arc::downgrade(peers),
             capture_id: plan.capture_id,
@@ -226,7 +239,6 @@ impl CaptureSession {
                 flows: Vec::new(),
                 original_device: None,
                 system_device: None,
-                full_history: full::FullHistory::new(),
                 read_history: Vec::new(),
                 inbound_history: ingress::InboundHistory::new(),
                 requests: 0,
@@ -563,7 +575,9 @@ impl CaptureSession {
             plan,
             spans,
             physical_publication: crate::overlay_requests::PhysicalSendPublication::new(),
-            full_retained_ns: OnceLock::new(),
+            full_retained_ns: AtomicU64::new(0),
+            #[cfg(any(target_os = "linux", all(unix, test)))]
+            full_completion_pending: AtomicBool::new(false),
             original_publication_ns: OnceLock::new(),
             original_peers,
             original_responses,
@@ -631,7 +645,8 @@ impl CaptureSession {
                     flow_invalid: flow.invalid,
                     historical_frame_full_complete: self.full_complete.load(Ordering::Acquire)
                         && !flow.invalid
-                        && state.full_history.frame_complete(
+                        && full::frame_complete(
+                            &state.read_history,
                             flow_index,
                             key.sequence as usize,
                             plan,
@@ -692,7 +707,7 @@ impl CaptureSession {
             active: self.is_live(Instant::now()),
             gaps: self.gaps.load(Ordering::Relaxed),
             requests,
-            historical_full_packets: state.full_history.snapshot(),
+            historical_full_packets: full::snapshot(&state.read_history),
             system_tun_full_writes: state.inbound_history.snapshot(),
             // Registration alone leaves these false. Only the sole native
             // current-owner/once transaction can make every frame verified;
@@ -703,6 +718,7 @@ impl CaptureSession {
             incoming_provenance_complete: self.inbound_complete.load(Ordering::Acquire),
             original_read_observation_complete: self.read_complete.load(Ordering::Acquire),
             original_full_retention_complete: self.full_complete.load(Ordering::Acquire),
+            first_original_full_retention_loss: self.full_loss.snapshot(),
             retained_original_reads: state.read_history.len(),
         })
     }
@@ -710,47 +726,42 @@ impl CaptureSession {
 
 impl KernelReadBinding {
     pub(crate) fn is_current_at(&self, observed_at: Instant) -> bool {
-        self.scope.upgrade().is_some_and(|scope| {
-            scope.is_live(observed_at)
-                && scope.read_complete.load(Ordering::Acquire)
-                && self.read.is_current()
-                && self.read.at() <= observed_at
-                && scope
-                    .state
-                    .try_lock()
-                    .is_ok_and(|state| !state.flows[self.flow].invalid)
-        })
+        self.original_input_rejection(observed_at).is_none()
     }
 
-    pub(crate) fn exact_input(
+    // The original checks, order and single try-lock are unchanged. Returning
+    // a negative diagnostic does not lease an owner or authorize publication.
+    pub(crate) fn original_input_rejection(
         &self,
-        peers: &Arc<PeerManager>,
-        packet: &[u8],
         observed_at: Instant,
-    ) -> bool {
-        self.is_current_at(observed_at)
-            && self.scope.upgrade().is_some_and(|scope| {
-                Weak::ptr_eq(&scope.peers, &Arc::downgrade(peers))
-                    && self.original_peer_identity_is_current(&scope, observed_at)
-                    && scope.is_live(observed_at)
-                    && self.read.is_current()
-                    && self.read.at() <= observed_at
-                    && self.packet_len == packet.len()
-                    && self.packet_sha256 == <[u8; 32]>::from(Sha256::digest(packet))
-                    && !self.slots.is_empty()
-                    && self.slots.len() <= MAX_BINDINGS_PER_PACKET
-            })
-    }
-
-    pub(crate) fn exact_route(
-        &self,
-        peers: &Arc<PeerManager>,
-        packet: &OutboundPacket,
-        observed_at: Instant,
-    ) -> bool {
-        self.exact_input(peers, &packet.packet, observed_at)
-            && packet.peer_id == self.plan.peer
-            && packet.dst_ip == self.plan.flow.dst_v4.to_string()
-            && self.original_room_matches_permit(packet.room_authorization.as_ref())
+    ) -> Option<FullRetentionLossReason> {
+        use FullRetentionLossReason as Reason;
+        let Some(scope) = self.scope.upgrade() else {
+            return Some(Reason::InputScopeUnavailable);
+        };
+        if !scope.is_live(observed_at) {
+            return Some(Reason::InputScopeNotLive);
+        }
+        if !scope.read_complete.load(Ordering::Acquire) {
+            return Some(Reason::InputReadObservationIncomplete);
+        }
+        if !self.read.is_current() {
+            return Some(Reason::InputDeviceRetired);
+        }
+        if self.read.at() > observed_at {
+            return Some(Reason::InputClockBeforeRead);
+        }
+        let state = match scope.state.try_lock() {
+            Ok(state) => state,
+            Err(std::sync::TryLockError::WouldBlock) => {
+                return Some(Reason::InputRegistryContended)
+            }
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Some(Reason::InputRegistryPoisoned)
+            }
+        };
+        state.flows[self.flow]
+            .invalid
+            .then_some(Reason::InputFlowInvalid)
     }
 }

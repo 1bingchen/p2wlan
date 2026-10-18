@@ -1,7 +1,7 @@
 //! The two sealed input mints share the original physical-attempt producer.
 //! This weak identity never substitutes registration labels for a system read.
 use super::{CanonicalOverlayRequest, PhysicalSendPublication};
-use crate::os_request_capture::KernelReadBinding;
+use crate::os_request_capture::{FullRetentionLossReason, KernelReadBinding};
 use crate::peer::PeerManager;
 use crate::request_carriage::{RequestBinding, RequestBindingState};
 use std::sync::{Arc, Weak};
@@ -23,22 +23,34 @@ impl OriginalPhysicalInput {
         peers: &PeerManager,
         encrypted_at: Instant,
         peer_id: &str,
+        rejected: &mut FullRetentionLossReason,
     ) -> Option<(Self, Weak<PeerManager>)> {
         if let Some(request) = binding.token().request() {
             let owner = request.original_peer_owner(peers)?;
             return Some((Self::Canonical(Arc::downgrade(&request)), owner));
         }
         let kernel = binding.token().kernel()?;
-        if binding.state() != RequestBindingState::RoutedExact
-            || !kernel.is_current_at(encrypted_at)
-            || kernel.peer_id() != peer_id
-        {
+        let state = binding.state();
+        if state != RequestBindingState::RoutedExact {
+            *rejected = binding.original_kernel_rejection().unwrap_or(match state {
+                RequestBindingState::ReadExact => FullRetentionLossReason::InputBindingNotRouted,
+                _ => FullRetentionLossReason::InputRouteMismatch,
+            });
             return None;
         }
-        Some((
-            Self::Kernel(Arc::downgrade(kernel)),
-            kernel.original_peer_owner(peers)?,
-        ))
+        if let Some(reason) = kernel.original_input_rejection(encrypted_at) {
+            *rejected = reason;
+            return None;
+        }
+        if kernel.peer_id() != peer_id {
+            *rejected = FullRetentionLossReason::InputPeerMismatch;
+            return None;
+        }
+        let Some(owner) = kernel.original_peer_owner(peers) else {
+            *rejected = FullRetentionLossReason::InputPeerOwnerUnavailable;
+            return None;
+        };
+        Some((Self::Kernel(Arc::downgrade(kernel)), owner))
     }
 
     pub(super) fn upgrade(&self) -> Option<OriginalPhysicalInputOwner> {

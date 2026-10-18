@@ -19,6 +19,7 @@ use std::sync::{Arc, OnceLock, Weak};
 use std::time::Duration;
 use std::time::Instant;
 
+mod binding_rejection;
 #[cfg(unix)]
 mod control_lock;
 mod full;
@@ -762,37 +763,5 @@ impl KernelReadBinding {
         state.flows[self.flow]
             .invalid
             .then_some(Reason::InputFlowInvalid)
-    }
-
-    pub(crate) fn exact_input(
-        &self,
-        peers: &Arc<PeerManager>,
-        packet: &[u8],
-        observed_at: Instant,
-    ) -> bool {
-        self.is_current_at(observed_at)
-            && self.scope.upgrade().is_some_and(|scope| {
-                Weak::ptr_eq(&scope.peers, &Arc::downgrade(peers))
-                    && self.original_peer_identity_is_current(&scope, observed_at)
-                    && scope.is_live(observed_at)
-                    && self.read.is_current()
-                    && self.read.at() <= observed_at
-                    && self.packet_len == packet.len()
-                    && self.packet_sha256 == <[u8; 32]>::from(Sha256::digest(packet))
-                    && !self.slots.is_empty()
-                    && self.slots.len() <= MAX_BINDINGS_PER_PACKET
-            })
-    }
-
-    pub(crate) fn exact_route(
-        &self,
-        peers: &Arc<PeerManager>,
-        packet: &OutboundPacket,
-        observed_at: Instant,
-    ) -> bool {
-        self.exact_input(peers, &packet.packet, observed_at)
-            && packet.peer_id == self.plan.peer
-            && packet.dst_ip == self.plan.flow.dst_v4.to_string()
-            && self.original_room_matches_permit(packet.room_authorization.as_ref())
     }
 }

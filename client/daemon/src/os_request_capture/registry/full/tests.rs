@@ -289,6 +289,15 @@ fn encryption_capture_diagnostic_serializes_rejection_sites_without_authority() 
         (RoomPermitMismatch, "room_permit_mismatch"),
         (CipherOwnerMismatch, "cipher_owner_mismatch"),
         (EncryptionCopyFailed, "encryption_copy_failed"),
+        (InputBindingNotRouted, "input_binding_not_routed"),
+        (InputOwnerMismatch, "input_owner_mismatch"),
+        (InputReadPeerRejected, "input_read_peer_rejected"),
+        (InputPacketLengthMismatch, "input_packet_length_mismatch"),
+        (InputPacketDigestMismatch, "input_packet_digest_mismatch"),
+        (InputFrameBindingsInvalid, "input_frame_bindings_invalid"),
+        (RoutedPeerMismatch, "routed_peer_mismatch"),
+        (RoutedDestinationMismatch, "routed_destination_mismatch"),
+        (RoutedRoomPermitRejected, "routed_room_permit_rejected"),
     ] {
         let loss = FullRetentionLoss::new();
         loss.record(reason);

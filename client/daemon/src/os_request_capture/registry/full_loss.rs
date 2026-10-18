@@ -37,6 +37,15 @@ pub(crate) enum FullRetentionLossReason {
     RoomPermitMismatch,
     CipherOwnerMismatch,
     EncryptionCopyFailed,
+    InputBindingNotRouted,
+    InputOwnerMismatch,
+    InputReadPeerRejected,
+    InputPacketLengthMismatch,
+    InputPacketDigestMismatch,
+    InputFrameBindingsInvalid,
+    RoutedPeerMismatch,
+    RoutedDestinationMismatch,
+    RoutedRoomPermitRejected,
 }
 
 impl FullRetentionLossReason {
@@ -94,6 +103,15 @@ impl FullRetentionLoss {
             25 => Some(RoomPermitMismatch),
             26 => Some(CipherOwnerMismatch),
             27 => Some(EncryptionCopyFailed),
+            28 => Some(InputBindingNotRouted),
+            29 => Some(InputOwnerMismatch),
+            30 => Some(InputReadPeerRejected),
+            31 => Some(InputPacketLengthMismatch),
+            32 => Some(InputPacketDigestMismatch),
+            33 => Some(InputFrameBindingsInvalid),
+            34 => Some(RoutedPeerMismatch),
+            35 => Some(RoutedDestinationMismatch),
+            36 => Some(RoutedRoomPermitRejected),
             _ => None,
         }
     }

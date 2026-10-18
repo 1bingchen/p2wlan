@@ -66,6 +66,9 @@ pub(crate) enum RequestInputEligibility {
 pub(crate) struct RequestBinding {
     token: RequestSendToken,
     state: RequestBindingState,
+    // Immutable first refusal only. Clones carry the same negative metadata;
+    // route/encryption never rerun a failed check to refill this diagnostic.
+    kernel_input_rejection: Option<crate::os_request_capture::FullRetentionLossReason>,
 }
 
 impl RequestBinding {
@@ -77,12 +80,17 @@ impl RequestBinding {
     ) -> Option<Self> {
         let token = RequestSendToken::from_read_context(context?)?;
         if let Some(kernel) = token.kernel() {
-            let state = if kernel.exact_input(peers, packet, observed_at) {
+            let rejected = kernel.input_rejection(peers, packet, observed_at);
+            let state = if rejected.is_none() {
                 RequestBindingState::ReadExact
             } else {
                 RequestBindingState::Invalid(RequestBindingFailure::OriginalKernelSource)
             };
-            return Some(Self { token, state });
+            return Some(Self {
+                token,
+                state,
+                kernel_input_rejection: rejected,
+            });
         }
         if let Some(echo) = token.echo() {
             let state = if echo.exact_input(peers, packet, observed_at) {
@@ -90,7 +98,11 @@ impl RequestBinding {
             } else {
                 RequestBindingState::Invalid(RequestBindingFailure::OriginalBytes)
             };
-            return Some(Self { token, state });
+            return Some(Self {
+                token,
+                state,
+                kernel_input_rejection: None,
+            });
         }
         // The temporary Arc is dropped synchronously before any route await.
         let state = match token.request() {
@@ -110,7 +122,11 @@ impl RequestBinding {
                 failure.map_or(RequestBindingState::ReadExact, RequestBindingState::Invalid)
             }
         };
-        Some(Self { token, state })
+        Some(Self {
+            token,
+            state,
+            kernel_input_rejection: None,
+        })
     }
 
     pub(crate) fn recheck_routed(
@@ -123,11 +139,13 @@ impl RequestBinding {
             return;
         }
         if let Some(kernel) = self.token.kernel() {
-            self.state = if kernel.exact_route(peers, packet, observed_at) {
+            let rejected = kernel.route_rejection(peers, packet, observed_at);
+            self.state = if rejected.is_none() {
                 RequestBindingState::RoutedExact
             } else {
                 RequestBindingState::Invalid(RequestBindingFailure::OriginalKernelSource)
             };
+            self.kernel_input_rejection = rejected;
             return;
         }
         if let Some(echo) = self.token.echo() {
@@ -168,6 +186,12 @@ impl RequestBinding {
 
     pub(crate) fn state(&self) -> RequestBindingState {
         self.state
+    }
+
+    pub(crate) fn original_kernel_rejection(
+        &self,
+    ) -> Option<crate::os_request_capture::FullRetentionLossReason> {
+        self.kernel_input_rejection
     }
 
     /// The final receipt/credit transaction must still check current owners,

@@ -30,8 +30,12 @@ impl OriginalPhysicalInput {
             return Some((Self::Canonical(Arc::downgrade(&request)), owner));
         }
         let kernel = binding.token().kernel()?;
-        if binding.state() != RequestBindingState::RoutedExact {
-            *rejected = FullRetentionLossReason::InputRouteMismatch;
+        let state = binding.state();
+        if state != RequestBindingState::RoutedExact {
+            *rejected = binding.original_kernel_rejection().unwrap_or(match state {
+                RequestBindingState::ReadExact => FullRetentionLossReason::InputBindingNotRouted,
+                _ => FullRetentionLossReason::InputRouteMismatch,
+            });
             return None;
         }
         if let Some(reason) = kernel.original_input_rejection(encrypted_at) {

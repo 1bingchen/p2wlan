@@ -81,7 +81,7 @@ impl OriginalKernelReadPeer {
 }
 
 impl PeerManager {
-    #[cfg(test)]
+    #[cfg(all(unix, test))]
     pub(crate) fn with_original_kernel_peer_connections_held_for_test<R>(
         &self,
         operation: impl FnOnce() -> R,
@@ -90,7 +90,7 @@ impl PeerManager {
         operation()
     }
 
-    #[cfg(test)]
+    #[cfg(all(unix, test))]
     pub(crate) fn with_original_kernel_peer_membership_held_for_test<R>(
         &self,
         operation: impl FnOnce() -> R,

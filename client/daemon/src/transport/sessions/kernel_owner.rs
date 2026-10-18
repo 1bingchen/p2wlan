@@ -15,6 +15,13 @@ pub(crate) struct OriginalKernelTransportCurrent {
     emit: Arc<EmitRegistry>,
 }
 
+#[cfg(any(target_os = "linux", all(unix, test)))]
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum OriginalKernelEmitFailure {
+    Registry,
+    Emit,
+}
+
 impl WireGuardTransport {
     pub(crate) fn original_kernel_transport_owners(&self) -> OriginalKernelTransportOwners {
         OriginalKernelTransportOwners {
@@ -40,10 +47,14 @@ impl OriginalKernelTransportOwners {
 
 #[cfg(any(target_os = "linux", all(unix, test)))]
 impl OriginalKernelTransportCurrent {
-    pub(crate) fn try_emit_guard(&self, peer: &str) -> Option<OwnedMutexGuard<()>> {
-        WireGuardTransport::try_outbound_emit_lock_in(&self.emit, peer)?
+    pub(crate) fn try_emit_guard(
+        &self,
+        peer: &str,
+    ) -> std::result::Result<OwnedMutexGuard<()>, OriginalKernelEmitFailure> {
+        WireGuardTransport::try_outbound_emit_lock_in(&self.emit, peer)
+            .ok_or(OriginalKernelEmitFailure::Registry)?
             .try_lock_owned()
-            .ok()
+            .map_err(|_| OriginalKernelEmitFailure::Emit)
     }
 
     pub(crate) fn try_session_guard<'a>(
@@ -55,3 +66,6 @@ impl OriginalKernelTransportCurrent {
         OriginalOverlaySessionGuard::try_original_registry(&self.sessions, peer, tx, rx)
     }
 }
+
+#[cfg(all(unix, test))]
+mod tests;

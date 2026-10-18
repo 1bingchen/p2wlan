@@ -31,6 +31,7 @@ pub(crate) struct OriginalKernelExchange {
 
 pub(super) struct NativeFrameOutcome {
     outcome: Outcome,
+    owner_check: &'static str,
     committed: bool,
     commit_ns: Option<u64>,
     read_ordinals: Vec<u64>,
@@ -62,6 +63,7 @@ impl OriginalKernelOnce<'_> {
 pub(super) struct NativeFrameSnapshot {
     status: &'static str,
     outcome: String,
+    owner_check: &'static str,
     once_committed: bool,
     commit_monotonic_ns: Option<u64>,
     original_kernel_read_ordinals: Vec<u64>,
@@ -78,6 +80,7 @@ impl NativeFrameOutcome {
     fn failure(outcome: Outcome) -> Self {
         Self {
             outcome,
+            owner_check: "not_entered",
             committed: false,
             commit_ns: None,
             read_ordinals: Vec::new(),
@@ -92,6 +95,7 @@ impl NativeFrameOutcome {
 
     pub(super) fn snapshot(&self) -> NativeFrameSnapshot {
         NativeFrameSnapshot {
+            owner_check: self.owner_check,
             status: match self.outcome {
                 Outcome::Fresh(_) => "committed",
                 Outcome::AlreadyCommitted => "already_committed",
@@ -445,8 +449,12 @@ impl CaptureSession {
                     committed: &mut result.committed,
                     commit_ns: &mut result.commit_ns,
                 };
-                result.outcome =
-                    peers.try_commit_original_kernel_exchange(&owners, &candidate, &mut once);
+                result.outcome = peers.try_commit_original_kernel_exchange(
+                    &owners,
+                    &candidate,
+                    &mut once,
+                    &mut result.owner_check,
+                );
             }
             state.flows[flow].requests[slot].native_credit = Some(result);
         }

@@ -631,14 +631,14 @@ mod sessions;
 pub(crate) use resource_queue_test_gate::ResourceQueueTestGate;
 #[cfg(test)]
 pub(crate) use resource_queue_test_gate::{WorkerLossObservation, WorkerLossPoint};
-#[cfg(any(target_os = "linux", all(unix, test)))]
-pub(crate) use sessions::OriginalKernelTransportCurrent;
 pub(crate) use sessions::OriginalKernelTransportOwners;
 #[allow(unused_imports)] // Compatibility result types may be unused by a build.
 pub(crate) use sessions::{
     EncryptedOutboundWithSource, OriginalEchoSessionGuard, OriginalEncryptionSource,
     OriginalOverlaySessionFailure, OriginalOverlaySessionGuard, SessionBoundEncryptionWithSource,
 };
+#[cfg(any(target_os = "linux", all(unix, test)))]
+pub(crate) use sessions::{OriginalKernelEmitFailure, OriginalKernelTransportCurrent};
 mod wire;
 use sessions::PeerTransportSessions;
 #[allow(unused_imports)] // Opaque rollback API is available for future qualified callers.

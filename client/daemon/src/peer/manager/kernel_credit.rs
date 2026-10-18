@@ -14,8 +14,10 @@ impl PeerManager {
         owners: &OriginalKernelCurrentOwners,
         request: &OriginalKernelExchange,
         once: &mut OriginalKernelOnce<'_>,
+        owner_check: &mut &'static str,
     ) -> OverlayCreditOutcome {
         use OverlayCreditOutcome::{Contended, Stale, Unknown};
+        *owner_check = "original_peer";
         let expected = match request.original_peer() {
             Ok(peer) => peer,
             Err(reason) => return reason,
@@ -26,6 +28,7 @@ impl PeerManager {
         {
             return Stale(CreditStale::Identity);
         }
+        *owner_check = "original_sources";
         let mut records = Vec::new();
         let mut sources = Vec::new();
         if records.try_reserve(request.reads().len()).is_err()
@@ -45,6 +48,7 @@ impl PeerManager {
         let (Some(first_tx), Some(first_rx)) = (records.first(), sources.first()) else {
             return Unknown(CreditUnknown::OriginalSource);
         };
+        *owner_check = "room";
         let room = match owners.room.try_original_send_guard(
             request.room(),
             request.peer(),
@@ -54,12 +58,22 @@ impl PeerManager {
             Ok(guard) => guard,
             Err(reason) => return reason.into(),
         };
-        let Some(_emit) = owners.wireguard.try_emit_guard(request.peer()) else {
-            return Contended(CreditLock::Emit);
+        *owner_check = "emit_registry";
+        let _emit = match owners.wireguard.try_emit_guard(request.peer()) {
+            Ok(guard) => guard,
+            Err(crate::transport::OriginalKernelEmitFailure::Registry) => {
+                return Contended(CreditLock::Emit)
+            }
+            Err(crate::transport::OriginalKernelEmitFailure::Emit) => {
+                *owner_check = "emit";
+                return Contended(CreditLock::Emit);
+            }
         };
+        *owner_check = "epoch";
         let Ok(_epoch) = self.network_epoch_gate.try_lock() else {
             return Contended(CreditLock::Epoch);
         };
+        *owner_check = "session";
         let session = match owners.wireguard.try_session_guard(
             request.peer(),
             first_tx.encryption(),
@@ -76,19 +90,23 @@ impl PeerManager {
                 return Stale(CreditStale::Session)
             }
         };
+        *owner_check = "connections";
         let Ok(mut connections) = self.connections.try_write() else {
             return Contended(CreditLock::Connections);
         };
+        *owner_check = "membership";
         let membership = match self.peer_membership.try_lock() {
             Ok(guard) => guard,
             Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
             Err(std::sync::TryLockError::WouldBlock) => return Contended(CreditLock::Membership),
         };
+        *owner_check = "lifecycle";
         let lifecycle = membership.active_generation(request.peer());
         drop(membership);
         if lifecycle != Some(expected.lifecycle) || lifecycle != Some(session.lifecycle()) {
             return Stale(CreditStale::Lifecycle);
         }
+        *owner_check = "quarantine";
         let quarantine = match self.quarantine_deadline_mirror.try_lock() {
             Ok(guard) => guard,
             Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
@@ -101,6 +119,7 @@ impl PeerManager {
         if quarantined {
             return Stale(CreditStale::Quarantine);
         }
+        *owner_check = "generation";
         let generation = self.current_network_generation_sync();
         if generation != expected.generation
             || records
@@ -112,6 +131,7 @@ impl PeerManager {
         {
             return Stale(CreditStale::Generation);
         }
+        *owner_check = "session_identity";
         if records.iter().any(|record| {
             sources.iter().any(|source| {
                 !session.matches_original_sources(record.encryption(), source.session())
@@ -119,6 +139,7 @@ impl PeerManager {
         }) {
             return Stale(CreditStale::Session);
         }
+        *owner_check = "peer_state";
         let Some(conn) = connections.get_mut(request.peer()) else {
             return Stale(CreditStale::PeerState);
         };
@@ -141,11 +162,16 @@ impl PeerManager {
                 if tx.original_direct_commit().is_none() {
                     return Unknown(CreditUnknown::OriginalPublication);
                 }
-                if conn.state != ConnectionState::Direct
-                    || conn.direct_generation != generation
-                    || tx.original_direct_commit() != Some(conn.direct_commit_seq)
-                    || conn.selected_direct_endpoint_for_consent(generation) != Some(tx.endpoint())
-                {
+                *owner_check = "direct_state_generation";
+                if conn.state != ConnectionState::Direct || conn.direct_generation != generation {
+                    return Stale(CreditStale::DirectPublication);
+                }
+                *owner_check = "direct_commit_sequence";
+                if tx.original_direct_commit() != Some(conn.direct_commit_seq) {
+                    return Stale(CreditStale::DirectPublication);
+                }
+                *owner_check = "direct_consent_endpoint";
+                if conn.selected_direct_endpoint_for_consent(generation) != Some(tx.endpoint()) {
                     return Stale(CreditStale::DirectPublication);
                 }
                 txs.push(tx);
@@ -159,17 +185,19 @@ impl PeerManager {
                 };
                 rxs.push(rx);
             }
+            *owner_check = "direct_slot";
             let Ok(slot) = owners.udp.try_read() else {
                 return Contended(CreditLock::UdpSlot);
             };
             let Some(udp) = slot.as_ref() else {
                 return Stale(CreditStale::DirectPublication);
             };
-            let _publication = match udp.try_original_direct_publication_batch_guard(
+            let _publication = match udp.try_original_direct_publication_batch_guard_observed(
                 request.peer(),
                 generation,
                 &rxs,
                 &txs,
+                owner_check,
             ) {
                 Ok(guard) => guard,
                 Err(crate::udp::DirectOriginFailure::ContendedMembership) => {
@@ -188,6 +216,7 @@ impl PeerManager {
                     return Stale(CreditStale::DirectPublication)
                 }
             };
+            *owner_check = "final_transaction";
             Self::commit_original_kernel_locked(
                 self,
                 conn,
@@ -217,16 +246,19 @@ impl PeerManager {
             }) {
                 return Unknown(CreditUnknown::MixedPath);
             }
+            *owner_check = "relay_slot";
             let Ok(slot) = owners.relay.try_read() else {
                 return Contended(CreditLock::RelaySlot);
             };
             let Some(relay) = slot.as_ref() else {
                 return Stale(CreditStale::RelayPublication);
             };
+            *owner_check = "relay_membership";
             let member = match relay.try_original_member_guard(tx, rx, id) {
                 Ok(guard) => guard,
                 Err(reason) => return Self::kernel_relay_failure(reason),
             };
+            *owner_check = "relay_open";
             let _open = match member.try_open_guard() {
                 Ok(guard) => guard,
                 Err(reason) => return Self::kernel_relay_failure(reason),
@@ -249,9 +281,11 @@ impl PeerManager {
                     }
                 }
             }
+            *owner_check = "relay_current";
             if conn.relay_confirmed_connection_id != Some(id) || !member.is_current() {
                 return Stale(CreditStale::RelayPublication);
             }
+            *owner_check = "final_transaction";
             Self::commit_original_kernel_locked(
                 self,
                 conn,

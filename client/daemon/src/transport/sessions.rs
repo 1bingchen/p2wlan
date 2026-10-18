@@ -8,9 +8,9 @@ pub(crate) use encryption::{
     EncryptedOutboundWithSource, OriginalEchoSessionGuard, OriginalEncryptionSource,
     SessionBoundEncryptionWithSource,
 };
-#[cfg(any(target_os = "linux", all(unix, test)))]
-pub(crate) use kernel_owner::OriginalKernelTransportCurrent;
 pub(crate) use kernel_owner::OriginalKernelTransportOwners;
+#[cfg(any(target_os = "linux", all(unix, test)))]
+pub(crate) use kernel_owner::{OriginalKernelEmitFailure, OriginalKernelTransportCurrent};
 pub(crate) use overlay_credit::{OriginalOverlaySessionFailure, OriginalOverlaySessionGuard};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

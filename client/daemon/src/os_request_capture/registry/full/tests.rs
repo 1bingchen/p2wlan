@@ -264,3 +264,66 @@ fn full_loss_diagnostic_serializes_all_sites_without_publication_authority() {
         HistoryInvalid
     );
 }
+
+#[test]
+fn encryption_capture_diagnostic_serializes_rejection_sites_without_authority() {
+    use super::super::FullRetentionLoss;
+    use FullRetentionLossReason::*;
+    for (reason, expected) in [
+        (InputScopeUnavailable, "input_scope_unavailable"),
+        (InputScopeNotLive, "input_scope_not_live"),
+        (
+            InputReadObservationIncomplete,
+            "input_read_observation_incomplete",
+        ),
+        (InputDeviceRetired, "input_device_retired"),
+        (InputClockBeforeRead, "input_clock_before_read"),
+        (InputRegistryContended, "input_registry_contended"),
+        (InputRegistryPoisoned, "input_registry_poisoned"),
+        (InputFlowInvalid, "input_flow_invalid"),
+        (InputRouteMismatch, "input_route_mismatch"),
+        (InputPeerMismatch, "input_peer_mismatch"),
+        (InputPeerOwnerUnavailable, "input_peer_owner_unavailable"),
+        (PeerEncryptionMismatch, "peer_encryption_mismatch"),
+        (ResponseEncryptionMismatch, "response_encryption_mismatch"),
+        (RoomPermitMismatch, "room_permit_mismatch"),
+        (CipherOwnerMismatch, "cipher_owner_mismatch"),
+        (EncryptionCopyFailed, "encryption_copy_failed"),
+    ] {
+        let loss = FullRetentionLoss::new();
+        loss.record(reason);
+        assert_eq!(serde_json::to_value(loss.snapshot()).unwrap(), expected);
+    }
+}
+
+#[tokio::test]
+async fn encryption_capture_diagnostic_keeps_first_rejection_after_later_loss() {
+    let (setup, _parent) = descriptor_scope().await;
+    setup
+        .session
+        .original_full_retention_lost(FullRetentionLossReason::InputRegistryContended);
+    setup
+        .session
+        .original_full_retention_lost(FullRetentionLossReason::PeerEncryptionMismatch);
+    let value = serde_json::to_value(setup.session.snapshot().unwrap()).unwrap();
+    assert_eq!(
+        value["first_original_full_retention_loss"],
+        "input_registry_contended"
+    );
+    assert_eq!(setup.session.gaps.load(Ordering::Relaxed), 2);
+    assert_no_full_credit(&setup.session, false);
+}
+
+#[tokio::test]
+async fn encryption_capture_diagnostic_records_without_registry_lock_or_rearm() {
+    let (setup, _parent) = descriptor_scope().await;
+    let held = setup.session.state.try_lock().unwrap();
+    setup
+        .session
+        .original_full_retention_lost(FullRetentionLossReason::InputRegistryContended);
+    assert!(!setup.session.full_complete.load(Ordering::Acquire));
+    assert!(setup.session.read_complete.load(Ordering::Acquire));
+    assert!(setup.session.inbound_complete.load(Ordering::Acquire));
+    drop(held);
+    assert_no_full_credit(&setup.session, false);
+}

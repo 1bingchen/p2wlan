@@ -291,8 +291,8 @@ impl KernelReadBinding {
         }
     }
 
-    pub(crate) fn original_full_retention_lost(&self) {
-        self.full_retention_lost(FullRetentionLossReason::EncryptionCaptureFailed);
+    pub(crate) fn original_full_retention_lost(&self, reason: FullRetentionLossReason) {
+        self.full_retention_lost(reason);
     }
 
     fn full_retention_lost(&self, reason: FullRetentionLossReason) {

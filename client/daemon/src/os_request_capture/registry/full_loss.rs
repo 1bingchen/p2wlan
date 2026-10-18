@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU8, Ordering};
 #[cfg_attr(unix, derive(serde::Serialize))]
 #[cfg_attr(unix, serde(rename_all = "snake_case"))]
 #[repr(u8)]
-pub(super) enum FullRetentionLossReason {
+pub(crate) enum FullRetentionLossReason {
     ObservationDropped = 1,
     EncryptionCaptureFailed,
     PublicationClockUnavailable,
@@ -18,6 +18,22 @@ pub(super) enum FullRetentionLossReason {
     HistoryContended,
     HistoryCapacity,
     HistoryInvalid,
+    InputScopeUnavailable,
+    InputScopeNotLive,
+    InputReadObservationIncomplete,
+    InputDeviceRetired,
+    InputClockBeforeRead,
+    InputRegistryContended,
+    InputRegistryPoisoned,
+    InputFlowInvalid,
+    InputRouteMismatch,
+    InputPeerMismatch,
+    InputPeerOwnerUnavailable,
+    PeerEncryptionMismatch,
+    ResponseEncryptionMismatch,
+    RoomPermitMismatch,
+    CipherOwnerMismatch,
+    EncryptionCopyFailed,
 }
 
 impl FullRetentionLossReason {
@@ -59,6 +75,22 @@ impl FullRetentionLoss {
             9 => Some(HistoryContended),
             10 => Some(HistoryCapacity),
             11 => Some(HistoryInvalid),
+            12 => Some(InputScopeUnavailable),
+            13 => Some(InputScopeNotLive),
+            14 => Some(InputReadObservationIncomplete),
+            15 => Some(InputDeviceRetired),
+            16 => Some(InputClockBeforeRead),
+            17 => Some(InputRegistryContended),
+            18 => Some(InputRegistryPoisoned),
+            19 => Some(InputFlowInvalid),
+            20 => Some(InputRouteMismatch),
+            21 => Some(InputPeerMismatch),
+            22 => Some(InputPeerOwnerUnavailable),
+            23 => Some(PeerEncryptionMismatch),
+            24 => Some(ResponseEncryptionMismatch),
+            25 => Some(RoomPermitMismatch),
+            26 => Some(CipherOwnerMismatch),
+            27 => Some(EncryptionCopyFailed),
             _ => None,
         }
     }

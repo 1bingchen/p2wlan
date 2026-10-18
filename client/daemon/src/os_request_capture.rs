@@ -13,7 +13,8 @@ mod registry;
 pub(crate) use control::{requested_from_env, CaptureSetup};
 pub(crate) use device::SystemTun;
 pub(crate) use registry::{
-    KernelCaptureRuntime, KernelIngressBinding, KernelReadBinding, OriginalFullObservation,
+    FullRetentionLossReason, KernelCaptureRuntime, KernelIngressBinding, KernelReadBinding,
+    OriginalFullObservation,
 };
 #[cfg(any(target_os = "linux", all(unix, test)))]
 pub(crate) use registry::{

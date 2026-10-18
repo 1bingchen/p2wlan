@@ -25,7 +25,8 @@ mod full;
 mod full_loss;
 #[cfg(unix)]
 use control_lock::ControlState as RegistryMutex;
-use full_loss::{FullRetentionLoss, FullRetentionLossReason};
+use full_loss::FullRetentionLoss;
+pub(crate) use full_loss::FullRetentionLossReason;
 #[cfg(not(unix))]
 use std::sync::Mutex as RegistryMutex;
 #[cfg(any(target_os = "linux", all(unix, test)))]
@@ -716,16 +717,43 @@ impl CaptureSession {
 
 impl KernelReadBinding {
     pub(crate) fn is_current_at(&self, observed_at: Instant) -> bool {
-        self.scope.upgrade().is_some_and(|scope| {
-            scope.is_live(observed_at)
-                && scope.read_complete.load(Ordering::Acquire)
-                && self.read.is_current()
-                && self.read.at() <= observed_at
-                && scope
-                    .state
-                    .try_lock()
-                    .is_ok_and(|state| !state.flows[self.flow].invalid)
-        })
+        self.original_input_rejection(observed_at).is_none()
+    }
+
+    // The original checks, order and single try-lock are unchanged. Returning
+    // a negative diagnostic does not lease an owner or authorize publication.
+    pub(crate) fn original_input_rejection(
+        &self,
+        observed_at: Instant,
+    ) -> Option<FullRetentionLossReason> {
+        use FullRetentionLossReason as Reason;
+        let Some(scope) = self.scope.upgrade() else {
+            return Some(Reason::InputScopeUnavailable);
+        };
+        if !scope.is_live(observed_at) {
+            return Some(Reason::InputScopeNotLive);
+        }
+        if !scope.read_complete.load(Ordering::Acquire) {
+            return Some(Reason::InputReadObservationIncomplete);
+        }
+        if !self.read.is_current() {
+            return Some(Reason::InputDeviceRetired);
+        }
+        if self.read.at() > observed_at {
+            return Some(Reason::InputClockBeforeRead);
+        }
+        let state = match scope.state.try_lock() {
+            Ok(state) => state,
+            Err(std::sync::TryLockError::WouldBlock) => {
+                return Some(Reason::InputRegistryContended)
+            }
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Some(Reason::InputRegistryPoisoned)
+            }
+        };
+        state.flows[self.flow]
+            .invalid
+            .then_some(Reason::InputFlowInvalid)
     }
 
     pub(crate) fn exact_input(

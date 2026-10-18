@@ -614,14 +614,27 @@ where
         };
 
         let normalized_src_ip = parsed.src_addr_string();
-        let original_echo = binding.as_ref().and_then(|binding| binding.token().echo());
-        let room_authorization = if let Some(echo) = original_echo {
-            match echo.original_room_permit_for_route(
-                self.room_authorization.as_ref(),
-                &peer_id,
-                &dst_ip,
-                &normalized_src_ip,
-            ) {
+        let original_room = binding.as_ref().and_then(|binding| {
+            if let Some(kernel) = binding.token().kernel() {
+                kernel.original_response_room_for_route(
+                    self.room_authorization.as_ref(),
+                    &peer_id,
+                    &dst_ip,
+                    &normalized_src_ip,
+                )
+            } else {
+                binding.token().echo().map(|echo| {
+                    echo.original_room_permit_for_route(
+                        self.room_authorization.as_ref(),
+                        &peer_id,
+                        &dst_ip,
+                        &normalized_src_ip,
+                    )
+                })
+            }
+        });
+        let room_authorization = if let Some(original) = original_room {
+            match original {
                 Ok(permit) => permit,
                 Err(_) => {
                     self.record_room_drop(

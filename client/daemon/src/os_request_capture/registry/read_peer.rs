@@ -19,6 +19,15 @@ pub(super) struct ReadPeerSnapshot {
 }
 
 impl FirstReadPeer {
+    pub(super) fn matches_original_ingress(
+        &self,
+        source: &crate::transport::OriginalOverlayIngressSource,
+        before: Instant,
+    ) -> bool {
+        self.original
+            .as_ref()
+            .is_ok_and(|peer| peer.matches_original_ingress(source, before))
+    }
     fn capture(scope: &CaptureSession, plan: &RegisteredFlowPlan) -> Self {
         let original = scope
             .peers

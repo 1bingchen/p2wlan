@@ -33,6 +33,19 @@ impl OriginalKernelReadPeer {
             && self.observed_at <= encryption.encrypted_at()
     }
 
+    pub(crate) fn matches_original_ingress(
+        &self,
+        source: &crate::transport::OriginalOverlayIngressSource,
+        before: Instant,
+    ) -> bool {
+        Some(self.generation) == source.network_generation()
+            && self.peer == source.session().peer_id()
+            && Some(self.lifecycle) == source.session().authorized_peer_lifecycle()
+            && source.session().original_role() == crate::transport::OriginalSessionRole::Active
+            && source.session().authenticated_at() <= before
+            && before <= self.observed_at
+    }
+
     /// A synchronous identity observation only; callers must still perform the
     /// sole final transaction after every handoff before granting any credit.
     pub(crate) fn try_identity_at(

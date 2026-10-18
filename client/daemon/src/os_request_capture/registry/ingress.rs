@@ -15,6 +15,11 @@ use std::sync::OnceLock;
 const MAX_SYSTEM_WRITES: usize = 1024;
 const MAX_ORIGINAL_ENDPOINT_BYTES: usize = 4096;
 
+mod response;
+pub(super) use response::ResponseCapture;
+#[cfg(unix)]
+pub(super) use response::ResponseSnapshot;
+
 pub(crate) struct KernelCaptureRuntime {
     scope: Weak<CaptureSession>,
     room: Weak<RoomAuthorization>,
@@ -157,6 +162,9 @@ impl CaptureSession {
             Ok(())
         };
         if retain().is_err() {
+            // A lost Full-write observation cannot be repaired by a later
+            // duplicate sampled after a lifecycle change or room renewal.
+            self.inbound_complete.store(false, Ordering::Release);
             self.gap();
         }
     }

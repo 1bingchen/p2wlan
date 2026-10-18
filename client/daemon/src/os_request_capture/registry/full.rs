@@ -43,35 +43,67 @@ impl ReadFrameSpan {
     }
 }
 
+pub(super) struct FrameSpanCoverage {
+    slot: usize,
+    length: usize,
+    seen: [u64; MAX_FRAME_WIRE_BYTES.div_ceil(64)],
+    covered: usize,
+}
+
+impl FrameSpanCoverage {
+    pub(super) fn new(plan: &RegisteredFlowPlan, slot: usize) -> Option<Self> {
+        let length = match plan.protocol {
+            Protocol::Udp => 1,
+            Protocol::Tcp => 4 + 63 + usize::from(plan.payload_bytes),
+        };
+        (slot < plan.requests.len() && length <= MAX_FRAME_WIRE_BYTES).then_some(Self {
+            slot,
+            length,
+            seen: [0; MAX_FRAME_WIRE_BYTES.div_ceil(64)],
+            covered: 0,
+        })
+    }
+
+    /// True only when this original span contributes previously missing bytes.
+    pub(super) fn add(&mut self, span: &ReadFrameSpan) -> Result<bool, CaptureFailure> {
+        if span.slot != self.slot {
+            return Ok(false);
+        }
+        let (start, end) = (usize::from(span.start), usize::from(span.end));
+        if start >= end || end > self.length {
+            return Err(CaptureFailure::InvalidPlan);
+        }
+        let before = self.covered;
+        for byte in start..end {
+            let bit = 1 << (byte % 64);
+            if self.seen[byte / 64] & bit == 0 {
+                self.seen[byte / 64] |= bit;
+                self.covered += 1;
+            }
+        }
+        Ok(self.covered != before)
+    }
+
+    pub(super) fn is_complete(&self) -> bool {
+        self.covered == self.length
+    }
+}
+
 #[cfg(unix)]
 pub(super) fn spans_complete<'a>(
     spans: impl Iterator<Item = &'a ReadFrameSpan>,
     slot: usize,
     plan: &RegisteredFlowPlan,
 ) -> bool {
-    let length = match plan.protocol {
-        Protocol::Udp => 1,
-        Protocol::Tcp => 4 + 63 + usize::from(plan.payload_bytes),
-    };
-    if length > MAX_FRAME_WIRE_BYTES {
+    let Some(mut coverage) = FrameSpanCoverage::new(plan, slot) else {
         return false;
-    }
-    let mut seen = [0u64; MAX_FRAME_WIRE_BYTES.div_ceil(64)];
-    let mut covered = 0;
-    for span in spans.filter(|span| span.slot == slot) {
-        let (start, end) = (usize::from(span.start), usize::from(span.end));
-        if start >= end || end > length {
+    };
+    for span in spans {
+        if coverage.add(span).is_err() {
             return false;
         }
-        for byte in start..end {
-            let bit = 1 << (byte % 64);
-            if seen[byte / 64] & bit == 0 {
-                seen[byte / 64] |= bit;
-                covered += 1;
-            }
-        }
     }
-    covered == length
+    coverage.is_complete()
 }
 
 struct FullPacketHistory {
@@ -241,3 +273,6 @@ impl KernelReadBinding {
         }
     }
 }
+
+#[cfg(all(unix, test))]
+mod tests;

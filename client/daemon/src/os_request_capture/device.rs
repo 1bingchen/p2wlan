@@ -45,6 +45,10 @@ pub(super) struct KernelWrite {
 }
 
 impl KernelWrite {
+    pub(super) fn same_device_as(&self, read: &KernelRead) -> bool {
+        self.device.ptr_eq(&read.device)
+    }
+
     pub(super) fn is_current(&self) -> bool {
         self.ordinal != 0
             && self.monotonic_ns != 0

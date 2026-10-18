@@ -6,6 +6,62 @@ const REMOTE: &str = "10.21.1.3";
 const PEER: &str = "original-room-peer";
 
 #[test]
+fn original_permit_intersection_selects_existing_earliest_deadline_in_both_orders() {
+    let room = RoomAuthorization::new("room-original-intersection");
+    let started = Instant::now();
+    assert!(room.replace(LOCAL, roster(), started, 1));
+    let first = room
+        .try_capture_original_send_permit(PEER, REMOTE, LOCAL)
+        .unwrap()
+        .unwrap();
+    assert!(room.replace(LOCAL, roster(), started, 30));
+    let later = room
+        .try_capture_original_send_permit(PEER, REMOTE, LOCAL)
+        .unwrap()
+        .unwrap();
+    assert_ne!(first, later);
+    let selected = first.intersect_original(&later).unwrap();
+    assert_eq!(selected, first);
+    assert_eq!(later.intersect_original(&first).unwrap(), first);
+    let guard = room
+        .try_original_send_guard(Some(&selected), PEER, REMOTE, LOCAL)
+        .unwrap();
+    assert!(guard.is_current_at(started + Duration::from_millis(999)));
+    assert!(!guard.is_current_at(started + Duration::from_secs(1)));
+}
+
+#[test]
+fn original_permit_intersection_rejects_distinct_owners_with_equal_rosters() {
+    let (_room, first) = authorized();
+    let (_other_room, other) = authorized();
+    assert_eq!(
+        first.intersect_original(&other),
+        Err(OriginalRoomSendFailure::Stale)
+    );
+    assert_eq!(
+        other.intersect_original(&first),
+        Err(OriginalRoomSendFailure::Stale)
+    );
+}
+
+#[test]
+fn original_permit_intersection_never_resurrects_revoked_authority() {
+    let (room, first) = authorized();
+    room.invalidate();
+    assert!(room.replace(LOCAL, roster(), Instant::now(), 30));
+    let fresh = room
+        .try_capture_original_send_permit(PEER, REMOTE, LOCAL)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        first.intersect_original(&fresh),
+        Err(OriginalRoomSendFailure::Stale)
+    );
+    assert!(!first.is_valid());
+    assert!(fresh.is_valid());
+}
+
+#[test]
 fn original_request_capture_keeps_the_captured_deadline_after_renewal() {
     let room = RoomAuthorization::new("room-request-capture");
     let started = Instant::now();

@@ -13,6 +13,37 @@ const PEER: &str = "peer-b";
 const LOCAL: &str = "10.21.1.2";
 const REMOTE: &str = "10.21.1.3";
 
+#[tokio::test]
+async fn actual_reader_ingress_peer_metadata_cannot_borrow_new_network_identity() {
+    let mut harness = Harness::new(false, true).await;
+    let binding = harness.receive(&packet(true)).await;
+    harness.close().await;
+    // This is a clock/peer metadata control, never a constructed KernelRead.
+    let before = Instant::now();
+    let original = harness
+        .peers
+        .try_capture_original_kernel_read_peer(PEER, REMOTE.parse().unwrap())
+        .unwrap();
+    assert!(original.matches_original_ingress(&binding.source, before));
+    let generation = harness
+        .peers
+        .advance_network_generation("original-ingress-control")
+        .await;
+    let later_time = Instant::now();
+    let later = harness
+        .peers
+        .try_capture_original_kernel_read_peer(PEER, REMOTE.parse().unwrap())
+        .unwrap();
+    assert_eq!(later.generation(), generation);
+    assert!(!later.matches_original_ingress(&binding.source, later_time));
+    assert!(original
+        .try_identity_at(&harness.peers, Instant::now())
+        .is_err());
+    let snapshot = serde_json::to_value(harness.setup.session.snapshot().unwrap()).unwrap();
+    assert_eq!(snapshot["system_tun_full_writes"], json!([]));
+    assert_eq!(snapshot["canonical_current_owner_verified"], false);
+}
+
 fn packet(request: bool) -> Vec<u8> {
     let mut body = vec![0; 63 + 128];
     body[..8].copy_from_slice(b"P2WUDE1\0");

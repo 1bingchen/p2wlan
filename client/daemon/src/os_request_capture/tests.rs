@@ -92,6 +92,7 @@ fn untrusted_source_or_owner_fields_never_construct_a_registration() {
         "pid",
         "kernel_tun_verified",
         "physical_send_verified",
+        "original_response_input",
     ] {
         let mut value = plan();
         value[field] = json!(true);

@@ -69,6 +69,7 @@ struct FlowState {
 }
 struct RequestReadState {
     first_peer: Option<Arc<read_peer::FirstReadPeer>>,
+    first_response: Option<Arc<ingress::ResponseCapture>>,
     read_events: u64,
     first_read: Option<Arc<KernelRead>>,
     last_read: Option<Arc<KernelRead>>,
@@ -90,6 +91,7 @@ pub(crate) struct KernelReadBinding {
     spans: Vec<full::ReadFrameSpan>,
     physical_publication: crate::overlay_requests::PhysicalSendPublication,
     original_peers: Vec<Arc<read_peer::FirstReadPeer>>,
+    original_responses: Vec<Arc<ingress::ResponseCapture>>,
 }
 
 #[cfg(unix)]
@@ -138,6 +140,7 @@ struct RequestSnapshot {
     incoming_frame_system_write_complete: bool,
     incoming_flow_invalid: bool,
     original_peer: Option<read_peer::ReadPeerSnapshot>,
+    original_response_input: Option<ingress::ResponseSnapshot>,
 }
 
 #[cfg(any(target_os = "linux", all(unix, test)))]
@@ -247,6 +250,7 @@ impl CaptureSession {
                     .iter()
                     .map(|_| RequestReadState {
                         first_peer: None,
+                        first_response: None,
                         read_events: 0,
                         first_read: None,
                         last_read: None,
@@ -475,6 +479,7 @@ impl CaptureSession {
             }
             read.last_read = Some(original.clone());
         }
+        let original_responses = self.first_response_inputs(&mut state, index, &slots, &original);
         Ok(Some(KernelReadBinding {
             scope: Arc::downgrade(self),
             read: original,
@@ -486,6 +491,7 @@ impl CaptureSession {
             spans,
             physical_publication: crate::overlay_requests::PhysicalSendPublication::new(),
             original_peers,
+            original_responses,
         }))
     }
 
@@ -540,6 +546,10 @@ impl CaptureSession {
                         ),
                     incoming_flow_invalid: flow.inbound.invalid,
                     original_peer: read.first_peer.as_ref().map(|peer| peer.snapshot()),
+                    original_response_input: read
+                        .first_response
+                        .as_ref()
+                        .map(|input| input.snapshot()),
                 });
             }
         }
@@ -613,5 +623,6 @@ impl KernelReadBinding {
         self.exact_input(peers, &packet.packet, observed_at)
             && packet.peer_id == self.plan.peer
             && packet.dst_ip == self.plan.flow.dst_v4.to_string()
+            && self.original_response_matches_permit(packet.room_authorization.as_ref())
     }
 }

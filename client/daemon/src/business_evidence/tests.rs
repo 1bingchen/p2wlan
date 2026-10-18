@@ -832,6 +832,10 @@ fn pure_maximum_plan_has_2000_real_slots_with_bounded_contexts_and_carriers() {
         size_of::<Option<Arc<AuthenticatedIngressContext>>>(),
         size_of::<usize>()
     );
+    assert_eq!(
+        size_of::<Option<Arc<crate::dataplane::PacketIngressEvidence>>>(),
+        size_of::<usize>()
+    );
     assert!(size_of::<crate::transport::ReceivedEncryptedPacket>() <= 1024);
     assert!(size_of::<crate::dataplane::InboundPacket>() <= 512);
     let disabled_physical: Option<Arc<PhysicalIngressContext>> = None;

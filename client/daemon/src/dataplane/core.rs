@@ -32,8 +32,7 @@ pub struct InboundPacket {
     /// first-usable evidence for the current session.
     pub from_previous_session: bool,
     /// Original opt-in auth facts; default None is one pointer wide.
-    pub(crate) authenticated_ingress:
-        Option<Arc<crate::business_evidence::AuthenticatedIngressContext>>,
+    pub(crate) authenticated_ingress: Option<Arc<PacketIngressEvidence>>,
     /// Low-frequency userspace latency context, attached only by the live
     /// decrypt worker before the packet is written to TUN.
     pub(crate) trace: Option<DataplaneRxTrace>,
@@ -942,7 +941,11 @@ where
         let tun_evidence = self.rx_business_capture.as_ref().map(|capture| {
             (
                 capture.clone(),
-                packet.authenticated_ingress.clone(),
+                packet
+                    .authenticated_ingress
+                    .as_deref()
+                    .and_then(PacketIngressEvidence::legacy)
+                    .cloned(),
                 self.tun_evidence_identity,
                 if source_was_normalized {
                     peer.virtual_ip.parse::<Ipv4Addr>().ok()
@@ -951,11 +954,16 @@ where
                 },
             )
         });
-        let written = self
-            .tun
-            .write(&inbound_packet)
-            .await
-            .map_err(|e| DaemonError::Network(format!("TUN write failed: {e}")))?;
+        let kernel_write = packet
+            .authenticated_ingress
+            .as_deref()
+            .and_then(PacketIngressEvidence::kernel)
+            .and_then(|original| original.write_context(&self.peers, &inbound_packet));
+        let written = match kernel_write {
+            Some(context) => self.tun.write_with_context(&inbound_packet, context).await,
+            None => self.tun.write(&inbound_packet).await,
+        }
+        .map_err(|e| DaemonError::Network(format!("TUN write failed: {e}")))?;
         let tun_write_completed = std::time::Instant::now();
 
         if written != inbound_packet.len() {

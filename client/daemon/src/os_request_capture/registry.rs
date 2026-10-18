@@ -1,6 +1,6 @@
 #[cfg(unix)]
 use super::clock::{monotonic_ns, NativeClockScope};
-use super::device::KernelRead;
+use super::device::{DeviceLease, KernelRead};
 use super::plan::{CaptureFailure, Protocol, RegisteredFlowPlan, MAX_BINDINGS_PER_PACKET};
 #[cfg(any(target_os = "linux", all(unix, test)))]
 use super::plan::{RegistrationPlan, CAPTURE_TTL_SECS, MAX_REQUESTS};
@@ -20,6 +20,8 @@ use std::time::Duration;
 use std::time::Instant;
 
 mod full;
+mod ingress;
+pub(crate) use ingress::{KernelCaptureRuntime, KernelIngressBinding};
 
 #[cfg(any(target_os = "linux", all(unix, test)))]
 static NEXT_SCOPE: AtomicU64 = AtomicU64::new(1);
@@ -28,6 +30,7 @@ pub(crate) struct CaptureSession {
     #[cfg(unix)]
     owner: u64,
     active: AtomicBool,
+    inbound_complete: AtomicBool,
     expires: Instant,
     peers: Weak<PeerManager>,
     #[cfg(unix)]
@@ -43,7 +46,9 @@ pub(crate) struct CaptureSession {
 struct RegistryState {
     flows: Vec<FlowState>,
     original_device: Option<Arc<KernelRead>>,
+    system_device: Option<Weak<DeviceLease>>,
     full_history: full::FullHistory,
+    inbound_history: ingress::InboundHistory,
     #[cfg(unix)]
     requests: usize,
     #[cfg(unix)]
@@ -58,6 +63,7 @@ struct FlowState {
     tcp_open: Option<u32>,
     invalid: bool,
     requests: Vec<RequestReadState>,
+    inbound: ingress::InboundFlow,
 }
 struct RequestReadState {
     read_events: u64,
@@ -99,9 +105,11 @@ pub(super) struct ReadSnapshot {
     gaps: u64,
     requests: Vec<RequestSnapshot>,
     historical_full_packets: Vec<full::FullPacketSnapshot>,
+    system_tun_full_writes: Vec<ingress::WriteSnapshot>,
     daemon_registration_verified: bool,
     physical_send_verified: bool,
     canonical_current_owner_verified: bool,
+    incoming_provenance_complete: bool,
 }
 #[cfg(unix)]
 #[derive(Serialize)]
@@ -122,6 +130,8 @@ struct RequestSnapshot {
     kernel_frame_read_complete: bool,
     flow_invalid: bool,
     historical_frame_full_complete: bool,
+    incoming_frame_system_write_complete: bool,
+    incoming_flow_invalid: bool,
 }
 
 #[cfg(any(target_os = "linux", all(unix, test)))]
@@ -155,6 +165,7 @@ impl CaptureSession {
         let session = Arc::new(Self {
             owner,
             active: AtomicBool::new(true),
+            inbound_complete: AtomicBool::new(true),
             expires,
             peers: Arc::downgrade(peers),
             capture_id: plan.capture_id,
@@ -163,7 +174,9 @@ impl CaptureSession {
             state: Mutex::new(RegistryState {
                 flows: Vec::new(),
                 original_device: None,
+                system_device: None,
                 full_history: full::FullHistory::new(),
+                inbound_history: ingress::InboundHistory::new(),
                 requests: 0,
                 revision: 0,
                 producers: std::collections::BTreeSet::new(),
@@ -234,6 +247,7 @@ impl CaptureSession {
                     })
                     .collect();
                 FlowState {
+                    inbound: ingress::InboundFlow::new(plan.requests.len()),
                     plan: Arc::new(plan),
                     producer_scope: producer,
                     tcp_open: None,
@@ -259,6 +273,19 @@ impl CaptureSession {
 
     pub(crate) fn retire(&self) {
         self.active.store(false, Ordering::Release);
+    }
+
+    pub(super) fn bind_system_device(&self, device: &Arc<DeviceLease>) -> bool {
+        let Ok(mut state) = self.state.try_lock() else {
+            self.gap();
+            return false;
+        };
+        if state.system_device.is_some() || !self.is_live(Instant::now()) {
+            self.gap();
+            return false;
+        }
+        state.system_device = Some(Arc::downgrade(device));
+        true
     }
     #[cfg(unix)]
     pub(super) fn expires(&self) -> Instant {
@@ -303,6 +330,13 @@ impl CaptureSession {
             .state
             .try_lock()
             .map_err(|_| CaptureFailure::Contended)?;
+        if state
+            .system_device
+            .as_ref()
+            .is_none_or(|device| !original.belongs_to(device))
+        {
+            return Err(CaptureFailure::ForeignDevice);
+        }
         let Some(index) = state
             .flows
             .iter()
@@ -482,6 +516,13 @@ impl CaptureSession {
                             key.sequence as usize,
                             plan,
                         ),
+                    incoming_frame_system_write_complete: !flow.inbound.invalid
+                        && state.inbound_history.frame_complete(
+                            flow_index,
+                            key.sequence as usize,
+                            plan,
+                        ),
+                    incoming_flow_invalid: flow.inbound.invalid,
                 });
             }
         }
@@ -500,11 +541,13 @@ impl CaptureSession {
             gaps: self.gaps.load(Ordering::Relaxed),
             requests,
             historical_full_packets: state.full_history.snapshot(),
+            system_tun_full_writes: state.inbound_history.snapshot(),
             // These remain false: registration data and completed system reads
             // are not a complete original OS-write/daemon/physical/once chain.
             daemon_registration_verified: false,
             physical_send_verified: false,
             canonical_current_owner_verified: false,
+            incoming_provenance_complete: self.inbound_complete.load(Ordering::Acquire),
         })
     }
 }

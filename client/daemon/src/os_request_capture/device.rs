@@ -1,6 +1,8 @@
 use super::clock::monotonic_ns;
 use super::registry::CaptureSession;
-use p2pnet_tun::{InterfaceConfig, PacketReadContext, TunDevice, VirtualInterface};
+use p2pnet_tun::{
+    InterfaceConfig, PacketReadContext, PacketWriteContext, TunDevice, VirtualInterface,
+};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -17,6 +19,7 @@ pub(crate) struct SystemTun {
     device: Option<Arc<DeviceLease>>,
     last_read: Option<PacketReadContext>,
     ordinal: u64,
+    write_ordinal: u64,
 }
 
 pub(super) struct DeviceLease {
@@ -32,6 +35,39 @@ pub(super) struct KernelRead {
     monotonic_ns: u64,
 }
 
+/// Constructed only after this concrete system backend returned a nonempty
+/// complete write. An untrusted context or caller-supplied length cannot mint it.
+pub(super) struct KernelWrite {
+    device: Weak<DeviceLease>,
+    ordinal: u64,
+    at: Instant,
+    monotonic_ns: u64,
+}
+
+impl KernelWrite {
+    pub(super) fn is_current(&self) -> bool {
+        self.ordinal != 0
+            && self.monotonic_ns != 0
+            && self
+                .device
+                .upgrade()
+                .is_some_and(|device| device.live.load(Ordering::Acquire))
+    }
+    pub(super) fn belongs_to(&self, device: &Weak<DeviceLease>) -> bool {
+        self.device.ptr_eq(device)
+    }
+    pub(super) fn at(&self) -> Instant {
+        self.at
+    }
+    #[cfg(unix)]
+    pub(super) fn ordinal(&self) -> u64 {
+        self.ordinal
+    }
+    pub(super) fn monotonic_ns(&self) -> u64 {
+        self.monotonic_ns
+    }
+}
+
 impl KernelRead {
     pub(super) fn is_current(&self) -> bool {
         self.ordinal != 0
@@ -43,6 +79,9 @@ impl KernelRead {
     }
     pub(super) fn same_device(&self, other: &Self) -> bool {
         Weak::ptr_eq(&self.device, &other.device)
+    }
+    pub(super) fn belongs_to(&self, device: &Weak<DeviceLease>) -> bool {
+        self.device.ptr_eq(device)
     }
     #[cfg(unix)]
     pub(super) fn ordinal(&self) -> u64 {
@@ -82,15 +121,21 @@ impl SystemTun {
             device: None,
             last_read: None,
             ordinal: 0,
+            write_ordinal: 0,
         }
     }
 
     pub(crate) fn with_capture(mut self, capture: Arc<CaptureSession>) -> Self {
         if self.created_system_device {
-            self.device = Some(Arc::new(DeviceLease {
+            let device = Arc::new(DeviceLease {
                 live: AtomicBool::new(true),
-            }));
-            self.capture = Some(Arc::downgrade(&capture));
+            });
+            if capture.bind_system_device(&device) {
+                self.device = Some(device);
+                self.capture = Some(Arc::downgrade(&capture));
+            } else {
+                capture.retire();
+            }
         }
         self
     }
@@ -174,6 +219,45 @@ impl VirtualInterface for SystemTun {
         Self: 'future,
     {
         self.inner.write(buf)
+    }
+    fn write_with_context<'a, 'b, 'future>(
+        &'a mut self,
+        buf: &'b [u8],
+        context: PacketWriteContext,
+    ) -> Pin<Box<dyn Future<Output = p2pnet_tun::Result<usize>> + Send + 'future>>
+    where
+        'a: 'future,
+        'b: 'future,
+        Self: 'future,
+    {
+        let binding = match context.downcast::<Arc<super::KernelIngressBinding>>() {
+            Ok(binding) if self.created_system_device && self.capture.is_some() => *binding,
+            _ => return self.inner.write(buf),
+        };
+        Box::pin(async move {
+            let n = self.inner.write(buf).await?;
+            if n != 0 && n == buf.len() {
+                if let (Some(capture), Some(device)) =
+                    (self.capture.as_ref().and_then(Weak::upgrade), &self.device)
+                {
+                    let (Some(ordinal), Some(clock)) =
+                        (self.write_ordinal.checked_add(1), monotonic_ns())
+                    else {
+                        capture.retire();
+                        return Ok(n);
+                    };
+                    self.write_ordinal = ordinal;
+                    let original = KernelWrite {
+                        device: Arc::downgrade(device),
+                        ordinal,
+                        at: Instant::now(),
+                        monotonic_ns: clock,
+                    };
+                    capture.observe_system_write(original, binding, buf);
+                }
+            }
+            Ok(n)
+        })
     }
     fn take_last_read_context(&mut self) -> Option<PacketReadContext> {
         self.last_read.take()

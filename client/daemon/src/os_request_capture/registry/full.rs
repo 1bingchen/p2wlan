@@ -27,6 +27,10 @@ impl ReadFrameSpan {
         Self { slot, start, end }
     }
 
+    pub(super) fn slot(&self) -> usize {
+        self.slot
+    }
+
     fn fits(&self, plan: &RegisteredFlowPlan) -> bool {
         let length = match plan.protocol {
             Protocol::Udp => 1,
@@ -37,6 +41,37 @@ impl ReadFrameSpan {
             && usize::from(self.end) <= length
             && length <= MAX_FRAME_WIRE_BYTES
     }
+}
+
+#[cfg(unix)]
+pub(super) fn spans_complete<'a>(
+    spans: impl Iterator<Item = &'a ReadFrameSpan>,
+    slot: usize,
+    plan: &RegisteredFlowPlan,
+) -> bool {
+    let length = match plan.protocol {
+        Protocol::Udp => 1,
+        Protocol::Tcp => 4 + 63 + usize::from(plan.payload_bytes),
+    };
+    if length > MAX_FRAME_WIRE_BYTES {
+        return false;
+    }
+    let mut seen = [0u64; MAX_FRAME_WIRE_BYTES.div_ceil(64)];
+    let mut covered = 0;
+    for span in spans.filter(|span| span.slot == slot) {
+        let (start, end) = (usize::from(span.start), usize::from(span.end));
+        if start >= end || end > length {
+            return false;
+        }
+        for byte in start..end {
+            let bit = 1 << (byte % 64);
+            if seen[byte / 64] & bit == 0 {
+                seen[byte / 64] |= bit;
+                covered += 1;
+            }
+        }
+    }
+    covered == length
 }
 
 struct FullPacketHistory {
@@ -112,34 +147,14 @@ impl FullHistory {
         slot: usize,
         plan: &RegisteredFlowPlan,
     ) -> bool {
-        let length = match plan.protocol {
-            Protocol::Udp => 1,
-            Protocol::Tcp => 4 + 63 + usize::from(plan.payload_bytes),
-        };
-        if length > MAX_FRAME_WIRE_BYTES {
-            return false;
-        }
-        let mut seen = [0u64; MAX_FRAME_WIRE_BYTES.div_ceil(64)];
-        let mut covered = 0;
-        for packet in &self.packets {
-            if packet.read.flow != flow || packet.observed_monotonic_ns == 0 {
-                continue;
-            }
-            for span in packet.read.spans.iter().filter(|span| span.slot == slot) {
-                let (start, end) = (usize::from(span.start), usize::from(span.end));
-                if start >= end || end > length {
-                    return false;
-                }
-                for byte in start..end {
-                    let bit = 1 << (byte % 64);
-                    if seen[byte / 64] & bit == 0 {
-                        seen[byte / 64] |= bit;
-                        covered += 1;
-                    }
-                }
-            }
-        }
-        covered == length
+        spans_complete(
+            self.packets
+                .iter()
+                .filter(|packet| packet.read.flow == flow && packet.observed_monotonic_ns != 0)
+                .flat_map(|packet| &packet.read.spans),
+            slot,
+            plan,
+        )
     }
 
     #[cfg(unix)]

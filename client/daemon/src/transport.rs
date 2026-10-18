@@ -533,6 +533,7 @@ pub struct WireGuardTransport {
     /// Default-disabled evidence owner; never session/path authority.
     #[allow(dead_code)]
     rx_business_capture: Option<Arc<crate::business_evidence::CaptureOwner>>,
+    kernel_capture: Option<Arc<crate::os_request_capture::KernelCaptureRuntime>>,
     #[allow(dead_code)]
     wg_evidence_owner: crate::business_evidence::WgEvidenceOwnerId,
     sessions: Arc<Mutex<HashMap<String, PeerTransportSessions>>>,

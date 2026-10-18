@@ -92,6 +92,13 @@ fn untrusted_source_or_owner_fields_never_construct_a_registration() {
         "pid",
         "kernel_tun_verified",
         "physical_send_verified",
+        "original_response_input",
+        "original_write_window",
+        "original_request_room",
+        "original_full_retention_complete",
+        "native_credit",
+        "current_owners",
+        "retained_original_reads",
     ] {
         let mut value = plan();
         value[field] = json!(true);
@@ -144,6 +151,7 @@ fn raw_plan_any_and_mock_context_cannot_become_a_kernel_read_token() {
     assert!(RequestSendToken::from_read_context(Box::new(plan())).is_none());
     assert!(RequestSendToken::from_read_context(Box::new(decode(&plan()).unwrap())).is_none());
     assert!(RequestSendToken::from_read_context(Box::new(17_u64)).is_none());
+    assert!(RequestSendToken::from_read_context(Box::new(Arc::new(plan()))).is_none());
 }
 
 #[test]
@@ -186,7 +194,8 @@ async fn actual_connected_descriptor_accepts_labels_without_any_read_send_credit
     let mut line = String::new();
     reader.read_line(&mut line).await.unwrap();
     let snapshot: Value = serde_json::from_str(&line).unwrap();
-    assert_eq!(snapshot["scope"], "registered_kernel_read_only");
+    assert_eq!(snapshot["schema_version"], 2);
+    assert_eq!(snapshot["scope"], "registered_native_frame_capture");
     assert_eq!(snapshot["requests"][0]["read_events"], 0);
     assert_eq!(snapshot["requests"][0]["kernel_frame_read_complete"], false);
     assert_eq!(snapshot["daemon_registration_verified"], false);

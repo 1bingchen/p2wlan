@@ -122,11 +122,19 @@ fn sequence_wrap_and_neighboring_frame_bytes_are_clipped_to_this_frame() {
     let mut before = vec![0xcc; 8];
     before.extend_from_slice(&wire[..100]);
     assert_eq!(
+        coverage.matching_span(&segment(first.wrapping_sub(8), &before)),
+        Some((0, 100))
+    );
+    assert_eq!(
         coverage.observe(&segment(first.wrapping_sub(8), &before), now),
         TcpCoverageResult::Added(100)
     );
     let mut after = wire[80..].to_vec();
     after.extend_from_slice(&[0xdd; 10]);
+    assert_eq!(
+        coverage.matching_span(&segment(first.wrapping_add(80), &after)),
+        Some((80, 195))
+    );
     assert_eq!(
         coverage.observe(&segment(first.wrapping_add(80), &after), now),
         TcpCoverageResult::Added(95)
@@ -146,6 +154,7 @@ fn a_conflicting_retransmission_invalidates_the_frame_without_repair() {
     );
     let mut changed = wire.clone();
     changed[10] ^= 1;
+    assert_eq!(coverage.matching_span(&segment(1000, &changed)), None);
     assert_eq!(
         coverage.observe(&segment(1000, &changed), now),
         TcpCoverageResult::Conflict
@@ -156,6 +165,7 @@ fn a_conflicting_retransmission_invalidates_the_frame_without_repair() {
         TcpCoverageResult::Invalidated
     );
     assert!(!coverage.is_complete());
+    assert_eq!(coverage.matching_span(&segment(1000, &wire)), None);
 }
 
 #[test]

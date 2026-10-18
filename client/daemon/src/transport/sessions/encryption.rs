@@ -413,7 +413,14 @@ impl WireGuardTransport {
         &self,
         peer_id: &str,
     ) -> Option<Arc<Mutex<()>>> {
-        let mut locks = self.outbound_emit_locks.try_lock().ok()?;
+        Self::try_outbound_emit_lock_in(&self.outbound_emit_locks, peer_id)
+    }
+
+    pub(in crate::transport) fn try_outbound_emit_lock_in(
+        registry: &Mutex<HashMap<String, Weak<Mutex<()>>>>,
+        peer_id: &str,
+    ) -> Option<Arc<Mutex<()>>> {
+        let mut locks = registry.try_lock().ok()?;
         if let Some(lock) = locks.get(peer_id).and_then(Weak::upgrade) {
             return Some(lock);
         }

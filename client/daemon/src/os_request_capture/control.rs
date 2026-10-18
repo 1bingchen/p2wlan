@@ -11,6 +11,8 @@ use std::sync::Arc;
 
 const FD_ENV: &str = "P2WLAN_OS_REQUEST_CONTROL_FD";
 const SOCKET_ENV: &str = "P2WLAN_OS_REQUEST_CONTROL_SOCKET";
+#[cfg(unix)]
+mod deadline;
 
 /// Select envelope capacity before constructing the original transport.
 /// Presence alone grants no capture authority; setup still validates the
@@ -44,11 +46,18 @@ pub(crate) struct ControlChannel;
 #[derive(Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 enum Command {
-    Snapshot {},
+    Snapshot {
+        original_deadline_ns: Option<u64>,
+    },
     Close {},
     #[cfg(any(target_os = "linux", all(unix, test)))]
     Register {
         plan: WirePlan,
+        original_deadline_ns: Option<u64>,
+    },
+    #[cfg(any(target_os = "linux", all(unix, test)))]
+    ObserveOriginalWriteWindow {
+        window: super::registry::write_window::WireWriteWindow,
     },
 }
 
@@ -293,20 +302,45 @@ impl ControlChannel {
             if self.records > MAX_CONTROL_RECORDS || line.len() > MAX_PLAN_BYTES {
                 return Err(CaptureFailure::Capacity);
             }
-            let encoded = match serde_json::from_slice::<Command>(&line)
+            let (encoded, reply_end) = match serde_json::from_slice::<Command>(&line)
                 .map_err(|_| CaptureFailure::ControlProtocol)?
             {
                 Command::Close {} => return Ok(()),
-                Command::Snapshot {} => serde_json::to_vec(&self.session.snapshot()?),
+                Command::Snapshot {
+                    original_deadline_ns,
+                } => {
+                    let (value, reply_end) = match original_deadline_ns {
+                        Some(ns) => {
+                            let end = self.session.metadata_command_deadline(ns)?;
+                            (self.session.snapshot_control(end).await?, end)
+                        }
+                        None => (self.session.snapshot()?, end),
+                    };
+                    (serde_json::to_vec(&value), reply_end)
+                }
                 #[cfg(any(target_os = "linux", all(unix, test)))]
-                Command::Register { plan } => serde_json::to_vec(
-                    &self
-                        .session
-                        .register(RegistrationPlan::from_registration(plan)?)?,
-                ),
-            }
-            .map_err(|_| CaptureFailure::ControlProtocol)?;
-            self.reply(encoded, end).await?;
+                Command::Register {
+                    plan,
+                    original_deadline_ns,
+                } => {
+                    let plan = RegistrationPlan::from_registration(plan)?;
+                    let (value, reply_end) = match original_deadline_ns {
+                        Some(ns) => {
+                            let end = self.session.metadata_command_deadline(ns)?;
+                            (self.session.register_control(plan, end).await?, end)
+                        }
+                        None => (self.session.register(plan)?, end),
+                    };
+                    (serde_json::to_vec(&value), reply_end)
+                }
+                #[cfg(any(target_os = "linux", all(unix, test)))]
+                Command::ObserveOriginalWriteWindow { window } => {
+                    self.session.observe_original_write_window(window).await?;
+                    continue;
+                }
+            };
+            let encoded = encoded.map_err(|_| CaptureFailure::ControlProtocol)?;
+            self.reply(encoded, reply_end).await?;
         }
     }
 

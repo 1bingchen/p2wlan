@@ -211,8 +211,46 @@ impl UdpTransport {
         received: Option<&OriginalUdpIngressSource>,
         sent: Option<&UdpFullSendFact>,
     ) -> Result<DirectOriginPublicationGuard<'_>, DirectOriginFailure> {
-        self.try_original_direct_publication_guard_with_prepared(
-            peer, generation, received, sent, None,
+        self.try_original_direct_publication_batch_guard(
+            peer,
+            generation,
+            received.as_slice(),
+            sent.as_slice(),
+        )
+    }
+
+    /// All fragments share one acquisition of the original socket/publication
+    /// owners. Calling the single-packet guard repeatedly would self-contend.
+    pub(crate) fn try_original_direct_publication_batch_guard(
+        &self,
+        peer: &str,
+        generation: u64,
+        received: &[&OriginalUdpIngressSource],
+        sent: &[&UdpFullSendFact],
+    ) -> Result<DirectOriginPublicationGuard<'_>, DirectOriginFailure> {
+        self.try_original_direct_publication_batch_with_prepared(
+            peer, generation, received, sent, None, None,
+        )
+    }
+
+    /// Diagnostic position only. It neither changes admission nor grants an
+    /// owner verdict; every original source and budget check is shared below.
+    #[cfg(any(target_os = "linux", all(unix, test)))]
+    pub(crate) fn try_original_direct_publication_batch_guard_observed(
+        &self,
+        peer: &str,
+        generation: u64,
+        received: &[&OriginalUdpIngressSource],
+        sent: &[&UdpFullSendFact],
+        owner_check: &mut &'static str,
+    ) -> Result<DirectOriginPublicationGuard<'_>, DirectOriginFailure> {
+        self.try_original_direct_publication_batch_with_prepared(
+            peer,
+            generation,
+            received,
+            sent,
+            None,
+            Some(owner_check),
         )
     }
 
@@ -224,14 +262,45 @@ impl UdpTransport {
         sent: Option<&UdpFullSendFact>,
         prepared: Option<&super::PreparedDirectBusinessSend>,
     ) -> Result<DirectOriginPublicationGuard<'_>, DirectOriginFailure> {
-        if (received.is_none() && sent.is_none())
-            || sent.is_some_and(|fact| fact.fence() == UdpSendFence::LegacyUnknown)
+        self.try_original_direct_publication_batch_with_prepared(
+            peer,
+            generation,
+            received.as_slice(),
+            sent.as_slice(),
+            prepared,
+            None,
+        )
+    }
+
+    fn try_original_direct_publication_batch_with_prepared(
+        &self,
+        peer: &str,
+        generation: u64,
+        received: &[&OriginalUdpIngressSource],
+        sent: &[&UdpFullSendFact],
+        prepared: Option<&super::PreparedDirectBusinessSend>,
+        mut owner_check: Option<&mut &'static str>,
+    ) -> Result<DirectOriginPublicationGuard<'_>, DirectOriginFailure> {
+        let mut observe = |site| {
+            if let Some(destination) = owner_check.as_deref_mut() {
+                *destination = site;
+            }
+        };
+        observe("direct_source_fence");
+        if (received.is_empty() && sent.is_empty())
+            || sent
+                .iter()
+                .any(|fact| fact.fence() == UdpSendFence::LegacyUnknown)
         {
             return Err(DirectOriginFailure::Unknown);
         }
         // Do not call the legacy blocking membership predicate under our UDP
         // locks. Unknown membership can never be an unsupported/legacy bypass.
-        let lan_capable = if sent.is_some_and(|fact| fact.fence() == UdpSendFence::LanPublication) {
+        observe("direct_capability");
+        let lan_capable = if sent
+            .iter()
+            .any(|fact| fact.fence() == UdpSendFence::LanPublication)
+        {
             match self.peers.try_peer_dplpmtud_capability(peer) {
                 crate::peer::PeerDplpmtudCapability::Contended => {
                     return Err(DirectOriginFailure::ContendedMembership)
@@ -245,9 +314,10 @@ impl UdpTransport {
         } else {
             false
         };
+        observe("direct_socket_registry");
         let dynamic = |index| index >= DYNAMIC_SOCKET_INDEX_BASE && index != IPV6_SOCKET_INDEX;
-        let sockets = if received.is_some_and(|fact| dynamic(fact.socket_index))
-            || sent.is_some_and(|fact| dynamic(fact.socket_index()))
+        let sockets = if received.iter().any(|fact| dynamic(fact.socket_index))
+            || sent.iter().any(|fact| dynamic(fact.socket_index()))
             || prepared.is_some_and(|prepared| dynamic(prepared.socket_index))
         {
             Some(
@@ -258,10 +328,12 @@ impl UdpTransport {
         } else {
             None
         };
+        observe("direct_publication_gate");
         let publication = self
             .dplpmtud
             .try_original_business_publication_guard()
             .ok_or(DirectOriginFailure::ContendedPublication)?;
+        observe("direct_transport_owner");
         let owner = self.inbound_publication_owner();
         if owner == 0 || generation != self.peers.current_network_generation_sync() {
             return Err(DirectOriginFailure::Stale);
@@ -285,7 +357,8 @@ impl UdpTransport {
                 self.active_sockets().get(index)
             }
         };
-        if let Some(fact) = received {
+        for fact in received {
+            observe("direct_received_source");
             if !fact.belongs_to_transport(self)
                 || fact.publication_owner != owner
                 || fact.network_generation != generation
@@ -296,6 +369,7 @@ impl UdpTransport {
             }
         }
         if let Some(prepared) = prepared {
+            observe("direct_prepared_source");
             let token = &prepared.token;
             if token.path_identity.peer_id != peer
                 || token.path_identity.epoch.network_generation != generation
@@ -309,7 +383,8 @@ impl UdpTransport {
                 return Err(DirectOriginFailure::Stale);
             }
         }
-        if let Some(fact) = sent {
+        for fact in sent {
+            observe("direct_sent_source");
             if !fact.belongs_to_registry(self)
                 || fact.transport_instance() != self.transport_instance_id()
                 || fact.publication_owner() != Some(owner)
@@ -318,6 +393,7 @@ impl UdpTransport {
             {
                 return Err(DirectOriginFailure::Stale);
             }
+            observe("direct_lan_policy");
             match fact.fence() {
                 UdpSendFence::LegacyUnknown => return Err(DirectOriginFailure::Unknown),
                 UdpSendFence::LanPublication
@@ -330,6 +406,7 @@ impl UdpTransport {
                     return Err(DirectOriginFailure::Stale);
                 }
                 UdpSendFence::ManagedPublication => {
+                    observe("direct_managed_identity");
                     let token = fact
                         .original_managed_token()
                         .ok_or(DirectOriginFailure::Unknown)?;
@@ -341,14 +418,18 @@ impl UdpTransport {
                         || token.path_identity.socket.socket_index != fact.socket_index()
                         || Some(token.path_identity.local_endpoint) != fact.local_endpoint()
                         || token.path_identity.authenticated_remote_endpoint != fact.endpoint()
-                        || !publication.matches_original_token(token)
                     {
+                        return Err(DirectOriginFailure::Stale);
+                    }
+                    observe("direct_managed_budget");
+                    if !publication.matches_original_token(token) {
                         return Err(DirectOriginFailure::Stale);
                     }
                 }
                 UdpSendFence::LanPublication => {}
             }
         }
+        observe("direct_guards_held");
         Ok(DirectOriginPublicationGuard {
             _sockets: sockets,
             _publication: publication,

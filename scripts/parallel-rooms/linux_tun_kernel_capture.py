@@ -17,6 +17,7 @@ import sys
 import time
 
 from linux_tun_probe_capture import streams, udp
+import linux_tun_native_transaction as native
 
 MAX_BYTES = 4 * 1024 * 1024
 MAX_LINE = 1024 * 1024
@@ -25,9 +26,15 @@ MAX_ENDPOINTS = 2
 MAX_ENTRIES = 4
 
 
+class CaptureError(ValueError):
+    def __init__(self, code):
+        self.code = code
+        super().__init__(code)
+
+
 def require(ok, reason):
     if not ok:
-        raise ValueError(reason)
+        raise CaptureError(reason)
 
 
 def integer(value, minimum=0):
@@ -49,6 +56,7 @@ class Endpoint:
         self.receipts = []
 
     def send(self, value, end):
+        require(self.connection is not None, "kernel_control_connection_closed")
         raw = encode(value)
         require(len(raw) <= MAX_PLAN and self.output_bytes + len(raw) <= MAX_BYTES, "kernel_control_input_capacity")
         self.connection.settimeout(max(.000001, end - time.monotonic()))
@@ -56,8 +64,28 @@ class Endpoint:
         self.connection.sendall(raw)
         self.output_bytes += len(raw)
 
+    def observe_original_write_window(self, window):
+        """One nonblocking write, no response, buffering, wait or retry."""
+        require(self.connection is not None, "kernel_control_connection_closed")
+        raw = encode(dict(op="observe_original_write_window", window=window))
+        require(len(raw) <= 512 and self.output_bytes + len(raw) <= MAX_BYTES,
+                "original_window_control_capacity")
+        try:
+            self.connection.setblocking(False)
+            n = self.connection.send(raw)
+            self.output_bytes += n
+            require(n == len(raw), "original_window_short_control_write")
+        except (OSError, ValueError):
+            self.close()  # A partial JSON record must never be refilled.
+            raise
+
     def exchange(self, value, *, deadline=None):
-        end = min(time.monotonic() + 1, deadline) if deadline is not None else time.monotonic() + 1
+        end_ns = time.monotonic_ns() + 1_000_000_000
+        if deadline is not None:
+            end_ns = min(end_ns, int(deadline * 1_000_000_000))
+        end = end_ns / 1_000_000_000
+        if value.get("op") in {"snapshot", "register"}:
+            value = dict(value, original_deadline_ns=end_ns)
         self.send(value, end)
         while b"\n" not in self.pending:
             require(len(self.pending) < MAX_LINE and time.monotonic() < end, "kernel_control_reply_capacity_or_deadline")
@@ -96,6 +124,9 @@ class Endpoint:
     def snapshot(self, *, deadline=None):
         require(len(self.raw_snapshots) < MAX_ENTRIES, "original_kernel_snapshot_count_capacity")
         value, raw = self.exchange({"op": "snapshot"}, deadline=deadline)
+        # Retain the actual reply even if birth/scope validation rejects it.
+        # Raw bytes alone grant no authority; snapshot validation still fails.
+        self.raw_snapshots.append(raw + b"\n")
         expected = self.original
         clock = value.get("clock_scope")
         require(isinstance(clock, dict) and clock.get("clock_name") == "CLOCK_MONOTONIC"
@@ -103,15 +134,15 @@ class Endpoint:
                 and clock.get("parent_pid") == expected.parent_pid and clock.get("uid") == expected.uid
                 and clock.get("start_ticks") == expected.start_ticks and clock.get("net_namespace") == expected.net_namespace,
                 "kernel_original_daemon_birth_namespace_clock_mismatch")
-        require(value.get("scope") == "registered_kernel_read_only" and value.get("active") is True
+        require(type(value.get("schema_version")) is int and value["schema_version"] == 2
+                and value.get("scope") == "registered_native_frame_capture" and value.get("active") is True
                 and value.get("producer_scope") == self.producer_scope
                 and value.get("registration_revision") == self.revision
                 and integer(value.get("observed_monotonic_ns"), 1)
                 and isinstance(value.get("requests"), list) and len(value["requests"]) <= 1000
                 and all(isinstance(row, dict) for row in value["requests"])
-                and all(value.get(k) is False for k in ["daemon_registration_verified", "physical_send_verified", "canonical_current_owner_verified"]),
+                and all(type(value.get(k)) is bool for k in ["daemon_registration_verified", "physical_send_verified", "canonical_current_owner_verified"]),
                 "kernel_read_snapshot_scope_or_capacity")
-        self.raw_snapshots.append(raw + b"\n")
         return value
 
     def close(self):
@@ -203,15 +234,16 @@ class KernelCaptures:
             for endpoint, value in zip(endpoints, [document("request", config.bind, config.target, snapshots[target]["node_id"]),
                                                      document("response", config.target, config.bind, snapshots[source]["node_id"])]):
                 endpoint.register(value, deadline=deadline)
+            capture.enable_live_window_bridge(endpoints)
             record["endpoints"] = endpoints
         except (OSError, ValueError, KeyError) as error:
-            record["gap"] = "original_kernel_registration_failed:" + type(error).__name__
+            record["gap"] = "original_kernel_registration_failed:" + getattr(error, "code", type(error).__name__)
         return record
 
     def finish(self, record, *, deadline=None):
         if record["result"] is not None:
             return record["result"]
-        result = dict(scope="original_owned_daemon_kernel_reads_only", request_count=8,
+        result = dict(scope="original_owned_daemon_full128_kernel_transactions", request_count=8,
                       passed=False, physical_send_verified=False, canonical_current_owner_verified=False,
                       requests=[], gap_reason=record.get("gap"))
         try:
@@ -220,7 +252,12 @@ class KernelCaptures:
             writes = record["entry"].get("original_write_stream", {})
             require(writes.get("stream_complete") is True and writes.get("original_child_birth_namespace_matched") is True
                     and writes.get("original_same_boot_clock_matched") is True, "original_kernel_OS_write_stream_unavailable")
-            pairs = []
+            bridge = capture.live_window_bridge.summary() if capture.live_window_bridge is not None else None
+            result["original_live_write_windows"] = bridge
+            require(bridge is not None and bridge["gap_reason"] is None, "original_live_write_window_bridge_unavailable")
+            pairs, native_pairs = [], []
+            app = record["entry"].get("records")
+            require(isinstance(app, list) and len(app) == 8, "original_kernel_original_application_records_missing")
             for endpoint, kind in zip(record["endpoints"], ["request", "response"]):
                 snapshot = endpoint.snapshot(deadline=deadline)
                 rows = [r for r in snapshot["requests"] if r.get("producer_scope") == capture.prepared.producer_scope]
@@ -230,22 +267,53 @@ class KernelCaptures:
                             and r.get("run_nonce") == capture.config.run_nonce and r.get("round_nonce") == capture.config.round_nonce
                             and r.get("request_nonce") == capture.prepared.nonces[i] for i, r in enumerate(rows)),
                         "original_kernel_full128_plan_mismatch")
+                for row, write, live in zip(rows, writes["requests"], bridge["requests"]):
+                    window = row.get("original_write_window")
+                    if write["accepted_in_original_deadline"]:
+                        expected = live.get("window", {})
+                        require(live["delivered"] and isinstance(window, dict)
+                                and window.get("scope") == "original_controller_write_window_only"
+                                and all(window.get(k) == expected[k] for k in ["request_nonce", "original_started_ns", "original_sent_ns",
+                                    "original_deadline_ns", "complete_returned_ns", "frame_bytes", "frame_sha256"])
+                                and integer(window.get("received_monotonic_ns"), expected["complete_returned_ns"])
+                                and window["received_monotonic_ns"] < expected["original_deadline_ns"]
+                                and window.get("native_os_write_verified") is False
+                                and window.get("canonical_current_owner_verified") is False,
+                                "original_live_write_window_missing_changed_or_late")
+                    else:
+                        require(window is None, "original_unsent_request_has_write_window")
                 pairs.append(rows)
+                comparisons = []
+                for row, application in zip(rows, app):
+                    if application["status"] == "success":
+                        require(all(snapshot.get(k) is True for k in ["incoming_provenance_complete", "original_read_observation_complete", "original_full_retention_complete"]),
+                                "original_native_capture_provenance_incomplete")
+                        comparisons.append(native.frame_comparison(snapshot, row, row["original_write_window"]))
+                    else:
+                        # Preserve failed/unsent application samples. A local
+                        # kernel receipt alone never turns them into successes.
+                        comparisons.append(dict(matched=False, application_status=application["status"]))
+                native_pairs.append(comparisons)
             records = [read_pair(a, b, w) for a, b, w in zip(*pairs, writes["requests"])]
             require(len(records) == 8, "original_kernel_fixed_denominator_changed")
             result.update(requests=records, capture_id=capture.prepared.capture_id, producer_scope=capture.prepared.producer_scope,
                           original_owned_connections_and_native_clock_matched=True)
+            for row, source, response, application in zip(records, *native_pairs, app):
+                row.update(source_native_transaction=source, response_native_transaction=response,
+                           full128_owner_qualified=application["status"] == "success" and source["matched"] and response["matched"])
             # Unsent original TCP requests remain eight unsent, never synthetic
             # successes. Sent inputs require the actual complete system read.
-            app = record["entry"].get("records")
-            require(isinstance(app, list) and len(app) == 8, "original_kernel_original_application_records_missing")
             result["passed"] = all((r["source_kernel_read_in_original_deadline"] if w["accepted_in_original_deadline"]
                 else not r["source_kernel_frame_read_complete"] and w.get("accepted_bytes") == 0 and a["status"] == "not_sent")
                 and (r["response_kernel_read_in_original_deadline"] if a["status"] == "success" else True)
                 for r, w, a in zip(records, writes["requests"], app))
+            result["full128_owner_evidence_complete"] = all(a["status"] != "success" or r["full128_owner_qualified"] for r, a in zip(records, app))
+            result["passed"] = result["passed"] and result["full128_owner_evidence_complete"]
+            result["canonical_current_owner_verified"] = all(r["full128_owner_qualified"] for r in records)
+            result["physical_send_verified"] = result["canonical_current_owner_verified"]
             result["gap_reason"] = None if result["passed"] else "original_kernel_read_missing_conflicted_or_outside_original_deadline"
         except (OSError, ValueError, KeyError, TypeError) as error:
-            result["gap_reason"] = result["gap_reason"] or "original_kernel_collection_failed:" + type(error).__name__
+            result["gap_reason"] = result["gap_reason"] or "original_kernel_collection_failed:" + getattr(error, "code", type(error).__name__)
         record["result"] = result
         record["entry"]["original_kernel_reads"] = result
         return result
@@ -283,17 +351,21 @@ class KernelCaptures:
                 stream.write(raw)
         for record in self.entries:
             if record["result"] is None:
-                record["entry"]["original_kernel_reads"] = dict(scope="original_owned_daemon_kernel_reads_only",
+                record["entry"]["original_kernel_reads"] = dict(scope="original_owned_daemon_full128_kernel_transactions",
                     request_count=8, passed=False, gap_reason="original_kernel_collection_not_completed",
                     physical_send_verified=False, canonical_current_owner_verified=False, requests=[])
 
     def summary(self, entries):
         results = [entry.get("original_kernel_reads", {}) for entry in entries]
         records = [r for result in results for r in result.get("requests", [])]
-        return dict(scope="original_owned_daemon_kernel_reads_only", prescheduled_requests=self.expected_entries * 8,
+        return dict(scope="original_owned_daemon_full128_kernel_transactions", prescheduled_requests=self.expected_entries * 8,
+                    actual_collected_request_records=len(records), uncollected_or_unknown_requests=self.expected_entries * 8 - len(records),
                     passed=len(results) == self.expected_entries and all(r.get("passed") is True for r in results),
                     actual_source_kernel_frames=sum(r["source_kernel_frame_read_complete"] for r in records),
                     actual_source_frames_in_original_deadline=sum(r["source_kernel_read_in_original_deadline"] for r in records),
                     actual_response_kernel_frames=sum(r["response_kernel_frame_read_complete"] for r in records),
                     actual_response_frames_in_original_deadline=sum(r["response_kernel_read_in_original_deadline"] for r in records),
-                    physical_send_verified=False, canonical_current_owner_verified=False)
+                    full128_owner_evidence_complete=len(results) == self.expected_entries and all(r.get("full128_owner_evidence_complete") is True for r in results),
+                    actual_full128_owner_qualified_requests=sum(r.get("full128_owner_qualified") is True for r in records),
+                    physical_send_verified=len(results) == self.expected_entries and all(r.get("physical_send_verified") is True for r in results),
+                    canonical_current_owner_verified=len(results) == self.expected_entries and all(r.get("canonical_current_owner_verified") is True for r in results))

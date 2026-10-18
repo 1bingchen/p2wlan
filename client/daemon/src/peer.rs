@@ -681,6 +681,9 @@ include!("peer/manager/core.rs");
 include!("peer/manager/capability_publication.rs");
 include!("peer/manager/overlay_credit.rs");
 include!("peer/manager/echo_origin.rs");
+include!("peer/manager/kernel_read.rs");
+#[cfg(any(target_os = "linux", all(unix, test)))]
+include!("peer/manager/kernel_credit.rs");
 include!("peer/manager/peers.rs");
 include!("peer/manager/candidates.rs");
 include!("peer/manager/path.rs");

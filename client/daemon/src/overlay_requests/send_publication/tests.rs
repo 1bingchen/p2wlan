@@ -84,6 +84,63 @@ async fn actual_fact(
         .expect("only actual full poll_send_to can mint this fact")
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn b17_original_non_delivery_fence_is_bound_to_one_publication_and_attempt() {
+    tokio::time::timeout(Duration::from_secs(1), async {
+        let (a, transport, _, _) = setup().await;
+        let (_, prepared) = encrypted(&a, &transport).await;
+        let mut publisher = prepared.open().unwrap();
+        publisher.finish(true);
+        let old = a
+            .record
+            .physical_publication
+            .original_non_delivery_fence()
+            .unwrap();
+        assert!(a
+            .record
+            .physical_publication
+            .still_original_non_delivery(&old));
+        let (b, other, _, _) = setup().await;
+        let (_, prepared) = encrypted(&b, &other).await;
+        let mut publisher = prepared.open().unwrap();
+        publisher.finish(true);
+        assert!(!b
+            .record
+            .physical_publication
+            .still_original_non_delivery(&old));
+        let (_, prepared) = encrypted(&a, &transport).await;
+        let mut reopened = prepared.open().unwrap();
+        assert!(a
+            .record
+            .physical_publication
+            .original_non_delivery_fence()
+            .is_none());
+        assert!(!a
+            .record
+            .physical_publication
+            .still_original_non_delivery(&old));
+        reopened.finish(true);
+        let current = a
+            .record
+            .physical_publication
+            .original_non_delivery_fence()
+            .unwrap();
+        assert!(current.attempt_id() > old.attempt_id());
+        assert!(!a
+            .record
+            .physical_publication
+            .still_original_non_delivery(&old));
+        assert!(a
+            .record
+            .physical_publication
+            .still_original_non_delivery(&current));
+        assert!(a.record.physical_publication.record().is_none());
+    })
+    .await
+    .unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn b17_canonical_competing_producers_external_cancel_stale_id_and_new_attempt() {
     tokio::time::timeout(Duration::from_secs(1), async {

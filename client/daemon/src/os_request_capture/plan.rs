@@ -98,6 +98,8 @@ pub(crate) enum CaptureFailure {
     ForeignDevice,
     FrameConflict,
     MissingTcpOpen,
+    DuplicateWrite,
+    OriginalIngressSource,
     #[cfg(any(target_os = "linux", all(unix, test)))]
     RegistrationConflict,
     #[cfg(any(target_os = "linux", all(unix, test)))]

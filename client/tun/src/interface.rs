@@ -14,6 +14,10 @@ use crate::error::Result;
 /// binding to the packet before using it as an identity or capability.
 pub type PacketReadContext = Box<dyn Any + Send + Sync>;
 
+/// Untrusted local metadata for one write. A backend may recognize a private
+/// producer's type, but metadata itself never proves a successful system write.
+pub type PacketWriteContext = Box<dyn Any + Send + Sync>;
+
 /// The core trait for a virtual network interface.
 ///
 /// Implementations provide async packet read/write operations.
@@ -47,6 +51,17 @@ pub trait VirtualInterface: Send {
     ///
     /// * `buf` - The packet data to write (a complete IP packet).
     async fn write(&mut self, buf: &[u8]) -> Result<usize>;
+
+    /// Preserve the ordinary write for backends without a private observer.
+    /// Mock and generic implementations cannot mint a concrete system receipt.
+    async fn write_with_context(
+        &mut self,
+        buf: &[u8],
+        context: PacketWriteContext,
+    ) -> Result<usize> {
+        drop(context);
+        self.write(buf).await
+    }
 
     /// Get the interface name (e.g. "p2pnet0", "wintun0").
     fn name(&self) -> &str;

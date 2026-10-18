@@ -64,6 +64,8 @@ pub(super) use asymmetric_endpoint::{
     exercise_asymmetric_receive_socket, exercise_asymmetric_receive_socket_invalidation,
     exercise_equal_remote_distinct_socket,
 };
+#[path = "batch_publication.rs"]
+mod batch_publication;
 #[path = "network_change.rs"]
 mod network_change;
 pub(super) use network_change::exercise_network_change;
@@ -83,6 +85,7 @@ pub(super) enum PathKind {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum Scenario {
+    BatchPublication,
     Fresh,
     DuplicateAndNew,
     MissingSource,
@@ -1631,6 +1634,9 @@ async fn exercise_rounds(
         a.node == NODE_A && b.node == NODE_B,
         "actual fixture endpoint roles changed",
     )?;
+    if scenario == Scenario::BatchPublication {
+        return Box::pin(batch_publication::exercise_batch(a, b, path, budget)).await;
+    }
     if let Scenario::Room(case) = scenario {
         // Keep the new room fixture's state out of every pre-existing case's
         // inline future. The original thread stack and body end stay unchanged.

@@ -21,6 +21,18 @@ impl Daemon {
             Vec::new()
         };
         if let Some(mut tun) = tun {
+            let room_authorization = self.control.room_authorization().await;
+            if let Some(setup) = &capture_setup {
+                setup.session.bind_original_current_owners(
+                    &self.transport,
+                    &self.udp_transport,
+                    &self.relay_transport,
+                    &room_authorization,
+                );
+            }
+            let kernel_runtime = capture_setup
+                .as_ref()
+                .map(|setup| setup.session.inbound_runtime(&room_authorization));
             if let Some(setup) = capture_setup {
                 tun = tun.with_capture(setup.session);
                 self.task_manager
@@ -43,7 +55,7 @@ impl Daemon {
             let mut dataplane = dataplane
                 .with_acl(self.acl.clone(), self.config.node.node_id.clone())
                 .with_overlay_cidr(&self.config.network.cidr)
-                .with_room_authorization(self.control.room_authorization().await)
+                .with_room_authorization(room_authorization)
                 .with_local_source_addresses(local_sources);
 
             let outbound_transport = transport.clone();
@@ -53,7 +65,10 @@ impl Daemon {
                 })
                 .await;
 
-            let inbound_transport = transport.clone();
+            let inbound_transport = match kernel_runtime {
+                Some(runtime) => transport.clone().with_kernel_capture(runtime),
+                None => transport.clone(),
+            };
             let inbound_peers = self.peers.clone();
             let inbound_udp_updates = self.udp_transport_publication.subscribe();
             let inbound_evidence = Some(crate::transport::InboundEvidenceFeed {

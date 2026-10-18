@@ -42,6 +42,46 @@ fn try_guard<T>(
 }
 
 impl RelayMemberGuard<'_> {
+    /// Recheck additional original fragments under this same routes/live
+    /// guard. This does not acquire the member or close mutex a second time.
+    pub(crate) fn matches_original_fragment(
+        &self,
+        tx: &RelayFullSendFact,
+        rx: &OriginalRelayFrameRead,
+        original_rx_connection_id: u64,
+    ) -> Result<(), RelayMemberFailure> {
+        if tx.disposition() != RelayBranchDisposition::FullWrite || tx.original().is_none() {
+            return Err(RelayMemberFailure::UnknownWrite);
+        }
+        if original_rx_connection_id != self.transport.connection_id()
+            || !tx.matches_publication(
+                self.transport.connection_id(),
+                &self.transport.write_boundaries_live,
+            )
+            || tx.endpoint() != self.endpoint
+            || !self.is_current()
+        {
+            return Err(RelayMemberFailure::StalePublication);
+        }
+        let client = self.client()?;
+        if !tx.matches_client(client) {
+            return Err(RelayMemberFailure::StaleMember);
+        }
+        if !rx.belongs_to_client(client) {
+            return Err(RelayMemberFailure::UnknownReader);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn is_current(&self) -> bool {
+        self._live.as_ref().is_none_or(|live| **live)
+            && self
+                .transport
+                .rendezvous
+                .as_ref()
+                .is_none_or(|pool| !pool.stopped.load(Ordering::Acquire))
+    }
+
     fn client(&self) -> Result<&Arc<RelayClient>, RelayMemberFailure> {
         match &self.routes {
             Some(routes) => routes
@@ -203,13 +243,7 @@ impl RelayTransport {
             routes,
             _live: Some(live),
         };
-        let client = guard.client()?;
-        if !tx.matches_client(client) {
-            return Err(RelayMemberFailure::StaleMember);
-        }
-        if !rx.belongs_to_client(client) {
-            return Err(RelayMemberFailure::UnknownReader);
-        }
+        guard.matches_original_fragment(tx, rx, original_rx_connection_id)?;
         Ok(guard)
     }
 }

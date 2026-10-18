@@ -129,10 +129,12 @@ impl WireGuardTransport {
                     Instant::now().duration_since(udp_received),
                 );
             }
-            let overlay_origin = evidence
-                .as_ref()
-                .and_then(|feed| feed.overlay_ingress_tx.as_ref())
-                .map(|_| EncryptedOverlayOrigin::capture(&packet));
+            let overlay_origin = (self.kernel_capture.is_some()
+                || evidence
+                    .as_ref()
+                    .and_then(|feed| feed.overlay_ingress_tx.as_ref())
+                    .is_some())
+            .then(|| EncryptedOverlayOrigin::capture(&packet));
             let source = packet.source;
             let local_endpoint = packet.local_endpoint;
             let relay_endpoint = packet.relay_endpoint;
@@ -172,6 +174,13 @@ impl WireGuardTransport {
                     #[cfg(test)]
                     let mut overlay_source = overlay_source;
                     let decrypt_completed = Instant::now();
+                    // Preserve this actual auth/read and original REQUEST room
+                    // permit before the first post-decrypt await. Labels alone
+                    // cannot create this source or a system TUN write receipt.
+                    let kernel_ingress = self.kernel_capture.as_ref().and_then(|runtime| {
+                        runtime.capture_authenticated(self, overlay_source.as_ref()?, &inbound)
+                    });
+                    let mut legacy_ingress = None;
                     if let Some(capture) = self.rx_business_capture.as_ref() {
                         let wire = match (
                             wire_receiver_index(&packet.wire_bytes),
@@ -187,7 +196,7 @@ impl WireGuardTransport {
                             }
                             _ => None,
                         };
-                        inbound.authenticated_ingress = capture.capture_authenticated(
+                        legacy_ingress = capture.capture_authenticated(
                             &inbound.packet,
                             &inbound.peer_id,
                             physical_ingress.as_deref(),
@@ -198,6 +207,11 @@ impl WireGuardTransport {
                             decrypt_completed,
                         );
                     }
+                    inbound.authenticated_ingress =
+                        crate::dataplane::PacketIngressEvidence::from_parts(
+                            legacy_ingress,
+                            kernel_ingress,
+                        );
                     profiler.record(
                         sampled,
                         "rx_decrypt_us",

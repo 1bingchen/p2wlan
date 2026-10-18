@@ -346,6 +346,21 @@ async fn b26_original_publication_revoke_precedes_waiting_slot_writer() {
             ),
             Err(DirectOriginFailure::Stale)
         ));
+        #[cfg(unix)]
+        {
+            let mut site = "not_entered";
+            assert!(matches!(
+                udp.try_original_direct_publication_batch_guard_observed(
+                    "origin-peer",
+                    peers.current_network_generation_sync(),
+                    &[&old],
+                    &[],
+                    &mut site,
+                ),
+                Err(DirectOriginFailure::Stale)
+            ));
+            assert_eq!(site, "direct_transport_owner");
+        }
         drop(original_slot);
         let _next_lease = publish.await;
         let packet = read_one(&next, 0, next.socket.clone(), &wire).await;
@@ -367,6 +382,21 @@ async fn b26_original_publication_revoke_precedes_waiting_slot_writer() {
             ),
             Err(DirectOriginFailure::Stale)
         ));
+        #[cfg(unix)]
+        {
+            let mut site = "not_entered";
+            assert!(matches!(
+                next.try_original_direct_publication_batch_guard_observed(
+                    "origin-peer",
+                    peers.current_network_generation_sync(),
+                    &[&old],
+                    &[],
+                    &mut site,
+                ),
+                Err(DirectOriginFailure::Stale)
+            ));
+            assert_eq!(site, "direct_received_source");
+        }
         let runtime = next.dplpmtud_runtime();
         let gate = runtime.try_original_business_publication_guard().unwrap();
         assert!(matches!(
@@ -378,6 +408,21 @@ async fn b26_original_publication_revoke_precedes_waiting_slot_writer() {
             ),
             Err(DirectOriginFailure::ContendedPublication)
         ));
+        #[cfg(unix)]
+        {
+            let mut site = "not_entered";
+            assert!(matches!(
+                next.try_original_direct_publication_batch_guard_observed(
+                    "origin-peer",
+                    peers.current_network_generation_sync(),
+                    &[&fresh],
+                    &[],
+                    &mut site,
+                ),
+                Err(DirectOriginFailure::ContendedPublication)
+            ));
+            assert_eq!(site, "direct_publication_gate");
+        }
         drop(gate);
         assert!(next
             .try_original_direct_publication_guard(

@@ -159,7 +159,13 @@ Rust 依赖摘要由 `scripts/security/dependency_reports.py` 的 `rust` 子命�
 
 Linux 原系统 TUN 验收的 `scripts/parallel-rooms/linux_tun_evidence.py --write-facts --kernel-read-facts` 使用原父进程拥有的两个 daemon 控制连接，按启动后的原 probe 计划追加预期输入。每个 daemon 最多登记 1000 个请求，作用域最多 120 秒，两条控制流各最多收发 4 MiB；注册只能追加，不能替换或重新计时。父进程在原 daemon 首次 poll/wait 前绑定原 Popen 出生身份与 Unix peer credentials；daemon 只读取自身 Linux 出生身份、网络 namespace、boot ID 与 CLOCK_MONOTONIC。具体系统设备完成真实 read 后才创建私有来源，注册 JSON、Any 与 Mock 输入不能创建该来源。
 
-读取记录保留完整 128 位 run/round/request nonce。TCP 以原 SYN 序号和有界字节覆盖处理分段、合并与重传；每包最多关联八帧，冲突使该流不具备完整覆盖。父进程将实际读取与原子进程写入流、原请求截止时间分别比较，保留原 normal32/fault32/stall16、未发送 TCP 与晚到回程。该记录不证明实际 UDP/Relay Full、当前连接 owner 或最终 once；这些资格仍须由原物理发送来源和唯一 PeerManager 事务提供。采集结束只关闭实际拥有的连接，进程清理后不再查询 PID 或补取控制记录。
+读取记录保留完整 128 位 run/round/request nonce。TCP 以原 SYN 序号和有界字节覆盖处理分段、合并与重传；每包最多关联八帧，冲突使该流不具备完整覆盖。父进程将实际读取与原子进程写入流、原请求截止时间分别比较，保留原 normal32/fault32/stall16、未发送 TCP 与晚到回程。读取覆盖字段只描述历史字节；`native_credit` 另外记录唯一 PeerManager 对原 KernelRead、加密和实际 UDP/Relay Full、认证入站与同设备完整写入的最终事务。该事务在原期限内核验当前 session、generation、生命周期、路径和原房间许可后消费一次确认，记录 `commit_monotonic_ns`。历史确认不代表快照读取时连接仍然可用；新请求须重新核验当前所有者。采集结束只关闭实际拥有的连接，进程清理后不再查询 PID 或补取控制记录。
+
+控制连接的注册和快照请求携带发送方原有的一秒交换截止时间；原写入窗口沿用原 OS 请求截止时间。单个控制任务可在这些既有期限内让出调度、等待元数据短临界区，最多一个等待者；取消释放等待位置，锁中毒与过期仍拒绝。数据包观察和最终网络 owner 核验保持 try-only，元数据等待不重发业务、不续期，也不清除原来源缺失。快照只序列化已有结果。
+
+`native_credit.owner_check` 记录原最终事务最后到达的检查位置，区分发送锁登记表、发送锁、Direct 提交编号、端点、来源及预算发布等位置。该固定诊断码只解释已有终态，不授予 owner 或发送信用；缺少位置不推导通过，失败终态不因后续快照而重新确认。
+
+Linux TUN 验收失败时，归档保存与原报告镜像 SHA 一致的既有 daemon/control 字节及清单。每个镜像最多 1 GiB，共两个镜像；缺少原报告哈希或已有镜像时记录不可用。镜像留存发生在测量流程结束后，不改变原请求、进程组与回收记录。
 
 新增关键状态机时，同时考虑：当前状态、最后一次转移原因、失败计数、队列/任务规模和版本 identity 是否能从现有诊断入口获得。可观测性不是在出现事故后再补日志。
 

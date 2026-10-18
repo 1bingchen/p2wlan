@@ -19,6 +19,10 @@ use crate::error::{DaemonError, Result};
 use crate::peer::PeerManager;
 use crate::request_carriage::{RawOutboundSink, RawRequestDelivery, RequestBinding};
 
+#[path = "dataplane/ingress_evidence.rs"]
+mod ingress_evidence;
+pub(crate) use ingress_evidence::PacketIngressEvidence;
+
 include!("dataplane/core.rs");
 include!("dataplane/normalization.rs");
 include!("dataplane/logging.rs");

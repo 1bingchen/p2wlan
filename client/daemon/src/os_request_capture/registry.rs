@@ -1,6 +1,6 @@
 #[cfg(unix)]
 use super::clock::{monotonic_ns, NativeClockScope};
-use super::device::KernelRead;
+use super::device::{DeviceLease, KernelRead};
 use super::plan::{CaptureFailure, Protocol, RegisteredFlowPlan, MAX_BINDINGS_PER_PACKET};
 #[cfg(any(target_os = "linux", all(unix, test)))]
 use super::plan::{RegistrationPlan, CAPTURE_TTL_SECS, MAX_REQUESTS};
@@ -14,10 +14,32 @@ use crate::peer::PeerManager;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, OnceLock, Weak};
 #[cfg(any(target_os = "linux", all(unix, test)))]
 use std::time::Duration;
 use std::time::Instant;
+
+#[cfg(unix)]
+mod control_lock;
+mod full;
+#[cfg(unix)]
+use control_lock::ControlState as RegistryMutex;
+#[cfg(not(unix))]
+use std::sync::Mutex as RegistryMutex;
+#[cfg(any(target_os = "linux", all(unix, test)))]
+mod native;
+mod owners;
+pub(crate) use full::OriginalFullObservation;
+#[cfg(any(target_os = "linux", all(unix, test)))]
+pub(crate) use native::{OriginalKernelExchange, OriginalKernelOnce};
+#[cfg(any(target_os = "linux", all(unix, test)))]
+pub(crate) use owners::OriginalKernelCurrentOwners;
+mod ingress;
+mod read_peer;
+mod read_room;
+#[cfg(any(target_os = "linux", all(unix, test)))]
+pub(super) mod write_window;
+pub(crate) use ingress::{KernelCaptureRuntime, KernelIngressBinding};
 
 #[cfg(any(target_os = "linux", all(unix, test)))]
 static NEXT_SCOPE: AtomicU64 = AtomicU64::new(1);
@@ -26,6 +48,9 @@ pub(crate) struct CaptureSession {
     #[cfg(unix)]
     owner: u64,
     active: AtomicBool,
+    inbound_complete: AtomicBool,
+    read_complete: AtomicBool,
+    full_complete: AtomicBool,
     expires: Instant,
     peers: Weak<PeerManager>,
     #[cfg(unix)]
@@ -34,13 +59,21 @@ pub(crate) struct CaptureSession {
     producer_scope: [u8; 16],
     #[cfg(unix)]
     clock_scope: Option<NativeClockScope>,
-    state: Mutex<RegistryState>,
+    state: RegistryMutex<RegistryState>,
     gaps: AtomicU64,
 }
 
 struct RegistryState {
+    current_owners: Option<owners::OriginalKernelOwners>,
+    original_room_owner: Option<Weak<crate::rooms::RoomAuthorization>>,
     flows: Vec<FlowState>,
     original_device: Option<Arc<KernelRead>>,
+    system_device: Option<Weak<DeviceLease>>,
+    full_history: full::FullHistory,
+    // Actual original read order includes unresolved and failed publications.
+    // A later duplicate Full cannot replace an earlier uncertain producer.
+    read_history: Vec<Arc<KernelReadBinding>>,
+    inbound_history: ingress::InboundHistory,
     #[cfg(unix)]
     requests: usize,
     #[cfg(unix)]
@@ -55,8 +88,16 @@ struct FlowState {
     tcp_open: Option<u32>,
     invalid: bool,
     requests: Vec<RequestReadState>,
+    inbound: ingress::InboundFlow,
 }
 struct RequestReadState {
+    #[cfg(any(target_os = "linux", all(unix, test)))]
+    native_credit: Option<native::NativeFrameOutcome>,
+    first_request_room: Option<Arc<ingress::OriginalIncomingRoom>>,
+    #[cfg(any(target_os = "linux", all(unix, test)))]
+    original_write_window: Option<write_window::WriteWindow>,
+    first_peer: Option<Arc<read_peer::FirstReadPeer>>,
+    first_response: Option<Arc<ingress::ResponseCapture>>,
     read_events: u64,
     first_read: Option<Arc<KernelRead>>,
     last_read: Option<Arc<KernelRead>>,
@@ -75,6 +116,13 @@ pub(crate) struct KernelReadBinding {
     packet_len: usize,
     packet_sha256: [u8; 32],
     plan: Arc<RegisteredFlowPlan>,
+    spans: Vec<full::ReadFrameSpan>,
+    physical_publication: crate::overlay_requests::PhysicalSendPublication,
+    full_retained_ns: OnceLock<u64>,
+    original_publication_ns: OnceLock<u64>,
+    original_peers: Vec<Arc<read_peer::FirstReadPeer>>,
+    original_responses: Vec<Arc<ingress::ResponseCapture>>,
+    original_request_rooms: Vec<Arc<ingress::OriginalIncomingRoom>>,
 }
 
 #[cfg(unix)]
@@ -93,13 +141,21 @@ pub(super) struct ReadSnapshot {
     active: bool,
     gaps: u64,
     requests: Vec<RequestSnapshot>,
+    historical_full_packets: Vec<full::FullPacketSnapshot>,
+    system_tun_full_writes: Vec<ingress::WriteSnapshot>,
     daemon_registration_verified: bool,
     physical_send_verified: bool,
     canonical_current_owner_verified: bool,
+    incoming_provenance_complete: bool,
+    original_read_observation_complete: bool,
+    original_full_retention_complete: bool,
+    retained_original_reads: usize,
 }
 #[cfg(unix)]
 #[derive(Serialize)]
 struct RequestSnapshot {
+    #[cfg(any(target_os = "linux", all(unix, test)))]
+    native_credit: Option<native::NativeFrameSnapshot>,
     flow: usize,
     producer_scope: String,
     sequence: u32,
@@ -115,6 +171,14 @@ struct RequestSnapshot {
     last_read_monotonic_ns: Option<u64>,
     kernel_frame_read_complete: bool,
     flow_invalid: bool,
+    historical_frame_full_complete: bool,
+    incoming_frame_system_write_complete: bool,
+    incoming_flow_invalid: bool,
+    original_peer: Option<read_peer::ReadPeerSnapshot>,
+    original_request_room: Option<read_room::ReadRoomSnapshot>,
+    original_response_input: Option<ingress::ResponseSnapshot>,
+    #[cfg(any(target_os = "linux", all(unix, test)))]
+    original_write_window: Option<write_window::WriteWindow>,
 }
 
 #[cfg(any(target_os = "linux", all(unix, test)))]
@@ -148,14 +212,23 @@ impl CaptureSession {
         let session = Arc::new(Self {
             owner,
             active: AtomicBool::new(true),
+            inbound_complete: AtomicBool::new(true),
+            read_complete: AtomicBool::new(true),
+            full_complete: AtomicBool::new(true),
             expires,
             peers: Arc::downgrade(peers),
             capture_id: plan.capture_id,
             producer_scope: plan.producer_scope,
             clock_scope: NativeClockScope::capture(),
-            state: Mutex::new(RegistryState {
+            state: RegistryMutex::new(RegistryState {
+                current_owners: None,
+                original_room_owner: None,
                 flows: Vec::new(),
                 original_device: None,
+                system_device: None,
+                full_history: full::FullHistory::new(),
+                read_history: Vec::new(),
+                inbound_history: ingress::InboundHistory::new(),
                 requests: 0,
                 revision: 0,
                 producers: std::collections::BTreeSet::new(),
@@ -175,15 +248,34 @@ impl CaptureSession {
         &self,
         plan: RegistrationPlan,
     ) -> Result<RegistrationReceipt, CaptureFailure> {
+        let mut state = self
+            .state
+            .try_lock()
+            .map_err(|_| CaptureFailure::Contended)?;
+        self.register_in(plan, &mut state)
+    }
+
+    #[cfg(any(target_os = "linux", all(unix, test)))]
+    pub(super) async fn register_control(
+        &self,
+        plan: RegistrationPlan,
+        end: tokio::time::Instant,
+    ) -> Result<RegistrationReceipt, CaptureFailure> {
+        let mut state = self.state.lock_until(end).await?;
+        self.register_in(plan, &mut state)
+    }
+
+    #[cfg(any(target_os = "linux", all(unix, test)))]
+    fn register_in(
+        &self,
+        plan: RegistrationPlan,
+        state: &mut RegistryState,
+    ) -> Result<RegistrationReceipt, CaptureFailure> {
         if plan.capture_id != self.capture_id || plan.flows.is_empty() {
             return Err(CaptureFailure::InvalidPlan);
         }
         let producer = plan.producer_scope;
         let added: usize = plan.flows.iter().map(|flow| flow.requests.len()).sum();
-        let mut state = self
-            .state
-            .try_lock()
-            .map_err(|_| CaptureFailure::Contended)?;
         if !self.is_live(Instant::now()) {
             return Err(CaptureFailure::Expired);
         }
@@ -218,6 +310,11 @@ impl CaptureSession {
                     .requests
                     .iter()
                     .map(|_| RequestReadState {
+                        native_credit: None,
+                        first_request_room: None,
+                        original_write_window: None,
+                        first_peer: None,
+                        first_response: None,
                         read_events: 0,
                         first_read: None,
                         last_read: None,
@@ -226,6 +323,7 @@ impl CaptureSession {
                     })
                     .collect();
                 FlowState {
+                    inbound: ingress::InboundFlow::new(plan.requests.len()),
                     plan: Arc::new(plan),
                     producer_scope: producer,
                     tcp_open: None,
@@ -252,6 +350,19 @@ impl CaptureSession {
     pub(crate) fn retire(&self) {
         self.active.store(false, Ordering::Release);
     }
+
+    pub(super) fn bind_system_device(&self, device: &Arc<DeviceLease>) -> bool {
+        let Ok(mut state) = self.state.try_lock() else {
+            self.gap();
+            return false;
+        };
+        if state.system_device.is_some() || !self.is_live(Instant::now()) {
+            self.gap();
+            return false;
+        }
+        state.system_device = Some(Arc::downgrade(device));
+        true
+    }
     #[cfg(unix)]
     pub(super) fn expires(&self) -> Instant {
         self.expires
@@ -271,13 +382,19 @@ impl CaptureSession {
         self: &Arc<Self>,
         original: KernelRead,
         packet: &[u8],
-    ) -> Option<KernelReadBinding> {
-        if !original.is_current() || !self.is_live(original.at()) {
+    ) -> Option<Arc<KernelReadBinding>> {
+        if !original.is_current()
+            || !self.is_live(original.at())
+            || !self.read_complete.load(Ordering::Acquire)
+        {
             return None;
         }
         match self.capture_read(original, packet) {
             Ok(binding) => binding,
             Err(_) => {
+                // A lost original read cannot be replaced by a later copy
+                // sampled under a newer peer lifecycle or network generation.
+                self.read_complete.store(false, Ordering::Release);
                 self.gap();
                 None
             }
@@ -288,13 +405,20 @@ impl CaptureSession {
         self: &Arc<Self>,
         original: KernelRead,
         packet: &[u8],
-    ) -> Result<Option<KernelReadBinding>, CaptureFailure> {
+    ) -> Result<Option<Arc<KernelReadBinding>>, CaptureFailure> {
         let udp = parse_os_udp(packet).ok();
         let tcp = parse_tcp_segment(packet).ok();
         let mut state = self
             .state
             .try_lock()
             .map_err(|_| CaptureFailure::Contended)?;
+        if state
+            .system_device
+            .as_ref()
+            .is_none_or(|device| !original.belongs_to(device))
+        {
+            return Err(CaptureFailure::ForeignDevice);
+        }
         let Some(index) = state
             .flows
             .iter()
@@ -320,18 +444,21 @@ impl CaptureSession {
         if state.original_device.is_none() {
             state.original_device = Some(original.clone());
         }
+        let room = state.original_room_owner.clone();
         let flow = &mut state.flows[index];
         let plan = flow.plan.clone();
         if flow.invalid {
             return Err(CaptureFailure::FrameConflict);
         }
         let mut slots = Vec::with_capacity(MAX_BINDINGS_PER_PACKET);
+        let mut spans = Vec::with_capacity(MAX_BINDINGS_PER_PACKET);
         if let Some(parsed) = udp {
             if plan.protocol != Protocol::Udp || parsed.payload_bytes != plan.payload_bytes {
                 return Ok(None);
             }
             if let Some(slot) = plan.requests.iter().position(|key| *key == parsed.key) {
                 slots.push(slot);
+                spans.push(full::ReadFrameSpan::new(slot, 0, 1));
                 flow.requests[slot].udp_complete = true;
             }
         } else if let Some(segment) = tcp {
@@ -396,11 +523,17 @@ impl CaptureSession {
                     flow.invalid = true;
                     return Err(CaptureFailure::FrameConflict);
                 }
+                let (start, end) = coverage
+                    .matching_span(&segment)
+                    .ok_or(CaptureFailure::FrameConflict)?;
+                spans.push(full::ReadFrameSpan::new(*slot, start, end));
             }
         }
         if slots.is_empty() {
             return Ok(None);
         }
+        let original_peers = self.first_read_peers(flow, &slots);
+        let original_request_rooms = self.first_read_request_rooms(flow, &slots, room.as_ref());
         for slot in &slots {
             let read = &mut flow.requests[*slot];
             read.read_events = read
@@ -412,7 +545,15 @@ impl CaptureSession {
             }
             read.last_read = Some(original.clone());
         }
-        Ok(Some(KernelReadBinding {
+        let original_responses = self.first_response_inputs(&mut state, index, &slots, &original);
+        if state.read_history.len() >= full::MAX_FULL_PACKETS {
+            return Err(CaptureFailure::Capacity);
+        }
+        state
+            .read_history
+            .try_reserve(1)
+            .map_err(|_| CaptureFailure::Capacity)?;
+        let binding = Arc::new(KernelReadBinding {
             scope: Arc::downgrade(self),
             read: original,
             flow: index,
@@ -420,7 +561,16 @@ impl CaptureSession {
             packet_len: packet.len(),
             packet_sha256: Sha256::digest(packet).into(),
             plan,
-        }))
+            spans,
+            physical_publication: crate::overlay_requests::PhysicalSendPublication::new(),
+            full_retained_ns: OnceLock::new(),
+            original_publication_ns: OnceLock::new(),
+            original_peers,
+            original_responses,
+            original_request_rooms,
+        });
+        state.read_history.push(binding.clone());
+        Ok(Some(binding))
     }
 
     #[cfg(unix)]
@@ -429,11 +579,30 @@ impl CaptureSession {
             .state
             .try_lock()
             .map_err(|_| CaptureFailure::Contended)?;
+        self.snapshot_in(&state)
+    }
+
+    #[cfg(unix)]
+    pub(super) async fn snapshot_control(
+        &self,
+        end: tokio::time::Instant,
+    ) -> Result<ReadSnapshot, CaptureFailure> {
+        let state = self.state.lock_until(end).await?;
+        self.snapshot_in(&state)
+    }
+
+    #[cfg(unix)]
+    fn snapshot_in(&self, state: &RegistryState) -> Result<ReadSnapshot, CaptureFailure> {
         let mut requests = Vec::new();
         for (flow_index, flow) in state.flows.iter().enumerate() {
             let plan = &flow.plan;
             for (key, read) in plan.requests.iter().zip(&flow.requests) {
                 requests.push(RequestSnapshot {
+                    #[cfg(any(target_os = "linux", all(unix, test)))]
+                    native_credit: read
+                        .native_credit
+                        .as_ref()
+                        .map(native::NativeFrameOutcome::snapshot),
                     flow: flow_index,
                     producer_scope: hex::encode(flow.producer_scope),
                     sequence: key.sequence,
@@ -460,12 +629,58 @@ impl CaptureSession {
                         && (read.udp_complete
                             || read.tcp.as_ref().is_some_and(|tcp| tcp.is_complete())),
                     flow_invalid: flow.invalid,
+                    historical_frame_full_complete: self.full_complete.load(Ordering::Acquire)
+                        && !flow.invalid
+                        && state.full_history.frame_complete(
+                            flow_index,
+                            key.sequence as usize,
+                            plan,
+                        ),
+                    incoming_frame_system_write_complete: !flow.inbound.invalid
+                        && state.inbound_history.frame_complete(
+                            flow_index,
+                            key.sequence as usize,
+                            plan,
+                        ),
+                    incoming_flow_invalid: flow.inbound.invalid,
+                    original_peer: read.first_peer.as_ref().map(|peer| peer.snapshot()),
+                    original_request_room: read
+                        .first_request_room
+                        .as_ref()
+                        .map(|room| room.snapshot()),
+                    original_response_input: read
+                        .first_response
+                        .as_ref()
+                        .map(|input| input.snapshot()),
+                    #[cfg(any(target_os = "linux", all(unix, test)))]
+                    original_write_window: read.original_write_window.clone(),
                 });
             }
         }
+        #[cfg(any(target_os = "linux", all(unix, test)))]
+        let native_verified = state.requests != 0
+            && self.read_complete.load(Ordering::Acquire)
+            && self.inbound_complete.load(Ordering::Acquire)
+            && self.full_complete.load(Ordering::Acquire)
+            && state
+                .flows
+                .iter()
+                .all(|flow| !flow.invalid && !flow.inbound.invalid)
+            && state
+                .flows
+                .iter()
+                .flat_map(|flow| &flow.requests)
+                .all(|request| {
+                    request
+                        .native_credit
+                        .as_ref()
+                        .is_some_and(native::NativeFrameOutcome::verified)
+                });
+        #[cfg(not(any(target_os = "linux", all(unix, test))))]
+        let native_verified = false;
         Ok(ReadSnapshot {
-            schema_version: 1,
-            scope: "registered_kernel_read_only",
+            schema_version: 2,
+            scope: "registered_native_frame_capture",
             owner: self.owner,
             capture_id: hex::encode(self.capture_id),
             producer_scope: hex::encode(self.producer_scope),
@@ -477,11 +692,18 @@ impl CaptureSession {
             active: self.is_live(Instant::now()),
             gaps: self.gaps.load(Ordering::Relaxed),
             requests,
-            // These remain false: registration data and completed system reads
-            // are not a complete original OS-write/daemon/physical/once chain.
-            daemon_registration_verified: false,
-            physical_send_verified: false,
-            canonical_current_owner_verified: false,
+            historical_full_packets: state.full_history.snapshot(),
+            system_tun_full_writes: state.inbound_history.snapshot(),
+            // Registration alone leaves these false. Only the sole native
+            // current-owner/once transaction can make every frame verified;
+            // original application OS-write qualification stays separate.
+            daemon_registration_verified: native_verified,
+            physical_send_verified: native_verified,
+            canonical_current_owner_verified: native_verified,
+            incoming_provenance_complete: self.inbound_complete.load(Ordering::Acquire),
+            original_read_observation_complete: self.read_complete.load(Ordering::Acquire),
+            original_full_retention_complete: self.full_complete.load(Ordering::Acquire),
+            retained_original_reads: state.read_history.len(),
         })
     }
 }
@@ -490,6 +712,7 @@ impl KernelReadBinding {
     pub(crate) fn is_current_at(&self, observed_at: Instant) -> bool {
         self.scope.upgrade().is_some_and(|scope| {
             scope.is_live(observed_at)
+                && scope.read_complete.load(Ordering::Acquire)
                 && self.read.is_current()
                 && self.read.at() <= observed_at
                 && scope
@@ -508,6 +731,7 @@ impl KernelReadBinding {
         self.is_current_at(observed_at)
             && self.scope.upgrade().is_some_and(|scope| {
                 Weak::ptr_eq(&scope.peers, &Arc::downgrade(peers))
+                    && self.original_peer_identity_is_current(&scope, observed_at)
                     && scope.is_live(observed_at)
                     && self.read.is_current()
                     && self.read.at() <= observed_at
@@ -527,5 +751,6 @@ impl KernelReadBinding {
         self.exact_input(peers, &packet.packet, observed_at)
             && packet.peer_id == self.plan.peer
             && packet.dst_ip == self.plan.flow.dst_v4.to_string()
+            && self.original_room_matches_permit(packet.room_authorization.as_ref())
     }
 }

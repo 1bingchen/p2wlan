@@ -2,11 +2,15 @@ use super::*;
 
 mod decryption;
 mod encryption;
+mod kernel_owner;
 mod overlay_credit;
 pub(crate) use encryption::{
     EncryptedOutboundWithSource, OriginalEchoSessionGuard, OriginalEncryptionSource,
     SessionBoundEncryptionWithSource,
 };
+pub(crate) use kernel_owner::OriginalKernelTransportOwners;
+#[cfg(any(target_os = "linux", all(unix, test)))]
+pub(crate) use kernel_owner::{OriginalKernelEmitFailure, OriginalKernelTransportCurrent};
 pub(crate) use overlay_credit::{OriginalOverlaySessionFailure, OriginalOverlaySessionGuard};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -248,6 +252,13 @@ impl PeerTransportSessions {
 }
 
 impl WireGuardTransport {
+    pub(crate) fn with_kernel_capture(
+        mut self,
+        runtime: crate::os_request_capture::KernelCaptureRuntime,
+    ) -> Self {
+        self.kernel_capture = Some(Arc::new(runtime));
+        self
+    }
     pub(crate) fn accepts_request_carriage(&self) -> bool {
         self.outbound_tx.is_tracked()
     }
@@ -328,6 +339,7 @@ impl WireGuardTransport {
             #[cfg(test)]
             previous_overlay_observer: Arc::new(std::sync::Mutex::new(None)),
             rx_business_capture: None,
+            kernel_capture: None,
             wg_evidence_owner: crate::business_evidence::WgEvidenceOwnerId::allocate(),
             sessions: Arc::new(Mutex::new(HashMap::new())),
             next_session_instance: Arc::new(AtomicU64::new(1)),

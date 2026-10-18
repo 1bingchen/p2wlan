@@ -49,6 +49,7 @@ class ProbeCapture:
         self.eof = False
         self.gap = None
         self.result = None
+        self.live_window_bridge = None
         self.config, self.transport, self.namespace = config, transport, namespace
         self.plan_path = root / (stem + "-request-plan.json")
         self.raw_path = root / (stem + "-write-stream.jsonl")
@@ -80,8 +81,16 @@ class ProbeCapture:
                 self.gap = self.gap or "owned_capture_descriptor_close_failed"
 
     def close(self) -> None:
+        if self.live_window_bridge is not None:
+            self.live_window_bridge.seal()
         self._close("writer")
         self._close("reader")
+
+    def enable_live_window_bridge(self, endpoints) -> None:
+        from linux_tun_live_window import OriginalWriteWindows
+        if self.live_window_bridge is not None or self.stream is not None:
+            raise ValueError("original_window_bridge_already_bound")
+        self.live_window_bridge = OriginalWriteWindows(self, endpoints)
 
     def bind(self, groups, child) -> None:
         try:
@@ -92,13 +101,15 @@ class ProbeCapture:
             original = streams.OriginalChild.from_spawn(
                 child, owners[0]["child_spawn_requested_monotonic_ns"], self.namespace)
             self.stream = streams.WriteStream(self.config, self.prepared, self.transport, original)
+            if self.live_window_bridge is not None:
+                self.live_window_bridge.bind(self, child)
         except (OSError, ValueError, KeyError) as error:
             self.gap = "original_capture_bind_failed:" + type(error).__name__
             self._close("reader")
         finally:
             self._close("writer")  # Only the original child retains the inherited write end.
 
-    def drain(self) -> None:
+    def drain(self, *, live: bool = True) -> None:
         """At most one nonblocking 4096-byte read; no sleep, poll, PID lookup or retry."""
         if self.reader is None or self.gap is not None:
             return
@@ -123,15 +134,19 @@ class ProbeCapture:
         if self.stream.gap is not None:
             self.gap = self.stream.gap
             self._close("reader")
+        elif live and self.live_window_bridge is not None:
+            self.live_window_bridge.observe(self, time.monotonic_ns())
 
     def finish(self, report: dict | None) -> dict:
         if self.result is not None:
             return self.result
+        if self.live_window_bridge is not None:
+            self.live_window_bridge.seal()
         # Called only after the original wait completed. Drain already-written
         # bytes without introducing a new deadline or waiting for another writer.
         for _ in range(MAX_FINAL_READS):
             before = len(self.raw)
-            self.drain()
+            self.drain(live=False)
             if self.reader is None or len(self.raw) == before:
                 break
         if not self.eof:

@@ -3,6 +3,21 @@ use super::{RoomAuthorization, RoomSendPermit, RoomSnapshot};
 use std::sync::{MutexGuard, TryLockError};
 use std::time::Instant;
 
+impl RoomSendPermit {
+    /// Select an existing original, never mint a renewed or combined grant.
+    /// Current validity/roster checks remain with the original room owner.
+    pub(crate) fn intersect_original(&self, other: &Self) -> Result<Self, OriginalRoomSendFailure> {
+        if !std::sync::Arc::ptr_eq(&self.live, &other.live) {
+            return Err(OriginalRoomSendFailure::Stale);
+        }
+        Ok(if self.expires_at <= other.expires_at {
+            self.clone()
+        } else {
+            other.clone()
+        })
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum OriginalRoomSendFailure {
     MissingOriginal,
@@ -31,6 +46,12 @@ impl OriginalRoomSendGuard<'_> {
 }
 
 impl RoomAuthorization {
+    /// Nonblocking owner health observation for an already captured grant.
+    /// This grants no permit and does not replace the final room-owner guard.
+    pub(crate) fn original_snapshot_is_poisoned(&self) -> bool {
+        self.snapshot.is_poisoned()
+    }
+
     /// Capture once at the original REQUEST entrance, before any wait/queue.
     pub(crate) fn try_capture_original_send_permit(
         &self,

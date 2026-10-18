@@ -42,21 +42,29 @@ impl OriginalEchoSessionGuard<'_> {
 }
 
 impl OriginalEncryptionSource {
+    /// Intrinsic TX/RX identity only. The original guard below separately
+    /// retains and checks the live session owner through the synchronous send.
+    pub(crate) fn matches_original_receive_source(
+        &self,
+        rx: &crate::transport::OriginalSessionSource,
+    ) -> bool {
+        use crate::transport::OriginalSessionRole;
+        self.owner.ptr_eq(&rx.owner)
+            && self.peer_id == rx.peer_id()
+            && self.original_role == OriginalSessionRole::Active
+            && rx.original_role() == OriginalSessionRole::Active
+            && self.session_instance == rx.session_instance()
+            && self.authorized_peer_lifecycle.is_some()
+            && self.authorized_peer_lifecycle == rx.authorized_peer_lifecycle()
+    }
+
     /// Keep the actual session registry through the echo's synchronous boundary.
     /// Even a registry writer outside emit cannot revoke these original facts.
     pub(crate) fn try_original_echo_receive_session_guard<'a>(
         &'a self,
         rx: &crate::transport::OriginalSessionSource,
     ) -> Option<OriginalEchoSessionGuard<'a>> {
-        use crate::transport::OriginalSessionRole;
-        if !self.owner.ptr_eq(&rx.owner)
-            || self.peer_id != rx.peer_id()
-            || self.original_role != OriginalSessionRole::Active
-            || rx.original_role() != OriginalSessionRole::Active
-            || self.session_instance != rx.session_instance()
-            || self.authorized_peer_lifecycle.is_none()
-            || self.authorized_peer_lifecycle != rx.authorized_peer_lifecycle()
-        {
+        if !self.matches_original_receive_source(rx) {
             return None;
         }
         let sessions = self.owner.upgrade()?.try_lock_owned().ok()?;

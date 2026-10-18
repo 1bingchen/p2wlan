@@ -10,6 +10,9 @@ use crate::request_carriage::{in_original_window, RequestBindingState};
 use crate::transport::OriginalEncryptionSource;
 use crate::udp::UdpFullSendFact;
 
+mod input;
+use input::OriginalPhysicalInput;
+
 const ID_MAX: u64 = (1u64 << 61) - 1;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u64)]
@@ -46,8 +49,38 @@ pub(crate) struct PhysicalSendPublication {
     #[cfg(test)]
     recorded_observation_hook: std::sync::Mutex<Option<Box<dyn FnOnce() + Send + 'static>>>,
 }
+
+/// Captured only from the original producer's proven non-delivery terminal.
+/// A reopen changes the attempt word, so it cannot masquerade as this fence.
+#[cfg(any(target_os = "linux", all(unix, test)))]
+pub(crate) struct OriginalNonDeliveryFence {
+    owner: usize,
+    word: u64,
+}
+
+#[cfg(any(target_os = "linux", all(unix, test)))]
+impl OriginalNonDeliveryFence {
+    pub(crate) fn attempt_id(&self) -> u64 {
+        self.word >> 3
+    }
+}
 impl PhysicalSendPublication {
-    pub(super) fn new() -> Self {
+    #[cfg(any(target_os = "linux", all(unix, test)))]
+    pub(crate) fn original_non_delivery_fence(&self) -> Option<OriginalNonDeliveryFence> {
+        let word = self.phase.load(Ordering::Acquire);
+        (state(word) == PhysicalPublicationState::DefinitelyNotHanded).then_some(
+            OriginalNonDeliveryFence {
+                owner: self as *const Self as usize,
+                word,
+            },
+        )
+    }
+    #[cfg(any(target_os = "linux", all(unix, test)))]
+    pub(crate) fn still_original_non_delivery(&self, original: &OriginalNonDeliveryFence) -> bool {
+        original.owner == self as *const Self as usize
+            && self.phase.load(Ordering::Acquire) == original.word
+    }
+    pub(crate) fn new() -> Self {
         Self {
             phase: AtomicU64::new(0),
             record: OnceLock::new(),
@@ -165,7 +198,8 @@ pub(crate) enum PhysicalInputQualification {
 // Prepared under the original encryption epoch, before any Open/Publishing CAS.
 // Visibility trusts crate call sites; it is not an adversarial crate boundary.
 pub(crate) struct PreparedPhysicalPublication {
-    pub(super) request: Weak<CanonicalOverlayRequest>,
+    full_observation: Option<crate::os_request_capture::OriginalFullObservation>,
+    request: OriginalPhysicalInput,
     pub(super) peer_owner: Weak<PeerManager>,
     pub(super) binding: RequestBindingState,
     pub(super) encryption: OriginalEncryptionSource,
@@ -182,12 +216,39 @@ impl PreparedPhysicalPublication {
         actual_generation: u64,
         packet: &crate::transport::EncryptedPeerPacket,
     ) -> Result<Option<Self>, PublicationFailure> {
-        let Some(request) = binding.token().request() else {
+        let prepared =
+            Self::capture_original(binding, source, peers, transport, actual_generation, packet);
+        if !matches!(&prepared, Ok(Some(_))) {
+            if let Some(read) = binding.token().kernel() {
+                read.original_full_retention_lost();
+            }
+        }
+        prepared
+    }
+
+    fn capture_original(
+        binding: &crate::request_carriage::RequestBinding,
+        source: &OriginalEncryptionSource,
+        peers: &PeerManager,
+        transport: &crate::transport::WireGuardTransport,
+        actual_generation: u64,
+        packet: &crate::transport::EncryptedPeerPacket,
+    ) -> Result<Option<Self>, PublicationFailure> {
+        let Some((request, peer_owner)) =
+            OriginalPhysicalInput::capture(binding, peers, source.encrypted_at(), source.peer_id())
+        else {
             return Ok(None);
         };
-        let Some(peer_owner) = request.original_peer_owner(peers) else {
+        // The original caller already owns epoch. Match immutable first-read
+        // identity to the actual crypto source here; never try to acquire that
+        // same epoch again through a route-time current-identity observer.
+        if binding.token().kernel().is_some_and(|read| {
+            !read.original_peer_matches_encryption(&peer_owner, actual_generation, source)
+                || !read.original_response_matches_encryption(source)
+                || !read.original_room_matches_permit(packet.room_authorization.as_ref())
+        }) {
             return Ok(None);
-        };
+        }
         if !source.belongs_to(transport) {
             return Ok(None);
         }
@@ -196,7 +257,11 @@ impl PreparedPhysicalPublication {
             .try_copy_for_publication()
             .map_err(|_| PublicationFailure::MetadataFailed)?;
         Ok(Some(Self {
-            request: std::sync::Arc::downgrade(&request),
+            full_observation: binding
+                .token()
+                .kernel()
+                .map(|read| read.original_full_observation()),
+            request,
             peer_owner,
             binding: binding.state(),
             encryption,
@@ -209,9 +274,29 @@ impl PreparedPhysicalPublication {
             ),
         }))
     }
-    pub(crate) fn open(self) -> Result<PhysicalRequestPublisher, PublicationFailure> {
+    pub(crate) fn open(mut self) -> Result<PhysicalRequestPublisher, PublicationFailure> {
+        if let Some(observation) = &mut self.full_observation {
+            observation.arm();
+        }
         let request = self.request.upgrade().ok_or(PublicationFailure::Retired)?;
-        let id = request.physical_publication.open()?;
+        let id = match request.publication().open() {
+            Ok(id) => id,
+            Err(reason) => {
+                // The same read's existing winning producer still owns its
+                // observation. A losing open must not cancel that producer.
+                if matches!(
+                    request.publication().state(),
+                    PhysicalPublicationState::Open
+                        | PhysicalPublicationState::Publishing
+                        | PhysicalPublicationState::Recorded
+                ) {
+                    if let Some(observation) = &mut self.full_observation {
+                        observation.complete();
+                    }
+                }
+                return Err(reason);
+            }
+        };
         drop(request);
         Ok(PhysicalRequestPublisher {
             id,
@@ -243,7 +328,7 @@ impl PhysicalTransportFact {
 }
 
 pub(crate) struct PhysicalSendRecord {
-    request: Weak<CanonicalOverlayRequest>,
+    request: OriginalPhysicalInput,
     attempt_id: u64,
     peer_owner: Weak<PeerManager>,
     binding: RequestBindingState,
@@ -254,6 +339,42 @@ pub(crate) struct PhysicalSendRecord {
 }
 #[allow(dead_code)] // Read-only intrinsic evidence; current-owner guards are separate.
 impl PhysicalSendRecord {
+    pub(crate) fn matches_original_kernel_read(
+        &self,
+        read: &crate::os_request_capture::KernelReadBinding,
+    ) -> bool {
+        self.request.matches_kernel(read)
+            && self.binding == RequestBindingState::RoutedExact
+            && read.original_peer_owner_ptr_matches(&self.peer_owner)
+            && read.original_peer_matches_encryption(
+                &self.peer_owner,
+                self.encryption_generation,
+                &self.encryption,
+            )
+            && read.original_response_matches_encryption(&self.encryption)
+            && read.original_room_matches_permit(self.room_authorization.as_ref())
+            && read.peer_id() == self.encryption.peer_id()
+            && read.read_at() <= self.encryption.encrypted_at()
+            && self.encryption.authorized_peer_lifecycle().is_some()
+            && self
+                .full_completed_at()
+                .is_some_and(|completed| self.encryption.encrypted_at() <= completed)
+    }
+
+    pub(crate) fn full_completed_at(&self) -> Option<Instant> {
+        match &self.transport {
+            PhysicalTransportFact::Udp(fact) => (self.encryption.encrypted_at()
+                <= fact.syscall_started()
+                && fact.syscall_started() <= fact.syscall_completed())
+            .then_some(fact.syscall_completed()),
+            PhysicalTransportFact::Relay(fact) => fact.original().and_then(|write| {
+                (self.encryption.encrypted_at() <= write.write_started_at()
+                    && write.write_started_at() <= write.completed_at())
+                .then_some(write.completed_at())
+            }),
+        }
+    }
+
     pub(crate) fn attempt_id(&self) -> u64 {
         self.attempt_id
     }
@@ -283,7 +404,7 @@ impl PhysicalSendRecord {
         request: &CanonicalOverlayRequest,
         now: Instant,
     ) -> PhysicalInputQualification {
-        if !std::ptr::eq(self.request.as_ptr(), request) {
+        if !self.request.matches_canonical(request) {
             return PhysicalInputQualification::OriginalMismatch;
         }
         if self.peer_owner.upgrade().is_none()
@@ -332,7 +453,7 @@ impl PhysicalSendRecord {
         request: &CanonicalOverlayRequest,
         now: Instant,
     ) -> bool {
-        std::ptr::eq(self.request.as_ptr(), request)
+        self.request.matches_canonical(request)
             && self.peer_owner.ptr_eq(&request.target.owner)
             && self.binding == RequestBindingState::RoutedExact
             && request.injection_accepted()
@@ -384,7 +505,7 @@ impl PhysicalRequestPublisher {
             .request
             .upgrade()
             .ok_or(PublicationFailure::Retired)?;
-        let publication = &request.physical_publication;
+        let publication = request.publication();
         if !transport.matches_wire(prepared.wire, prepared.encryption.peer_id()) {
             publication.terminal(self.id, PhysicalPublicationState::MetadataFailed);
             return Err(PublicationFailure::MetadataFailed);
@@ -428,24 +549,21 @@ impl PhysicalRequestPublisher {
                 hook();
             }
         }
+        request.before_recorded();
         let _ = publication.recorded_observed_at.set(Instant::now());
         // Log only after the original observation exists. Logging must not
         // move that boundary or manufacture a fact for an earlier ACK read.
-        tracing::debug!(target: "p2pnet_daemon::overlay_native_credit",
-            event = "overlay_original_publication_observed",
-            peer = %request.peer_id, nonce = request.nonce, seq = request.seq,
-            attempt_id = self.id,
-            publication_age_us = ?publication.recorded_observed_at()
-                .and_then(|observed| observed.checked_duration_since(request.sent_at))
-                .map(|age| age.as_micros()),
-            "original Full publication observed; no ACK credit granted");
+        request.recorded(self.id);
+        if let Some(mut observation) = prepared.full_observation {
+            observation.complete();
+        }
         Ok(())
     }
     pub(crate) fn fail_metadata(&mut self) {
         if let Some(prepared) = self.prepared.take() {
             if let Some(request) = prepared.request.upgrade() {
                 request
-                    .physical_publication
+                    .publication()
                     .terminal(self.id, PhysicalPublicationState::MetadataFailed);
             }
         }
@@ -453,7 +571,7 @@ impl PhysicalRequestPublisher {
     pub(crate) fn finish(&mut self, definitely_not_handed: bool) {
         if let Some(prepared) = self.prepared.take() {
             if let Some(request) = prepared.request.upgrade() {
-                request.physical_publication.terminal(
+                let terminal = request.publication().terminal(
                     self.id,
                     if definitely_not_handed {
                         PhysicalPublicationState::DefinitelyNotHanded
@@ -461,6 +579,11 @@ impl PhysicalRequestPublisher {
                         PhysicalPublicationState::CancelledOrUncertain
                     },
                 );
+                if definitely_not_handed && terminal {
+                    if let Some(mut observation) = prepared.full_observation {
+                        observation.complete();
+                    }
+                }
             }
         }
     }

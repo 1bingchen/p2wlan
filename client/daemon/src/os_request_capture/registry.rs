@@ -22,6 +22,8 @@ use std::time::Instant;
 mod full;
 mod ingress;
 mod read_peer;
+#[cfg(any(target_os = "linux", all(unix, test)))]
+pub(super) mod write_window;
 pub(crate) use ingress::{KernelCaptureRuntime, KernelIngressBinding};
 
 #[cfg(any(target_os = "linux", all(unix, test)))]
@@ -68,6 +70,8 @@ struct FlowState {
     inbound: ingress::InboundFlow,
 }
 struct RequestReadState {
+    #[cfg(any(target_os = "linux", all(unix, test)))]
+    original_write_window: Option<write_window::WriteWindow>,
     first_peer: Option<Arc<read_peer::FirstReadPeer>>,
     first_response: Option<Arc<ingress::ResponseCapture>>,
     read_events: u64,
@@ -141,6 +145,8 @@ struct RequestSnapshot {
     incoming_flow_invalid: bool,
     original_peer: Option<read_peer::ReadPeerSnapshot>,
     original_response_input: Option<ingress::ResponseSnapshot>,
+    #[cfg(any(target_os = "linux", all(unix, test)))]
+    original_write_window: Option<write_window::WriteWindow>,
 }
 
 #[cfg(any(target_os = "linux", all(unix, test)))]
@@ -249,6 +255,7 @@ impl CaptureSession {
                     .requests
                     .iter()
                     .map(|_| RequestReadState {
+                        original_write_window: None,
                         first_peer: None,
                         first_response: None,
                         read_events: 0,
@@ -550,6 +557,8 @@ impl CaptureSession {
                         .first_response
                         .as_ref()
                         .map(|input| input.snapshot()),
+                    #[cfg(any(target_os = "linux", all(unix, test)))]
+                    original_write_window: read.original_write_window.clone(),
                 });
             }
         }

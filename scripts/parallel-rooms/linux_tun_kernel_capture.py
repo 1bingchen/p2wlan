@@ -49,12 +49,28 @@ class Endpoint:
         self.receipts = []
 
     def send(self, value, end):
+        require(self.connection is not None, "kernel_control_connection_closed")
         raw = encode(value)
         require(len(raw) <= MAX_PLAN and self.output_bytes + len(raw) <= MAX_BYTES, "kernel_control_input_capacity")
         self.connection.settimeout(max(.000001, end - time.monotonic()))
         require(time.monotonic() < end, "kernel_control_original_deadline")
         self.connection.sendall(raw)
         self.output_bytes += len(raw)
+
+    def observe_original_write_window(self, window):
+        """One nonblocking write, no response, buffering, wait or retry."""
+        require(self.connection is not None, "kernel_control_connection_closed")
+        raw = encode(dict(op="observe_original_write_window", window=window))
+        require(len(raw) <= 512 and self.output_bytes + len(raw) <= MAX_BYTES,
+                "original_window_control_capacity")
+        try:
+            self.connection.setblocking(False)
+            n = self.connection.send(raw)
+            self.output_bytes += n
+            require(n == len(raw), "original_window_short_control_write")
+        except (OSError, ValueError):
+            self.close()  # A partial JSON record must never be refilled.
+            raise
 
     def exchange(self, value, *, deadline=None):
         end = min(time.monotonic() + 1, deadline) if deadline is not None else time.monotonic() + 1
@@ -203,6 +219,7 @@ class KernelCaptures:
             for endpoint, value in zip(endpoints, [document("request", config.bind, config.target, snapshots[target]["node_id"]),
                                                      document("response", config.target, config.bind, snapshots[source]["node_id"])]):
                 endpoint.register(value, deadline=deadline)
+            capture.enable_live_window_bridge(endpoints)
             record["endpoints"] = endpoints
         except (OSError, ValueError, KeyError) as error:
             record["gap"] = "original_kernel_registration_failed:" + type(error).__name__
@@ -220,6 +237,9 @@ class KernelCaptures:
             writes = record["entry"].get("original_write_stream", {})
             require(writes.get("stream_complete") is True and writes.get("original_child_birth_namespace_matched") is True
                     and writes.get("original_same_boot_clock_matched") is True, "original_kernel_OS_write_stream_unavailable")
+            bridge = capture.live_window_bridge.summary() if capture.live_window_bridge is not None else None
+            require(bridge is not None and bridge["gap_reason"] is None, "original_live_write_window_bridge_unavailable")
+            result["original_live_write_windows"] = bridge
             pairs = []
             for endpoint, kind in zip(record["endpoints"], ["request", "response"]):
                 snapshot = endpoint.snapshot(deadline=deadline)
@@ -230,6 +250,21 @@ class KernelCaptures:
                             and r.get("run_nonce") == capture.config.run_nonce and r.get("round_nonce") == capture.config.round_nonce
                             and r.get("request_nonce") == capture.prepared.nonces[i] for i, r in enumerate(rows)),
                         "original_kernel_full128_plan_mismatch")
+                for row, write, live in zip(rows, writes["requests"], bridge["requests"]):
+                    window = row.get("original_write_window")
+                    if write["accepted_in_original_deadline"]:
+                        expected = live.get("window", {})
+                        require(live["delivered"] and isinstance(window, dict)
+                                and window.get("scope") == "original_controller_write_window_only"
+                                and all(window.get(k) == expected[k] for k in ["request_nonce", "original_started_ns", "original_sent_ns",
+                                    "original_deadline_ns", "complete_returned_ns", "frame_bytes", "frame_sha256"])
+                                and integer(window.get("received_monotonic_ns"), expected["complete_returned_ns"])
+                                and window["received_monotonic_ns"] < expected["original_deadline_ns"]
+                                and window.get("native_os_write_verified") is False
+                                and window.get("canonical_current_owner_verified") is False,
+                                "original_live_write_window_missing_changed_or_late")
+                    else:
+                        require(window is None, "original_unsent_request_has_write_window")
                 pairs.append(rows)
             records = [read_pair(a, b, w) for a, b, w in zip(*pairs, writes["requests"])]
             require(len(records) == 8, "original_kernel_fixed_denominator_changed")

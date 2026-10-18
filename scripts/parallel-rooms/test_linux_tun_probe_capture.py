@@ -227,6 +227,7 @@ class OwnedCaptureControls(unittest.TestCase):
         reader, writer = os.pipe()
         capture = captures.ProbeCapture.__new__(captures.ProbeCapture)
         capture.reader, capture.writer, capture.gap, capture.raw = reader, writer, None, bytearray()
+        capture.live_window_bridge = None
         feeds = []
         capture.stream = SimpleNamespace(gap=None, feed=feeds.append)
         try:

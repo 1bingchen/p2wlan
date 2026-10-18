@@ -17,6 +17,11 @@ pub(super) struct NativeClockScope {
 
 #[cfg(unix)]
 impl NativeClockScope {
+    #[cfg(any(target_os = "linux", all(unix, test)))]
+    pub(super) fn same_boot(&self, boot_id: &str) -> bool {
+        self.boot_id == boot_id
+    }
+
     #[cfg(target_os = "linux")]
     pub(super) fn capture() -> Option<Self> {
         use std::io::Read;

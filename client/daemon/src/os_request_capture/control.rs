@@ -50,6 +50,10 @@ enum Command {
     Register {
         plan: WirePlan,
     },
+    #[cfg(any(target_os = "linux", all(unix, test)))]
+    ObserveOriginalWriteWindow {
+        window: super::registry::write_window::WireWriteWindow,
+    },
 }
 
 impl CaptureSetup {
@@ -304,6 +308,11 @@ impl ControlChannel {
                         .session
                         .register(RegistrationPlan::from_registration(plan)?)?,
                 ),
+                #[cfg(any(target_os = "linux", all(unix, test)))]
+                Command::ObserveOriginalWriteWindow { window } => {
+                    self.session.observe_original_write_window(window)?;
+                    continue;
+                }
             }
             .map_err(|_| CaptureFailure::ControlProtocol)?;
             self.reply(encoded, end).await?;

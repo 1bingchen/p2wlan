@@ -27,7 +27,10 @@ def retain(args, manifest):
             if value.get("source_commit") != args.head:
                 raise ValueError("original report checkout mismatch")
             reports.append(value)
-    for role, source in [("daemon", args.daemon), ("control", args.control)]:
+    sources = [("daemon", args.daemon), ("control", args.control)]
+    if getattr(args, "relay", None) is not None:
+        sources.append(("relay", args.relay))
+    for role, source in sources:
         expected = {r.get("binary_sha256", {}).get(role) for r in reports} - {None}
         row = dict(role=role, available=False)
         manifest["images"].append(row)
@@ -68,6 +71,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--daemon", type=Path, required=True)
     parser.add_argument("--control", type=Path, required=True)
+    parser.add_argument("--relay", type=Path, help="optional original measured Relay image")
     parser.add_argument("--head", required=True)
     parser.add_argument("--report", type=Path, action="append", default=[])
     parser.add_argument("--output", type=Path, required=True)

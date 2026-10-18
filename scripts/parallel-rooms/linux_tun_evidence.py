@@ -24,6 +24,7 @@ import linux_tun_fault_contract as fault_contract
 from linux_tun_fault import FaultOwner
 import linux_tun_stall
 import linux_tun_stall_contract as stall_contract
+import linux_tun_relay as relay_fixture
 
 ROOT = Path(__file__).resolve().parents[2]
 DUAL = ROOT / "scripts/dual-end"
@@ -52,6 +53,8 @@ class EvidenceLab(original.Lab):
         clean = {k: v for k, v in os.environ.items() if not k.startswith("P2WLAN_")}
         clean.update(RUST_LOG="info", RUST_BACKTRACE="0", P2WLAN_TEST_RUN_ID=self.run_id)
         clean.update(env or {})
+        if getattr(self.args, "relay_application", None) and command[:1] == [str(self.args.daemon)]:
+            command = [*command, "--relay-only"]
         if getattr(self.args, "server_stall", False) and command[:1] == [str(self.args.daemon)]:
             # Explicit existing public CLI fixture input; product defaults and
             # the separate normal/blackhole entries retain their original argv.
@@ -284,8 +287,12 @@ def exercise(lab: EvidenceLab, groups: OwnedGroups, report: dict, out: Path,
     if info.get("git_commit") != lab.args.head or info.get("binary_sha256") != digest(lab.args.daemon):
         raise RuntimeError("original daemon/source/binary identity mismatch")
     lab.setup()
-    lab.spawn("control", "control", [str(lab.args.control)], env={"PORT": "8080", "DB_PATH": str(lab.root / "control.db"),
-                                                              "JWT_SECRET": secrets.token_hex(32)})
+    relay_mode = getattr(lab.args, "relay_application", None)
+    if relay_mode:
+        relay_fixture.start(lab, report)
+    else:
+        lab.spawn("control", "control", [str(lab.args.control)], env={"PORT": "8080", "DB_PATH": str(lab.root / "control.db"),
+                                                                  "JWT_SECRET": secrets.token_hex(32)})
     lab.wait("control readiness", lambda: lab.http("control", "/health"), 20)
     password = secrets.token_urlsafe(24)
     users = {label: lab.http("control", "/api/v1/register", method="POST",
@@ -298,11 +305,11 @@ def exercise(lab: EvidenceLab, groups: OwnedGroups, report: dict, out: Path,
         lab.daemon(name, label, room, users[label]["token"], 41001)
     initial = {name: lab.wait(name + " readiness", lambda name=name: endpoint(lab, name)) for name in ("a1", "b1")}
     for name, peer in (("a1", "b1"), ("b1", "a1")):
-        # Wait for the original committed encrypted Direct readiness; no probe
+        # Wait for the original committed encrypted path readiness; no probe
         # request is sent/retried to turn a failed application run into a pass.
-        lab.wait(name + " original Direct readiness", lambda name=name, peer=peer: any(
+        lab.wait(name + " original encrypted path readiness", lambda name=name, peer=peer: any(
             p.get("node_id") == initial[peer]["node_id"] and p.get("online") is True
-            and p.get("active_path") == "direct" for p in lab.status(name).get("peers", [])
+            and p.get("active_path") == ("relay" if relay_mode else "direct") for p in lab.status(name).get("peers", [])
         ))
     snapshots = {name: endpoint(lab, name, initial[peer]["virtual_ip"]) for name, peer in (("a1", "b1"), ("b1", "a1"))}
     if snapshots["a1"]["node_id"] == snapshots["b1"]["node_id"]:
@@ -316,7 +323,7 @@ def exercise(lab: EvidenceLab, groups: OwnedGroups, report: dict, out: Path,
     elif fault_slot is None:
         for entry in report["manifest"]:
             measure(lab, groups, entry, out, snapshots)
-            report["application"] = summarize(report["manifest"])
+            report["application"] = (relay_fixture.summarize if relay_mode else summarize)(report["manifest"])
     else:
         fault = FaultOwner(lab.ns("b"), report["owned_resources"], lab.namespaces,
                            snapshots["a1"], snapshots["b1"], report["manifest"])
@@ -378,6 +385,8 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--daemon", type=lambda x: Path(x).resolve(), required=True)
     parser.add_argument("--control", type=lambda x: Path(x).resolve(), required=True)
+    parser.add_argument("--relay", type=lambda x: Path(x).resolve())
+    parser.add_argument("--relay-keygen", type=lambda x: Path(x).resolve())
     parser.add_argument("--head", required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--write-facts", action="store_true",
@@ -389,9 +398,15 @@ def main() -> int:
                         help="independent fixed32 application DROP/clear/fresh scope; original baseline unchanged")
     mode.add_argument("--server-stall", action="store_true",
                       help="independent UDP fixed16 original echo STOP/CONT; explicit keepalive interval1")
+    mode.add_argument("--relay-application", choices=["udp", "tcp"],
+                      help="independent bidirectional Relay16; original normal32/fault32/stall16 unchanged")
     args = parser.parse_args()
     if args.kernel_read_facts and not args.write_facts:
         parser.error("--kernel-read-facts requires the original --write-facts plans")
+    if args.relay_application and not (args.relay and args.relay_keygen and args.kernel_read_facts and args.write_facts):
+        parser.error("Relay16 requires --relay, --relay-keygen, --kernel-read-facts and --write-facts")
+    if not args.relay_application and (args.relay or args.relay_keygen):
+        parser.error("Relay fixture binaries require --relay-application")
     if sys.platform != "linux" or os.geteuid() != 0 or not Path("/dev/net/tun").exists():
         parser.error("Linux root and kernel /dev/net/tun required; no mock downgrade")
     if original.run(["git", "-C", str(ROOT), "rev-parse", "HEAD"]).stdout.strip() != args.head:
@@ -403,10 +418,11 @@ def main() -> int:
     groups = OwnedGroups()
     lab = EvidenceLab(args, groups)
     run_nonce, round_nonce = secrets.token_hex(16), secrets.token_hex(16)
-    report = {"schema_version": 1, "scope": stall_contract.SCOPE if args.server_stall else fault_contract.SCOPE if args.fault_recovery else "linux_same_host_kernel_tun_application", "source_commit": args.head,
+    report = {"schema_version": 1, "scope": relay_fixture.SCOPE if args.relay_application else stall_contract.SCOPE if args.server_stall else fault_contract.SCOPE if args.fault_recovery else "linux_same_host_kernel_tun_application", "source_commit": args.head,
               "run_id": lab.run_id, "github_run_id": os.environ.get("GITHUB_RUN_ID"),
               "github_run_attempt": os.environ.get("GITHUB_RUN_ATTEMPT"),
-              "manifest": (stall_contract.manifest(run_nonce, round_nonce) if args.server_stall else
+              "manifest": (relay_fixture.manifest(run_nonce, round_nonce, args.relay_application) if args.relay_application else
+                           stall_contract.manifest(run_nonce, round_nonce) if args.server_stall else
                            fault_contract.manifest(run_nonce, round_nonce) if args.fault_recovery else manifest(run_nonce, round_nonce)),
               "kernel_environment_verified": None, "canonical_current_owner_verified": None,
               "full_d03_fault_matrix_verified": None, "passed": False,
@@ -417,6 +433,7 @@ def main() -> int:
                                  Path(__file__).with_name("linux_tun_owned.py"), Path(__file__).with_name("linux_tun_contract.py"),
                                  Path(__file__).with_name("linux_tun_fault.py"), Path(__file__).with_name("linux_tun_fault_contract.py"),
                                  Path(__file__).with_name("linux_tun_stall.py"), Path(__file__).with_name("linux_tun_stall_contract.py"),
+                                 Path(__file__).with_name("linux_tun_relay.py"),
                                  Path(__file__).with_name("udp_stall_echo.py"),
                                  DUAL / "udp_business_probe.py", DUAL / "udp_business_summary.py", DUAL / "tcp_business_probe.py",
                                  ROOT / ".github/workflows/parallel-rooms.yml")},
@@ -432,6 +449,11 @@ def main() -> int:
     error = None
     captures = None
     kernel_captures = None
+    measured_binaries = {"daemon": args.daemon, "control": args.control}
+    if args.relay_application:
+        measured_binaries.update(relay=args.relay, relay_keygen=args.relay_keygen)
+        path = ROOT / "scripts/relay_keygen.go"
+        report["source_sha256"][str(path.relative_to(ROOT))] = digest(path)
     try:
         if args.write_facts:
             from linux_tun_probe_capture import WriteCaptures
@@ -458,7 +480,7 @@ def main() -> int:
             for name in ["linux_tun_kernel_capture.py", "linux_tun_live_window.py", "linux_tun_native_transaction.py"]:
                 path = Path(__file__).with_name(name)
                 report["source_sha256"][str(path.relative_to(ROOT))] = digest(path)
-        report["binary_sha256"] = {"daemon": digest(args.daemon), "control": digest(args.control)}
+        report["binary_sha256"] = {name: digest(path) for name, path in measured_binaries.items()}
         for path, expected in report["source_sha256"].items():
             committed = subprocess.check_output(["git", "-C", str(ROOT), "show", args.head + ":" + path], timeout=20)
             if hashlib.sha256(committed).hexdigest() != expected:
@@ -468,7 +490,7 @@ def main() -> int:
         exercise(lab, groups, report, args.output_dir, fault_slot=fault_slot, stall_slot=stall_slot)
         if any(digest(ROOT / path) != expected for path, expected in report["source_sha256"].items()):
             raise RuntimeError("original evidence source changed during execution")
-        if {"daemon": digest(args.daemon), "control": digest(args.control)} != report["binary_sha256"]:
+        if {name: digest(path) for name, path in measured_binaries.items()} != report["binary_sha256"]:
             raise RuntimeError("original executable bytes changed during execution")
     except BaseException as caught:
         error = caught
@@ -490,8 +512,8 @@ def main() -> int:
         finalize_observations(report, groups, lambda deadline=None: cleanup_network(plan, deadline=deadline),
                               fault_cleanup=(lambda deadline: fault_slot[0].cleanup(deadline) if fault_slot else
                                              {"complete": True, "admitted": False, "original_namespace_fd_closed": True}) if args.fault_recovery else None,
-                              summary=stall_contract.summarize if args.server_stall else fault_contract.summarize if args.fault_recovery else summarize,
-                              requested_count=16 if args.server_stall else 32)
+                              summary=relay_fixture.summarize if args.relay_application else stall_contract.summarize if args.server_stall else fault_contract.summarize if args.fault_recovery else summarize,
+                              requested_count=16 if args.server_stall or args.relay_application else 32)
         if captures is not None:
             captures.persist_interrupted()
             report["original_write_observations"] = captures.summary(report["manifest"])
@@ -531,6 +553,9 @@ def main() -> int:
             report["kernel_environment_verified"] = qualified
             report["canonical_current_owner_verified"] = qualified and original_kernel.get("canonical_current_owner_verified") is True
             report["passed"] = report["passed"] and qualified
+        if args.relay_application:
+            report["relay_native_path_comparisons"] = relay_fixture.path_summary(report["manifest"])
+            report["passed"] = report["passed"] and report["relay_native_path_comparisons"]["complete"]
         udp.write_report(args.report, report)
         # Preserve 0600 files while making only this non-secret output readable
         # by the invoking CI runner for upload; private Lab credentials were removed.
@@ -538,7 +563,7 @@ def main() -> int:
             uid, gid = int(os.environ["SUDO_UID"]), int(os.environ["SUDO_GID"])
             for path in [*args.output_dir.rglob("*"), args.output_dir]:
                 os.chown(path, uid, gid)
-    result = {"scope": report["scope"], "passed": report["passed"], "requests": 16 if args.server_stall else 32,
+    result = {"scope": report["scope"], "passed": report["passed"], "requests": 16 if args.server_stall or args.relay_application else 32,
               "success_requests": report["application"]["success_requests"], "cleanup_complete": report["cleanup_complete"]}
     if args.write_facts:
         result["original_write_observations_passed"] = report.get("original_write_observations", {}).get("passed", False)

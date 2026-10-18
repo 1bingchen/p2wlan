@@ -16,6 +16,9 @@ const MAX_SYSTEM_WRITES: usize = 1024;
 const MAX_ORIGINAL_ENDPOINT_BYTES: usize = 4096;
 
 mod response;
+#[cfg(all(unix, test))]
+pub(super) use response::known_route_room;
+pub(super) use response::merge_original_permits;
 pub(super) use response::ResponseCapture;
 #[cfg(unix)]
 pub(super) use response::ResponseSnapshot;
@@ -25,9 +28,9 @@ pub(crate) struct KernelCaptureRuntime {
     room: Weak<RoomAuthorization>,
 }
 
-struct OriginalIncomingRoom {
-    owner: Weak<RoomAuthorization>,
-    permit: Result<Option<RoomSendPermit>, OriginalRoomSendFailure>,
+pub(super) struct OriginalIncomingRoom {
+    pub(super) owner: Weak<RoomAuthorization>,
+    pub(super) permit: Result<Option<RoomSendPermit>, OriginalRoomSendFailure>,
 }
 
 pub(super) struct InboundFlow {
@@ -109,9 +112,23 @@ impl CaptureSession {
         self: &Arc<Self>,
         room: &Arc<RoomAuthorization>,
     ) -> KernelCaptureRuntime {
+        let expected = Arc::downgrade(room);
+        let bound = self.state.try_lock().is_ok_and(|mut state| {
+            if let Some(original) = &state.original_room_owner {
+                original.ptr_eq(&expected)
+            } else {
+                state.original_room_owner = Some(expected.clone());
+                true
+            }
+        });
+        if !bound {
+            self.read_complete.store(false, Ordering::Release);
+            self.inbound_complete.store(false, Ordering::Release);
+            self.gap();
+        }
         KernelCaptureRuntime {
             scope: Arc::downgrade(self),
-            room: Arc::downgrade(room),
+            room: expected,
         }
     }
 

@@ -22,6 +22,7 @@ use std::time::Instant;
 mod full;
 mod ingress;
 mod read_peer;
+mod read_room;
 #[cfg(any(target_os = "linux", all(unix, test)))]
 pub(super) mod write_window;
 pub(crate) use ingress::{KernelCaptureRuntime, KernelIngressBinding};
@@ -48,6 +49,7 @@ pub(crate) struct CaptureSession {
 }
 
 struct RegistryState {
+    original_room_owner: Option<Weak<crate::rooms::RoomAuthorization>>,
     flows: Vec<FlowState>,
     original_device: Option<Arc<KernelRead>>,
     system_device: Option<Weak<DeviceLease>>,
@@ -70,6 +72,7 @@ struct FlowState {
     inbound: ingress::InboundFlow,
 }
 struct RequestReadState {
+    first_request_room: Option<Arc<ingress::OriginalIncomingRoom>>,
     #[cfg(any(target_os = "linux", all(unix, test)))]
     original_write_window: Option<write_window::WriteWindow>,
     first_peer: Option<Arc<read_peer::FirstReadPeer>>,
@@ -96,6 +99,7 @@ pub(crate) struct KernelReadBinding {
     physical_publication: crate::overlay_requests::PhysicalSendPublication,
     original_peers: Vec<Arc<read_peer::FirstReadPeer>>,
     original_responses: Vec<Arc<ingress::ResponseCapture>>,
+    original_request_rooms: Vec<Arc<ingress::OriginalIncomingRoom>>,
 }
 
 #[cfg(unix)]
@@ -144,6 +148,7 @@ struct RequestSnapshot {
     incoming_frame_system_write_complete: bool,
     incoming_flow_invalid: bool,
     original_peer: Option<read_peer::ReadPeerSnapshot>,
+    original_request_room: Option<read_room::ReadRoomSnapshot>,
     original_response_input: Option<ingress::ResponseSnapshot>,
     #[cfg(any(target_os = "linux", all(unix, test)))]
     original_write_window: Option<write_window::WriteWindow>,
@@ -188,6 +193,7 @@ impl CaptureSession {
             producer_scope: plan.producer_scope,
             clock_scope: NativeClockScope::capture(),
             state: Mutex::new(RegistryState {
+                original_room_owner: None,
                 flows: Vec::new(),
                 original_device: None,
                 system_device: None,
@@ -255,6 +261,7 @@ impl CaptureSession {
                     .requests
                     .iter()
                     .map(|_| RequestReadState {
+                        first_request_room: None,
                         original_write_window: None,
                         first_peer: None,
                         first_response: None,
@@ -387,6 +394,7 @@ impl CaptureSession {
         if state.original_device.is_none() {
             state.original_device = Some(original.clone());
         }
+        let room = state.original_room_owner.clone();
         let flow = &mut state.flows[index];
         let plan = flow.plan.clone();
         if flow.invalid {
@@ -475,6 +483,7 @@ impl CaptureSession {
             return Ok(None);
         }
         let original_peers = self.first_read_peers(flow, &slots);
+        let original_request_rooms = self.first_read_request_rooms(flow, &slots, room.as_ref());
         for slot in &slots {
             let read = &mut flow.requests[*slot];
             read.read_events = read
@@ -499,6 +508,7 @@ impl CaptureSession {
             physical_publication: crate::overlay_requests::PhysicalSendPublication::new(),
             original_peers,
             original_responses,
+            original_request_rooms,
         }))
     }
 
@@ -553,6 +563,10 @@ impl CaptureSession {
                         ),
                     incoming_flow_invalid: flow.inbound.invalid,
                     original_peer: read.first_peer.as_ref().map(|peer| peer.snapshot()),
+                    original_request_room: read
+                        .first_request_room
+                        .as_ref()
+                        .map(|room| room.snapshot()),
                     original_response_input: read
                         .first_response
                         .as_ref()
@@ -632,6 +646,6 @@ impl KernelReadBinding {
         self.exact_input(peers, &packet.packet, observed_at)
             && packet.peer_id == self.plan.peer
             && packet.dst_ip == self.plan.flow.dst_v4.to_string()
-            && self.original_response_matches_permit(packet.room_authorization.as_ref())
+            && self.original_room_matches_permit(packet.room_authorization.as_ref())
     }
 }

@@ -196,7 +196,7 @@ impl PreparedPhysicalPublication {
         if binding.token().kernel().is_some_and(|read| {
             !read.original_peer_matches_encryption(&peer_owner, actual_generation, source)
                 || !read.original_response_matches_encryption(source)
-                || !read.original_response_matches_permit(packet.room_authorization.as_ref())
+                || !read.original_room_matches_permit(packet.room_authorization.as_ref())
         }) {
             return Ok(None);
         }
@@ -279,7 +279,7 @@ impl PhysicalSendRecord {
                 &self.encryption,
             )
             && read.original_response_matches_encryption(&self.encryption)
-            && read.original_response_matches_permit(self.room_authorization.as_ref())
+            && read.original_room_matches_permit(self.room_authorization.as_ref())
             && read.peer_id() == self.encryption.peer_id()
             && read.read_at() <= self.encryption.encrypted_at()
             && self.encryption.authorized_peer_lifecycle().is_some()

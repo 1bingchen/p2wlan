@@ -19,6 +19,10 @@ pub(super) struct ReadPeerSnapshot {
 }
 
 impl FirstReadPeer {
+    pub(super) fn is_known(&self) -> bool {
+        self.original.is_ok()
+    }
+
     pub(super) fn matches_original_ingress(
         &self,
         source: &crate::transport::OriginalOverlayIngressSource,

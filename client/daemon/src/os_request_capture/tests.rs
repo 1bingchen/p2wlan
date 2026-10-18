@@ -94,6 +94,7 @@ fn untrusted_source_or_owner_fields_never_construct_a_registration() {
         "physical_send_verified",
         "original_response_input",
         "original_write_window",
+        "original_request_room",
     ] {
         let mut value = plan();
         value[field] = json!(true);

@@ -172,7 +172,7 @@ impl CaptureSession {
     }
 }
 
-fn merge_original_permits(
+pub(in crate::os_request_capture::registry) fn merge_original_permits(
     left: Option<RoomSendPermit>,
     right: Option<RoomSendPermit>,
 ) -> Outcome<Option<RoomSendPermit>> {
@@ -188,7 +188,7 @@ fn merge_original_permits(
 /// Missing sampling never replaces the original business policy. Any known
 /// original grant still constrains the entire packet, including coalesced
 /// frames whose source proof is incomplete. This is not a native-credit guard.
-fn known_route_room<'a>(
+pub(in crate::os_request_capture::registry) fn known_route_room<'a>(
     rooms: impl Iterator<Item = &'a Arc<OriginalIncomingRoom>>,
     current: Option<&Arc<RoomAuthorization>>,
 ) -> Option<Outcome<Option<RoomSendPermit>>> {
@@ -265,15 +265,17 @@ impl KernelReadBinding {
         ))
     }
 
-    pub(crate) fn original_response_matches_permit(&self, permit: Option<&RoomSendPermit>) -> bool {
-        !self.is_response()
-            || (self.response_inputs().is_ok_and(|inputs| {
-                inputs
-                    .iter()
-                    .all(|input| input.matches_original_read(&self.scope, &self.read))
-            }) && self
-                .frozen_response_permit()
-                .is_ok_and(|saved| saved.as_ref() == permit))
+    pub(crate) fn original_room_matches_permit(&self, permit: Option<&RoomSendPermit>) -> bool {
+        if !self.is_response() {
+            return self.original_request_room_matches_permit(permit);
+        }
+        self.response_inputs().is_ok_and(|inputs| {
+            inputs
+                .iter()
+                .all(|input| input.matches_original_read(&self.scope, &self.read))
+        }) && self
+            .frozen_response_permit()
+            .is_ok_and(|saved| saved.as_ref() == permit)
     }
 
     pub(crate) fn original_response_matches_encryption(
@@ -293,23 +295,24 @@ impl KernelReadBinding {
 
     /// Unknown sampling keeps the original forwarding policy and is excluded
     /// from native proof above. A known original grant cannot borrow renewal.
-    pub(crate) fn original_response_room_for_route(
+    pub(crate) fn original_room_for_route(
         &self,
         current: Option<&Arc<RoomAuthorization>>,
         peer: &str,
         target: &str,
         local: &str,
     ) -> Option<Outcome<Option<RoomSendPermit>>> {
-        if !self.is_response() {
-            return None;
-        }
-        known_route_room(
-            self.original_responses
-                .iter()
-                .filter_map(|input| input.room.as_ref()),
-            current,
-        )
-        .map(|original| {
+        let original = if self.is_response() {
+            known_route_room(
+                self.original_responses
+                    .iter()
+                    .filter_map(|input| input.room.as_ref()),
+                current,
+            )
+        } else {
+            known_route_room(self.original_request_rooms.iter(), current)
+        };
+        original.map(|original| {
             if peer != self.plan.peer
                 || target != self.plan.flow.dst_v4.to_string()
                 || local != self.plan.flow.src_v4.to_string()

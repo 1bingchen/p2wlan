@@ -168,6 +168,7 @@ pub(crate) enum PhysicalInputQualification {
 // Prepared under the original encryption epoch, before any Open/Publishing CAS.
 // Visibility trusts crate call sites; it is not an adversarial crate boundary.
 pub(crate) struct PreparedPhysicalPublication {
+    full_observation: Option<crate::os_request_capture::OriginalFullObservation>,
     request: OriginalPhysicalInput,
     pub(super) peer_owner: Weak<PeerManager>,
     pub(super) binding: RequestBindingState,
@@ -178,6 +179,24 @@ pub(crate) struct PreparedPhysicalPublication {
 }
 impl PreparedPhysicalPublication {
     pub(crate) fn capture_encryption_epoch(
+        binding: &crate::request_carriage::RequestBinding,
+        source: &OriginalEncryptionSource,
+        peers: &PeerManager,
+        transport: &crate::transport::WireGuardTransport,
+        actual_generation: u64,
+        packet: &crate::transport::EncryptedPeerPacket,
+    ) -> Result<Option<Self>, PublicationFailure> {
+        let prepared =
+            Self::capture_original(binding, source, peers, transport, actual_generation, packet);
+        if !matches!(&prepared, Ok(Some(_))) {
+            if let Some(read) = binding.token().kernel() {
+                read.original_full_retention_lost();
+            }
+        }
+        prepared
+    }
+
+    fn capture_original(
         binding: &crate::request_carriage::RequestBinding,
         source: &OriginalEncryptionSource,
         peers: &PeerManager,
@@ -208,6 +227,10 @@ impl PreparedPhysicalPublication {
             .try_copy_for_publication()
             .map_err(|_| PublicationFailure::MetadataFailed)?;
         Ok(Some(Self {
+            full_observation: binding
+                .token()
+                .kernel()
+                .map(|read| read.original_full_observation()),
             request,
             peer_owner,
             binding: binding.state(),
@@ -221,9 +244,29 @@ impl PreparedPhysicalPublication {
             ),
         }))
     }
-    pub(crate) fn open(self) -> Result<PhysicalRequestPublisher, PublicationFailure> {
+    pub(crate) fn open(mut self) -> Result<PhysicalRequestPublisher, PublicationFailure> {
+        if let Some(observation) = &mut self.full_observation {
+            observation.arm();
+        }
         let request = self.request.upgrade().ok_or(PublicationFailure::Retired)?;
-        let id = request.publication().open()?;
+        let id = match request.publication().open() {
+            Ok(id) => id,
+            Err(reason) => {
+                // The same read's existing winning producer still owns its
+                // observation. A losing open must not cancel that producer.
+                if matches!(
+                    request.publication().state(),
+                    PhysicalPublicationState::Open
+                        | PhysicalPublicationState::Publishing
+                        | PhysicalPublicationState::Recorded
+                ) {
+                    if let Some(observation) = &mut self.full_observation {
+                        observation.complete();
+                    }
+                }
+                return Err(reason);
+            }
+        };
         drop(request);
         Ok(PhysicalRequestPublisher {
             id,
@@ -480,6 +523,9 @@ impl PhysicalRequestPublisher {
         // Log only after the original observation exists. Logging must not
         // move that boundary or manufacture a fact for an earlier ACK read.
         request.recorded(self.id);
+        if let Some(mut observation) = prepared.full_observation {
+            observation.complete();
+        }
         Ok(())
     }
     pub(crate) fn fail_metadata(&mut self) {
@@ -494,7 +540,7 @@ impl PhysicalRequestPublisher {
     pub(crate) fn finish(&mut self, definitely_not_handed: bool) {
         if let Some(prepared) = self.prepared.take() {
             if let Some(request) = prepared.request.upgrade() {
-                request.publication().terminal(
+                let terminal = request.publication().terminal(
                     self.id,
                     if definitely_not_handed {
                         PhysicalPublicationState::DefinitelyNotHanded
@@ -502,6 +548,11 @@ impl PhysicalRequestPublisher {
                         PhysicalPublicationState::CancelledOrUncertain
                     },
                 );
+                if definitely_not_handed && terminal {
+                    if let Some(mut observation) = prepared.full_observation {
+                        observation.complete();
+                    }
+                }
             }
         }
     }

@@ -12,7 +12,9 @@ mod registry;
 
 pub(crate) use control::{requested_from_env, CaptureSetup};
 pub(crate) use device::SystemTun;
-pub(crate) use registry::{KernelCaptureRuntime, KernelIngressBinding, KernelReadBinding};
+pub(crate) use registry::{
+    KernelCaptureRuntime, KernelIngressBinding, KernelReadBinding, OriginalFullObservation,
+};
 
 #[cfg(test)]
 mod tests;

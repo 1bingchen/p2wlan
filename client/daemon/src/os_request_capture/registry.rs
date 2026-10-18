@@ -20,6 +20,7 @@ use std::time::Duration;
 use std::time::Instant;
 
 mod full;
+pub(crate) use full::OriginalFullObservation;
 mod ingress;
 mod read_peer;
 mod read_room;
@@ -36,6 +37,7 @@ pub(crate) struct CaptureSession {
     active: AtomicBool,
     inbound_complete: AtomicBool,
     read_complete: AtomicBool,
+    full_complete: AtomicBool,
     expires: Instant,
     peers: Weak<PeerManager>,
     #[cfg(unix)]
@@ -125,6 +127,7 @@ pub(super) struct ReadSnapshot {
     canonical_current_owner_verified: bool,
     incoming_provenance_complete: bool,
     original_read_observation_complete: bool,
+    original_full_retention_complete: bool,
 }
 #[cfg(unix)]
 #[derive(Serialize)]
@@ -187,6 +190,7 @@ impl CaptureSession {
             active: AtomicBool::new(true),
             inbound_complete: AtomicBool::new(true),
             read_complete: AtomicBool::new(true),
+            full_complete: AtomicBool::new(true),
             expires,
             peers: Arc::downgrade(peers),
             capture_id: plan.capture_id,
@@ -549,7 +553,8 @@ impl CaptureSession {
                         && (read.udp_complete
                             || read.tcp.as_ref().is_some_and(|tcp| tcp.is_complete())),
                     flow_invalid: flow.invalid,
-                    historical_frame_full_complete: !flow.invalid
+                    historical_frame_full_complete: self.full_complete.load(Ordering::Acquire)
+                        && !flow.invalid
                         && state.full_history.frame_complete(
                             flow_index,
                             key.sequence as usize,
@@ -599,6 +604,7 @@ impl CaptureSession {
             canonical_current_owner_verified: false,
             incoming_provenance_complete: self.inbound_complete.load(Ordering::Acquire),
             original_read_observation_complete: self.read_complete.load(Ordering::Acquire),
+            original_full_retention_complete: self.full_complete.load(Ordering::Acquire),
         })
     }
 }

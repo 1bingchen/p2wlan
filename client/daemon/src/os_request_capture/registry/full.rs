@@ -1,11 +1,12 @@
 //! Historical Fulls from the existing original physical-attempt producer.
 //! No current connection state or final once permission is owned here.
-use super::{KernelReadBinding, RegisteredFlowPlan};
+use super::{CaptureSession, KernelReadBinding, RegisteredFlowPlan};
 use crate::os_request_capture::clock::monotonic_ns;
 use crate::os_request_capture::plan::{CaptureFailure, Protocol};
 use crate::peer::PeerManager;
 #[cfg(unix)]
 use serde::Serialize;
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Weak};
 use std::time::Instant;
 
@@ -13,6 +14,45 @@ use std::time::Instant;
 // capacity. Fragmentation/retransmission cannot grow retained metadata forever.
 const MAX_FULL_PACKETS: usize = 1024;
 const MAX_FRAME_WIRE_BYTES: usize = 1204;
+
+/// A negative observation guard, never a Full or current-owner permission.
+/// Only an actual KernelRead supplies its weak scope. Preparation alone does
+/// not arm it; the original physical-attempt owner arms it before opening.
+pub(crate) struct OriginalFullObservation {
+    scope: Weak<CaptureSession>,
+    armed: bool,
+}
+
+impl OriginalFullObservation {
+    pub(crate) fn arm(&mut self) {
+        self.armed = true;
+    }
+
+    /// Called only after the original Full callback or a definitely-not-handed
+    /// terminal. Disarming this observer cannot restore a previously lost one.
+    pub(crate) fn complete(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for OriginalFullObservation {
+    fn drop(&mut self) {
+        if self.armed {
+            if let Some(scope) = self.scope.upgrade() {
+                scope.original_full_retention_lost();
+            }
+        }
+    }
+}
+
+impl CaptureSession {
+    fn original_full_retention_lost(&self) {
+        // No lock or retry: loss must remain observable even when the history
+        // mutex itself caused the miss. Later duplicates never rearm a scope.
+        self.full_complete.store(false, Ordering::Release);
+        self.gap();
+    }
+}
 
 #[derive(Clone, Copy)]
 #[cfg_attr(unix, derive(Serialize))]
@@ -219,6 +259,19 @@ impl FullHistory {
 }
 
 impl KernelReadBinding {
+    pub(crate) fn original_full_observation(&self) -> OriginalFullObservation {
+        OriginalFullObservation {
+            scope: self.scope.clone(),
+            armed: false,
+        }
+    }
+
+    pub(crate) fn original_full_retention_lost(&self) {
+        if let Some(scope) = self.scope.upgrade() {
+            scope.original_full_retention_lost();
+        }
+    }
+
     pub(crate) fn physical_publication(&self) -> &crate::overlay_requests::PhysicalSendPublication {
         &self.physical_publication
     }
@@ -269,7 +322,7 @@ impl KernelReadBinding {
             state.full_history.retain(self, observed)
         };
         if retain().is_err() {
-            scope.gap();
+            scope.original_full_retention_lost();
         }
     }
 }

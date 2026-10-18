@@ -304,13 +304,16 @@ def exercise(lab: EvidenceLab, groups: OwnedGroups, report: dict, out: Path,
     for name, label in (("a1", "a"), ("b1", "b")):
         lab.daemon(name, label, room, users[label]["token"], 41001)
     initial = {name: lab.wait(name + " readiness", lambda name=name: endpoint(lab, name)) for name in ("a1", "b1")}
-    for name, peer in (("a1", "b1"), ("b1", "a1")):
-        # Wait for the original committed encrypted path readiness; no probe
-        # request is sent/retried to turn a failed application run into a pass.
-        lab.wait(name + " original encrypted path readiness", lambda name=name, peer=peer: any(
-            p.get("node_id") == initial[peer]["node_id"] and p.get("online") is True
-            and p.get("active_path") == ("relay" if relay_mode else "direct") for p in lab.status(name).get("peers", [])
-        ))
+    if relay_mode:
+        relay_fixture.wait(lab, initial, report)
+    else:
+        for name, peer in (("a1", "b1"), ("b1", "a1")):
+            # Wait for the original committed encrypted Direct readiness; no
+            # probe request is sent/retried to turn a failed run into a pass.
+            lab.wait(name + " original Direct readiness", lambda name=name, peer=peer: any(
+                p.get("node_id") == initial[peer]["node_id"] and p.get("online") is True
+                and p.get("active_path") == "direct" for p in lab.status(name).get("peers", [])
+            ))
     snapshots = {name: endpoint(lab, name, initial[peer]["virtual_ip"]) for name, peer in (("a1", "b1"), ("b1", "a1"))}
     if snapshots["a1"]["node_id"] == snapshots["b1"]["node_id"]:
         raise RuntimeError("two original endpoint identities collapsed")
@@ -525,6 +528,8 @@ def main() -> int:
                 report["original_kernel_read_observations"] = {"passed": False, "gap_reason": type(kernel_error).__name__}
         try:
             lab.preserve_logs()
+            if args.relay_application:
+                relay_fixture.preserve_service_logs(lab, original.redact_text)
         except Exception as capture_error:
             report["debug_capture_error"] = type(capture_error).__name__
         report["stages"] = lab.evidence["stages"]

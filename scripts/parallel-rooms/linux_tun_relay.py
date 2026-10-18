@@ -50,6 +50,55 @@ def parse_keypair(text):
     return parts
 
 
+def readiness(snapshot, peer_id):
+    """Diagnostic preflight only; final native transactions remain mandatory."""
+    peers = [p for p in snapshot.get("peers", []) if p.get("node_id") == peer_id]
+    peer = peers[0] if len(peers) == 1 else {}
+    selection = peer.get("current_path_selection") or {}
+    generation = snapshot.get("network_generation")
+    ready_id, confirmed_id = (peer.get(k) for k in ["relay_ready_connection_id", "relay_confirmed_connection_id"])
+    generations = [generation, peer.get("relay_ready_generation"), peer.get("relay_confirmed_generation")]
+    ready = (snapshot.get("relay_connected") is True and peer.get("online") is True
+             and all(type(value) is int and value >= 0 for value in generations)
+             and generations[0] == generations[1] == generations[2]
+             and type(ready_id) is int and type(confirmed_id) is int and ready_id > 0 and ready_id == confirmed_id
+             and peer.get("relay_ready_endpoint") == peer.get("relay_confirmed_endpoint") == ENDPOINT
+             and selection.get("path") == "relay" and selection.get("reason_code") == "path_direct_disabled")
+    return dict(scope="diagnostic_relay_selection_readiness_only", ready=ready, native_evidence=False,
+                expected_peer=peer_id, observed_peer_count=len(peers), network_generation=generation,
+                relay_ready_generation=peer.get("relay_ready_generation"),
+                relay_confirmed_generation=peer.get("relay_confirmed_generation"),
+                relay_ready_connection_id=ready_id, relay_confirmed_connection_id=confirmed_id,
+                relay_ready_endpoint=peer.get("relay_ready_endpoint"),
+                relay_confirmed_endpoint=peer.get("relay_confirmed_endpoint"),
+                observed_connection_active_path=peer.get("active_path"),
+                current_business_selection=selection.get("path"), selection_reason_code=selection.get("reason_code"))
+
+
+def wait(lab, initial, report):
+    observations = report.setdefault("relay_readiness", {})
+    for name, remote in [("a1", "b1"), ("b1", "a1")]:
+        def observe():
+            value = readiness(lab.status(name), initial[remote]["node_id"])
+            observations[name] = value
+            return value if value["ready"] else None
+        # Reuse the original ninety-second readiness bound, before any
+        # application request plan/window. Never warm up or replay business.
+        lab.wait(name + " original confirmed Relay selection readiness", observe)
+
+
+def preserve_service_logs(lab, redact):
+    for role in ["control", "relay"]:
+        source = lab.root / (role + ".console")
+        with source.open("rb") as stream:
+            stream.seek(0, 2)
+            stream.seek(max(0, stream.tell() - 256 * 1024))
+            lines = stream.read(256 * 1024).decode(errors="replace").splitlines()[-1000:]
+        destination = lab.debug_dir / ("service-" + role + ".console.log")
+        destination.write_text("\n".join(redact(line) for line in lines) + "\n")
+        destination.chmod(0o600)
+
+
 def start(lab, report):
     # The existing synchronous command slot retains its twenty-second bound.
     # Keys stay in the private child environment, never in report or saved argv.

@@ -13,6 +13,58 @@ import retain_linux_tun_programs as retention
 
 
 class RelayDataControls(unittest.TestCase):
+    def readiness_data(self):
+        return dict(network_generation=0, relay_connected=True, peers=[dict(node_id="peer-1", online=True,
+            active_path="direct", relay_ready_generation=0, relay_confirmed_generation=0,
+            relay_ready_connection_id=1, relay_confirmed_connection_id=1,
+            relay_ready_endpoint=relay.ENDPOINT, relay_confirmed_endpoint=relay.ENDPOINT,
+            current_path_selection=dict(path="relay", reason_code="path_direct_disabled"))])
+
+    def test_diagnostic_readiness_uses_current_business_selection_and_matching_confirmation(self):
+        snapshot = self.readiness_data()
+        before = copy.deepcopy(snapshot)
+        result = relay.readiness(snapshot, "peer-1")
+        self.assertTrue(result["ready"])
+        self.assertFalse(result["native_evidence"])
+        self.assertEqual(result["observed_connection_active_path"], "direct")
+        self.assertEqual(result["current_business_selection"], "relay")
+        self.assertEqual(snapshot, before)
+
+    def test_local_connect_stale_generation_replacement_or_wrong_selector_is_not_ready(self):
+        changes = [dict(relay_confirmed_generation=None), dict(relay_confirmed_generation=1),
+                   dict(relay_confirmed_generation=False), dict(relay_confirmed_connection_id=2),
+                   dict(relay_confirmed_connection_id=True), dict(relay_ready_connection_id=0),
+                   dict(relay_confirmed_endpoint="tcp://192.0.2.2:18082"), dict(online=False),
+                   dict(node_id="other-peer"), dict(current_path_selection=dict(path="direct", reason_code="path_direct_disabled")),
+                   dict(current_path_selection=dict(path="relay", reason_code="other"))]
+        for change in changes:
+            snapshot = self.readiness_data()
+            snapshot["peers"][0].update(change)
+            self.assertFalse(relay.readiness(snapshot, "peer-1")["ready"], change)
+        for change in [dict(network_generation=1), dict(network_generation=False), dict(relay_connected=False)]:
+            snapshot = self.readiness_data()
+            snapshot.update(change)
+            self.assertFalse(relay.readiness(snapshot, "peer-1")["ready"])
+        snapshot = self.readiness_data()
+        snapshot["peers"] *= 2
+        self.assertFalse(relay.readiness(snapshot, "peer-1")["ready"])
+
+    def test_original_service_file_tails_are_bounded_and_redacted_before_private_cleanup(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            debug = root / "debug"
+            debug.mkdir()
+            for role in ["control", "relay"]:
+                (root / (role + ".console")).write_text("public-line\n" * 30000 + "Bearer ephemeral-fixture\n")
+            relay.preserve_service_logs(SimpleNamespace(root=root, debug_dir=debug),
+                                        lambda line: line.replace("Bearer ephemeral-fixture", "Bearer [REDACTED]"))
+            for path in debug.iterdir():
+                text = path.read_text()
+                self.assertLessEqual(len(text.splitlines()), 1000)
+                self.assertLess(path.stat().st_size, 256 * 1024)
+                self.assertNotIn("ephemeral-fixture", text)
+                self.assertIn("Bearer [REDACTED]", text)
+
     def test_separate_fixed16_uses_original_eight_slots_and_all_original_timing(self):
         for protocol in ["udp", "tcp"]:
             entries = relay.manifest("11" * 16, "22" * 16, protocol)

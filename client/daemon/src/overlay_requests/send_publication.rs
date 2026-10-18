@@ -190,6 +190,14 @@ impl PreparedPhysicalPublication {
         else {
             return Ok(None);
         };
+        // The original caller already owns epoch. Match immutable first-read
+        // identity to the actual crypto source here; never try to acquire that
+        // same epoch again through a route-time current-identity observer.
+        if binding.token().kernel().is_some_and(|read| {
+            !read.original_peer_matches_encryption(&peer_owner, actual_generation, source)
+        }) {
+            return Ok(None);
+        }
         if !source.belongs_to(transport) {
             return Ok(None);
         }
@@ -263,6 +271,11 @@ impl PhysicalSendRecord {
         self.request.matches_kernel(read)
             && self.binding == RequestBindingState::RoutedExact
             && read.original_peer_owner_ptr_matches(&self.peer_owner)
+            && read.original_peer_matches_encryption(
+                &self.peer_owner,
+                self.encryption_generation,
+                &self.encryption,
+            )
             && read.peer_id() == self.encryption.peer_id()
             && read.read_at() <= self.encryption.encrypted_at()
             && self.encryption.authorized_peer_lifecycle().is_some()

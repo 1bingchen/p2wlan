@@ -21,6 +21,7 @@ use std::time::Instant;
 
 mod full;
 mod ingress;
+mod read_peer;
 pub(crate) use ingress::{KernelCaptureRuntime, KernelIngressBinding};
 
 #[cfg(any(target_os = "linux", all(unix, test)))]
@@ -31,6 +32,7 @@ pub(crate) struct CaptureSession {
     owner: u64,
     active: AtomicBool,
     inbound_complete: AtomicBool,
+    read_complete: AtomicBool,
     expires: Instant,
     peers: Weak<PeerManager>,
     #[cfg(unix)]
@@ -66,6 +68,7 @@ struct FlowState {
     inbound: ingress::InboundFlow,
 }
 struct RequestReadState {
+    first_peer: Option<Arc<read_peer::FirstReadPeer>>,
     read_events: u64,
     first_read: Option<Arc<KernelRead>>,
     last_read: Option<Arc<KernelRead>>,
@@ -86,6 +89,7 @@ pub(crate) struct KernelReadBinding {
     plan: Arc<RegisteredFlowPlan>,
     spans: Vec<full::ReadFrameSpan>,
     physical_publication: crate::overlay_requests::PhysicalSendPublication,
+    original_peers: Vec<Arc<read_peer::FirstReadPeer>>,
 }
 
 #[cfg(unix)]
@@ -110,6 +114,7 @@ pub(super) struct ReadSnapshot {
     physical_send_verified: bool,
     canonical_current_owner_verified: bool,
     incoming_provenance_complete: bool,
+    original_read_observation_complete: bool,
 }
 #[cfg(unix)]
 #[derive(Serialize)]
@@ -132,6 +137,7 @@ struct RequestSnapshot {
     historical_frame_full_complete: bool,
     incoming_frame_system_write_complete: bool,
     incoming_flow_invalid: bool,
+    original_peer: Option<read_peer::ReadPeerSnapshot>,
 }
 
 #[cfg(any(target_os = "linux", all(unix, test)))]
@@ -166,6 +172,7 @@ impl CaptureSession {
             owner,
             active: AtomicBool::new(true),
             inbound_complete: AtomicBool::new(true),
+            read_complete: AtomicBool::new(true),
             expires,
             peers: Arc::downgrade(peers),
             capture_id: plan.capture_id,
@@ -239,6 +246,7 @@ impl CaptureSession {
                     .requests
                     .iter()
                     .map(|_| RequestReadState {
+                        first_peer: None,
                         read_events: 0,
                         first_read: None,
                         last_read: None,
@@ -307,12 +315,18 @@ impl CaptureSession {
         original: KernelRead,
         packet: &[u8],
     ) -> Option<KernelReadBinding> {
-        if !original.is_current() || !self.is_live(original.at()) {
+        if !original.is_current()
+            || !self.is_live(original.at())
+            || !self.read_complete.load(Ordering::Acquire)
+        {
             return None;
         }
         match self.capture_read(original, packet) {
             Ok(binding) => binding,
             Err(_) => {
+                // A lost original read cannot be replaced by a later copy
+                // sampled under a newer peer lifecycle or network generation.
+                self.read_complete.store(false, Ordering::Release);
                 self.gap();
                 None
             }
@@ -449,6 +463,7 @@ impl CaptureSession {
         if slots.is_empty() {
             return Ok(None);
         }
+        let original_peers = self.first_read_peers(flow, &slots);
         for slot in &slots {
             let read = &mut flow.requests[*slot];
             read.read_events = read
@@ -470,6 +485,7 @@ impl CaptureSession {
             plan,
             spans,
             physical_publication: crate::overlay_requests::PhysicalSendPublication::new(),
+            original_peers,
         }))
     }
 
@@ -523,6 +539,7 @@ impl CaptureSession {
                             plan,
                         ),
                     incoming_flow_invalid: flow.inbound.invalid,
+                    original_peer: read.first_peer.as_ref().map(|peer| peer.snapshot()),
                 });
             }
         }
@@ -548,6 +565,7 @@ impl CaptureSession {
             physical_send_verified: false,
             canonical_current_owner_verified: false,
             incoming_provenance_complete: self.inbound_complete.load(Ordering::Acquire),
+            original_read_observation_complete: self.read_complete.load(Ordering::Acquire),
         })
     }
 }
@@ -556,6 +574,7 @@ impl KernelReadBinding {
     pub(crate) fn is_current_at(&self, observed_at: Instant) -> bool {
         self.scope.upgrade().is_some_and(|scope| {
             scope.is_live(observed_at)
+                && scope.read_complete.load(Ordering::Acquire)
                 && self.read.is_current()
                 && self.read.at() <= observed_at
                 && scope
@@ -574,6 +593,7 @@ impl KernelReadBinding {
         self.is_current_at(observed_at)
             && self.scope.upgrade().is_some_and(|scope| {
                 Weak::ptr_eq(&scope.peers, &Arc::downgrade(peers))
+                    && self.original_peer_identity_is_current(&scope, observed_at)
                     && scope.is_live(observed_at)
                     && self.read.is_current()
                     && self.read.at() <= observed_at
